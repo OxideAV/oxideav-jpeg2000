@@ -430,7 +430,7 @@ fn write_qcd_irreversible(
     out.push(((guard_bits << 5) & 0xE0) | 0x02);
     for &eps in band_eps {
         // mu = 0 → stepsize = 2^(Rb - eps) with Rb = precision.
-        let v: u16 = ((eps as u16 & 0x1F) << 11) | 0;
+        let v: u16 = (eps as u16 & 0x1F) << 11;
         out.extend_from_slice(&v.to_be_bytes());
     }
     Ok(())

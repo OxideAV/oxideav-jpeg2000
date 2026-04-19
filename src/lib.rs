@@ -164,8 +164,20 @@ impl Decoder for J2kDecoder {
     }
 
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
-        let cs = codestream::parse(&packet.data)?;
-        let frame = decode::frame::decode_frame(&cs, &packet.data)?;
+        // Auto-detect JP2 ISOBMFF wrapper: a jp2 file starts with the
+        // 12-byte signature box `00 00 00 0C 6A 50 20 20 0D 0A 87 0A`.
+        // Raw j2k codestreams start with SOC = FF 4F. If we see the JP2
+        // magic, extract the inner `.j2k` codestream before parsing.
+        let jp2_signature = [
+            0x00, 0x00, 0x00, 0x0C, b'j', b'P', b' ', b' ', 0x0D, 0x0A, 0x87, 0x0A,
+        ];
+        let data: Vec<u8> = if packet.data.len() >= 12 && packet.data[..12] == jp2_signature {
+            encode::codestream::extract_jp2_codestream(&packet.data)?
+        } else {
+            packet.data.clone()
+        };
+        let cs = codestream::parse(&data)?;
+        let frame = decode::frame::decode_frame(&cs, &data)?;
         self.last_parsed = Some(cs);
         self.pending = Some(frame);
         Ok(())
