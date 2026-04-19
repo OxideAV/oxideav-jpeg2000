@@ -6,7 +6,7 @@ rust-version = "1.80"
 license = "MIT"
 repository = "https://github.com/OxideAV/oxideav-jpeg2000"
 authors = ["Mark Karpeles"]
-description = "Pure-Rust JPEG 2000 (J2K) codec — Part-1 codestream marker parser; sample decode (DWT + MQ coder + EBCOT) and encoder not yet implemented"
+description = "Pure-Rust JPEG 2000 (J2K) codec — Part-1 codestream parser, MQ arithmetic coder, EBCOT tier-1, tier-2 packet headers (LRCP / RLCP), 5/3 + 9/7 inverse DWT, RCT component transform; encoder not yet implemented"
 
 readme = "README.md"
 homepage = "https://github.com/OxideAV/oxideav-jpeg2000"
