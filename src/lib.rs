@@ -39,7 +39,7 @@
 pub mod codestream;
 pub mod decode;
 
-use oxideav_codec::{CodecRegistry, Decoder, Encoder};
+use oxideav_codec::{CodecInfo, CodecRegistry, Decoder, Encoder};
 use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, Error, Frame, Packet, Result};
 
 pub use codestream::{Codestream, ComponentInfo, Marker, Siz, TilePart};
@@ -57,8 +57,12 @@ pub fn register(reg: &mut CodecRegistry) {
     let caps = CodecCapabilities::video("jpeg2000")
         .with_lossy(true)
         .with_intra_only(true);
-    reg.register_decoder_impl(CodecId::new(CODEC_ID_STR), caps.clone(), make_decoder);
-    reg.register_encoder_impl(CodecId::new(CODEC_ID_STR), caps, make_encoder);
+    reg.register(
+        CodecInfo::new(CodecId::new(CODEC_ID_STR))
+            .capabilities(caps)
+            .decoder(make_decoder)
+            .encoder(make_encoder),
+    );
 }
 
 fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
