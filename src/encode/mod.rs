@@ -2,12 +2,16 @@
 //!
 //! Scope of this module:
 //!
-//! - **5/3 integer reversible** wavelet (Part-1 lossless default).
+//! - **5/3 integer reversible** and **9/7 irreversible float** wavelets.
 //! - **Single quality layer**, **single tile**, **LRCP** progression.
 //! - **Default precinct** grid (one precinct per resolution) — PPx =
 //!   PPy = 15 in the COD.
 //! - **No mode switches** (`Cblksty = 0`): sigprop / magref / cleanup
 //!   passes are all MQ-coded.
+//! - **Gray8** and **Rgb24** input with optional forward RCT / ICT
+//!   component transform.
+//! - Optional **JP2 ISOBMFF box wrapper** (`.jp2`) around the raw
+//!   `.j2k` codestream.
 //!
 //! The submodules mirror the decoder's structure:
 //!

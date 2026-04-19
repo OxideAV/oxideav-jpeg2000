@@ -22,26 +22,31 @@
 //!     transform (ICT) for 3-component 9/7 streams.
 //!   - LRCP + RLCP progression orders. Single quality layer. Single
 //!     tile. Default precinct size (one precinct per resolution).
-//! - A Part-1 **sample encoder** that writes baseline `.j2k`
-//!   codestreams for 5/3 integer reversible (lossless) input. The
-//!   encode pipeline is a mirror of the decoder's: forward 5/3
-//!   lifting, MQ encoder, EBCOT tier-1 passes, tier-2 packet
-//!   construction (inclusion + zero-bitplane tag trees, adaptive
-//!   Lblock, comma-coded pass count), SOC / SIZ / COD / QCD / SOT /
-//!   SOD / EOC markers.
+//! - A Part-1 **sample encoder** that writes `.j2k` codestreams (or
+//!   `.jp2` containers) for 8-bit Gray / RGB input. Supports both
+//!   transforms:
+//!     - 5/3 integer reversible (bit-exact lossless) with optional
+//!       forward RCT (§G.1) for 3-channel input.
+//!     - 9/7 irreversible float with per-band scalar quantisation and
+//!       optional forward ICT (§G.2).
+//!
+//!   Pipeline mirrors the decoder: forward DWT, MQ encoder, EBCOT
+//!   tier-1 passes, tier-2 packet construction (inclusion +
+//!   zero-bitplane tag trees, adaptive Lblock, comma-coded pass
+//!   count), and the SOC / SIZ / COD / QCD / SOT / SOD / EOC marker
+//!   chain. Setting `EncodeOptions::jp2_wrapper` additionally emits
+//!   the ISOBMFF `jP  ` + `ftyp` + `jp2h` + `jp2c` boxes from
+//!   ISO/IEC 15444-1 Annex I; the decoder auto-detects and strips the
+//!   wrapper on input.
 //!
 //! What is not here yet:
 //!
 //! - Multi-tile codestreams, multi-layer (progressive quality) streams,
 //!   user-defined precinct grids, and the CPRL / PCRL progression
 //!   orders.
-//! - The JP2 ISOBMFF box wrapper (`.jp2` with the
-//!   `00 00 00 0C 6A 50 20 20 0D 0A 87 0A` signature box + JP2 Colour
-//!   Specification / Metadata boxes). `.j2k` raw codestreams are what
-//!   the parser accepts.
-//! - 9/7 (irreversible) encoder — decode is wired but encode only
-//!   emits 5/3.
-//! - Encoder input pixel formats beyond `Gray8`.
+//! - Encoder input pixel formats beyond `Gray8` / `Rgb24` 8-bit.
+//! - RGB input whose RCT chroma excursions go outside the 8-bit
+//!   signed range (requires 9-bit signed chroma in the SIZ).
 
 pub mod codestream;
 pub mod decode;

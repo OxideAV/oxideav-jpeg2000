@@ -6,7 +6,7 @@ rust-version = "1.80"
 license = "MIT"
 repository = "https://github.com/OxideAV/oxideav-jpeg2000"
 authors = ["Mark Karpeles"]
-description = "Pure-Rust JPEG 2000 (J2K) codec — Part-1 codestream parser, MQ arithmetic coder, EBCOT tier-1 / tier-2 (LRCP / RLCP), 5/3 + 9/7 inverse DWT, RCT / ICT component transforms. 5/3 lossless encoder with bit-exact round-trip."
+description = "Pure-Rust JPEG 2000 (J2K + JP2) codec — Part-1 codestream parser, MQ arithmetic coder, EBCOT tier-1 / tier-2 (LRCP / RLCP), 5/3 + 9/7 DWT (forward + inverse), forward + inverse RCT / ICT component transforms, ISOBMFF JP2 box wrapper. 5/3 lossless and 9/7 irreversible encoder."
 
 readme = "README.md"
 homepage = "https://github.com/OxideAV/oxideav-jpeg2000"

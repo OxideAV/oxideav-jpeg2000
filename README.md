@@ -38,12 +38,23 @@ baseline `.j2k` codestreams. The pipeline covers:
   and **irreversible colour transform (ICT)** for 3-channel 9/7
   streams with `MCT = 1` in the COD.
 
-**Sample encoder** — the `encode` module emits baseline `.j2k`
-codestreams for **5/3 integer reversible (lossless)** input. The
+**Sample encoder** — the `encode` module emits `.j2k` codestreams
+(or `.jp2` containers) for both the **5/3 integer reversible
+(lossless)** and the **9/7 irreversible (lossy)** transforms. The
 pipeline covers:
 
 - **Forward 5/3 integer lifting** — 1-D / 2-D, multi-level pyramid
   with quadrant-packed output.
+- **Forward 9/7 float lifting** — the same multi-level driver with
+  float samples; scales the output using OpenJPEG's `BUG_WEIRD_TWO_INVK`
+  convention (evens ÷ `K`, odds ÷ `2/K`) so the matching inverse
+  recovers the input.
+- **Per-band scalar quantiser** (§E.1.1) for the 9/7 path. Emits the
+  QCD in "expounded" form (qntsty = 2) with `mu_b = 0` and
+  `eps_b = precision`, yielding `stepsize_b = 1` on every sub-band.
+- **Forward component transforms** — RCT (§G.1) for `Rgb24` +
+  reversible, ICT (§G.2) for `Rgb24` + irreversible. The COD's
+  `MCT` flag is set to 1 when applied.
 - **MQ arithmetic encoder** — 47-state table, `CODEMPS` / `CODELPS` /
   `RENORME` / `BYTEOUT` / `FLUSH` primitives.
 - **EBCOT tier-1 encoder** — mirror of the decoder's sigprop / magref
@@ -54,15 +65,21 @@ pipeline covers:
   adaptive Lblock growth, bit-packed MSB-first headers with 0xFF
   stuff-bit.
 - **Codestream writer** — SOC / SIZ / COD / QCD / SOT / SOD / EOC
-  marker chain.
+  marker chain. Transform byte in COD reports 5/3 (1) or 9/7 (0).
+- **JP2 ISOBMFF wrapper** — optional `signature` + `ftyp` + `jp2h`
+  (with `ihdr` + `colr`) + `jp2c` boxes per ISO/IEC 15444-1 Annex I.
+  Enabled via `EncodeOptions::jp2_wrapper`. The decoder auto-detects
+  the wrapper on input, so `.jp2` buffers decode through the same
+  `reg.make_decoder(...)` API.
 
 Round-trip `encode_frame → send_packet → receive_frame` is **bit-exact
-lossless** for 8-bit grayscale input on the 5/3 reversible transform.
+lossless** for 8-bit grayscale (and for RGB whose RCT chroma stays in
+the 8-bit signed range) on the 5/3 reversible transform. The 9/7
+irreversible path produces a lossy bitstream with round-trip PSNR
+> 43 dB on the 64×64 gray / RGB gradient fixtures.
 
 ## What does not work yet
 
-- **9/7 irreversible encoder** — 9/7 decode is wired but the encoder
-  writes 5/3 only. Use `opj_compress -I` if you need a 9/7 bitstream.
 - **Bit-exact pixel reconstruction against OpenJPEG's decoder** is
   approximate for complex content — the shape is complete and passes
   coarse quality metrics on the 64×64 baseline / lossy fixtures, but
@@ -74,13 +91,11 @@ lossless** for 8-bit grayscale input on the 5/3 reversible transform.
 - **User-defined precinct grids**, **CPRL / PCRL / RPCL progression
   orders**, **PPT / PPM packed headers**, **region-of-interest
   (RGN)**, the **HT block coder** (Part 15).
-- **Encoder pixel formats beyond `Gray8`** — RGB / YUV support is
-  blocked on a forward RCT / ICT implementation and the corresponding
-  SIZ + COD emission changes.
-- **The JP2 ISOBMFF box wrapper** (`.jp2` with the
-  `00 00 00 0C 6A 50 20 20 0D 0A 87 0A` signature box + JP2 Colour
-  Specification / Metadata boxes). Feed the inner `.j2k` codestream
-  directly to the parser.
+- **RGB input beyond 8-bit unsigned chroma** — the decoder's RCT
+  inverse currently clamps chroma to unsigned 8-bit before the
+  inverse transform, so encoder inputs with chroma excursions outside
+  [-128, 127] can overflow. 9-bit signed RCT chroma (the OpenJPEG
+  convention) is not yet implemented.
 - **Part-2 extensions** (multi-component transform, arbitrary wavelet
   kernels, etc.).
 
@@ -162,6 +177,33 @@ let mut enc = reg.make_encoder(&params)?;
 enc.send_frame(&Frame::Video(vf))?;
 let pkt = enc.receive_packet()?;
 println!("emitted {} bytes of J2K", pkt.data.len());
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+### Encode a 9/7 irreversible .jp2
+
+```rust,no_run
+use oxideav_core::{Frame, PixelFormat, TimeBase, VideoFrame, VideoPlane};
+use oxideav_jpeg2000::encode::{encode_frame, EncodeOptions, TransformMode};
+
+// RGB input — 3 × 8-bit packed.
+let vf = VideoFrame {
+    format: PixelFormat::Rgb24,
+    width: 64,
+    height: 64,
+    pts: None,
+    time_base: TimeBase::new(1, 1),
+    planes: vec![VideoPlane { stride: 64 * 3, data: vec![128u8; 64 * 64 * 3] }],
+};
+
+let opts = EncodeOptions {
+    transform: TransformMode::Irreversible97,  // 9/7 float wavelet
+    jp2_wrapper: true,                         // emit .jp2 boxes
+    use_color_transform: true,                 // apply forward ICT
+    ..Default::default()
+};
+let bytes = encode_frame(&Frame::Video(vf), &opts).expect("encode");
+std::fs::write("image.jp2", &bytes)?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
