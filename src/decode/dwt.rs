@@ -16,21 +16,12 @@
 
 /// Apply a single-level inverse 5/3 integer lifting on an arbitrary-
 /// sized rectangular region.
+///
+/// The 2-D inverse runs the **vertical pass first**, mirroring the
+/// encode side (which applies rows then columns forward) so the pair
+/// `fdwt_53 → idwt_53` forms a bit-exact reversible round-trip.
 pub fn idwt_53(buf: &mut [i32], w: usize, h: usize, stride: usize) {
-    // Horizontal pass first: each row of the subband quadrant has w
-    // samples. After un-deinterleaving we run `idwt_53_1d` in place.
-    let mut row_scratch = vec![0i32; w];
-    for y in 0..h {
-        for x in 0..w {
-            row_scratch[x] = buf[y * stride + x];
-        }
-        interleave_i32(&mut row_scratch);
-        idwt_53_1d(&mut row_scratch);
-        for x in 0..w {
-            buf[y * stride + x] = row_scratch[x];
-        }
-    }
-    // Vertical pass.
+    // Vertical pass first.
     let mut col_scratch = vec![0i32; h];
     for x in 0..w {
         for y in 0..h {
@@ -42,11 +33,23 @@ pub fn idwt_53(buf: &mut [i32], w: usize, h: usize, stride: usize) {
             buf[y * stride + x] = col_scratch[y];
         }
     }
+    // Horizontal pass.
+    let mut row_scratch = vec![0i32; w];
+    for y in 0..h {
+        for x in 0..w {
+            row_scratch[x] = buf[y * stride + x];
+        }
+        interleave_i32(&mut row_scratch);
+        idwt_53_1d(&mut row_scratch);
+        for x in 0..w {
+            buf[y * stride + x] = row_scratch[x];
+        }
+    }
 }
 
 /// Un-deinterleave a 1-D signal: input is `[L0, L1, ..., Lm, H0, H1, ..., Hk]`
 /// with `m = (n + 1) / 2`; output is `[L0, H0, L1, H1, ...]`.
-fn interleave_i32(x: &mut [i32]) {
+pub(crate) fn interleave_i32(x: &mut [i32]) {
     let n = x.len();
     if n < 2 {
         return;

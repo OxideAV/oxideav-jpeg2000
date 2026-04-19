@@ -14,13 +14,21 @@
 //!     refinement, cleanup.
 //!   - Tier-2 packet header parsing + inclusion / zero-bitplane tag
 //!     trees.
-//!   - Inverse 5/3 integer reversible and 9/7 irreversible lifting
-//!     (the 9/7 path is implemented but not currently exercised by the
-//!     top-level driver).
+//!   - Inverse 5/3 integer reversible lifting (Part-1 lossless) and
+//!     9/7 irreversible float lifting (end-to-end; RGB → YCbCr inverse
+//!     ICT for 3-component streams).
 //!   - DC level-shift, clipping, reversible component transform (RCT)
-//!     for 3-component streams.
+//!     for 3-component 5/3 streams and irreversible component
+//!     transform (ICT) for 3-component 9/7 streams.
 //!   - LRCP + RLCP progression orders. Single quality layer. Single
 //!     tile. Default precinct size (one precinct per resolution).
+//! - A Part-1 **sample encoder** that writes baseline `.j2k`
+//!   codestreams for 5/3 integer reversible (lossless) input. The
+//!   encode pipeline is a mirror of the decoder's: forward 5/3
+//!   lifting, MQ encoder, EBCOT tier-1 passes, tier-2 packet
+//!   construction (inclusion + zero-bitplane tag trees, adaptive
+//!   Lblock, comma-coded pass count), SOC / SIZ / COD / QCD / SOT /
+//!   SOD / EOC markers.
 //!
 //! What is not here yet:
 //!
@@ -31,13 +39,13 @@
 //!   `00 00 00 0C 6A 50 20 20 0D 0A 87 0A` signature box + JP2 Colour
 //!   Specification / Metadata boxes). `.j2k` raw codestreams are what
 //!   the parser accepts.
-//! - The irreversible 9/7 path is compiled but not wired into the
-//!   top-level driver — baseline fixtures emitted by OpenJPEG default
-//!   to 5/3, which is what the driver exercises.
-//! - Any encoder.
+//! - 9/7 (irreversible) encoder — decode is wired but encode only
+//!   emits 5/3.
+//! - Encoder input pixel formats beyond `Gray8`.
 
 pub mod codestream;
 pub mod decode;
+pub mod encode;
 
 use oxideav_codec::{CodecInfo, CodecRegistry, Decoder, Encoder};
 use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, Error, Frame, Packet, Result};
@@ -69,8 +77,62 @@ fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     Ok(Box::new(J2kDecoder::new(params.codec_id.clone())))
 }
 
-fn make_encoder(_params: &CodecParameters) -> Result<Box<dyn Encoder>> {
-    Err(Error::unsupported("jpeg2000: encoder not yet implemented"))
+fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
+    Ok(Box::new(J2kEncoder::new(params.codec_id.clone())))
+}
+
+/// JPEG 2000 sample encoder — 5/3 integer reversible (lossless),
+/// single-tile, single-layer, default precincts. See
+/// [`encode::EncodeOptions`] for the knobs this implementation honours.
+pub struct J2kEncoder {
+    output_params: CodecParameters,
+    opts: encode::EncodeOptions,
+    pending: Option<Packet>,
+    seq_counter: u64,
+}
+
+impl J2kEncoder {
+    pub fn new(codec_id: CodecId) -> Self {
+        Self {
+            output_params: CodecParameters::video(codec_id),
+            opts: encode::EncodeOptions::default(),
+            pending: None,
+            seq_counter: 0,
+        }
+    }
+
+    /// Replace the encode parameters. Call before any `send_frame`.
+    pub fn set_options(&mut self, opts: encode::EncodeOptions) {
+        self.opts = opts;
+    }
+}
+
+impl Encoder for J2kEncoder {
+    fn codec_id(&self) -> &CodecId {
+        &self.output_params.codec_id
+    }
+
+    fn output_params(&self) -> &CodecParameters {
+        &self.output_params
+    }
+
+    fn send_frame(&mut self, frame: &Frame) -> Result<()> {
+        let bytes = encode::encode_frame(frame, &self.opts)?;
+        let pkt = Packet::new(0u32, oxideav_core::TimeBase::new(1, 1), bytes);
+        self.seq_counter = self.seq_counter.wrapping_add(1);
+        self.pending = Some(pkt);
+        Ok(())
+    }
+
+    fn receive_packet(&mut self) -> Result<Packet> {
+        self.pending
+            .take()
+            .ok_or_else(|| Error::invalid("jpeg2000: no packet pending"))
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// JPEG 2000 sample decoder.
@@ -151,15 +213,12 @@ mod tests {
     }
 
     #[test]
-    fn encoder_factory_still_unsupported() {
+    fn encoder_factory_builds_live_encoder() {
         let mut reg = CodecRegistry::new();
         register(&mut reg);
         let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
-        match reg.make_encoder(&params) {
-            Err(Error::Unsupported(_)) => {}
-            Err(other) => panic!("expected Unsupported, got error {other:?}"),
-            Ok(_) => panic!("expected Unsupported, got a live encoder"),
-        }
+        let enc = reg.make_encoder(&params).expect("factory returns encoder");
+        assert_eq!(enc.codec_id().as_str(), CODEC_ID_STR);
     }
 
     fn build_tiny_j2k() -> Vec<u8> {

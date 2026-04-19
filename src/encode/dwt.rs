@@ -1,0 +1,329 @@
+//! Forward 5/3 integer reversible lifting — ISO/IEC 15444-1 §F.4.8.1.
+//!
+//! Partner to [`crate::decode::dwt`]. Takes an `i32` canvas and runs
+//! the forward discrete wavelet transform in place, leaving the output
+//! in the de-interleaved per-band layout (L samples first on each row
+//! and each column, then H samples). That is, after one level of
+//! analysis on a row of length `n`, the first `ceil(n/2)` entries hold
+//! the low-pass samples and the remaining `floor(n/2)` hold the
+//! high-pass samples.
+
+/// One-dimensional 5/3 reversible forward lifting.
+///
+/// Symmetric whole-sample extension matches the decoder; the standard
+/// forward pass is:
+///
+/// ```text
+///   d[n] = x[2n+1] - floor((x[2n] + x[2n+2]) / 2)
+///   s[n] = x[2n]   + floor((d[n-1] + d[n] + 2) / 4)
+/// ```
+///
+/// where `x[i]` reflects through the boundaries.
+pub fn fdwt_53_1d(x: &mut [i32]) {
+    let n = x.len();
+    if n < 2 {
+        return;
+    }
+    // Step 1: update odd samples (high-pass).
+    //   x[2k+1] -= (x[2k] + x[2k+2]) >> 1
+    let mut k = 0;
+    while 2 * k + 1 < n {
+        let i = 2 * k + 1;
+        let l = x[i - 1];
+        let r = if i + 1 < n { x[i + 1] } else { l };
+        x[i] = x[i].wrapping_sub(l.wrapping_add(r) >> 1);
+        k += 1;
+    }
+    // Step 2: predict even samples (low-pass).
+    //   x[2k] += (x[2k-1] + x[2k+1] + 2) >> 2
+    let mut k = 0;
+    while 2 * k < n {
+        let i = 2 * k;
+        let l = if i >= 1 {
+            x[i - 1]
+        } else if i + 1 < n {
+            x[i + 1]
+        } else {
+            0
+        };
+        let r = if i + 1 < n {
+            x[i + 1]
+        } else if i >= 1 {
+            x[i - 1]
+        } else {
+            0
+        };
+        x[i] = x[i].wrapping_add(l.wrapping_add(r).wrapping_add(2) >> 2);
+        k += 1;
+    }
+    // Step 3: deinterleave. Move L samples to [0..m] and H samples to
+    // [m..n], where m = ceil(n / 2). This is the mirror of the
+    // `interleave_i32` used on decode.
+    deinterleave_i32(x);
+}
+
+/// Inverse of [`crate::decode::dwt::interleave_i32`]: take an
+/// interleaved `[L0, H0, L1, H1, ...]` buffer and rearrange it to
+/// `[L0, L1, ..., Lm-1, H0, H1, ...]`.
+fn deinterleave_i32(x: &mut [i32]) {
+    let n = x.len();
+    if n < 2 {
+        return;
+    }
+    let m = n.div_ceil(2);
+    let mut tmp = vec![0i32; n];
+    for k in 0..m {
+        tmp[k] = x[2 * k];
+    }
+    let k_high = n - m;
+    for k in 0..k_high {
+        tmp[m + k] = x[2 * k + 1];
+    }
+    x.copy_from_slice(&tmp);
+}
+
+/// Apply a single level of 2-D forward 5/3 lifting to a rectangular
+/// region. The output lays low-pass samples in the top-left quadrant,
+/// HL in the top-right, LH in the bottom-left, HH in the bottom-right
+/// — matching the canvas layout the decoder expects.
+pub fn fdwt_53(buf: &mut [i32], w: usize, h: usize, stride: usize) {
+    let mut row = vec![0i32; w];
+    for y in 0..h {
+        for x in 0..w {
+            row[x] = buf[y * stride + x];
+        }
+        fdwt_53_1d(&mut row);
+        for x in 0..w {
+            buf[y * stride + x] = row[x];
+        }
+    }
+    let mut col = vec![0i32; h];
+    for x in 0..w {
+        for y in 0..h {
+            col[y] = buf[y * stride + x];
+        }
+        fdwt_53_1d(&mut col);
+        for y in 0..h {
+            buf[y * stride + x] = col[y];
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::decode::dwt::idwt_53_1d;
+
+    #[test]
+    fn deinterleave_roundtrip() {
+        let mut x = vec![10, 1, 20, 2, 30, 3];
+        deinterleave_i32(&mut x);
+        assert_eq!(x, vec![10, 20, 30, 1, 2, 3]);
+    }
+
+    /// Forward 5/3 followed by inverse 5/3 must reconstruct the
+    /// original signal bit-exactly (reversible).
+    #[test]
+    fn roundtrip_small() {
+        let orig = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let mut buf = orig.clone();
+        fdwt_53_1d(&mut buf);
+        // Interleave back to L/H alternating then run inverse.
+        // `idwt_53_1d` expects the interleaved layout; we built the
+        // output in deinterleaved layout, so re-interleave first.
+        crate::decode::dwt::interleave_i32(&mut buf);
+        idwt_53_1d(&mut buf);
+        assert_eq!(buf, orig);
+    }
+
+    /// 2-D round-trip on a small rectangle.
+    #[test]
+    fn roundtrip_2d() {
+        let w = 8;
+        let h = 4;
+        let orig: Vec<i32> = (0..(w * h) as i32).collect();
+        let mut buf = orig.clone();
+        fdwt_53(&mut buf, w, h, w);
+        // To invert, we need the single-level inverse. The decoder's
+        // 2-D inverse expects the quadrant-packed layout — which is
+        // exactly what `fdwt_53` produced — so we can plug it in.
+        crate::decode::dwt::idwt_53(&mut buf, w, h, w);
+        assert_eq!(buf, orig);
+    }
+
+    /// 2-D round-trip of a simple ramp in X direction.
+    #[test]
+    fn roundtrip_x_ramp_2d() {
+        let w = 8;
+        let h = 4;
+        let mut orig = Vec::with_capacity(w * h);
+        for y in 0..h {
+            for x in 0..w {
+                orig.push(x as i32 * 10 + y as i32);
+            }
+        }
+        let mut buf = orig.clone();
+        fdwt_53(&mut buf, w, h, w);
+        crate::decode::dwt::idwt_53(&mut buf, w, h, w);
+        for i in 0..orig.len() {
+            assert_eq!(
+                buf[i],
+                orig[i],
+                "ramp mismatch at ({}, {}): orig {}, got {}",
+                i % w,
+                i / w,
+                orig[i],
+                buf[i]
+            );
+        }
+    }
+
+    /// 2-D round-trip on a gradient (the round-trip failure case from
+    /// the top-level encoder test).
+    #[test]
+    fn roundtrip_gradient_2d() {
+        let w = 8;
+        let h = 8;
+        let mut orig = Vec::with_capacity(w * h);
+        for y in 0..h {
+            for x in 0..w {
+                let v = ((x + y) * 255 / (w + h - 2)).min(255) as i32 - 128;
+                orig.push(v);
+            }
+        }
+        let mut buf = orig.clone();
+        fdwt_53(&mut buf, w, h, w);
+        // Apply a second forward (if the encoder does multiple levels,
+        // but not relevant here — we only test single level).
+        // Then the exact inverse:
+        crate::decode::dwt::idwt_53(&mut buf, w, h, w);
+        for i in 0..orig.len() {
+            assert_eq!(
+                buf[i],
+                orig[i],
+                "mismatch at ({}, {}): orig {}, got {}",
+                i % w,
+                i / w,
+                orig[i],
+                buf[i]
+            );
+        }
+    }
+
+    /// 2-D roundtrip with col-first inverse (reverses forward order).
+    #[test]
+    fn roundtrip_gradient_col_first_inv() {
+        let w = 8;
+        let h = 8;
+        let mut orig = Vec::with_capacity(w * h);
+        for y in 0..h {
+            for x in 0..w {
+                let v = ((x + y) * 255 / (w + h - 2)).min(255) as i32 - 128;
+                orig.push(v);
+            }
+        }
+        let mut buf = orig.clone();
+        fdwt_53(&mut buf, w, h, w);
+        // Manual col-first inverse.
+        let mut col = vec![0i32; h];
+        for x in 0..w {
+            for y in 0..h {
+                col[y] = buf[y * w + x];
+            }
+            crate::decode::dwt::interleave_i32(&mut col);
+            crate::decode::dwt::idwt_53_1d(&mut col);
+            for y in 0..h {
+                buf[y * w + x] = col[y];
+            }
+        }
+        let mut row = vec![0i32; w];
+        for y in 0..h {
+            for x in 0..w {
+                row[x] = buf[y * w + x];
+            }
+            crate::decode::dwt::interleave_i32(&mut row);
+            crate::decode::dwt::idwt_53_1d(&mut row);
+            for x in 0..w {
+                buf[y * w + x] = row[x];
+            }
+        }
+        for i in 0..orig.len() {
+            assert_eq!(
+                buf[i],
+                orig[i],
+                "col-first-inv mismatch at ({}, {}): orig {}, got {}",
+                i % w,
+                i / w,
+                orig[i],
+                buf[i]
+            );
+        }
+    }
+
+    /// 1-D forward then inverse on a single gradient row should be
+    /// bit-exact.
+    #[test]
+    fn roundtrip_gradient_1d() {
+        let orig = vec![-128i32, -110, -92, -74, -56, -37, -19, -1];
+        let mut buf = orig.clone();
+        fdwt_53_1d(&mut buf);
+        // Re-interleave and invert.
+        crate::decode::dwt::interleave_i32(&mut buf);
+        crate::decode::dwt::idwt_53_1d(&mut buf);
+        assert_eq!(buf, orig);
+    }
+
+    /// Row ∘ Col vs Col ∘ Row should give the same result (separable
+    /// DWT commutes).
+    #[test]
+    fn forward_col_row_vs_row_col() {
+        let w = 4;
+        let h = 4;
+        let orig = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        // Row then col:
+        let mut rc = orig.clone();
+        let mut r = vec![0i32; w];
+        for y in 0..h {
+            for x in 0..w {
+                r[x] = rc[y * w + x];
+            }
+            fdwt_53_1d(&mut r);
+            for x in 0..w {
+                rc[y * w + x] = r[x];
+            }
+        }
+        let mut c = vec![0i32; h];
+        for x in 0..w {
+            for y in 0..h {
+                c[y] = rc[y * w + x];
+            }
+            fdwt_53_1d(&mut c);
+            for y in 0..h {
+                rc[y * w + x] = c[y];
+            }
+        }
+        // Col then row:
+        let mut cr = orig.clone();
+        let mut c2 = vec![0i32; h];
+        for x in 0..w {
+            for y in 0..h {
+                c2[y] = cr[y * w + x];
+            }
+            fdwt_53_1d(&mut c2);
+            for y in 0..h {
+                cr[y * w + x] = c2[y];
+            }
+        }
+        let mut r2 = vec![0i32; w];
+        for y in 0..h {
+            for x in 0..w {
+                r2[x] = cr[y * w + x];
+            }
+            fdwt_53_1d(&mut r2);
+            for x in 0..w {
+                cr[y * w + x] = r2[x];
+            }
+        }
+        assert_eq!(rc, cr, "separable transforms should commute");
+    }
+}
