@@ -2,14 +2,25 @@
 //!
 //! The code mirrors [`crate::decode::tile`] on the output side. We
 //! build the same per-resolution / per-subband layouts, run the
-//! forward 5/3 lifting quadrant-first, encode each code-block with
-//! [`super::t1::encode_cblk`], then emit one packet per precinct per
-//! resolution per layer (LRCP order, single layer).
+//! forward 5/3 lifting (reversible integer) or 9/7 lifting
+//! (irreversible float + scalar quantisation), encode each code-block
+//! with [`super::t1::encode_cblk`], then emit one packet per precinct
+//! per resolution per layer (LRCP order, single layer).
 
-use super::dwt::fdwt_53;
+use super::dwt::{fdwt_53, fdwt_97};
 use super::t1::{encode_cblk, EncodedCblk};
 use crate::decode::tile::{build_subbands, SubbandInfo};
 use oxideav_core::{Error, Result};
+
+/// Wavelet transform kind selected by the caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransformKind {
+    /// 5/3 reversible integer (Part-1 lossless default).
+    Reversible53,
+    /// 9/7 irreversible float with per-band scalar quantisation
+    /// (Part-1 lossy default).
+    Irreversible97,
+}
 
 /// Encoder-side equivalent of the decoder's `PrecinctState`. We keep
 /// one of these per sub-band (single precinct per sub-band at PPx =
@@ -47,6 +58,7 @@ pub struct EncodedTile {
 /// - `num_decomp`: number of DWT decomposition levels (5/3 default 5).
 /// - `cblk_w_log2`, `cblk_h_log2`: code-block dimensions in log2.
 /// - `guard_bits`: guard bits from QCD (2 is the default).
+#[allow(clippy::too_many_arguments)]
 pub fn encode_tile(
     comp_planes: &[Vec<i32>],
     comp_sizes: &[(u32, u32, u32, u32)],
@@ -270,6 +282,203 @@ pub fn encode_tile(
         }
     }
 
+    Ok(EncodedTile { body })
+}
+
+/// Encode a single tile using the 9/7 irreversible transform with
+/// per-band scalar quantisation.
+///
+/// - `comp_planes_f32`: per-component sample arrays in `f32`, already
+///   DC-level shifted.
+/// - `band_stepsizes`: pre-computed quantisation step sizes indexed by
+///   the canonical band order (LL of resolution 0, then HL/LH/HH per
+///   resolution). Must have `3 * num_decomp + 1` entries.
+/// - `band_eps`: matching `eps_b` values for the QCD. Same ordering.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_tile_97(
+    comp_planes_f32: &[Vec<f32>],
+    comp_sizes: &[(u32, u32, u32, u32)],
+    num_decomp: u8,
+    cblk_w_log2: u8,
+    cblk_h_log2: u8,
+    guard_bits: u8,
+    band_stepsizes: &[f32],
+    band_eps: &[u8],
+) -> Result<EncodedTile> {
+    if comp_planes_f32.len() != comp_sizes.len() {
+        return Err(Error::invalid(
+            "jpeg2000: component plane / size array length mismatch",
+        ));
+    }
+    let num_bands = 3 * (num_decomp as usize) + 1;
+    if band_stepsizes.len() != num_bands || band_eps.len() != num_bands {
+        return Err(Error::invalid(
+            "jpeg2000: band stepsize / eps length mismatch",
+        ));
+    }
+    let num_comps = comp_planes_f32.len();
+    let num_res = (num_decomp as usize) + 1;
+
+    let mut per_comp: Vec<Vec<EncResolution>> = Vec::with_capacity(num_comps);
+    for (comp_idx, &(cx0, cy0, cx1, cy1)) in comp_sizes.iter().enumerate() {
+        let comp_w = (cx1 - cx0) as usize;
+        let comp_h = (cy1 - cy0) as usize;
+        let subbands_all = build_subbands(cx0, cy0, cx1, cy1, num_decomp);
+
+        let mut canvas = comp_planes_f32[comp_idx].clone();
+        if canvas.len() != comp_w * comp_h {
+            return Err(Error::invalid(
+                "jpeg2000: component plane size mismatch with comp_sizes",
+            ));
+        }
+
+        // Level-by-level forward 9/7 pyramid. Same driver shape as the
+        // 5/3 path: at each level, transform the current active
+        // rectangle, then compact the low-pass quadrant so the next
+        // level operates on a smaller top-left region.
+        let mut cur_w = comp_w;
+        let mut cur_h = comp_h;
+        for _level in 0..num_decomp as usize {
+            if cur_w < 2 || cur_h < 2 {
+                break;
+            }
+            fdwt_97(&mut canvas, cur_w, cur_h, comp_w);
+            let sub_w = cur_w.div_ceil(2);
+            let sub_h = cur_h.div_ceil(2);
+            let mut sub = vec![0f32; sub_w * sub_h];
+            for y in 0..sub_h {
+                for x in 0..sub_w {
+                    sub[y * sub_w + x] = canvas[y * comp_w + x];
+                }
+            }
+            for y in 0..sub_h {
+                for x in 0..sub_w {
+                    canvas[y * comp_w + x] = sub[y * sub_w + x];
+                }
+            }
+            cur_w = sub_w;
+            cur_h = sub_h;
+        }
+
+        // Build per-resolution / per-subband tier-1 output.
+        let mut res_out: Vec<EncResolution> = Vec::with_capacity(num_res);
+        for resno in 0..num_res as u8 {
+            let subs: Vec<SubbandInfo> = subbands_all
+                .iter()
+                .copied()
+                .filter(|sb| sb.resno == resno)
+                .collect();
+            let mut precincts = Vec::with_capacity(subs.len());
+            for sb in &subs {
+                let bw = (sb.x1 - sb.x0) as usize;
+                let bh = (sb.y1 - sb.y0) as usize;
+                if bw == 0 || bh == 0 {
+                    precincts.push(EncPrecinct {
+                        cblks_w: 1,
+                        cblks_h: 1,
+                        cblks: Vec::new(),
+                        included: Vec::new(),
+                    });
+                    continue;
+                }
+                let level_from_top = num_decomp as usize - resno as usize;
+                let mut scale_w = comp_w;
+                let mut scale_h = comp_h;
+                for _ in 0..level_from_top {
+                    scale_w = scale_w.div_ceil(2);
+                    scale_h = scale_h.div_ceil(2);
+                }
+                let (band_cx0, band_cy0) = match sb.band_kind {
+                    0 => (0usize, 0usize),
+                    1 => (scale_w.div_ceil(2), 0),
+                    2 => (0, scale_h.div_ceil(2)),
+                    3 => (scale_w.div_ceil(2), scale_h.div_ceil(2)),
+                    _ => (0, 0),
+                };
+
+                // Quantise: q = sign(c) * floor(|c| / stepsize * 2) / 2
+                // The *2 factor here comes from T.800 Eq E-6's
+                // `2 * sign(y) * floor(|y| / 2Δ)` convention — but
+                // OpenJPEG folds the factor-of-2 into the decoder by
+                // using `scale = 0.5 * stepsize` and having tier-1 emit
+                // `2|q| | 1`. So on the encoder side we produce
+                // `q = sign(c) * floor(|c| / stepsize)` and let tier-1
+                // multiply by 2 internally.
+                let stepsize = band_stepsizes[sb.band_idx];
+                if !stepsize.is_finite() || stepsize <= 0.0 {
+                    return Err(Error::invalid("jpeg2000: invalid 9/7 stepsize"));
+                }
+                let mut band_buf_i = vec![0i32; bw * bh];
+                for by in 0..bh {
+                    for bx in 0..bw {
+                        let c = canvas[(band_cy0 + by) * comp_w + (band_cx0 + bx)];
+                        // Plain dead-zone scalar quantiser.
+                        let qf = c / stepsize;
+                        let q = if qf >= 0.0 {
+                            qf.floor() as i32
+                        } else {
+                            -((-qf).floor() as i32)
+                        };
+                        band_buf_i[by * bw + bx] = q;
+                    }
+                }
+
+                // Tier-1 on each code-block. Band numbps follows the
+                // decoder's formula: `band_numbps = guard_bits + eps - 1`.
+                let cw = 1u32 << cblk_w_log2;
+                let ch = 1u32 << cblk_h_log2;
+                let cblks_w = (bw as u32).div_ceil(cw) as usize;
+                let cblks_h = (bh as u32).div_ceil(ch) as usize;
+                let mut cblks: Vec<EncodedCblk> = Vec::with_capacity(cblks_w * cblks_h);
+                let mut included = Vec::with_capacity(cblks_w * cblks_h);
+                let eps = band_eps[sb.band_idx] as i32;
+                let band_numbps = guard_bits as i32 + eps - 1;
+                for cy in 0..cblks_h {
+                    for cx in 0..cblks_w {
+                        let x0 = sb.x0 + cx as u32 * cw;
+                        let y0 = sb.y0 + cy as u32 * ch;
+                        let x1 = (x0 + cw).min(sb.x1);
+                        let y1 = (y0 + ch).min(sb.y1);
+                        let cw_real = (x1 - x0) as usize;
+                        let ch_real = (y1 - y0) as usize;
+                        let rel_x = (x0 - sb.x0) as usize;
+                        let rel_y = (y0 - sb.y0) as usize;
+                        let mut local = vec![0i32; cw_real * ch_real];
+                        for ly in 0..ch_real {
+                            for lx in 0..cw_real {
+                                local[ly * cw_real + lx] =
+                                    band_buf_i[(rel_y + ly) * bw + (rel_x + lx)];
+                            }
+                        }
+                        let enc = encode_cblk(&local, cw_real, ch_real, band_numbps, sb.orient);
+                        let mb = band_numbps + 1;
+                        let block_included = (enc.missing_msb as i32) < mb;
+                        included.push(block_included);
+                        cblks.push(enc);
+                    }
+                }
+                precincts.push(EncPrecinct {
+                    cblks_w,
+                    cblks_h,
+                    cblks,
+                    included,
+                });
+            }
+            res_out.push(EncResolution {
+                subbands: subs,
+                precincts,
+            });
+        }
+        per_comp.push(res_out);
+    }
+
+    // Tier-2.
+    let mut body: Vec<u8> = Vec::new();
+    for resno in 0..num_res {
+        for per_comp_entry in per_comp.iter_mut().take(num_comps) {
+            emit_packet(&mut body, &mut per_comp_entry[resno])?;
+        }
+    }
     Ok(EncodedTile { body })
 }
 
