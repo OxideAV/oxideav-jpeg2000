@@ -130,6 +130,9 @@ const BETA: f32 = -0.052_980_12;
 const GAMMA: f32 = 0.882_911_1;
 const DELTA: f32 = 0.443_506_85;
 const K_GAIN: f32 = 1.230_174_1;
+/// `2 / K` — historical OpenJPEG constant used on the high-pass lane
+/// during inverse 9/7. See `BUG_WEIRD_TWO_INVK` in `opj_tcd.c`.
+const TWO_INV_K: f32 = 1.625_732_4;
 
 /// One-dimensional 9/7 inverse lifting.
 pub fn idwt_97_1d(x: &mut [f32]) {
@@ -137,15 +140,20 @@ pub fn idwt_97_1d(x: &mut [f32]) {
     if n < 2 {
         return;
     }
-    // Step 0: scale (even by 1/K, odd by K).
+    // Step 0: undo the forward-transform scale. We follow OpenJPEG's
+    // `BUG_WEIRD_TWO_INVK` convention: evens are multiplied by `K`
+    // (opj_K), odds by `2/K` (opj_two_invK). The `2/K` on odds absorbs
+    // the per-band `log2_gain_b` factor that T.800 §E.1.1.2 would
+    // normally put into the stepsize — this way we can use the
+    // simpler `Rb = precision` stepsize (see `synth_component_97`).
     let mut k = 0;
     while 2 * k < n {
-        x[2 * k] /= K_GAIN;
+        x[2 * k] *= K_GAIN;
         k += 1;
     }
     let mut k = 0;
     while 2 * k + 1 < n {
-        x[2 * k + 1] *= K_GAIN;
+        x[2 * k + 1] *= TWO_INV_K;
         k += 1;
     }
     // Step 1: update even — x[2k] -= delta * (x[2k-1] + x[2k+1]).

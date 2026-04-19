@@ -334,6 +334,13 @@ fn build_resolutions(
         .collect()
 }
 
+/// Per-component decoded sample bit-depth hint used to compute the 9/7
+/// sub-band step size. `None` means "use the guard-bits-based heuristic"
+/// — fine for 8-bit components but deeper ones will skew.
+pub struct DecodeParams<'a> {
+    pub comp_precisions: &'a [u32],
+}
+
 #[allow(clippy::needless_range_loop)]
 pub fn decode_tile(
     body: &[u8],
@@ -341,14 +348,30 @@ pub fn decode_tile(
     cod: &CodParams,
     qcd: &QcdParams,
 ) -> Result<Vec<Vec<i32>>> {
+    // Legacy signature used by tests: assume 8-bit components.
+    let precisions: Vec<u32> = vec![8u32; comp_sizes.len()];
+    let params = DecodeParams {
+        comp_precisions: &precisions,
+    };
+    decode_tile_with_params(body, comp_sizes, cod, qcd, &params)
+}
+
+#[allow(clippy::needless_range_loop)]
+pub fn decode_tile_with_params(
+    body: &[u8],
+    comp_sizes: &[(u32, u32, u32, u32)],
+    cod: &CodParams,
+    qcd: &QcdParams,
+    params: &DecodeParams<'_>,
+) -> Result<Vec<Vec<i32>>> {
     if cod.num_layers != 1 {
         return Err(Error::unsupported(
             "jpeg2000: only one quality layer is currently supported",
         ));
     }
-    if cod.transform != 1 {
+    if cod.transform > 1 {
         return Err(Error::unsupported(
-            "jpeg2000: only 5/3 reversible transform is currently supported",
+            "jpeg2000: unknown transform id (must be 0 or 1)",
         ));
     }
     if !(cod.progression_order == 0 || cod.progression_order == 1) {
@@ -402,144 +425,293 @@ pub fn decode_tile(
             out.push(Vec::new());
             continue;
         }
-
-        // Decode every sub-band's code-blocks into its own buffer.
-        let mut band_bufs: Vec<Vec<i32>> = Vec::with_capacity(num_res * 3 + 1);
-        for resno in 0..num_res {
-            let layout = &layouts[comp_idx][resno];
-            for (sb_idx, sb) in layout.subbands.iter().enumerate() {
-                let bw = (sb.x1 - sb.x0) as usize;
-                let bh = (sb.y1 - sb.y0) as usize;
-                let mut buf = vec![0i32; bw * bh];
-                let prec = &layout.prec_states[sb_idx];
-                for cy in 0..prec.cblks_h {
-                    for cx in 0..prec.cblks_w {
-                        let idx = cy * prec.cblks_w + cx;
-                        let st = &prec.cblks[idx];
-                        if !st.included || st.total_passes == 0 {
-                            continue;
-                        }
-                        let (bx0, by0, bx1, by1) = layout.cblk_rects[sb_idx][idx];
-                        let w = (bx1 - bx0) as usize;
-                        let h = (by1 - by0) as usize;
-                        let (eps, _mant) = qcd.bands[sb.band_idx];
-                        // band->numbps = guard_bits + eps - 1 (T.800 Eq E-2).
-                        // cblk->numbps = band->numbps + 1 - missing_msb.
-                        // OpenJPEG starts tier-1 with bpno_plus_one = cblk->numbps.
-                        // Our `bpno` matches their `bpno_plus_one` naming.
-                        let band_numbps = qcd.guard_bits as i32 + eps as i32 - 1;
-                        let bpno = band_numbps + 1 - st.missing_msb as i32;
-                        if bpno < 1 {
-                            continue;
-                        }
-                        let decoded = t1::decode_cblk(
-                            st.data.clone(),
-                            w,
-                            h,
-                            bpno,
-                            st.total_passes,
-                            sb.orient,
-                            cod.cblk_style,
-                        );
-                        // Copy decoded cblk into the band buffer at its
-                        // sub-band-relative position. For the reversible
-                        // (qmfbid=1) transform, OpenJPEG divides each
-                        // tier-1 sample by 2 before IDWT — this undoes
-                        // the `oneplushalf` magnitude that sigpass /
-                        // cleanup deposit so the magnitude is in the
-                        // natural [1<<(bpno-1), 1<<bpno) bracket.
-                        let rel_x = (bx0 - sb.x0) as usize;
-                        let rel_y = (by0 - sb.y0) as usize;
-                        for ly in 0..h {
-                            for lx in 0..w {
-                                let v = decoded.data[ly * w + lx];
-                                // Round toward zero for positive;
-                                // round up (toward zero) for negative.
-                                buf[(rel_y + ly) * bw + (rel_x + lx)] = v / 2;
-                            }
-                        }
-                    }
-                }
-                band_bufs.push(buf);
-            }
+        if cod.transform == 1 {
+            out.push(synth_component_53(
+                &layouts[comp_idx],
+                num_res,
+                comp_w,
+                comp_h,
+                cod,
+                qcd,
+            )?);
+        } else {
+            // 9/7 irreversible float path.
+            let prec = params.comp_precisions.get(comp_idx).copied().unwrap_or(8);
+            out.push(synth_component_97(
+                &layouts[comp_idx],
+                num_res,
+                comp_w,
+                comp_h,
+                cod,
+                qcd,
+                prec,
+            )?);
         }
-
-        // Now synthesise upward: at each resolution r in 1..=num_decomp,
-        // combine LL_{r-1} + HL_r + LH_r + HH_r → LL_r via IDWT-53.
-        //
-        // Index into `band_bufs`:
-        //   band 0              → LL (resno 0)
-        //   bands 1, 2, 3       → HL, LH, HH at resno 1
-        //   bands 4, 5, 6       → HL, LH, HH at resno 2
-        //   ...
-        let mut ll = band_bufs[0].clone();
-        let layout0 = &layouts[comp_idx][0];
-        let (mut ll_w, mut ll_h) = (
-            (layout0.subbands[0].x1 - layout0.subbands[0].x0) as usize,
-            (layout0.subbands[0].y1 - layout0.subbands[0].y0) as usize,
-        );
-
-        for resno in 1..num_res {
-            let layout = &layouts[comp_idx][resno];
-            // layout.subbands is in HL, LH, HH order.
-            let hl = &band_bufs[1 + (resno - 1) * 3];
-            let lh = &band_bufs[1 + (resno - 1) * 3 + 1];
-            let hh = &band_bufs[1 + (resno - 1) * 3 + 2];
-            let hl_sb = &layout.subbands[0];
-            let lh_sb = &layout.subbands[1];
-            let hh_sb = &layout.subbands[2];
-            let hl_w = (hl_sb.x1 - hl_sb.x0) as usize;
-            let hl_h = (hl_sb.y1 - hl_sb.y0) as usize;
-            let lh_w = (lh_sb.x1 - lh_sb.x0) as usize;
-            let lh_h = (lh_sb.y1 - lh_sb.y0) as usize;
-            let hh_w = (hh_sb.x1 - hh_sb.x0) as usize;
-            let hh_h = (hh_sb.y1 - hh_sb.y0) as usize;
-            // Canvas width / height for this level's synthesis. LL_{r-1}
-            // width + HL width = LL_r width. Likewise for height.
-            let canvas_w = ll_w + hl_w;
-            let canvas_h = ll_h + lh_h;
-            // Sanity check: widths should line up.
-            debug_assert_eq!(canvas_w, lh_w + hh_w);
-            debug_assert_eq!(canvas_h, hl_h + hh_h);
-            let mut canvas = vec![0i32; canvas_w * canvas_h];
-            // LL_{r-1} → top-left
-            for y in 0..ll_h {
-                for x in 0..ll_w {
-                    canvas[y * canvas_w + x] = ll[y * ll_w + x];
-                }
-            }
-            // HL → top-right
-            for y in 0..hl_h {
-                for x in 0..hl_w {
-                    canvas[y * canvas_w + (ll_w + x)] = hl[y * hl_w + x];
-                }
-            }
-            // LH → bottom-left
-            for y in 0..lh_h {
-                for x in 0..lh_w {
-                    canvas[(ll_h + y) * canvas_w + x] = lh[y * lh_w + x];
-                }
-            }
-            // HH → bottom-right
-            for y in 0..hh_h {
-                for x in 0..hh_w {
-                    canvas[(ll_h + y) * canvas_w + (ll_w + x)] = hh[y * hh_w + x];
-                }
-            }
-            // IDWT.
-            dwt::idwt_53(&mut canvas, canvas_w, canvas_h, canvas_w);
-            ll = canvas;
-            ll_w = canvas_w;
-            ll_h = canvas_h;
-        }
-
-        // `ll` now holds the fully synthesised component samples, size
-        // `(cx1-cx0) × (cy1-cy0)` = comp_w × comp_h.
-        debug_assert_eq!(ll.len(), comp_w * comp_h);
-        out.push(ll);
     }
 
     Ok(out)
+}
+
+/// Decode + synthesise one component using the 5/3 reversible integer
+/// wavelet.
+#[allow(clippy::needless_range_loop)]
+fn synth_component_53(
+    layouts: &[ResolutionLayout],
+    num_res: usize,
+    comp_w: usize,
+    comp_h: usize,
+    cod: &CodParams,
+    qcd: &QcdParams,
+) -> Result<Vec<i32>> {
+    // Decode every sub-band's code-blocks into its own buffer.
+    let mut band_bufs: Vec<Vec<i32>> = Vec::with_capacity(num_res * 3 + 1);
+    for resno in 0..num_res {
+        let layout = &layouts[resno];
+        for (sb_idx, sb) in layout.subbands.iter().enumerate() {
+            let bw = (sb.x1 - sb.x0) as usize;
+            let bh = (sb.y1 - sb.y0) as usize;
+            let mut buf = vec![0i32; bw * bh];
+            let prec = &layout.prec_states[sb_idx];
+            for cy in 0..prec.cblks_h {
+                for cx in 0..prec.cblks_w {
+                    let idx = cy * prec.cblks_w + cx;
+                    let st = &prec.cblks[idx];
+                    if !st.included || st.total_passes == 0 {
+                        continue;
+                    }
+                    let (bx0, by0, bx1, by1) = layout.cblk_rects[sb_idx][idx];
+                    let w = (bx1 - bx0) as usize;
+                    let h = (by1 - by0) as usize;
+                    let (eps, _mant) = qcd.bands[sb.band_idx];
+                    let band_numbps = qcd.guard_bits as i32 + eps as i32 - 1;
+                    let bpno = band_numbps + 1 - st.missing_msb as i32;
+                    if bpno < 1 {
+                        continue;
+                    }
+                    let decoded = t1::decode_cblk(
+                        st.data.clone(),
+                        w,
+                        h,
+                        bpno,
+                        st.total_passes,
+                        sb.orient,
+                        cod.cblk_style,
+                    );
+                    let rel_x = (bx0 - sb.x0) as usize;
+                    let rel_y = (by0 - sb.y0) as usize;
+                    for ly in 0..h {
+                        for lx in 0..w {
+                            let v = decoded.data[ly * w + lx];
+                            buf[(rel_y + ly) * bw + (rel_x + lx)] = v / 2;
+                        }
+                    }
+                }
+            }
+            band_bufs.push(buf);
+        }
+    }
+
+    // Synthesise upward: at each resolution r in 1..=num_decomp,
+    // combine LL_{r-1} + HL_r + LH_r + HH_r → LL_r via IDWT-53.
+    let mut ll = band_bufs[0].clone();
+    let layout0 = &layouts[0];
+    let (mut ll_w, mut ll_h) = (
+        (layout0.subbands[0].x1 - layout0.subbands[0].x0) as usize,
+        (layout0.subbands[0].y1 - layout0.subbands[0].y0) as usize,
+    );
+
+    for resno in 1..num_res {
+        let layout = &layouts[resno];
+        let hl = &band_bufs[1 + (resno - 1) * 3];
+        let lh = &band_bufs[1 + (resno - 1) * 3 + 1];
+        let hh = &band_bufs[1 + (resno - 1) * 3 + 2];
+        let hl_sb = &layout.subbands[0];
+        let lh_sb = &layout.subbands[1];
+        let hh_sb = &layout.subbands[2];
+        let hl_w = (hl_sb.x1 - hl_sb.x0) as usize;
+        let hl_h = (hl_sb.y1 - hl_sb.y0) as usize;
+        let lh_w = (lh_sb.x1 - lh_sb.x0) as usize;
+        let lh_h = (lh_sb.y1 - lh_sb.y0) as usize;
+        let hh_w = (hh_sb.x1 - hh_sb.x0) as usize;
+        let hh_h = (hh_sb.y1 - hh_sb.y0) as usize;
+        let canvas_w = ll_w + hl_w;
+        let canvas_h = ll_h + lh_h;
+        debug_assert_eq!(canvas_w, lh_w + hh_w);
+        debug_assert_eq!(canvas_h, hl_h + hh_h);
+        let mut canvas = vec![0i32; canvas_w * canvas_h];
+        for y in 0..ll_h {
+            for x in 0..ll_w {
+                canvas[y * canvas_w + x] = ll[y * ll_w + x];
+            }
+        }
+        for y in 0..hl_h {
+            for x in 0..hl_w {
+                canvas[y * canvas_w + (ll_w + x)] = hl[y * hl_w + x];
+            }
+        }
+        for y in 0..lh_h {
+            for x in 0..lh_w {
+                canvas[(ll_h + y) * canvas_w + x] = lh[y * lh_w + x];
+            }
+        }
+        for y in 0..hh_h {
+            for x in 0..hh_w {
+                canvas[(ll_h + y) * canvas_w + (ll_w + x)] = hh[y * hh_w + x];
+            }
+        }
+        dwt::idwt_53(&mut canvas, canvas_w, canvas_h, canvas_w);
+        ll = canvas;
+        ll_w = canvas_w;
+        ll_h = canvas_h;
+    }
+
+    debug_assert_eq!(ll.len(), comp_w * comp_h);
+    Ok(ll)
+}
+
+/// Decode + synthesise one component using the 9/7 irreversible float
+/// wavelet. Returns a flat `Vec<i32>` of component samples in the same
+/// coordinate system as the 5/3 path, so `frame.rs` can apply DC level
+/// shift / clipping uniformly.
+///
+/// Dequantisation (T.800 §E.1.1.2):
+///
+/// ```text
+///   stepsize_b = (1 + mant/2^11) * 2^(Rb - eps)
+///   sample_f   = sample_i * 0.5 * stepsize_b
+/// ```
+///
+/// Following OpenJPEG's `BUG_WEIRD_TWO_INVK` convention: `Rb = prec`
+/// (no per-band gain on decode). The gain is baked into the lifting
+/// scale factors on the inverse transform.
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+fn synth_component_97(
+    layouts: &[ResolutionLayout],
+    num_res: usize,
+    comp_w: usize,
+    comp_h: usize,
+    cod: &CodParams,
+    qcd: &QcdParams,
+    precision: u32,
+) -> Result<Vec<i32>> {
+    // Decode every sub-band's code-blocks into a float buffer with
+    // dequantised samples.
+    let mut band_bufs: Vec<Vec<f32>> = Vec::with_capacity(num_res * 3 + 1);
+    for resno in 0..num_res {
+        let layout = &layouts[resno];
+        for (sb_idx, sb) in layout.subbands.iter().enumerate() {
+            let bw = (sb.x1 - sb.x0) as usize;
+            let bh = (sb.y1 - sb.y0) as usize;
+            let mut buf = vec![0f32; bw * bh];
+            let prec_state = &layout.prec_states[sb_idx];
+            let (eps, mant) = qcd.bands[sb.band_idx];
+            // Stepsize per T.800 Eq E-3. For the 9/7 decoder we match
+            // OpenJPEG's `BUG_WEIRD_TWO_INVK` convention (see
+            // `opj_tcd_init_tile`): `Rb = precision` (no `log2_gain_b`
+            // factor). The `log2_gain_b` bits are recovered instead by
+            // the IDWT's `K` / `2/K` scaling — see `idwt_97_1d`.
+            let rb = precision as i32;
+            let stepsize = (1.0f64 + (mant as f64) / 2048.0) * 2f64.powi(rb - eps as i32);
+            // 0.5 factor matches OpenJPEG's `0.5f * band->stepsize`:
+            // our tier-1 samples carry the `oneplushalf` magnitude which
+            // bakes a factor of 2 into the value. Halving it undoes that.
+            let scale = 0.5f64 * stepsize;
+            for cy in 0..prec_state.cblks_h {
+                for cx in 0..prec_state.cblks_w {
+                    let idx = cy * prec_state.cblks_w + cx;
+                    let st = &prec_state.cblks[idx];
+                    if !st.included || st.total_passes == 0 {
+                        continue;
+                    }
+                    let (bx0, by0, bx1, by1) = layout.cblk_rects[sb_idx][idx];
+                    let w = (bx1 - bx0) as usize;
+                    let h = (by1 - by0) as usize;
+                    let band_numbps = qcd.guard_bits as i32 + eps as i32 - 1;
+                    let bpno = band_numbps + 1 - st.missing_msb as i32;
+                    if bpno < 1 {
+                        continue;
+                    }
+                    let decoded = t1::decode_cblk(
+                        st.data.clone(),
+                        w,
+                        h,
+                        bpno,
+                        st.total_passes,
+                        sb.orient,
+                        cod.cblk_style,
+                    );
+                    let rel_x = (bx0 - sb.x0) as usize;
+                    let rel_y = (by0 - sb.y0) as usize;
+                    for ly in 0..h {
+                        for lx in 0..w {
+                            let v = decoded.data[ly * w + lx];
+                            buf[(rel_y + ly) * bw + (rel_x + lx)] = (v as f64 * scale) as f32;
+                        }
+                    }
+                }
+            }
+            band_bufs.push(buf);
+            let _ = bh;
+        }
+    }
+
+    // Synthesise upward using the 9/7 float IDWT.
+    let mut ll = band_bufs[0].clone();
+    let layout0 = &layouts[0];
+    let (mut ll_w, mut ll_h) = (
+        (layout0.subbands[0].x1 - layout0.subbands[0].x0) as usize,
+        (layout0.subbands[0].y1 - layout0.subbands[0].y0) as usize,
+    );
+
+    for resno in 1..num_res {
+        let layout = &layouts[resno];
+        let hl = &band_bufs[1 + (resno - 1) * 3];
+        let lh = &band_bufs[1 + (resno - 1) * 3 + 1];
+        let hh = &band_bufs[1 + (resno - 1) * 3 + 2];
+        let hl_sb = &layout.subbands[0];
+        let lh_sb = &layout.subbands[1];
+        let hh_sb = &layout.subbands[2];
+        let hl_w = (hl_sb.x1 - hl_sb.x0) as usize;
+        let hl_h = (hl_sb.y1 - hl_sb.y0) as usize;
+        let lh_w = (lh_sb.x1 - lh_sb.x0) as usize;
+        let lh_h = (lh_sb.y1 - lh_sb.y0) as usize;
+        let hh_w = (hh_sb.x1 - hh_sb.x0) as usize;
+        let hh_h = (hh_sb.y1 - hh_sb.y0) as usize;
+        let canvas_w = ll_w + hl_w;
+        let canvas_h = ll_h + lh_h;
+        debug_assert_eq!(canvas_w, lh_w + hh_w);
+        debug_assert_eq!(canvas_h, hl_h + hh_h);
+        let mut canvas = vec![0f32; canvas_w * canvas_h];
+        for y in 0..ll_h {
+            for x in 0..ll_w {
+                canvas[y * canvas_w + x] = ll[y * ll_w + x];
+            }
+        }
+        for y in 0..hl_h {
+            for x in 0..hl_w {
+                canvas[y * canvas_w + (ll_w + x)] = hl[y * hl_w + x];
+            }
+        }
+        for y in 0..lh_h {
+            for x in 0..lh_w {
+                canvas[(ll_h + y) * canvas_w + x] = lh[y * lh_w + x];
+            }
+        }
+        for y in 0..hh_h {
+            for x in 0..hh_w {
+                canvas[(ll_h + y) * canvas_w + (ll_w + x)] = hh[y * hh_w + x];
+            }
+        }
+        dwt::idwt_97(&mut canvas, canvas_w, canvas_h, canvas_w);
+        ll = canvas;
+        ll_w = canvas_w;
+        ll_h = canvas_h;
+    }
+
+    debug_assert_eq!(ll.len(), comp_w * comp_h);
+    // Round floats to nearest integer for the downstream level-shift
+    // pipeline.
+    Ok(ll.into_iter().map(|v| v.round() as i32).collect())
 }
 
 struct Cursor<'a> {

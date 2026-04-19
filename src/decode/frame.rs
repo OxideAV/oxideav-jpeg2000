@@ -3,7 +3,7 @@
 
 use oxideav_core::{Error, Frame, PixelFormat, Result, TimeBase, VideoFrame, VideoPlane};
 
-use super::tile::{decode_tile, parse_cod, parse_qcd};
+use super::tile::{decode_tile_with_params, parse_cod, parse_qcd, DecodeParams};
 use crate::codestream::Codestream;
 
 /// Decode one JPEG 2000 still into an uncompressed video frame.
@@ -57,7 +57,11 @@ pub fn decode_frame(cs: &Codestream, buf: &[u8]) -> Result<Frame> {
         })
         .collect();
 
-    let component_planes = decode_tile(&tile_body, &comp_sizes, &cod, &qcd)?;
+    let comp_precisions: Vec<u32> = cs.siz.components.iter().map(|c| c.bit_depth()).collect();
+    let params = DecodeParams {
+        comp_precisions: &comp_precisions,
+    };
+    let component_planes = decode_tile_with_params(&tile_body, &comp_sizes, &cod, &qcd, &params)?;
 
     // DC level-shift + clip to per-component dynamic range.
     let mut shifted: Vec<Vec<u8>> = Vec::with_capacity(component_planes.len());
@@ -112,16 +116,26 @@ pub fn decode_frame(cs: &Codestream, buf: &[u8]) -> Result<Frame> {
             } else {
                 PixelFormat::Yuv444P
             };
-            // Apply reversible component transform (RCT) if MCT=1 in the
-            // COD. This round-trips RGB <-> YUV using the integer
-            // transform in T.800 G.2.
+            // Apply the relevant inverse component transform when MCT=1
+            // in the COD. For reversible (5/3) streams this is the RCT
+            // (T.800 §G.1); for irreversible (9/7) streams it is the
+            // ICT (§G.2) — YCbCr → RGB with the standard 0.299/0.587
+            // 0.114 luma weights.
             let mut planes = shifted;
             if cod.mct == 1 {
-                apply_rct_inverse(
-                    &mut planes,
-                    comp_sizes[0].2 as usize,
-                    comp_sizes[0].3 as usize,
-                );
+                if cod.transform == 1 {
+                    apply_rct_inverse(
+                        &mut planes,
+                        comp_sizes[0].2 as usize,
+                        comp_sizes[0].3 as usize,
+                    );
+                } else {
+                    apply_ict_inverse(
+                        &mut planes,
+                        comp_sizes[0].2 as usize,
+                        comp_sizes[0].3 as usize,
+                    );
+                }
             }
             let planes = planes
                 .into_iter()
@@ -173,6 +187,32 @@ fn apply_rct_inverse(planes: &mut [Vec<u8>], w: usize, h: usize) {
             planes[0][i] = r.clamp(0, 255) as u8;
             planes[1][i] = g.clamp(0, 255) as u8;
             planes[2][i] = b.clamp(0, 255) as u8;
+        }
+    }
+}
+
+/// Reverse the JPEG 2000 irreversible component transform (ICT),
+/// mapping YCbCr back into RGB per T.800 §G.2 (identical matrix to ITU-R
+/// BT.601 JPEG YCbCr):
+///
+/// ```text
+///   R = Y              + 1.402   * (Cr - 128)
+///   G = Y - 0.34413 * (Cb - 128) - 0.71414 * (Cr - 128)
+///   B = Y + 1.772   * (Cb - 128)
+/// ```
+fn apply_ict_inverse(planes: &mut [Vec<u8>], w: usize, h: usize) {
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            let yf = planes[0][i] as f32;
+            let cb = planes[1][i] as f32 - 128.0;
+            let cr = planes[2][i] as f32 - 128.0;
+            let r = yf + 1.402 * cr;
+            let g = yf - 0.344_13 * cb - 0.714_14 * cr;
+            let b = yf + 1.772 * cb;
+            planes[0][i] = r.round().clamp(0.0, 255.0) as u8;
+            planes[1][i] = g.round().clamp(0.0, 255.0) as u8;
+            planes[2][i] = b.round().clamp(0.0, 255.0) as u8;
         }
     }
 }
