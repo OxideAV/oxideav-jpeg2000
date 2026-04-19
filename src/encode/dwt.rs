@@ -109,6 +109,153 @@ pub fn fdwt_53(buf: &mut [i32], w: usize, h: usize, stride: usize) {
     }
 }
 
+// --- 9/7 irreversible forward DWT ---
+
+/// 9/7 lifting constants — must match the decoder's
+/// [`crate::decode::dwt`] constants.
+const ALPHA: f32 = -1.586_134_3;
+const BETA: f32 = -0.052_980_12;
+const GAMMA: f32 = 0.882_911_1;
+const DELTA: f32 = 0.443_506_85;
+const K_GAIN: f32 = 1.230_174_1;
+/// `2 / K` — inverse uses this on the odd lane to absorb the per-band
+/// gain factor. See `BUG_WEIRD_TWO_INVK` in OpenJPEG's `opj_tcd.c`.
+const TWO_INV_K: f32 = 1.625_732_4;
+
+/// One-dimensional 9/7 irreversible forward lifting.
+///
+/// Inverse of [`crate::decode::dwt::idwt_97_1d`] — applies the five
+/// lifting steps in reverse order and finally scales even samples by
+/// `1/K` and odd samples by `K/2` (= `1 / (2/K)`). On return the buffer
+/// is in the deinterleaved `[L0, L1, ..., Lm-1, H0, H1, ..., Hk-1]`
+/// layout.
+pub fn fdwt_97_1d(x: &mut [f32]) {
+    let n = x.len();
+    if n < 2 {
+        return;
+    }
+    // Step 1 (reverse of idwt step 4): predict odd — add ALPHA * even neighbours.
+    //   x[2k+1] += alpha * (x[2k] + x[2k+2])
+    let mut k = 0;
+    while 2 * k + 1 < n {
+        let i = 2 * k + 1;
+        let l = x[i - 1];
+        let r = if i + 1 < n { x[i + 1] } else { l };
+        x[i] += ALPHA * (l + r);
+        k += 1;
+    }
+    // Step 2 (reverse of idwt step 3): update even — add BETA * odd neighbours.
+    let mut k = 0;
+    while 2 * k < n {
+        let i = 2 * k;
+        let l = if i >= 1 {
+            x[i - 1]
+        } else if i + 1 < n {
+            x[i + 1]
+        } else {
+            0.0
+        };
+        let r = if i + 1 < n {
+            x[i + 1]
+        } else if i >= 1 {
+            x[i - 1]
+        } else {
+            0.0
+        };
+        x[i] += BETA * (l + r);
+        k += 1;
+    }
+    // Step 3 (reverse of idwt step 2): predict odd — add GAMMA * even neighbours.
+    let mut k = 0;
+    while 2 * k + 1 < n {
+        let i = 2 * k + 1;
+        let l = x[i - 1];
+        let r = if i + 1 < n { x[i + 1] } else { l };
+        x[i] += GAMMA * (l + r);
+        k += 1;
+    }
+    // Step 4 (reverse of idwt step 1): update even — add DELTA * odd neighbours.
+    let mut k = 0;
+    while 2 * k < n {
+        let i = 2 * k;
+        let l = if i >= 1 {
+            x[i - 1]
+        } else if i + 1 < n {
+            x[i + 1]
+        } else {
+            0.0
+        };
+        let r = if i + 1 < n {
+            x[i + 1]
+        } else if i >= 1 {
+            x[i - 1]
+        } else {
+            0.0
+        };
+        x[i] += DELTA * (l + r);
+        k += 1;
+    }
+    // Step 5 (reverse of idwt step 0): scale. Inverse multiplied evens
+    // by `K` and odds by `2/K`; we must multiply by the reciprocals.
+    let mut k = 0;
+    while 2 * k < n {
+        x[2 * k] /= K_GAIN;
+        k += 1;
+    }
+    let mut k = 0;
+    while 2 * k + 1 < n {
+        x[2 * k + 1] /= TWO_INV_K;
+        k += 1;
+    }
+    // Deinterleave: even → low-pass, odd → high-pass.
+    deinterleave_f32(x);
+}
+
+fn deinterleave_f32(x: &mut [f32]) {
+    let n = x.len();
+    if n < 2 {
+        return;
+    }
+    let m = n.div_ceil(2);
+    let mut tmp = vec![0f32; n];
+    for k in 0..m {
+        tmp[k] = x[2 * k];
+    }
+    let k_high = n - m;
+    for k in 0..k_high {
+        tmp[m + k] = x[2 * k + 1];
+    }
+    x.copy_from_slice(&tmp);
+}
+
+/// Apply one level of 2-D forward 9/7 lifting to a rectangular region.
+/// Column pass runs first, mirroring the decoder's row-first inverse —
+/// `fdwt_97 → idwt_97` recovers the input (up to float precision).
+pub fn fdwt_97(buf: &mut [f32], w: usize, h: usize, stride: usize) {
+    // Column pass first (inverse of idwt's final col pass).
+    let mut col = vec![0f32; h];
+    for x in 0..w {
+        for y in 0..h {
+            col[y] = buf[y * stride + x];
+        }
+        fdwt_97_1d(&mut col);
+        for y in 0..h {
+            buf[y * stride + x] = col[y];
+        }
+    }
+    // Then row pass.
+    let mut row = vec![0f32; w];
+    for y in 0..h {
+        for x in 0..w {
+            row[x] = buf[y * stride + x];
+        }
+        fdwt_97_1d(&mut row);
+        for x in 0..w {
+            buf[y * stride + x] = row[x];
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,6 +418,56 @@ mod tests {
         crate::decode::dwt::interleave_i32(&mut buf);
         crate::decode::dwt::idwt_53_1d(&mut buf);
         assert_eq!(buf, orig);
+    }
+
+    /// Forward 9/7 followed by inverse 9/7 reconstructs the original
+    /// signal to within float precision.
+    #[test]
+    fn roundtrip_97_1d() {
+        let orig: Vec<f32> = (0..16).map(|i| (i as f32) * 3.0 - 10.0).collect();
+        let mut buf = orig.clone();
+        fdwt_97_1d(&mut buf);
+        // Reinterleave for the inverse (inverse expects the interleaved
+        // `[L0, H0, L1, H1, ...]` layout).
+        let mut interleaved = vec![0f32; buf.len()];
+        let m = buf.len().div_ceil(2);
+        for k in 0..m {
+            interleaved[2 * k] = buf[k];
+        }
+        let k_high = buf.len() - m;
+        for k in 0..k_high {
+            interleaved[2 * k + 1] = buf[m + k];
+        }
+        crate::decode::dwt::idwt_97_1d(&mut interleaved);
+        for i in 0..orig.len() {
+            assert!(
+                (interleaved[i] - orig[i]).abs() < 1e-3,
+                "9/7 1D roundtrip mismatch at {}: orig={}, got={}",
+                i,
+                orig[i],
+                interleaved[i]
+            );
+        }
+    }
+
+    /// 2-D 9/7 roundtrip on a small rectangle.
+    #[test]
+    fn roundtrip_97_2d() {
+        let w = 8;
+        let h = 8;
+        let orig: Vec<f32> = (0..(w * h) as i32).map(|v| v as f32).collect();
+        let mut buf = orig.clone();
+        fdwt_97(&mut buf, w, h, w);
+        crate::decode::dwt::idwt_97(&mut buf, w, h, w);
+        for i in 0..orig.len() {
+            assert!(
+                (buf[i] - orig[i]).abs() < 1e-2,
+                "9/7 2D roundtrip mismatch at {}: orig={}, got={}",
+                i,
+                orig[i],
+                buf[i]
+            );
+        }
     }
 
     /// Row ∘ Col vs Col ∘ Row should give the same result (separable
