@@ -48,8 +48,8 @@ PPT, PLM, PLT, TLM, CRG, COM. Unknown markers surface as
 
 ```toml
 [dependencies]
-oxideav-core = "0.0"
-oxideav-codec = "0.0"
+oxideav-core = "0.1"
+oxideav-codec = "0.1"
 oxideav-jpeg2000 = "0.0"
 ```
 
