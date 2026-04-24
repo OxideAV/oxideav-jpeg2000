@@ -1,68 +1,23 @@
-//! **Round-8 black-box probe** for the HH-sub-band OpenJPEG interop drift.
+//! Round-8 black-box probes for the HH-sub-band OpenJPEG interop
+//! investigation. The tests sweep `opj_compress` over carefully-chosen
+//! input patterns and compare the extracted sub-bands against our
+//! in-tree FDWT. Round 8 established that:
 //!
-//! Round 7 got LL / HL / LH bit-exact against OpenJPEG-encoded fixtures
-//! at every MQ event. HH still diverges on ~50/64 cells of the 16x16
-//! `opj16_l1.j2k` fixture. Round 7 speculated that the forward 5/3
-//! lifting's HH pass rounds differently from what OpenJPEG emits.
-//!
-//! Round 8 ran a black-box spike-probe sweep against `opj_compress`
-//! (see this file's tests) and found:
-//!
-//! 1. Single-pixel spikes at every (x, y) in a 16x16 canvas, encoded
-//!    with opj_compress and then decoded through our own sub-band
-//!    extractor, match our `fdwt_53` output bit-exactly — both the
-//!    magnitude AND the sign. The 1-D lifting + boundary extension is
-//!    therefore spec-conformant.
-//!
-//! 2. Smooth gradients, horizontal stripes, and vertical stripes all
-//!    match bit-exactly.
-//!
-//! 3. Sparse two-spike patterns (spikes at (0,0) + (2,2), (0,0) + (4,4),
-//!    etc.) match bit-exactly.
-//!
+//! 1. Single-pixel spikes at every `(x, y)` in a 16×16 canvas match
+//!    bit-exactly.
+//! 2. Smooth gradients, horizontal stripes, and vertical stripes match
+//!    bit-exactly.
+//! 3. Sparse two-spike patterns also match.
 //! 4. Patterns with simultaneous high-frequency content on BOTH axes
-//!    (pure checkerboard, the `opj16.pgm` testsrc texture) diverge in
-//!    HH only. Ours gives uniform -510 on a checkerboard; OpenJPEG
-//!    gives spatially-varying values in the range -303..-511.
+//!    (checkerboard, the `opj16.pgm` testsrc texture) diverged on HH.
 //!
-//! 5. Our `fdwt_53` followed by our `idwt_53` reconstructs the original
-//!    image bit-exactly on every probe, so the forward/inverse pair is
-//!    self-consistent.
+//! Round 9 located the HH drift: `ctxno_zc` pre-clamped `ΣD` at 2 for
+//! every orientation, collapsing Table D.1's HH column (labels 6 and 8
+//! both cover `ΣD≥2`, but 8 specifically requires `ΣD≥3`). Un-clamping
+//! `ΣD` on the HH path restores interop — the checker and other bi-
+//! axial high-frequency patterns now round-trip bit-exact.
 //!
-//! 6. Critically: taking OPJ's encoded checkerboard codestream, running
-//!    our sub-band extractor on it, and feeding the result to our own
-//!    `idwt_53` produces 255/256 pixel errors. So the HH coefficients
-//!    we read back from an OPJ codestream are NOT what OPJ's own IDWT
-//!    would treat as the 5/3 coefficient — there's a scale / encoding
-//!    mismatch in how we read HH magnitudes.
-//!
-//! 7. Reciprocally: our encoded j2k, fed to `opj_decompress`, gives
-//!    215/256 pixel errors on the checkerboard, so OPJ cannot
-//!    reconstruct from the HH magnitudes we emit either.
-//!
-//! **Implication.** The drift is NOT in the 1-D lifting formula and NOT
-//! in the 2-D axis order (both of which are bit-exact against OPJ for
-//! all isolated probes). It must be in one of:
-//! - **How our encoder packs HH magnitudes into the code-block bitstream
-//!   (encode/t1.rs : encode_cblk).** The <<1 "oneplushalf" scaling or
-//!   the sign convention may be wrong specifically for the HH orient.
-//! - **How our decoder interprets HH magnitudes (decode/t1.rs /
-//!   decode/tile.rs).** The `/ 2` in `decode_subbands_round6` and
-//!   `synth_component_53` may over- or under-scale HH.
-//! - **The `band_numbps` / `log2_gain_b` / `eps` calculation** for the
-//!   HH band. Table E.1 sets `log2_gain(HH) = 2` (gain = 4), giving
-//!   `eps(HH) = precision + 2 = 10` and `band_numbps = guard + eps - 1
-//!   = 11`. Our encoder matches this. Something downstream of
-//!   `band_numbps` is where the drift enters.
-//!
-//! **Next round suggested approach.** Read the exact MQ trace from the
-//! opj_t1_mqtrace harness at event #185 (the first HH divergence) and
-//! check whether the diverging symbol is a sign bit, a cleanup-pass
-//! significance bit, or a refinement bit. The *kind* of symbol narrows
-//! which of the three hypotheses above is correct.
-//!
-//! These tests use opj_compress as a black-box probe and so skip
-//! gracefully if opj_compress isn't on PATH.
+//! The tests skip gracefully if `opj_compress` is missing on PATH.
 
 use oxideav_jpeg2000::decode::tile::decode_subbands_round6;
 use oxideav_jpeg2000::encode::dwt::fdwt_53;
@@ -142,11 +97,11 @@ fn tmp_path(tag: &str) -> (String, String) {
     )
 }
 
-/// Confirms the **positive** finding: single-pixel spikes at every
-/// sampled position produce HH coefficients that match OPJ bit-exactly.
-/// This rules out a per-sample rounding bug in the forward 5/3 lifting.
+/// Black-box probe: single-pixel spikes at various positions all
+/// round-trip through `opj_compress` → our sub-band extractor bit-
+/// exactly. Documents round-8's positive finding; gated on
+/// `opj_compress` being on PATH.
 #[test]
-#[ignore = "requires opj_compress on PATH; black-box probe that documents round-8 findings"]
 fn round8_spike_hh_bit_exact() {
     if !opj_available() {
         eprintln!("SKIP: opj_compress not on PATH");
@@ -188,11 +143,10 @@ fn round8_spike_hh_bit_exact() {
     );
 }
 
-/// The **negative** finding: patterns with simultaneous high-frequency
-/// content on BOTH axes diverge. Reproduces the checkerboard drift and
-/// documents the expected OPJ output for the next round.
+/// 16×16 checkerboard round-trip. Previously failed on 64/64 HH
+/// samples; after the round-9 HH ZC-context fix it is 0/64 bit-exact
+/// against `opj_compress`. Gated on `opj_compress` being on PATH.
 #[test]
-#[ignore = "requires opj_compress on PATH; documents the round-8 HH divergence on a checkerboard"]
 fn round8_checker_hh_divergence() {
     if !opj_available() {
         eprintln!("SKIP: opj_compress not on PATH");

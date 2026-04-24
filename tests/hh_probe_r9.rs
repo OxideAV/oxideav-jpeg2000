@@ -1,12 +1,16 @@
-//! Round-9 probe: verify our FDWT's HH output matches OPJ's HH output
-//! for the opj16 fixture. Before round 9 this reported 50/64 HH diffs;
-//! after the ZC-HH context fix (removing the erroneous `d.min(2)` clamp
-//! for the HH orientation) the HH is 0/64 bit-exact against OpenJPEG.
+//! Round-9 HH-interop regression probe.
 //!
-//! Run with:
-//! ```bash
-//! cargo test --test hh_probe_r9 -- --ignored --nocapture
-//! ```
+//! Before round 9 this fixture lit up 50/64 HH-coefficient mismatches
+//! against the OpenJPEG-emitted `opj16_l1.j2k` codestream: our forward
+//! 5/3 produced the spec-correct sub-band values for LL/HL/LH but the
+//! HH-band MQ context lookup inside the encoder/decoder was clamping
+//! ΣD at 2 for every orientation, which collapses Table D.1's HH
+//! column (context 6 for ΣD=2, context 8 for ΣD≥3) and desynchronises
+//! every arithmetic-coded HH bit after the first diagonal cluster.
+//!
+//! The `ctxno_zc(..., Orient::Hh)` path in both `src/encode/t1.rs` and
+//! `src/decode/t1.rs` no longer pre-clamps ΣD; this test pins the fix
+//! by asserting 0/64 HH drift at the `decode_subbands_round6` level.
 
 use oxideav_jpeg2000::decode::tile::decode_subbands_round6;
 use oxideav_jpeg2000::encode::dwt::fdwt_53;
@@ -45,11 +49,7 @@ fn parse_pgm(bytes: &[u8]) -> (u32, u32, Vec<u8>) {
     (w, h, bytes[i..].to_vec())
 }
 
-/// Forward-DWT the opj16 PGM and compare the resulting HH sub-band to
-/// what OpenJPEG's encoded stream decodes to. Before round 9 this
-/// reported 50/64 diffs on the 8x8 HH block; afterwards, 0/64.
 #[test]
-#[ignore = "round-9 HH interop probe"]
 fn r9_hh_compare() {
     let (_ll, _hl, _lh, hh_opj) = decode_subbands_round6(OPJ16_J2K).unwrap();
     let (w, h, raw) = parse_pgm(OPJ16_PGM);
@@ -68,6 +68,8 @@ fn r9_hh_compare() {
             diff_count += 1;
         }
     }
-    eprintln!("HH FDWT vs OPJ: {diff_count}/64 mismatches");
-    assert_eq!(diff_count, 0, "HH must be bit-exact against OpenJPEG");
+    assert_eq!(
+        diff_count, 0,
+        "HH must be bit-exact against OpenJPEG (pre-round-9: 50/64 drift)"
+    );
 }
