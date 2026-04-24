@@ -76,6 +76,24 @@ fn roundtrip_constant_gray_is_bit_exact() {
 }
 
 #[test]
+fn roundtrip_16x16_one_decomp_level_is_bit_exact() {
+    // Mirror the `opj16_l1.j2k` fixture's layout (16x16 Gray8, 1-level
+    // DWT) so the round-trip exercises the same decoder code path used
+    // at OpenJPEG interop.
+    let src = build_gradient(16, 16);
+    let opts = EncodeOptions {
+        num_decomp: 1,
+        ..EncodeOptions::default()
+    };
+    let bytes = encode_frame(&Frame::Video(src.clone()), &opts).expect("encode");
+    let dec = decode(&bytes);
+    assert_eq!(
+        dec.planes[0].data, src.planes[0].data,
+        "16x16 gradient at 1 DWT level must round-trip bit-exactly"
+    );
+}
+
+#[test]
 fn roundtrip_gradient_is_bit_exact() {
     let src = build_gradient(64, 64);
     let bytes =

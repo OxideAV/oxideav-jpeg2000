@@ -134,7 +134,7 @@ fn opj_spike_fixture_decodes_bit_exactly() {
 /// **DIAGNOSTIC / KNOWN-FAIL.** 16×16 OpenJPEG fixture with a
 /// single DWT level — isolates the tier-1 + 1-level IDWT interop.
 #[test]
-#[ignore = "known failure: tier-1 interop with opj_compress output — see module docs"]
+#[ignore = "partial interop: tier-1 bit-exact on spike4, but 16x16 1-level DWT still ~35 dB — residual bug in IDWT / packet parsing"]
 fn opj16_single_level_dwt_decodes_bit_exactly() {
     let (w, h, expected) = parse_pgm(OPJ16_PGM);
     assert_eq!((w, h), (16, 16));
@@ -142,24 +142,13 @@ fn opj16_single_level_dwt_decodes_bit_exactly() {
     let got = &vf.planes[0].data;
     let p = psnr(&expected, got);
     eprintln!("opj16_l1 PSNR = {p:.2} dB");
-    let mismatches: Vec<(usize, u8, u8)> = expected
-        .iter()
-        .zip(got.iter())
-        .enumerate()
-        .filter(|(_, (a, b))| a != b)
-        .map(|(i, (a, b))| (i, *a, *b))
-        .collect();
-    eprintln!("opj16_l1 mismatches ({}):", mismatches.len());
-    for (i, a, b) in &mismatches {
-        eprintln!("  [{i}] expected={a} got={b} diff={}", *a as i32 - *b as i32);
-    }
     assert!(p >= 40.0, "opj16 image PSNR too low: {p:.2}");
 }
 
 /// **DIAGNOSTIC / KNOWN-FAIL.** 32×32 OpenJPEG fixture with the
 /// default 5-level decomposition — full pipeline.
 #[test]
-#[ignore = "known failure: tier-1 interop with opj_compress output — see module docs"]
+#[ignore = "partial interop: tier-1 bit-exact on spike4, but 32x32 5-level DWT still ~30 dB — residual bug in IDWT / packet parsing"]
 fn opj_lossless_fixture_decodes_bit_exactly() {
     let (w, h, expected) = parse_pgm(OPJ_PGM);
     assert_eq!(w, 32);
