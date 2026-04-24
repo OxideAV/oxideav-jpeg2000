@@ -22,6 +22,7 @@
 
 use super::mqc::MqcEnc;
 use crate::decode::mqc::{CTX_AGG, CTX_MAG, CTX_UNI, CTX_ZC};
+use crate::decode::t1::trace as dec_trace;
 use crate::decode::t1::Orient;
 
 /// Number of MSB zero bit-planes for every sample in the code-block —
@@ -429,9 +430,11 @@ fn sigprop_pass_enc(state: &mut EncoderState, mqc: &mut MqcEnc, bpno: i32, orien
                 if h == 0 && v == 0 && d == 0 {
                     continue;
                 }
-                mqc.setcurctx(CTX_ZC + ctxno_zc(h, v, d, orient));
+                let zc_ctx = CTX_ZC + ctxno_zc(h, v, d, orient);
+                mqc.setcurctx(zc_ctx);
                 let sig = state.bit_at(x, sy, bpno);
                 mqc.encode(sig);
+                dec_trace::emit("sigprop_zc", bpno, x, sy, zc_ctx, sig);
                 // Mark sample as sigprop-tested so the cleanup pass
                 // doesn't revisit it. Must be set for every sample the
                 // sigprop pass probed — even when the decoded bit is 0.
@@ -442,7 +445,9 @@ fn sigprop_pass_enc(state: &mut EncoderState, mqc: &mut MqcEnc, bpno: i32, orien
                     let (sc_ctx, xor) = ctxno_sc(h_pos, h_neg, v_pos, v_neg);
                     mqc.setcurctx(sc_ctx);
                     let sbit_true = if state.sign[idx] { 1u32 } else { 0u32 };
-                    mqc.encode(sbit_true ^ xor);
+                    let raw = sbit_true ^ xor;
+                    mqc.encode(raw);
+                    dec_trace::emit("sigprop_sc", bpno, x, sy, sc_ctx, raw);
                     state.sigma[idx] = true;
                 }
             }
@@ -466,6 +471,7 @@ fn magref_pass_enc(state: &mut EncoderState, mqc: &mut MqcEnc, bpno: i32) {
                 mqc.setcurctx(ctx);
                 let bit = state.bit_at(x, sy, bpno);
                 mqc.encode(bit);
+                dec_trace::emit("magref", bpno, x, sy, ctx, bit);
                 state.mu[idx] = true;
             }
         }
@@ -500,13 +506,19 @@ fn cleanup_pass_enc(state: &mut EncoderState, mqc: &mut MqcEnc, bpno: i32, orien
                 mqc.setcurctx(CTX_AGG);
                 let Some(fs) = first_sig else {
                     mqc.encode(0);
+                    dec_trace::emit("cleanup_agg", bpno, x, y, CTX_AGG, 0);
                     continue;
                 };
                 mqc.encode(1);
+                dec_trace::emit("cleanup_agg", bpno, x, y, CTX_AGG, 1);
                 let run = fs - y;
                 mqc.setcurctx(CTX_UNI);
-                mqc.encode(((run >> 1) & 1) as u32);
-                mqc.encode((run & 1) as u32);
+                let hi = ((run >> 1) & 1) as u32;
+                let lo = (run & 1) as u32;
+                mqc.encode(hi);
+                dec_trace::emit("cleanup_uni_hi", bpno, x, y, CTX_UNI, hi);
+                mqc.encode(lo);
+                dec_trace::emit("cleanup_uni_lo", bpno, x, y, CTX_UNI, lo);
                 // Now sample at offset `run` becomes significant.
                 let sy = fs;
                 let idx = state.idx(x, sy);
@@ -515,7 +527,9 @@ fn cleanup_pass_enc(state: &mut EncoderState, mqc: &mut MqcEnc, bpno: i32, orien
                 let (sc_ctx, xor) = ctxno_sc(h_pos, h_neg, v_pos, v_neg);
                 mqc.setcurctx(sc_ctx);
                 let sbit_true = if state.sign[idx] { 1u32 } else { 0u32 };
-                mqc.encode(sbit_true ^ xor);
+                let raw = sbit_true ^ xor;
+                mqc.encode(raw);
+                dec_trace::emit("cleanup_sc_run", bpno, x, sy, sc_ctx, raw);
                 state.sigma[idx] = true;
                 // Continue per-sample coding for remainder of stripe.
                 for sy2 in (fs + 1)..stripe_end {
@@ -524,16 +538,20 @@ fn cleanup_pass_enc(state: &mut EncoderState, mqc: &mut MqcEnc, bpno: i32, orien
                         continue;
                     }
                     let (h, v, d) = state.hvd_counts(x, sy2);
-                    mqc.setcurctx(CTX_ZC + ctxno_zc(h, v, d, orient));
+                    let zc_ctx = CTX_ZC + ctxno_zc(h, v, d, orient);
+                    mqc.setcurctx(zc_ctx);
                     let sig = state.bit_at(x, sy2, bpno);
                     mqc.encode(sig);
+                    dec_trace::emit("cleanup_zc_post", bpno, x, sy2, zc_ctx, sig);
                     if sig != 0 {
                         let (h_pos, h_neg) = state.h_sign_flags(x, sy2);
                         let (v_pos, v_neg) = state.v_sign_flags(x, sy2);
                         let (sc_ctx, xor) = ctxno_sc(h_pos, h_neg, v_pos, v_neg);
                         mqc.setcurctx(sc_ctx);
                         let sbit_true = if state.sign[idx2] { 1u32 } else { 0u32 };
-                        mqc.encode(sbit_true ^ xor);
+                        let raw = sbit_true ^ xor;
+                        mqc.encode(raw);
+                        dec_trace::emit("cleanup_sc_post", bpno, x, sy2, sc_ctx, raw);
                         state.sigma[idx2] = true;
                     }
                 }
@@ -547,16 +565,20 @@ fn cleanup_pass_enc(state: &mut EncoderState, mqc: &mut MqcEnc, bpno: i32, orien
                     continue;
                 }
                 let (h, v, d) = state.hvd_counts(x, sy);
-                mqc.setcurctx(CTX_ZC + ctxno_zc(h, v, d, orient));
+                let zc_ctx = CTX_ZC + ctxno_zc(h, v, d, orient);
+                mqc.setcurctx(zc_ctx);
                 let sig = state.bit_at(x, sy, bpno);
                 mqc.encode(sig);
+                dec_trace::emit("cleanup_zc", bpno, x, sy, zc_ctx, sig);
                 if sig != 0 {
                     let (h_pos, h_neg) = state.h_sign_flags(x, sy);
                     let (v_pos, v_neg) = state.v_sign_flags(x, sy);
                     let (sc_ctx, xor) = ctxno_sc(h_pos, h_neg, v_pos, v_neg);
                     mqc.setcurctx(sc_ctx);
                     let sbit_true = if state.sign[idx] { 1u32 } else { 0u32 };
-                    mqc.encode(sbit_true ^ xor);
+                    let raw = sbit_true ^ xor;
+                    mqc.encode(raw);
+                    dec_trace::emit("cleanup_sc", bpno, x, sy, sc_ctx, raw);
                     state.sigma[idx] = true;
                 }
             }

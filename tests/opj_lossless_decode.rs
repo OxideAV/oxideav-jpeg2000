@@ -134,7 +134,7 @@ fn opj_spike_fixture_decodes_bit_exactly() {
 /// **DIAGNOSTIC / KNOWN-FAIL.** 16×16 OpenJPEG fixture with a
 /// single DWT level — isolates the tier-1 + 1-level IDWT interop.
 #[test]
-#[ignore = "partial interop: tier-1 bit-exact on spike4, but 16x16 1-level DWT still ~35 dB — residual bug in IDWT / packet parsing"]
+#[ignore = "partial interop: LL/HL/LH sub-bands are bit-exact against OPJ (round-6 MQ trace harness confirms 554/554 tier-1 events match for LL), but HH carries a +15 LSB systematic offset on ~50 samples that still pins PSNR at 35 dB. See tests/opj_t1_mqtrace.rs for the per-sub-band diff harness."]
 fn opj16_single_level_dwt_decodes_bit_exactly() {
     let (w, h, expected) = parse_pgm(OPJ16_PGM);
     assert_eq!((w, h), (16, 16));
@@ -142,13 +142,30 @@ fn opj16_single_level_dwt_decodes_bit_exactly() {
     let got = &vf.planes[0].data;
     let p = psnr(&expected, got);
     eprintln!("opj16_l1 PSNR = {p:.2} dB");
+    let diffs: Vec<(usize, u8, u8)> = expected
+        .iter()
+        .zip(got.iter())
+        .enumerate()
+        .filter(|(_, (a, b))| a != b)
+        .map(|(i, (a, b))| (i, *a, *b))
+        .collect();
+    eprintln!("{} mismatches out of {}", diffs.len(), expected.len());
+    for (i, e, g) in diffs.iter().take(10) {
+        eprintln!(
+            "  pos=({}, {}) expected={} got={}",
+            i % w as usize,
+            i / w as usize,
+            e,
+            g
+        );
+    }
     assert!(p >= 40.0, "opj16 image PSNR too low: {p:.2}");
 }
 
 /// **DIAGNOSTIC / KNOWN-FAIL.** 32×32 OpenJPEG fixture with the
 /// default 5-level decomposition — full pipeline.
 #[test]
-#[ignore = "partial interop: tier-1 bit-exact on spike4, but 32x32 5-level DWT still ~30 dB — residual bug in IDWT / packet parsing"]
+#[ignore = "partial interop: same HH-subband drift as the 16x16 case propagates through 5 levels of IDWT synthesis, pinning PSNR at ~30 dB"]
 fn opj_lossless_fixture_decodes_bit_exactly() {
     let (w, h, expected) = parse_pgm(OPJ_PGM);
     assert_eq!(w, 32);

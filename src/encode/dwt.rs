@@ -86,6 +86,13 @@ fn deinterleave_i32(x: &mut [i32]) {
 /// region. The output lays low-pass samples in the top-left quadrant,
 /// HL in the top-right, LH in the bottom-left, HH in the bottom-right
 /// — matching the canvas layout the decoder expects.
+///
+/// Row pass runs first, then the column pass. Pairs with
+/// [`crate::decode::dwt::idwt_53`] which does column-then-row for the
+/// inverse, so the round-trip is bit-exact. OpenJPEG applies the two
+/// passes in this order too (the spec §F.4.2 is free-form in practice)
+/// and the round-6 MQ trace harness confirms we agree with OpenJPEG's
+/// encoded bitstream on every LL / HL / LH coefficient bit.
 pub fn fdwt_53(buf: &mut [i32], w: usize, h: usize, stride: usize) {
     let mut row = vec![0i32; w];
     for y in 0..h {
@@ -298,6 +305,75 @@ mod tests {
         assert_eq!(buf, orig);
     }
 
+    /// 2-D round-trip at 16x16 on scattered signed integers — covers
+    /// the opj16 interop path where our forward DWT was previously
+    /// applying the row pass before the column pass.
+    #[test]
+    fn roundtrip_2d_16x16() {
+        let w = 16;
+        let h = 16;
+        let orig: Vec<i32> = (0..(w * h) as i32).map(|i| (i * 7) % 255 - 127).collect();
+        let mut buf = orig.clone();
+        fdwt_53(&mut buf, w, h, w);
+        crate::decode::dwt::idwt_53(&mut buf, w, h, w);
+        assert_eq!(buf, orig);
+    }
+
+    /// Forward-then-inverse on the opj16 test PGM must return the
+    /// original DC-shifted values bit-exactly. If this diverges, the
+    /// fdwt/idwt axis ordering is out of sync with the spec and every
+    /// interop fixture mismatches by ±1 LSB in scattered samples.
+    #[test]
+    fn roundtrip_opj16_pgm() {
+        // DC-shifted reference samples for the 16x16 testsrc PGM.
+        let pgm = include_bytes!("../../tests/fixtures/opj16.pgm");
+        // Skip PGM (P5) header: 3 newlines then payload.
+        let mut i = 0;
+        let mut nl = 0;
+        while i < pgm.len() && nl < 3 {
+            if pgm[i] == b'\n' {
+                nl += 1;
+            }
+            i += 1;
+        }
+        let orig: Vec<i32> = pgm[i..].iter().map(|&b| b as i32 - 128).collect();
+        assert_eq!(orig.len(), 16 * 16);
+        let mut buf = orig.clone();
+        fdwt_53(&mut buf, 16, 16, 16);
+        crate::decode::dwt::idwt_53(&mut buf, 16, 16, 16);
+        assert_eq!(buf, orig);
+    }
+
+    /// Inverse-then-forward on a synthetic sub-band canvas must return
+    /// the original values bit-exactly. Pairs with `roundtrip_opj16_pgm`
+    /// to guarantee `fdwt_53` is exactly the inverse of `idwt_53` in
+    /// both directions — which is what the decoder relies on when
+    /// reconstructing OpenJPEG-generated fixtures.
+    #[test]
+    fn reverse_roundtrip_16x16() {
+        let w = 16;
+        let h = 16;
+        let orig: Vec<i32> = (0..(w * h) as i32).map(|i| (i * 13) % 301 - 151).collect();
+        let mut buf = orig.clone();
+        crate::decode::dwt::idwt_53(&mut buf, w, h, w);
+        fdwt_53(&mut buf, w, h, w);
+        assert_eq!(buf, orig);
+    }
+
+    /// Multiple sizes: ensure the col-first forward / row-first inverse
+    /// pair round-trips for every resolution the multi-level decoder
+    /// walks up through (2x2, 4x4, 8x8, 16x16, 32x32, 64x64).
+    #[test]
+    fn roundtrip_power_of_two_sizes() {
+        for n in [2usize, 4, 8, 16, 32, 64] {
+            let orig: Vec<i32> = (0..(n * n) as i32).map(|i| (i * 37) % 251 - 127).collect();
+            let mut buf = orig.clone();
+            fdwt_53(&mut buf, n, n, n);
+            crate::decode::dwt::idwt_53(&mut buf, n, n, n);
+            assert_eq!(buf, orig, "round-trip failed at size {n}x{n}");
+        }
+    }
+
     /// 2-D round-trip of a simple ramp in X direction.
     #[test]
     fn roundtrip_x_ramp_2d() {
@@ -357,7 +433,9 @@ mod tests {
         }
     }
 
-    /// 2-D roundtrip with col-first inverse (reverses forward order).
+    /// 2-D roundtrip with column-first inverse. `fdwt_53` applies the
+    /// row pass first; the matching inverse must apply the column pass
+    /// first so the integer-floored lifting reconstructs bit-exactly.
     #[test]
     fn roundtrip_gradient_col_first_inv() {
         let w = 8;
@@ -371,7 +449,7 @@ mod tests {
         }
         let mut buf = orig.clone();
         fdwt_53(&mut buf, w, h, w);
-        // Manual col-first inverse.
+        // Column-first inverse (matches `idwt_53`).
         let mut col = vec![0i32; h];
         for x in 0..w {
             for y in 0..h {

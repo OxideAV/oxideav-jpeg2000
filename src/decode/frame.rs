@@ -89,7 +89,9 @@ pub fn decode_frame(cs: &Codestream, buf: &[u8]) -> Result<Frame> {
         return Err(Error::invalid("jpeg2000: empty tile grid"));
     }
     if total_tiles > u16::MAX as u64 + 1 {
-        return Err(Error::invalid("jpeg2000: tile count exceeds codestream limit"));
+        return Err(Error::invalid(
+            "jpeg2000: tile count exceeds codestream limit",
+        ));
     }
 
     // Group tile-parts by tile index, preserving on-the-wire order —

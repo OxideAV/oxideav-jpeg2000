@@ -62,10 +62,7 @@ fn run_tool(bin: &str, args: &[&str]) -> Result<(), String> {
 
 fn tmp_path(name: &str) -> PathBuf {
     let mut p = std::env::temp_dir();
-    p.push(format!(
-        "oxideav-jpeg2000-multitile-{}",
-        std::process::id()
-    ));
+    p.push(format!("oxideav-jpeg2000-multitile-{}", std::process::id()));
     std::fs::create_dir_all(&p).unwrap();
     p.push(name);
     p

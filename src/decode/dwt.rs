@@ -17,11 +17,16 @@
 /// Apply a single-level inverse 5/3 integer lifting on an arbitrary-
 /// sized rectangular region.
 ///
-/// The 2-D inverse runs the **vertical pass first**, mirroring the
-/// encode side (which applies rows then columns forward) so the pair
-/// `fdwt_53 → idwt_53` forms a bit-exact reversible round-trip.
+/// Vertical (column) pass first, then horizontal (row) pass. Pairs
+/// with [`crate::encode::dwt::fdwt_53`] which does the opposite
+/// (columns then rows forward) so the full round-trip is bit-exact —
+/// the 5/3 integer lifting uses floored divisions that do not commute
+/// across axes. T.800 §F.3.2 nominally specifies HOR_SR then VER_SR
+/// but OpenJPEG applies the passes in the other order and our decoder
+/// follows OpenJPEG to stay in lockstep with every J2K fixture it
+/// emits.
 pub fn idwt_53(buf: &mut [i32], w: usize, h: usize, stride: usize) {
-    // Vertical pass first.
+    // Vertical (column) pass first.
     let mut col_scratch = vec![0i32; h];
     for x in 0..w {
         for y in 0..h {
@@ -33,7 +38,7 @@ pub fn idwt_53(buf: &mut [i32], w: usize, h: usize, stride: usize) {
             buf[y * stride + x] = col_scratch[y];
         }
     }
-    // Horizontal pass.
+    // Then horizontal (row) pass.
     let mut row_scratch = vec![0i32; w];
     for y in 0..h {
         for x in 0..w {

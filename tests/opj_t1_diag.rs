@@ -131,8 +131,57 @@ fn diag_opj16_sub_band_values() {
         comp_precisions: &precisions,
     };
     let planes = decode_tile_with_params(&body, &comp_sizes, &cod, &qcd, &params).expect("tile");
+
+    // Per-sub-band diagnostic: decoded tier-1 values vs our_fdwt(reference).
+    let (ll_sb, hl_sb, lh_sb, hh_sb) =
+        oxideav_jpeg2000::decode::tile::decode_subbands_round6(OPJ16_J2K).expect("decode subbands");
+    let hw_u = hw;
+    let hh_u = hh;
+    println!("\nper-subband tier-1 output vs our_fdwt(reference):");
+    let mut total_diffs = 0;
+    for (name, sb_buf, offset_x, offset_y) in [
+        ("LL", &ll_sb, 0usize, 0usize),
+        ("HL", &hl_sb, hw_u, 0usize),
+        ("LH", &lh_sb, 0usize, hh_u),
+        ("HH", &hh_sb, hw_u, hh_u),
+    ] {
+        let mut diff = 0;
+        for y in 0..hh_u {
+            for x in 0..hw_u {
+                let ours = sb_buf[y * hw_u + x];
+                let refv = canvas[(offset_y + y) * w as usize + (offset_x + x)];
+                if ours != refv {
+                    diff += 1;
+                    if diff <= 3 {
+                        println!("  {name} ({x}, {y}): expected {refv}, decoded {ours}");
+                    }
+                }
+            }
+        }
+        println!("  {name} total diffs: {diff}");
+        total_diffs += diff;
+    }
+    println!("sub-band total diffs: {total_diffs}");
+
     let mut dec_fwd = planes[0].clone();
     fdwt_53(&mut dec_fwd, w as usize, h as usize, w as usize);
+    // Extra sanity prints
+    println!("\nraw decoded plane[0][0..8]: {:?}", &planes[0][0..8]);
+    println!("fdwt(decoded)[0..8]: {:?}", &dec_fwd[0..8]);
+    println!("fdwt(reference)[0..8]: {:?}", &canvas[0..8]);
+    let mut canvas_mismatches = 0;
+    for i in 0..(w * h) as usize {
+        if canvas[i] != dec_fwd[i] {
+            canvas_mismatches += 1;
+            if canvas_mismatches <= 10 {
+                println!(
+                    "  canvas/dec mismatch at {}: ref={} dec={}",
+                    i, canvas[i], dec_fwd[i]
+                );
+            }
+        }
+    }
+    println!("canvas-vs-dec_fwd total mismatches: {}", canvas_mismatches);
     println!("\nforward-DWT of our decoded plane (should match reference above):");
     println!(" LL:");
     for y in 0..hh {
@@ -152,4 +201,25 @@ fn diag_opj16_sub_band_values() {
             sb.orient, sb.band_kind, sb.resno, sb.x0, sb.y0, sb.x1, sb.y1
         );
     }
+
+    // Additionally: show our decoded plane (before DC shift) next to the
+    // DC-shifted reference. A mismatch here is the real interop failure —
+    // the forward-DWT round-trip above only validates that our fdwt and
+    // idwt are consistent with each other, not with OPJ's.
+    let reference_signed: Vec<i32> = pgm.iter().map(|&b| b as i32 - 128).collect();
+    println!("\nreference pgm (DC-shifted, signed) vs our decoded plane:");
+    let mut mismatches = 0;
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            let ours = planes[0][y * w as usize + x];
+            let refv = reference_signed[y * w as usize + x];
+            if ours != refv {
+                mismatches += 1;
+                if mismatches <= 10 {
+                    println!("  ({x}, {y}): expected {refv}, got {ours}");
+                }
+            }
+        }
+    }
+    println!("total mismatches: {}", mismatches);
 }

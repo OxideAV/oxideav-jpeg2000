@@ -22,6 +22,36 @@
 
 use super::mqc::{Mqc, CTX_AGG, CTX_MAG, CTX_SC, CTX_UNI, CTX_ZC};
 
+/// Diagnostic trace hook: when set, every MQ `decode()` call inside the
+/// tier-1 decoder emits a `(pass_name, bpno, x, y, ctx, bit)` tuple to
+/// this thread-local sink. Used only by the round-6 diff harness; no-op
+/// in production.
+pub mod trace {
+    use std::cell::RefCell;
+
+    thread_local! {
+        pub static EVENTS: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+    }
+
+    pub fn enable() {
+        EVENTS.with(|e| *e.borrow_mut() = Some(Vec::new()));
+    }
+
+    pub fn take() -> Option<Vec<String>> {
+        EVENTS.with(|e| e.borrow_mut().take())
+    }
+
+    pub(crate) fn emit(pass: &str, bpno: i32, x: usize, y: usize, ctx: usize, bit: u32) {
+        EVENTS.with(|e| {
+            if let Some(v) = e.borrow_mut().as_mut() {
+                v.push(format!(
+                    "{pass} bpno={bpno} x={x} y={y} ctx={ctx} bit={bit}"
+                ));
+            }
+        });
+    }
+}
+
 /// Subband orientation used for the ZC context lookup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Orient {
@@ -443,8 +473,10 @@ fn sigprop_pass(state: &mut DecoderState, mqc: &mut Mqc, bpno: i32, orient: Orie
                     continue;
                 }
                 // Zero coding context.
-                mqc.setcurctx(CTX_ZC + ctxno_zc(h, v, d, orient));
+                let zc_ctx = CTX_ZC + ctxno_zc(h, v, d, orient);
+                mqc.setcurctx(zc_ctx);
                 let sig = mqc.decode();
+                trace::emit("sigprop_zc", bpno, x, sy, zc_ctx, sig);
                 // Per T.800 §D.3.4, the cleanup pass covers only those
                 // samples NOT processed in the sigprop pass. "Processed"
                 // means the sigprop decoder asked the MQ coder about them,
@@ -461,7 +493,9 @@ fn sigprop_pass(state: &mut DecoderState, mqc: &mut Mqc, bpno: i32, orient: Orie
                     let (v_pos, v_neg) = state.v_sign_flags(x, sy);
                     let (sc_ctx, xor) = ctxno_sc(h_pos, h_neg, v_pos, v_neg);
                     mqc.setcurctx(sc_ctx);
-                    let sbit = mqc.decode() ^ xor;
+                    let raw_sbit = mqc.decode();
+                    trace::emit("sigprop_sc", bpno, x, sy, sc_ctx, raw_sbit);
+                    let sbit = raw_sbit ^ xor;
                     state.sigma[idx] = true;
                     state.sign[idx] = sbit != 0;
                     // Deposit magnitude bit 0x1 at this bit-plane's mask.
@@ -500,6 +534,7 @@ fn magref_pass(state: &mut DecoderState, mqc: &mut Mqc, bpno: i32, cblksty: u32)
                 let ctx = ctxno_mag(!state.mu[idx], any);
                 mqc.setcurctx(ctx);
                 let bit = mqc.decode();
+                trace::emit("magref", bpno, x, sy, ctx, bit);
                 // `bit` picks between +poshalf and -poshalf, XORed with
                 // the current sign so the refinement always moves the
                 // magnitude toward the correct bracket (see OpenJPEG
@@ -544,6 +579,7 @@ fn cleanup_pass(state: &mut DecoderState, mqc: &mut Mqc, bpno: i32, orient: Orie
             if all_clear {
                 mqc.setcurctx(CTX_AGG);
                 let agg = mqc.decode();
+                trace::emit("cleanup_agg", bpno, x, y, CTX_AGG, agg);
                 if agg == 0 {
                     // All four samples remain zero this bitplane.
                     continue;
@@ -551,7 +587,9 @@ fn cleanup_pass(state: &mut DecoderState, mqc: &mut Mqc, bpno: i32, orient: Orie
                 // Decode 2-bit run length using the uniform context.
                 mqc.setcurctx(CTX_UNI);
                 let hi = mqc.decode();
+                trace::emit("cleanup_uni_hi", bpno, x, y, CTX_UNI, hi);
                 let lo = mqc.decode();
+                trace::emit("cleanup_uni_lo", bpno, x, y, CTX_UNI, lo);
                 skip_rows = ((hi << 1) | lo) as usize;
                 // The first `skip_rows` samples in this column within the
                 // stripe stay non-significant; sample at offset
@@ -563,7 +601,9 @@ fn cleanup_pass(state: &mut DecoderState, mqc: &mut Mqc, bpno: i32, orient: Orie
                 let (v_pos, v_neg) = state.v_sign_flags(x, sy);
                 let (sc_ctx, xor) = ctxno_sc(h_pos, h_neg, v_pos, v_neg);
                 mqc.setcurctx(sc_ctx);
-                let sbit = mqc.decode() ^ xor;
+                let raw_sbit = mqc.decode();
+                trace::emit("cleanup_sc_run", bpno, x, sy, sc_ctx, raw_sbit);
+                let sbit = raw_sbit ^ xor;
                 state.sigma[idx] = true;
                 state.sign[idx] = sbit != 0;
                 if sbit != 0 {
@@ -581,14 +621,18 @@ fn cleanup_pass(state: &mut DecoderState, mqc: &mut Mqc, bpno: i32, orient: Orie
                     }
                     let last_row = vsc && (sy2 + 1 == stripe_end);
                     let (h, v, d) = state.hvd_counts(x, sy2, last_row);
-                    mqc.setcurctx(CTX_ZC + ctxno_zc(h, v, d, orient));
+                    let zc_ctx = CTX_ZC + ctxno_zc(h, v, d, orient);
+                    mqc.setcurctx(zc_ctx);
                     let sig = mqc.decode();
+                    trace::emit("cleanup_zc_post", bpno, x, sy2, zc_ctx, sig);
                     if sig != 0 {
                         let (h_pos, h_neg) = state.h_sign_flags(x, sy2);
                         let (v_pos, v_neg) = state.v_sign_flags(x, sy2);
                         let (sc_ctx, xor) = ctxno_sc(h_pos, h_neg, v_pos, v_neg);
                         mqc.setcurctx(sc_ctx);
-                        let sbit = mqc.decode() ^ xor;
+                        let raw_sbit2 = mqc.decode();
+                        trace::emit("cleanup_sc_post", bpno, x, sy2, sc_ctx, raw_sbit2);
+                        let sbit = raw_sbit2 ^ xor;
                         state.sigma[idx2] = true;
                         state.sign[idx2] = sbit != 0;
                         if sbit != 0 {
@@ -610,14 +654,18 @@ fn cleanup_pass(state: &mut DecoderState, mqc: &mut Mqc, bpno: i32, orient: Orie
                 }
                 let last_row = vsc && (sy + 1 == stripe_end);
                 let (h, v, d) = state.hvd_counts(x, sy, last_row);
-                mqc.setcurctx(CTX_ZC + ctxno_zc(h, v, d, orient));
+                let zc_ctx = CTX_ZC + ctxno_zc(h, v, d, orient);
+                mqc.setcurctx(zc_ctx);
                 let sig = mqc.decode();
+                trace::emit("cleanup_zc", bpno, x, sy, zc_ctx, sig);
                 if sig != 0 {
                     let (h_pos, h_neg) = state.h_sign_flags(x, sy);
                     let (v_pos, v_neg) = state.v_sign_flags(x, sy);
                     let (sc_ctx, xor) = ctxno_sc(h_pos, h_neg, v_pos, v_neg);
                     mqc.setcurctx(sc_ctx);
-                    let sbit = mqc.decode() ^ xor;
+                    let raw_sbit = mqc.decode();
+                    trace::emit("cleanup_sc", bpno, x, sy, sc_ctx, raw_sbit);
+                    let sbit = raw_sbit ^ xor;
                     state.sigma[idx] = true;
                     state.sign[idx] = sbit != 0;
                     if sbit != 0 {

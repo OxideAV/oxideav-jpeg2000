@@ -856,6 +856,261 @@ fn ilog2(n: u32) -> u32 {
     }
 }
 
+/// Round-6 diagnostic helper. Decodes a single-tile `.j2k` codestream
+/// and returns the per-sub-band tier-1 output (already `/ 2`) for LL,
+/// HL, LH, HH at resolution 1 (for a 1-level 5/3 codestream). Each
+/// returned buffer is flat `hw * hh` = quarter of the image. Used to
+/// pin which sub-band our decoder disagrees with the OPJ fixture on.
+#[allow(clippy::needless_range_loop, clippy::type_complexity)]
+pub fn decode_subbands_round6(j2k: &[u8]) -> Result<(Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>)> {
+    let cs = crate::codestream::parse(j2k)?;
+    let cod = parse_cod(cs.cod.as_ref().ok_or_else(|| Error::invalid("no cod"))?)?;
+    let qcd = parse_qcd(
+        cs.qcd.as_ref().ok_or_else(|| Error::invalid("no qcd"))?,
+        cod.num_decomp,
+    )?;
+    let (w, h) = (cs.siz.image_width(), cs.siz.image_height());
+    let subbands = build_subbands(0, 0, w, h, cod.num_decomp);
+    let num_comps = cs.siz.num_components();
+    let num_res = (cod.num_decomp as usize) + 1;
+    if num_res != 2 {
+        return Err(Error::unsupported(
+            "decode_subbands_round6: expects 1 decomposition level",
+        ));
+    }
+    let mut layouts: Vec<Vec<ResolutionLayout>> = Vec::with_capacity(num_comps);
+    for _ in 0..num_comps {
+        let sb = subbands.clone();
+        layouts.push(build_resolutions(
+            sb,
+            cod.num_decomp,
+            cod.cblk_w_log2,
+            cod.cblk_h_log2,
+        ));
+    }
+    let mut body = Vec::new();
+    for tp in &cs.tile_parts {
+        body.extend_from_slice(&j2k[tp.sod_offset..tp.sod_offset + tp.sod_length]);
+    }
+    let mut cursor = Cursor::new(&body);
+    match cod.progression_order {
+        0 => {
+            for layer in 0..cod.num_layers as u32 {
+                for resno in 0..num_res {
+                    for comp in 0..num_comps {
+                        parse_precinct_packet(&mut cursor, layer, &mut layouts[comp][resno], &cod)?;
+                    }
+                }
+            }
+        }
+        1 => {
+            for resno in 0..num_res {
+                for layer in 0..cod.num_layers as u32 {
+                    for comp in 0..num_comps {
+                        parse_precinct_packet(&mut cursor, layer, &mut layouts[comp][resno], &cod)?;
+                    }
+                }
+            }
+        }
+        _ => return Err(Error::unsupported("progression order")),
+    }
+    let mut subband_results: Vec<Vec<i32>> = Vec::with_capacity(4);
+    for resno in 0..num_res {
+        let layout = &layouts[0][resno];
+        for (sb_idx, sb) in layout.subbands.iter().enumerate() {
+            let bw = (sb.x1 - sb.x0) as usize;
+            let bh = (sb.y1 - sb.y0) as usize;
+            let mut buf = vec![0i32; bw * bh];
+            let prec = &layout.prec_states[sb_idx];
+            for cy in 0..prec.cblks_h {
+                for cx in 0..prec.cblks_w {
+                    let idx = cy * prec.cblks_w + cx;
+                    let st = &prec.cblks[idx];
+                    if !st.included || st.total_passes == 0 {
+                        continue;
+                    }
+                    let (bx0, by0, bx1, by1) = layout.cblk_rects[sb_idx][idx];
+                    let cbw = (bx1 - bx0) as usize;
+                    let cbh = (by1 - by0) as usize;
+                    let (eps, _mant) = qcd.bands[sb.band_idx];
+                    let band_numbps = qcd.guard_bits as i32 + eps as i32 - 1;
+                    let bpno = band_numbps + 1 - st.missing_msb as i32;
+                    if bpno < 1 {
+                        continue;
+                    }
+                    let decoded = t1::decode_cblk(
+                        st.data.clone(),
+                        cbw,
+                        cbh,
+                        bpno,
+                        st.total_passes,
+                        sb.orient,
+                        cod.cblk_style,
+                    );
+                    let rel_x = (bx0 - sb.x0) as usize;
+                    let rel_y = (by0 - sb.y0) as usize;
+                    for ly in 0..cbh {
+                        for lx in 0..cbw {
+                            let v = decoded.data[ly * cbw + lx];
+                            buf[(rel_y + ly) * bw + (rel_x + lx)] = v / 2;
+                        }
+                    }
+                }
+            }
+            subband_results.push(buf);
+        }
+    }
+    let _ = h;
+    let _ = w;
+    Ok((
+        subband_results[0].clone(),
+        subband_results[1].clone(),
+        subband_results[2].clone(),
+        subband_results[3].clone(),
+    ))
+}
+
+/// Round-6 diagnostic helper. Same shape as `extract_ll_cblk_round6`
+/// but targets one of the resolution-1 sub-band code-blocks. `band_kind`
+/// selects HL=1, LH=2, HH=3.
+#[allow(clippy::needless_range_loop)]
+pub fn extract_sb_cblk_round6(
+    j2k: &[u8],
+    band_kind: u8,
+) -> Result<(usize, usize, i32, i32, u32, Vec<u8>)> {
+    let cs = crate::codestream::parse(j2k)?;
+    let cod = parse_cod(cs.cod.as_ref().ok_or_else(|| Error::invalid("no cod"))?)?;
+    let qcd = parse_qcd(
+        cs.qcd.as_ref().ok_or_else(|| Error::invalid("no qcd"))?,
+        cod.num_decomp,
+    )?;
+    let (w, h) = (cs.siz.image_width(), cs.siz.image_height());
+    let subbands = build_subbands(0, 0, w, h, cod.num_decomp);
+    let num_comps = cs.siz.num_components();
+    let num_res = (cod.num_decomp as usize) + 1;
+    let mut layouts: Vec<Vec<ResolutionLayout>> = Vec::with_capacity(num_comps);
+    for _ in 0..num_comps {
+        let sb = subbands.clone();
+        layouts.push(build_resolutions(
+            sb,
+            cod.num_decomp,
+            cod.cblk_w_log2,
+            cod.cblk_h_log2,
+        ));
+    }
+    let mut body = Vec::new();
+    for tp in &cs.tile_parts {
+        body.extend_from_slice(&j2k[tp.sod_offset..tp.sod_offset + tp.sod_length]);
+    }
+    let mut cursor = Cursor::new(&body);
+    match cod.progression_order {
+        0 => {
+            for layer in 0..cod.num_layers as u32 {
+                for resno in 0..num_res {
+                    for comp in 0..num_comps {
+                        parse_precinct_packet(&mut cursor, layer, &mut layouts[comp][resno], &cod)?;
+                    }
+                }
+            }
+        }
+        1 => {
+            for resno in 0..num_res {
+                for layer in 0..cod.num_layers as u32 {
+                    for comp in 0..num_comps {
+                        parse_precinct_packet(&mut cursor, layer, &mut layouts[comp][resno], &cod)?;
+                    }
+                }
+            }
+        }
+        _ => return Err(Error::unsupported("progression order")),
+    }
+    // Pick sb_idx in resno=1 by band_kind. subbands at res=1 are stored
+    // in order HL, LH, HH (band_kind 1, 2, 3).
+    let sb_idx = match band_kind {
+        1 => 0,
+        2 => 1,
+        3 => 2,
+        _ => return Err(Error::invalid("band_kind must be 1..=3")),
+    };
+    let layout = &layouts[0][1];
+    let sb = &layout.subbands[sb_idx];
+    let bw = (sb.x1 - sb.x0) as usize;
+    let bh = (sb.y1 - sb.y0) as usize;
+    let (eps, _mant) = qcd.bands[sb.band_idx];
+    let band_numbps = qcd.guard_bits as i32 + eps as i32 - 1;
+    let prec = &layout.prec_states[sb_idx];
+    let st = &prec.cblks[0];
+    let bpno = band_numbps + 1 - st.missing_msb as i32;
+    Ok((bw, bh, band_numbps, bpno, st.total_passes, st.data.clone()))
+}
+
+/// Round-6 diagnostic helper. Parses a single-tile `.j2k` codestream,
+/// walks tier-2 just far enough to populate the LL-resolution-0 code
+/// block, and returns its raw byte stream along with the decoder
+/// parameters `decode_cblk` expects. Public-but-unstable: used only by
+/// the `opj_t1_mqtrace` diagnostic test.
+#[allow(clippy::needless_range_loop)]
+pub fn extract_ll_cblk_round6(j2k: &[u8]) -> Result<(usize, usize, i32, i32, u32, Vec<u8>)> {
+    let cs = crate::codestream::parse(j2k)?;
+    let cod = parse_cod(cs.cod.as_ref().ok_or_else(|| Error::invalid("no cod"))?)?;
+    let qcd = parse_qcd(
+        cs.qcd.as_ref().ok_or_else(|| Error::invalid("no qcd"))?,
+        cod.num_decomp,
+    )?;
+    let (w, h) = (cs.siz.image_width(), cs.siz.image_height());
+    let subbands = build_subbands(0, 0, w, h, cod.num_decomp);
+    let num_comps = cs.siz.num_components();
+    let num_res = (cod.num_decomp as usize) + 1;
+    let mut layouts: Vec<Vec<ResolutionLayout>> = Vec::with_capacity(num_comps);
+    for _ in 0..num_comps {
+        let sb = subbands.clone();
+        layouts.push(build_resolutions(
+            sb,
+            cod.num_decomp,
+            cod.cblk_w_log2,
+            cod.cblk_h_log2,
+        ));
+    }
+    let mut body = Vec::new();
+    for tp in &cs.tile_parts {
+        body.extend_from_slice(&j2k[tp.sod_offset..tp.sod_offset + tp.sod_length]);
+    }
+    let mut cursor = Cursor::new(&body);
+    // LRCP: resolution-major.
+    match cod.progression_order {
+        0 => {
+            for layer in 0..cod.num_layers as u32 {
+                for resno in 0..num_res {
+                    for comp in 0..num_comps {
+                        parse_precinct_packet(&mut cursor, layer, &mut layouts[comp][resno], &cod)?;
+                    }
+                }
+            }
+        }
+        1 => {
+            for resno in 0..num_res {
+                for layer in 0..cod.num_layers as u32 {
+                    for comp in 0..num_comps {
+                        parse_precinct_packet(&mut cursor, layer, &mut layouts[comp][resno], &cod)?;
+                    }
+                }
+            }
+        }
+        _ => return Err(Error::unsupported("progression order")),
+    }
+    // LL resolution 0 is layouts[0][0].subbands[0].
+    let layout0 = &layouts[0][0];
+    let sb = &layout0.subbands[0];
+    let bw = (sb.x1 - sb.x0) as usize;
+    let bh = (sb.y1 - sb.y0) as usize;
+    let (eps, _mant) = qcd.bands[sb.band_idx];
+    let band_numbps = qcd.guard_bits as i32 + eps as i32 - 1;
+    let prec = &layout0.prec_states[0];
+    let st = &prec.cblks[0];
+    let bpno = band_numbps + 1 - st.missing_msb as i32;
+    Ok((bw, bh, band_numbps, bpno, st.total_passes, st.data.clone()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
