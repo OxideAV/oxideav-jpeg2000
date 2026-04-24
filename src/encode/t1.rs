@@ -306,46 +306,57 @@ impl EncoderState {
 // to keep modules free of cross-references to internal helpers.
 
 fn ctxno_zc(h: u32, v: u32, d: u32, orient: Orient) -> usize {
-    let h = h.min(2);
-    let v = v.min(2);
-    let d = d.min(2);
+    // See `decode::t1::ctxno_zc` for the rationale: HH's Table D.1
+    // column has a label (8) selected by ΣD≥3, so ΣD must not be
+    // pre-clamped at 2. LL/HL clamp at 2 because their table columns
+    // distinguish at most ΣD=2.
     match orient {
-        Orient::Ll => match (h, v, d) {
-            (2, _, _) => 8,
-            (1, _, _) => {
-                if v >= 1 {
-                    7
-                } else if d >= 1 {
-                    6
-                } else {
-                    5
+        Orient::Ll => {
+            let h = h.min(2);
+            let v = v.min(2);
+            let d = d.min(2);
+            match (h, v, d) {
+                (2, _, _) => 8,
+                (1, _, _) => {
+                    if v >= 1 {
+                        7
+                    } else if d >= 1 {
+                        6
+                    } else {
+                        5
+                    }
                 }
+                (0, 2, _) => 4,
+                (0, 1, _) => 3,
+                (0, 0, 2) => 2,
+                (0, 0, 1) => 1,
+                _ => 0,
             }
-            (0, 2, _) => 4,
-            (0, 1, _) => 3,
-            (0, 0, 2) => 2,
-            (0, 0, 1) => 1,
-            _ => 0,
-        },
-        Orient::Hl => match (v, h, d) {
-            (2, _, _) => 8,
-            (1, _, _) => {
-                if h >= 1 {
-                    7
-                } else if d >= 1 {
-                    6
-                } else {
-                    5
+        }
+        Orient::Hl => {
+            let h = h.min(2);
+            let v = v.min(2);
+            let d = d.min(2);
+            match (v, h, d) {
+                (2, _, _) => 8,
+                (1, _, _) => {
+                    if h >= 1 {
+                        7
+                    } else if d >= 1 {
+                        6
+                    } else {
+                        5
+                    }
                 }
+                (0, 2, _) => 4,
+                (0, 1, _) => 3,
+                (0, 0, 2) => 2,
+                (0, 0, 1) => 1,
+                _ => 0,
             }
-            (0, 2, _) => 4,
-            (0, 1, _) => 3,
-            (0, 0, 2) => 2,
-            (0, 0, 1) => 1,
-            _ => 0,
-        },
+        }
         Orient::Hh => {
-            let hv = h + v;
+            let hv = (h + v).min(2);
             if d >= 3 {
                 8
             } else if d == 2 {

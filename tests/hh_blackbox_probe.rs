@@ -245,12 +245,15 @@ fn round8_checker_hh_divergence() {
         }
         eprintln!();
     }
-    // Round-8 witness: exactly 64/64 divergence on a 16x16 checker.
-    // Any change in the HH pipeline should move this downward — if a
-    // future round reduces it to 0, the next assert flips polarity and
-    // the bug is fixed.
+    // Round-9 witness: the HH drift was the erroneous `d.min(2)` clamp
+    // on the zero-coding context for HH (T.800 Table D.1 distinguishes
+    // ΣD=2 from ΣD≥3, so clamping ΣD at 2 collapsed labels 6/7/8 and
+    // desynchronised the MQ coder on any block crossing a 3- or 4-
+    // diagonal-neighbour coefficient). After fixing both `decode::t1`
+    // and `encode::t1` the 16x16 checkerboard HH is now 0/64 bit-exact
+    // against `opj_compress`.
     assert_eq!(
-        hh_diffs, 64,
-        "round-8 snapshot: checker diverges on all 64 samples; if this drops, flip the assert",
+        hh_diffs, 0,
+        "round-9 fix: checker HH must match OpenJPEG bit-exactly",
     );
 }

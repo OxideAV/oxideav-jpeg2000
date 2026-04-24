@@ -88,47 +88,62 @@ const NB_NW: u8 = 1 << 7;
 ///   d = count of diagonal   significant neighbours, clamped to 2
 /// plus the band orientation. Output: MQ context index in 0..=8.
 fn ctxno_zc(h: u32, v: u32, d: u32, orient: Orient) -> usize {
-    let h = h.min(2);
-    let v = v.min(2);
-    let d = d.min(2);
+    // LL/HL clamp ΣH, ΣV, ΣD at 2 per T.800 Table D.1 (the table has no
+    // rows distinguishing ΣD=2 from ΣD≥3 for these sub-bands). HH is
+    // different: it has a label (8) selected by ΣD≥3, so clamping ΣD at
+    // 2 for HH collapses contexts 6/7/8 and desynchronizes any MQ coder
+    // that crosses a coefficient whose true ΣD is 3 or 4.
     match orient {
-        Orient::Ll => match (h, v, d) {
-            (2, _, _) => 8,
-            (1, _, _) => {
-                if v >= 1 {
-                    7
-                } else if d >= 1 {
-                    6
-                } else {
-                    5
+        Orient::Ll => {
+            let h = h.min(2);
+            let v = v.min(2);
+            let d = d.min(2);
+            match (h, v, d) {
+                (2, _, _) => 8,
+                (1, _, _) => {
+                    if v >= 1 {
+                        7
+                    } else if d >= 1 {
+                        6
+                    } else {
+                        5
+                    }
                 }
+                (0, 2, _) => 4,
+                (0, 1, _) => 3,
+                (0, 0, 2) => 2,
+                (0, 0, 1) => 1,
+                _ => 0,
             }
-            (0, 2, _) => 4,
-            (0, 1, _) => 3,
-            (0, 0, 2) => 2,
-            (0, 0, 1) => 1,
-            _ => 0,
-        },
-        Orient::Hl => match (v, h, d) {
-            (2, _, _) => 8,
-            (1, _, _) => {
-                if h >= 1 {
-                    7
-                } else if d >= 1 {
-                    6
-                } else {
-                    5
+        }
+        Orient::Hl => {
+            let h = h.min(2);
+            let v = v.min(2);
+            let d = d.min(2);
+            match (v, h, d) {
+                (2, _, _) => 8,
+                (1, _, _) => {
+                    if h >= 1 {
+                        7
+                    } else if d >= 1 {
+                        6
+                    } else {
+                        5
+                    }
                 }
+                (0, 2, _) => 4,
+                (0, 1, _) => 3,
+                (0, 0, 2) => 2,
+                (0, 0, 1) => 1,
+                _ => 0,
             }
-            (0, 2, _) => 4,
-            (0, 1, _) => 3,
-            (0, 0, 2) => 2,
-            (0, 0, 1) => 1,
-            _ => 0,
-        },
+        }
         Orient::Hh => {
-            // HH uses the (h+v) + d structure (T.800 Table D-2).
-            let hv = h + v;
+            // HH: ΣD must NOT be pre-clamped at 2. Table D.1's HH
+            // column distinguishes ΣD=2 (labels 6/7) from ΣD≥3 (label 8).
+            // ΣH+ΣV is clamped at 2 (the table has no label requiring
+            // ΣH+ΣV>2).
+            let hv = (h + v).min(2);
             if d >= 3 {
                 8
             } else if d == 2 {
