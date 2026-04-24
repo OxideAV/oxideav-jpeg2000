@@ -17,28 +17,19 @@
 /// Apply a single-level inverse 5/3 integer lifting on an arbitrary-
 /// sized rectangular region.
 ///
-/// Vertical (column) pass first, then horizontal (row) pass. Pairs
-/// with [`crate::encode::dwt::fdwt_53`] which does the opposite
-/// (columns then rows forward) so the full round-trip is bit-exact —
-/// the 5/3 integer lifting uses floored divisions that do not commute
-/// across axes. T.800 §F.3.2 nominally specifies HOR_SR then VER_SR
-/// but OpenJPEG applies the passes in the other order and our decoder
-/// follows OpenJPEG to stay in lockstep with every J2K fixture it
-/// emits.
+/// Per T.800 §F.3.2 the 2D_SR procedure applies HOR_SR (row) first,
+/// then VER_SR (column). Pairs with [`crate::encode::dwt::fdwt_53`]
+/// which runs VER_SD (col) first then HOR_SD (row) per §F.4.2. The
+/// integer 5/3 lifting uses floored divisions that do NOT commute
+/// across axes, so the axis pairing is load-bearing: using
+/// col-then-row here would still self-round-trip but would mis-round
+/// HH-band samples when decoding a spec-conformant encoder's output.
+/// Round 7 swapped both the forward and inverse to their
+/// spec-mandated axis orders, which puts our encoder's LL / HL / LH
+/// output bit-exact against OpenJPEG (verified via
+/// `tests/opj_t1_mqtrace.rs`).
 pub fn idwt_53(buf: &mut [i32], w: usize, h: usize, stride: usize) {
-    // Vertical (column) pass first.
-    let mut col_scratch = vec![0i32; h];
-    for x in 0..w {
-        for y in 0..h {
-            col_scratch[y] = buf[y * stride + x];
-        }
-        interleave_i32(&mut col_scratch);
-        idwt_53_1d(&mut col_scratch);
-        for y in 0..h {
-            buf[y * stride + x] = col_scratch[y];
-        }
-    }
-    // Then horizontal (row) pass.
+    // Horizontal (row) pass first (HOR_SR).
     let mut row_scratch = vec![0i32; w];
     for y in 0..h {
         for x in 0..w {
@@ -48,6 +39,18 @@ pub fn idwt_53(buf: &mut [i32], w: usize, h: usize, stride: usize) {
         idwt_53_1d(&mut row_scratch);
         for x in 0..w {
             buf[y * stride + x] = row_scratch[x];
+        }
+    }
+    // Then vertical (column) pass (VER_SR).
+    let mut col_scratch = vec![0i32; h];
+    for x in 0..w {
+        for y in 0..h {
+            col_scratch[y] = buf[y * stride + x];
+        }
+        interleave_i32(&mut col_scratch);
+        idwt_53_1d(&mut col_scratch);
+        for y in 0..h {
+            buf[y * stride + x] = col_scratch[y];
         }
     }
 }

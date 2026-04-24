@@ -134,7 +134,7 @@ fn opj_spike_fixture_decodes_bit_exactly() {
 /// **DIAGNOSTIC / KNOWN-FAIL.** 16×16 OpenJPEG fixture with a
 /// single DWT level — isolates the tier-1 + 1-level IDWT interop.
 #[test]
-#[ignore = "partial interop: LL/HL/LH sub-bands are bit-exact against OPJ (round-6 MQ trace harness confirms 554/554 tier-1 events match for LL), but HH carries a +15 LSB systematic offset on ~50 samples that still pins PSNR at 35 dB. See tests/opj_t1_mqtrace.rs for the per-sub-band diff harness."]
+#[ignore = "partial interop: LL/HL/LH sub-bands are bit-exact against OPJ after the round-7 spec-conformant DWT axis swap (the MQ trace harness now shows no divergence across all 554 LL events / 532 HL events / LH match). HH still diverges at MQ event #185 — the spec-mandated 5/3 integer lifting disagrees with OpenJPEG's encoded HH values on ~50/64 cells after one level of decomposition, and the drift propagates through 5 levels to pin the 16x16 fixture at 35 dB PSNR. See tests/opj_t1_mqtrace.rs for the per-sub-band diff harness."]
 fn opj16_single_level_dwt_decodes_bit_exactly() {
     let (w, h, expected) = parse_pgm(OPJ16_PGM);
     assert_eq!((w, h), (16, 16));
@@ -165,7 +165,7 @@ fn opj16_single_level_dwt_decodes_bit_exactly() {
 /// **DIAGNOSTIC / KNOWN-FAIL.** 32×32 OpenJPEG fixture with the
 /// default 5-level decomposition — full pipeline.
 #[test]
-#[ignore = "partial interop: same HH-subband drift as the 16x16 case propagates through 5 levels of IDWT synthesis, pinning PSNR at ~30 dB"]
+#[ignore = "partial interop: same HH-subband drift as the 16x16 case propagates through 5 levels of IDWT synthesis, pinning PSNR at ~30 dB even after round-7 axis swap"]
 fn opj_lossless_fixture_decodes_bit_exactly() {
     let (w, h, expected) = parse_pgm(OPJ_PGM);
     assert_eq!(w, 32);

@@ -87,23 +87,18 @@ fn deinterleave_i32(x: &mut [i32]) {
 /// HL in the top-right, LH in the bottom-left, HH in the bottom-right
 /// — matching the canvas layout the decoder expects.
 ///
-/// Row pass runs first, then the column pass. Pairs with
-/// [`crate::decode::dwt::idwt_53`] which does column-then-row for the
-/// inverse, so the round-trip is bit-exact. OpenJPEG applies the two
-/// passes in this order too (the spec §F.4.2 is free-form in practice)
-/// and the round-6 MQ trace harness confirms we agree with OpenJPEG's
-/// encoded bitstream on every LL / HL / LH coefficient bit.
+/// Per T.800 §F.4.2 the 2D_SD procedure applies VER_SD (column pass)
+/// first, then HOR_SD (row pass). Matching that axis order is
+/// required — the integer 5/3 lifting uses floored divisions that do
+/// NOT commute across axes, so a row-first forward DWT produces
+/// coefficients that differ from the spec-conformant ordering in the
+/// HH sub-band (round 7: HH was the last-mile diff vs OpenJPEG).
+///
+/// Pairs with [`crate::decode::dwt::idwt_53`] which applies HOR_SR
+/// (row) then VER_SR (column) per §F.3.2, so the full round-trip is
+/// bit-exact.
 pub fn fdwt_53(buf: &mut [i32], w: usize, h: usize, stride: usize) {
-    let mut row = vec![0i32; w];
-    for y in 0..h {
-        for x in 0..w {
-            row[x] = buf[y * stride + x];
-        }
-        fdwt_53_1d(&mut row);
-        for x in 0..w {
-            buf[y * stride + x] = row[x];
-        }
-    }
+    // Column pass first (VER_SD in the spec).
     let mut col = vec![0i32; h];
     for x in 0..w {
         for y in 0..h {
@@ -112,6 +107,17 @@ pub fn fdwt_53(buf: &mut [i32], w: usize, h: usize, stride: usize) {
         fdwt_53_1d(&mut col);
         for y in 0..h {
             buf[y * stride + x] = col[y];
+        }
+    }
+    // Then row pass (HOR_SD).
+    let mut row = vec![0i32; w];
+    for y in 0..h {
+        for x in 0..w {
+            row[x] = buf[y * stride + x];
+        }
+        fdwt_53_1d(&mut row);
+        for x in 0..w {
+            buf[y * stride + x] = row[x];
         }
     }
 }
@@ -433,11 +439,12 @@ mod tests {
         }
     }
 
-    /// 2-D roundtrip with column-first inverse. `fdwt_53` applies the
-    /// row pass first; the matching inverse must apply the column pass
-    /// first so the integer-floored lifting reconstructs bit-exactly.
+    /// 2-D round-trip with explicit HOR-then-VER inverse (matches
+    /// `idwt_53` after the round-7 spec-conformant axis swap). `fdwt_53`
+    /// applies the column pass first per §F.4.2; the matching inverse
+    /// applies HOR_SR then VER_SR per §F.3.2.
     #[test]
-    fn roundtrip_gradient_col_first_inv() {
+    fn roundtrip_gradient_row_first_inv() {
         let w = 8;
         let h = 8;
         let mut orig = Vec::with_capacity(w * h);
@@ -449,18 +456,7 @@ mod tests {
         }
         let mut buf = orig.clone();
         fdwt_53(&mut buf, w, h, w);
-        // Column-first inverse (matches `idwt_53`).
-        let mut col = vec![0i32; h];
-        for x in 0..w {
-            for y in 0..h {
-                col[y] = buf[y * w + x];
-            }
-            crate::decode::dwt::interleave_i32(&mut col);
-            crate::decode::dwt::idwt_53_1d(&mut col);
-            for y in 0..h {
-                buf[y * w + x] = col[y];
-            }
-        }
+        // Row-first inverse (matches `idwt_53`).
         let mut row = vec![0i32; w];
         for y in 0..h {
             for x in 0..w {
@@ -472,11 +468,22 @@ mod tests {
                 buf[y * w + x] = row[x];
             }
         }
+        let mut col = vec![0i32; h];
+        for x in 0..w {
+            for y in 0..h {
+                col[y] = buf[y * w + x];
+            }
+            crate::decode::dwt::interleave_i32(&mut col);
+            crate::decode::dwt::idwt_53_1d(&mut col);
+            for y in 0..h {
+                buf[y * w + x] = col[y];
+            }
+        }
         for i in 0..orig.len() {
             assert_eq!(
                 buf[i],
                 orig[i],
-                "col-first-inv mismatch at ({}, {}): orig {}, got {}",
+                "row-first-inv mismatch at ({}, {}): orig {}, got {}",
                 i % w,
                 i / w,
                 orig[i],
