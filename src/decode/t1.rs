@@ -472,7 +472,12 @@ fn sigprop_pass(state: &mut DecoderState, mqc: &mut Mqc, bpno: i32, orient: Orie
 fn magref_pass(state: &mut DecoderState, mqc: &mut Mqc, bpno: i32, cblksty: u32) {
     let _ = cblksty;
     // Magnitude refinement updates by ±poshalf = ±(1 << (bpno-1)).
-    let poshalf = 1i32 << (bpno - 1);
+    // At bpno == 0 the refinement falls below the least-significant bit
+    // represented by the mid-point magnitude, so the contribution is
+    // zero. We still walk the significant samples and consume the MQ
+    // bits the encoder emitted (skipping the loop would leave the
+    // arithmetic decoder mis-aligned for any subsequent cleanup pass).
+    let poshalf = if bpno >= 1 { 1i32 << (bpno - 1) } else { 0 };
     let mut y = 0usize;
     while y < state.h {
         let stripe_end = (y + 4).min(state.h);

@@ -20,8 +20,12 @@
 //!   - DC level-shift, clipping, reversible component transform (RCT)
 //!     for 3-component 5/3 streams and irreversible component
 //!     transform (ICT) for 3-component 9/7 streams.
-//!   - LRCP + RLCP progression orders. Single quality layer. Single
-//!     tile. Default precinct size (one precinct per resolution).
+//!   - LRCP + RLCP progression orders. Single quality layer. Default
+//!     precinct size (one precinct per resolution).
+//!   - Multi-tile decode (§B.3): the frame-level driver walks the
+//!     tile grid, groups tile-parts by `Isot`, decodes each tile in
+//!     isolation (per-tile RCT / ICT per §G.1 / §G.2), and pastes
+//!     the result into the assembled image.
 //! - A Part-1 **sample encoder** that writes `.j2k` codestreams (or
 //!   `.jp2` containers) for 8-bit Gray / RGB input. Supports both
 //!   transforms:
@@ -41,9 +45,8 @@
 //!
 //! What is not here yet:
 //!
-//! - Multi-tile codestreams, multi-layer (progressive quality) streams,
-//!   user-defined precinct grids, and the CPRL / PCRL progression
-//!   orders.
+//! - Multi-layer (progressive quality) streams, user-defined precinct
+//!   grids, and the CPRL / PCRL progression orders.
 //! - Encoder input pixel formats beyond `Gray8` / `Rgb24` 8-bit.
 //! - RGB input whose RCT chroma excursions go outside the 8-bit
 //!   signed range (requires 9-bit signed chroma in the SIZ).

@@ -5,11 +5,15 @@
 //! Scope
 //! -----
 //!
-//! - **5/3 integer reversible** wavelet (Part-1 lossless default).
+//! - **5/3 integer reversible** wavelet (Part-1 lossless default) and
+//!   **9/7 irreversible** float wavelet (lossy).
 //! - **LRCP** and **RLCP** progression orders only.
-//! - One layer only (baseline lossless output).
+//! - One layer only (baseline output).
 //! - One precinct per resolution (PPx = PPy = 15 in the COD).
-//! - Single tile per frame.
+//!
+//! Decodes a single tile. The multi-tile walk lives in
+//! [`super::frame::decode_frame`], which groups tile-parts by `Isot`
+//! (T.800 §A.4, §B.3) and invokes this entry point once per tile.
 //!
 //! Layout strategy
 //! ---------------
