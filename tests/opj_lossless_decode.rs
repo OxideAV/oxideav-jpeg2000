@@ -131,10 +131,12 @@ fn opj_spike_fixture_decodes_bit_exactly() {
     assert!(p >= 40.0, "spike image PSNR too low: {p:.2}");
 }
 
-/// **DIAGNOSTIC / KNOWN-FAIL.** 16×16 OpenJPEG fixture with a
-/// single DWT level — isolates the tier-1 + 1-level IDWT interop.
+/// 16×16 OpenJPEG fixture with a single DWT level — isolates the
+/// tier-1 + 1-level IDWT interop. Round-9 fix to `ctxno_zc` for the HH
+/// orientation (no pre-clamping of ΣD below the 0/1/2/≥3 distinction
+/// T.800 Table D.1 makes) closes the last HH interop gap and lifts
+/// this to bit-exact.
 #[test]
-#[ignore = "partial interop: LL/HL/LH sub-bands are bit-exact against OPJ after the round-7 spec-conformant DWT axis swap. HH still diverges on ~50/64 cells.\n\nRound-8 black-box probe findings (see commit message):\n- Single-pixel spikes at every position match OPJ bit-exactly in HH.\n- 1-D ramps, gradients, h/v stripes match bit-exactly.\n- Two-spike sparse patterns match.\n- Only patterns with BOTH-AXIS high-frequency content (checkerboard, opj16 testsrc) diverge.\n- Our fdwt_53 followed by idwt_53 self-round-trips perfectly.\n- OPJ-encoded checkerboard j2k, when decoded through our sub-band extractor and inverted with our idwt_53, produces garbage (so the HH coefficients we extract from OPJ's codestream are NOT what OPJ's own IDWT sees).\n- Our encoder's j2k, when fed to opj_decompress, gives 215/256 pixel errors on the checkerboard (so our codestream is incorrect for OPJ).\n- Round-7's `/2` adjustment in decode_subbands_round6 cannot be right for HH because our HH raw value is exactly 2x some samples of OPJ's (checker: -510 ours vs -303..-491 OPJ varied).\n\nConclusion: the bug is NOT in the 1-D forward/inverse lifting (those match spec bit-exactly), and NOT in the 2-D axis order (single spikes would fail too). The bug is in one of (a) how our encoder packs HH magnitudes into the code-block and tier-2 packets, (b) how our decoder reads HH magnitudes back, or (c) the `band_numbps`/`log2_gain` handling specifically for HH. The round-7 MQ-trace harness shows divergence at HH MQ event #185 — re-read that event with attention to sign/magnitude scaling rather than lifting formula differences.\n\nSee tests/opj_t1_mqtrace.rs for the per-sub-band MQ diff harness."]
 fn opj16_single_level_dwt_decodes_bit_exactly() {
     let (w, h, expected) = parse_pgm(OPJ16_PGM);
     assert_eq!((w, h), (16, 16));
@@ -162,10 +164,11 @@ fn opj16_single_level_dwt_decodes_bit_exactly() {
     assert!(p >= 40.0, "opj16 image PSNR too low: {p:.2}");
 }
 
-/// **DIAGNOSTIC / KNOWN-FAIL.** 32×32 OpenJPEG fixture with the
-/// default 5-level decomposition — full pipeline.
+/// 32×32 OpenJPEG fixture with the default 5-level decomposition —
+/// full pipeline end-to-end against an OpenJPEG-emitted codestream.
+/// Round-9 HH-context fix (see `ctxno_zc` and the sibling single-level
+/// test) closes the last drift; PSNR = ∞ dB (bit-exact).
 #[test]
-#[ignore = "partial interop: same HH-subband drift as the 16x16 case propagates through 5 levels of IDWT synthesis, pinning PSNR at ~30 dB even after round-7 axis swap. See opj16_single_level_dwt_decodes_bit_exactly for the round-8 investigation notes — the drift is NOT in the lifting formulas."]
 fn opj_lossless_fixture_decodes_bit_exactly() {
     let (w, h, expected) = parse_pgm(OPJ_PGM);
     assert_eq!(w, 32);

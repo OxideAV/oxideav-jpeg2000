@@ -21,8 +21,19 @@ fn parse_pgm(bytes: &[u8]) -> Vec<u8> {
 }
 
 #[test]
-#[ignore = "diagnostic; encodes opj16 with our encoder and asks ffmpeg to decode"]
 fn encode_opj16_decodes_with_ffmpeg() {
+    // Skip gracefully if ffmpeg isn't on PATH (sandboxed CI).
+    if Command::new("ffmpeg")
+        .arg("-version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| !s.success())
+        .unwrap_or(true)
+    {
+        eprintln!("ffmpeg not available on PATH — skipping");
+        return;
+    }
     let pgm = include_bytes!("fixtures/opj16.pgm");
     let pixels = parse_pgm(pgm);
     assert_eq!(pixels.len(), 16 * 16);
