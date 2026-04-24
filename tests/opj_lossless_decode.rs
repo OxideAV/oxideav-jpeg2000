@@ -114,41 +114,43 @@ fn const_fixture_decodes_bit_exactly() {
 }
 
 /// **DIAGNOSTIC / KNOWN-FAIL.** Tier-1 interop with OpenJPEG's
-/// `opj_compress` is broken. Run with `--ignored` to reproduce.
+/// `opj_compress` is partially broken. Run with `--ignored` to
+/// reproduce.
 ///
-/// Findings from the 2026-04-24 investigation:
+/// Findings from the 2026-04-24 round-3 investigation:
 ///
-/// - Our own 5/3 encoder shifts magnitudes left by one before tier-1
-///   coding (`src/encode/t1.rs`, `*m <<= 1`) so the decoder's
-///   post-T1 `/ 2` cancels out. This makes our internal round-trip
-///   bit-exact (see `tests/roundtrip_53.rs`) but *shifts every
-///   bit-plane up by one compared to OpenJPEG's output*.
-/// - The OpenJPEG-generated fixture produces plausible sub-band
-///   magnitudes through the packet-parse and MQ-init stages (all
-///   byte counts match — e.g., 73 + 155 = 228 bytes matches
-///   Psot–SOD for `opj16_l1.j2k`), but the tier-1 post-decode
-///   samples are noise-like after the `/ 2` scaling, yielding
-///   ~5–8 dB PSNR.
-/// - Dequantisation exponent / guard-bit arithmetic is consistent
-///   with T.800 §E.1.1 (reversible 5/3 uses `Rb + G − 1 = numbps`;
-///   the QCD-parsed values reproduce the expected per-subband
-///   exponents `{8, 9, 9, 10}`).
-/// - DC-shift (§G.1) and IDWT (§F.3.2) pass their unit tests and
-///   are exercised correctly by the internal round-trip.
-/// - The tag-tree parser agrees with OpenJPEG's threshold
-///   convention — `missing_msb = i` where `i` is the smallest
-///   threshold for which the zero-bit-planes query returns true,
-///   i.e. `i = leaf + 1` = T.800 §B.10.5's `P+1`.
-/// - Suspected remaining root cause: either (a) the tier-1 pass
-///   ordering / context state loses synchronisation with OpenJPEG
-///   on the very first cleanup pass when the code-block is all
-///   non-significant (the common case for the high-frequency
-///   bands), or (b) the sign-coding context (T.800 Table D-3) is
-///   being computed with a subtly-wrong neighbour-sign aggregation
-///   (`h_sign_flags` / `v_sign_flags`) that happens to cancel in
-///   our own encoder's output.
+/// - **Root cause (fixed):** the MQ arithmetic decoder state table
+///   (`src/decode/mqc.rs`) had the `nlps` and `nmps` transition
+///   indices swapped relative to OpenJPEG's `mqc_states.h` / T.800
+///   Table C.2. Specifically, state 0's MPS-transition target was
+///   in the `nlps` field (value 2) and vice-versa. The self
+///   round-trip masked this because encoder+decoder used the
+///   mis-labelled table consistently. Fix: swap the values in the
+///   94-entry `STATES` arrays in both `src/decode/mqc.rs` and
+///   `src/encode/mqc.rs` so `nlps` = T.800 Table C.2 NLPS column
+///   (with SWITCH applied) and `nmps` = NMPS column.
+/// - This lifted interop from ~4 dB (random noise) to ~10–40 dB
+///   across all three fixtures — most pixels are now bit-exact,
+///   but a small residual bias remains (e.g. spike4 pixel [0,0]
+///   decodes to 89 instead of 100).
+/// - **Residual bug:** at sigprop bpno=6 for (0,0) in the 4×4
+///   spike fixture, our decoder reads MQ bit 1 where OpenJPEG's
+///   decoder reads 0, at the same `(state, a, c)` register state.
+///   This marks (0,0) significant at bpno=6 instead of bpno=5,
+///   depositing the `oneplushalf` midpoint one bit-plane too high
+///   and leaving a 22-unit systematic error after all refinements.
+///   The MQ state evolution matches OpenJPEG through all upstream
+///   ops (traced manually against Table C.2 transitions), so the
+///   divergence must be in a T1-layer convention — most likely
+///   the `band_numbps` / `missing_msb` → `bpno_start` mapping
+///   (currently `bpno = band_numbps + 1 - missing_msb`, which
+///   aligns with our encoder's `<<= 1` shift but may double-count
+///   for OpenJPEG streams).
+/// - DC-shift (§G.1), IDWT (§F.3.2), and the RCT/ICT (§G.1–2) all
+///   pass their unit tests and are exercised correctly by the
+///   internal round-trip.
 #[test]
-#[ignore = "known failure: tier-1 interop with opj_compress output — see module docs"]
+#[ignore = "known failure: partial tier-1 interop with opj_compress — see module docs"]
 fn opj_spike_fixture_decodes_bit_exactly() {
     let (w, h, expected) = parse_pgm(SPIKE_PGM);
     assert_eq!((w, h), (4, 4));
