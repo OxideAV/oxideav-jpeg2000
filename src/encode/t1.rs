@@ -432,6 +432,10 @@ fn sigprop_pass_enc(state: &mut EncoderState, mqc: &mut MqcEnc, bpno: i32, orien
                 mqc.setcurctx(CTX_ZC + ctxno_zc(h, v, d, orient));
                 let sig = state.bit_at(x, sy, bpno);
                 mqc.encode(sig);
+                // Mark sample as sigprop-tested so the cleanup pass
+                // doesn't revisit it. Must be set for every sample the
+                // sigprop pass probed — even when the decoded bit is 0.
+                state.pi[idx] = true;
                 if sig != 0 {
                     let (h_pos, h_neg) = state.h_sign_flags(x, sy);
                     let (v_pos, v_neg) = state.v_sign_flags(x, sy);
@@ -440,7 +444,6 @@ fn sigprop_pass_enc(state: &mut EncoderState, mqc: &mut MqcEnc, bpno: i32, orien
                     let sbit_true = if state.sign[idx] { 1u32 } else { 0u32 };
                     mqc.encode(sbit_true ^ xor);
                     state.sigma[idx] = true;
-                    state.pi[idx] = true;
                 }
             }
         }

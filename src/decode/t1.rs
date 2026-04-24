@@ -445,6 +445,16 @@ fn sigprop_pass(state: &mut DecoderState, mqc: &mut Mqc, bpno: i32, orient: Orie
                 // Zero coding context.
                 mqc.setcurctx(CTX_ZC + ctxno_zc(h, v, d, orient));
                 let sig = mqc.decode();
+                // Per T.800 §D.3.4, the cleanup pass covers only those
+                // samples NOT processed in the sigprop pass. "Processed"
+                // means the sigprop decoder asked the MQ coder about them,
+                // regardless of the outcome — so we set `pi` for every
+                // sigprop-tested sample, not just the ones that turned
+                // significant. Missing this flag causes the cleanup pass
+                // to re-test the sample and consume an extra MQ bit,
+                // drifting the decoder state for the remainder of the
+                // code-block.
+                state.pi[idx] = true;
                 if sig != 0 {
                     // Sample becomes significant this pass. Decode sign.
                     let (h_pos, h_neg) = state.h_sign_flags(x, sy);
@@ -460,7 +470,6 @@ fn sigprop_pass(state: &mut DecoderState, mqc: &mut Mqc, bpno: i32, orient: Orie
                     } else {
                         state.data[idx] = oneplushalf;
                     }
-                    state.pi[idx] = true;
                 }
             }
         }
