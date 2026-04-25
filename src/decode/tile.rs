@@ -7,15 +7,18 @@
 //!
 //! - **5/3 integer reversible** wavelet (Part-1 lossless default) and
 //!   **9/7 irreversible** float wavelet (lossy).
-//! - **LRCP**, **RLCP**, and **RPCL** progression orders. RPCL only
-//!   under default precincts (where the position dimension collapses
-//!   — see the dispatch in `decode_tile_with_params` below).
+//! - **LRCP**, **RLCP**, **RPCL**, **PCRL**, and **CPRL** progression
+//!   orders (T.800 §B.12.1). User-specified precinct partitions
+//!   (§A.6.1 / §B.6) are honoured: the tier-2 walker iterates one
+//!   packet per `(component, resolution, precinct, layer)` tuple in the
+//!   spec's order, with each precinct emitting only the code-blocks of
+//!   each sub-band that fall inside its rectangular footprint
+//!   (§B.6 / §B.7 / §B.9).
 //! - **Multiple quality layers** — each layer accumulates extra coding
 //!   passes per code-block. Per T.800 Table D.8 default ("termination
 //!   only on last pass"), the MQ stream is not broken at intermediate
 //!   layer boundaries, so the per-code-block byte segments concatenate
 //!   into one codeword segment that the tier-1 decoder runs once.
-//! - One precinct per resolution (PPx = PPy = 15 in the COD).
 //!
 //! Decodes a single tile. The multi-tile walk lives in
 //! [`super::frame::decode_frame`], which groups tile-parts by `Isot`
@@ -185,39 +188,75 @@ pub struct CblkState {
     pub missing_msb: u32,
 }
 
-pub struct PrecinctState {
+/// Per-(precinct, sub-band) tier-2 decoder state. Holds the inclusion
+/// and zero-bit-plane tag trees for the code-blocks of one sub-band
+/// that fall inside a given precinct, plus the precinct's local
+/// position in the sub-band's global code-block grid.
+pub struct PrecinctSubband {
     pub inclusion: TagTree,
     pub zero_bitplanes: TagTree,
-    pub cblks: Vec<CblkState>,
-    pub cblks_w: usize,
-    pub cblks_h: usize,
+    /// Top-left code-block index of this precinct in the sub-band's
+    /// global cblk grid (`[0..cblks_w[sb]) × [0..cblks_h[sb]))`).
+    pub cx0: usize,
+    pub cy0: usize,
+    /// Local code-block grid dimensions inside this precinct.
+    pub pcw: usize,
+    pub pch: usize,
 }
 
-impl PrecinctState {
-    fn new(cblks_w: usize, cblks_h: usize) -> Self {
-        let w = cblks_w.max(1);
-        let h = cblks_h.max(1);
-        PrecinctState {
-            inclusion: TagTree::new(w, h),
-            zero_bitplanes: TagTree::new(w, h),
-            cblks: vec![
-                CblkState {
-                    lblock: 3,
-                    ..Default::default()
-                };
-                w * h
-            ],
-            cblks_w,
-            cblks_h,
+impl PrecinctSubband {
+    fn new(cx0: usize, cy0: usize, pcw: usize, pch: usize) -> Self {
+        // Tag trees must have at least one leaf to keep `decode` honest
+        // even for empty precincts (§B.6 — every precinct emits a packet
+        // header even when the precinct contains no code-blocks).
+        let tw = pcw.max(1);
+        let th = pch.max(1);
+        PrecinctSubband {
+            inclusion: TagTree::new(tw, th),
+            zero_bitplanes: TagTree::new(tw, th),
+            cx0,
+            cy0,
+            pcw,
+            pch,
         }
     }
+}
+
+/// One precinct (T.800 §B.6). Holds per-sub-band tag-tree state and
+/// the precinct's reference-grid origin (used by RPCL/PCRL/CPRL).
+pub struct Precinct {
+    /// One slot per sub-band in this resolution (1 for `r = 0`,
+    /// 3 for `r > 0`, in HL/LH/HH order).
+    pub sb_states: Vec<PrecinctSubband>,
+    /// Reference-grid coordinates of the precinct's notional top-left
+    /// (per the spec the partition is anchored at LL_r (0,0); we map
+    /// back through the resolution scale and component sub-sampling to
+    /// reference-grid coordinates so the position-driven progression
+    /// orders can sort precincts in the spec's `(y, x)` walk order).
+    pub ref_x: u32,
+    pub ref_y: u32,
 }
 
 pub struct ResolutionLayout {
     pub resno: u8,
     pub subbands: Vec<SubbandInfo>,
-    pub prec_states: Vec<PrecinctState>,
+    /// Precincts in raster order (`px + py * nprec_w`).
+    pub precincts: Vec<Precinct>,
+    pub nprec_w: usize,
+    pub nprec_h: usize,
+    /// Per-sub-band global code-block grid + persistent decoder state.
+    /// All four arrays are indexed by sub-band slot in `subbands`.
+    pub cblks_w: Vec<usize>,
+    pub cblks_h: Vec<usize>,
     pub cblk_rects: Vec<Vec<(u32, u32, u32, u32)>>,
+    pub cblk_states: Vec<Vec<CblkState>>,
+    /// Precinct width/height exponents (§A.6.1 Table A.21).
+    pub ppx: u8,
+    pub ppy: u8,
+    /// Effective code-block log2 dimensions after the §B.7 clamp
+    /// (`min(xcb, PPx [- 1])` / same for `ycb`).
+    pub xcb_eff: u8,
+    pub ycb_eff: u8,
 }
 
 /// Build sub-band layouts following ISO 15444-1 §F.2 / §B.4.
@@ -297,11 +336,28 @@ pub fn build_subbands(tx0: u32, ty0: u32, tx1: u32, ty1: u32, num_decomp: u8) ->
     out
 }
 
+/// Build per-resolution layouts for one tile-component, including the
+/// precinct partition (§B.6), the code-block partition inside each
+/// sub-band (§B.7), and the `(precinct, sub-band) → cblk-range`
+/// mapping that the tier-2 walker needs.
+///
+/// `tile_comp_bounds = (tcx0, tcy0, tcx1, tcy1)` — the tile-component
+/// rectangle in component coordinates. We derive LL_r bounds at each
+/// resolution as `ceil(tc_/2^(NL - r))` (T.800 §F.4).
+///
+/// `xrsiz`/`yrsiz` come from SIZ. They are used only to map precinct
+/// LL_r coordinates back to reference-grid coordinates for the
+/// position-driven progression orders.
+#[allow(clippy::too_many_arguments)]
 fn build_resolutions(
     subbands: Vec<SubbandInfo>,
     num_decomp: u8,
     cblk_w_log2: u8,
     cblk_h_log2: u8,
+    precincts_pp: &[(u8, u8)],
+    tile_comp_bounds: (u32, u32, u32, u32),
+    xrsiz: u32,
+    yrsiz: u32,
 ) -> Vec<ResolutionLayout> {
     let num_res = (num_decomp as usize) + 1;
     let mut per_res: Vec<Vec<SubbandInfo>> = vec![Vec::new(); num_res];
@@ -312,16 +368,58 @@ fn build_resolutions(
         .into_iter()
         .enumerate()
         .map(|(resno, subs)| {
-            let mut prec_states = Vec::with_capacity(subs.len());
-            let mut cblk_rects = Vec::with_capacity(subs.len());
+            let (ppx, ppy) = precincts_pp.get(resno).copied().unwrap_or((15, 15));
+            // Effective code-block size per §B.7. For r > 0 the cblk
+            // extent inside the precinct partition is bounded by
+            // `2^(PPx - 1) × 2^(PPy - 1)`; for r = 0 it is the full
+            // `2^PPx × 2^PPy`.
+            let pp_cblk_x = if resno == 0 {
+                ppx
+            } else {
+                ppx.saturating_sub(1)
+            };
+            let pp_cblk_y = if resno == 0 {
+                ppy
+            } else {
+                ppy.saturating_sub(1)
+            };
+            let xcb_eff = cblk_w_log2.min(pp_cblk_x);
+            let ycb_eff = cblk_h_log2.min(pp_cblk_y);
+            let cw = 1u32 << xcb_eff;
+            let ch = 1u32 << ycb_eff;
+
+            // §B.6 precinct count for this resolution. The partition
+            // is anchored at (0,0) of the LL_r grid, so the spec's
+            // formula collapses to ceil(trx1/2^PPx) - floor(trx0/2^PPx)
+            // (Eq B-16). LL_r bounds come from the tile-component
+            // bounds scaled by `2^(NL - r)` per §F.4.
+            let (tcx0, tcy0, tcx1, tcy1) = tile_comp_bounds;
+            let down = 1u32 << (num_decomp as u32 - resno as u32);
+            let trx0 = div_ceil(tcx0, down);
+            let try0 = div_ceil(tcy0, down);
+            let trx1 = div_ceil(tcx1, down);
+            let try1 = div_ceil(tcy1, down);
+            let pp_cell_x = 1u32 << ppx;
+            let pp_cell_y = 1u32 << ppy;
+            let px_lo = trx0 / pp_cell_x;
+            let px_hi = div_ceil(trx1, pp_cell_x);
+            let py_lo = try0 / pp_cell_y;
+            let py_hi = div_ceil(try1, pp_cell_y);
+            let nprec_w = (px_hi - px_lo) as usize;
+            let nprec_h = (py_hi - py_lo) as usize;
+            let nprec_w_eff = nprec_w.max(1);
+            let nprec_h_eff = nprec_h.max(1);
+
+            // Per-sub-band global code-block grid.
+            let mut cblks_w_v: Vec<usize> = Vec::with_capacity(subs.len());
+            let mut cblks_h_v: Vec<usize> = Vec::with_capacity(subs.len());
+            let mut cblk_rects: Vec<Vec<(u32, u32, u32, u32)>> = Vec::with_capacity(subs.len());
+            let mut cblk_states: Vec<Vec<CblkState>> = Vec::with_capacity(subs.len());
             for sb in &subs {
-                let cw = 1u32 << cblk_w_log2;
-                let ch = 1u32 << cblk_h_log2;
                 let band_w = sb.x1.saturating_sub(sb.x0);
                 let band_h = sb.y1.saturating_sub(sb.y0);
                 let cblks_w = div_ceil(band_w, cw) as usize;
                 let cblks_h = div_ceil(band_h, ch) as usize;
-                prec_states.push(PrecinctState::new(cblks_w, cblks_h));
                 let mut rects = Vec::with_capacity(cblks_w * cblks_h);
                 for cy in 0..cblks_h {
                     for cx in 0..cblks_w {
@@ -333,12 +431,109 @@ fn build_resolutions(
                     }
                 }
                 cblk_rects.push(rects);
+                cblk_states.push(vec![
+                    CblkState {
+                        lblock: 3,
+                        ..Default::default()
+                    };
+                    cblks_w * cblks_h
+                ]);
+                cblks_w_v.push(cblks_w);
+                cblks_h_v.push(cblks_h);
             }
+
+            // Build precinct list (raster order). For each precinct,
+            // compute the per-sub-band code-block range that falls
+            // inside the precinct's footprint (§B.6 / §B.7). For r > 0
+            // the sub-band coords run at half the LL_r scale, so the
+            // precinct cell is `2^(PPx-1) × 2^(PPy-1)` in sub-band coords.
+            let mut precincts: Vec<Precinct> = Vec::with_capacity(nprec_w_eff * nprec_h_eff);
+            for py in 0..nprec_h_eff {
+                for px in 0..nprec_w_eff {
+                    let abs_px = (px_lo as usize + px) as u32;
+                    let abs_py = (py_lo as usize + py) as u32;
+                    // Precinct extent in LL_r coords.
+                    let p_ll_x0 = abs_px * pp_cell_x;
+                    let p_ll_y0 = abs_py * pp_cell_y;
+                    let p_ll_x1 = p_ll_x0 + pp_cell_x;
+                    let p_ll_y1 = p_ll_y0 + pp_cell_y;
+
+                    let mut sb_states = Vec::with_capacity(subs.len());
+                    for (sb_idx, sb) in subs.iter().enumerate() {
+                        // Map precinct extent into sub-band coords.
+                        // For r = 0 (LL only) the sub-band IS the LL_r
+                        // grid. For r > 0 we divide by 2.
+                        let (sx0_p, sy0_p, sx1_p, sy1_p) = if resno == 0 {
+                            (p_ll_x0, p_ll_y0, p_ll_x1, p_ll_y1)
+                        } else {
+                            (p_ll_x0 / 2, p_ll_y0 / 2, p_ll_x1 / 2, p_ll_y1 / 2)
+                        };
+                        // Clip to sub-band's own extent.
+                        let sx0 = sx0_p.max(sb.x0);
+                        let sy0 = sy0_p.max(sb.y0);
+                        let sx1 = sx1_p.min(sb.x1);
+                        let sy1 = sy1_p.min(sb.y1);
+                        // Code-block index range. Cblks are anchored
+                        // at sub-band (0, 0), so we floor-divide the
+                        // intersection by the cblk size and round up
+                        // the upper edge. Then translate by the
+                        // sub-band's own origin so the indices are
+                        // local to the sub-band's cblk array.
+                        let (cx0, cy0, pcw, pch) = if sx1 <= sx0 || sy1 <= sy0 {
+                            (0, 0, 0, 0)
+                        } else {
+                            let cx_lo = (sx0 / cw) as usize;
+                            let cx_hi = div_ceil(sx1, cw) as usize;
+                            let cy_lo = (sy0 / ch) as usize;
+                            let cy_hi = div_ceil(sy1, ch) as usize;
+                            // Translate to sub-band-local cblk index.
+                            let sb_cx_lo = (sb.x0 / cw) as usize;
+                            let sb_cy_lo = (sb.y0 / ch) as usize;
+                            (
+                                cx_lo.saturating_sub(sb_cx_lo),
+                                cy_lo.saturating_sub(sb_cy_lo),
+                                cx_hi.saturating_sub(cx_lo),
+                                cy_hi.saturating_sub(cy_lo),
+                            )
+                        };
+                        // Clamp to sub-band's global cblk grid bounds.
+                        let pcw = pcw.min(cblks_w_v[sb_idx].saturating_sub(cx0));
+                        let pch = pch.min(cblks_h_v[sb_idx].saturating_sub(cy0));
+                        sb_states.push(PrecinctSubband::new(cx0, cy0, pcw, pch));
+                    }
+
+                    // Reference-grid origin of this precinct, used by
+                    // the position-driven progression orders. For the
+                    // LL_r → reference-grid map (§B.5) we scale by
+                    // `2^(NL - r)` and the component sub-sampling.
+                    let nl = num_decomp as u32;
+                    let r = resno as u32;
+                    let scale = 1u32 << (nl - r);
+                    let ref_x = p_ll_x0.saturating_mul(scale).saturating_mul(xrsiz);
+                    let ref_y = p_ll_y0.saturating_mul(scale).saturating_mul(yrsiz);
+
+                    precincts.push(Precinct {
+                        sb_states,
+                        ref_x,
+                        ref_y,
+                    });
+                }
+            }
+
             ResolutionLayout {
                 resno: resno as u8,
                 subbands: subs,
-                prec_states,
+                precincts,
+                nprec_w: nprec_w_eff,
+                nprec_h: nprec_h_eff,
+                cblks_w: cblks_w_v,
+                cblks_h: cblks_h_v,
                 cblk_rects,
+                cblk_states,
+                ppx,
+                ppy,
+                xcb_eff,
+                ycb_eff,
             }
         })
         .collect()
@@ -384,23 +579,9 @@ pub fn decode_tile_with_params(
             "jpeg2000: unknown transform id (must be 0 or 1)",
         ));
     }
-    if !matches!(cod.progression_order, 0..=2) {
+    if !matches!(cod.progression_order, 0..=4) {
         return Err(Error::unsupported(
-            "jpeg2000: only LRCP / RLCP / RPCL progression orders are supported",
-        ));
-    }
-    // RPCL (T.800 §B.12.1.3) iterates outer in (y, x) over the reference
-    // grid. Under our current "one precinct per resolution" assumption
-    // (default `(15, 15)` precinct geometry — see §A.6.1 / Table A.21),
-    // every resolution has exactly one precinct that aligns with the
-    // top-left of the tile. The (y, x) loop therefore degenerates to
-    // emitting that single precinct's packets in component-then-layer
-    // order, i.e. `for r { for comp { for layer ... } }`. User-specified
-    // precincts would change that flow — refuse them up front so the
-    // decoder doesn't silently mis-walk the codestream.
-    if cod.progression_order == 2 && cod.precincts.iter().any(|&(px, py)| (px, py) != (15, 15)) {
-        return Err(Error::unsupported(
-            "jpeg2000: RPCL with user-specified precincts is not supported yet",
+            "jpeg2000: progression order must be 0..=4 (LRCP/RLCP/RPCL/PCRL/CPRL)",
         ));
     }
 
@@ -414,53 +595,18 @@ pub fn decode_tile_with_params(
             cod.num_decomp,
             cod.cblk_w_log2,
             cod.cblk_h_log2,
+            &cod.precincts,
+            (x0, y0, x1, y1),
+            // Component sub-sampling is already folded into `comp_sizes`
+            // by the caller, so component coords here are 1:1 with the
+            // reference grid for this tile-component. See `decode_frame`.
+            1,
+            1,
         ));
     }
 
     let mut cursor = Cursor::new(body);
-    match cod.progression_order {
-        // LRCP — T.800 §B.12.1.1. Layer-major: every layer's packets are
-        // emitted across all (resolution, component, precinct) tuples
-        // before the next layer begins.
-        0 => {
-            for layer in 0..cod.num_layers as u32 {
-                for resno in 0..num_res {
-                    for comp in 0..num_comps {
-                        parse_precinct_packet(&mut cursor, layer, &mut layouts[comp][resno], cod)?;
-                    }
-                }
-            }
-        }
-        // RLCP — T.800 §B.12.1.2. Resolution-major outer; layer-major
-        // inside.
-        1 => {
-            for resno in 0..num_res {
-                for layer in 0..cod.num_layers as u32 {
-                    for comp in 0..num_comps {
-                        parse_precinct_packet(&mut cursor, layer, &mut layouts[comp][resno], cod)?;
-                    }
-                }
-            }
-        }
-        // RPCL — T.800 §B.12.1.3. Resolution-position-component-layer.
-        // Under default precincts (one precinct per resolution per
-        // component) the position dimension collapses to a single
-        // precinct per (resolution, component), and the spec's
-        // alignment gating fires only once per resolution — at the
-        // top-left of the tile. So the effective walk degenerates to
-        // `for r { for comp { for layer } }`. The check above refuses
-        // user-precinct codestreams to keep this assumption sound.
-        2 => {
-            for resno in 0..num_res {
-                for comp in 0..num_comps {
-                    for layer in 0..cod.num_layers as u32 {
-                        parse_precinct_packet(&mut cursor, layer, &mut layouts[comp][resno], cod)?;
-                    }
-                }
-            }
-        }
-        _ => unreachable!(),
-    }
+    walk_packets(&mut cursor, cod, &mut layouts, num_res, num_comps)?;
 
     // Per-component IDWT using per-subband buffers.
     let mut out = Vec::with_capacity(num_comps);
@@ -517,11 +663,13 @@ fn synth_component_53(
             let bw = (sb.x1 - sb.x0) as usize;
             let bh = (sb.y1 - sb.y0) as usize;
             let mut buf = vec![0i32; bw * bh];
-            let prec = &layout.prec_states[sb_idx];
-            for cy in 0..prec.cblks_h {
-                for cx in 0..prec.cblks_w {
-                    let idx = cy * prec.cblks_w + cx;
-                    let st = &prec.cblks[idx];
+            let cblks = &layout.cblk_states[sb_idx];
+            let cblks_w = layout.cblks_w[sb_idx];
+            let cblks_h = layout.cblks_h[sb_idx];
+            for cy in 0..cblks_h {
+                for cx in 0..cblks_w {
+                    let idx = cy * cblks_w + cx;
+                    let st = &cblks[idx];
                     if !st.included || st.total_passes == 0 {
                         continue;
                     }
@@ -649,7 +797,9 @@ fn synth_component_97(
             let bw = (sb.x1 - sb.x0) as usize;
             let bh = (sb.y1 - sb.y0) as usize;
             let mut buf = vec![0f32; bw * bh];
-            let prec_state = &layout.prec_states[sb_idx];
+            let cblks = &layout.cblk_states[sb_idx];
+            let cblks_w = layout.cblks_w[sb_idx];
+            let cblks_h = layout.cblks_h[sb_idx];
             let (eps, mant) = qcd.bands[sb.band_idx];
             // Stepsize per T.800 Eq E-3. For the 9/7 decoder we match
             // OpenJPEG's `BUG_WEIRD_TWO_INVK` convention (see
@@ -662,10 +812,10 @@ fn synth_component_97(
             // our tier-1 samples carry the `oneplushalf` magnitude which
             // bakes a factor of 2 into the value. Halving it undoes that.
             let scale = 0.5f64 * stepsize;
-            for cy in 0..prec_state.cblks_h {
-                for cx in 0..prec_state.cblks_w {
-                    let idx = cy * prec_state.cblks_w + cx;
-                    let st = &prec_state.cblks[idx];
+            for cy in 0..cblks_h {
+                for cx in 0..cblks_w {
+                    let idx = cy * cblks_w + cx;
+                    let st = &cblks[idx];
                     if !st.included || st.total_passes == 0 {
                         continue;
                     }
@@ -782,10 +932,14 @@ impl<'a> Cursor<'a> {
     }
 }
 
+/// Parse one packet header + body for a single (resolution, precinct,
+/// layer) tuple. The packet covers all sub-bands of `res` whose
+/// code-blocks fall inside the chosen precinct (§B.6 / §B.9 / §B.10).
 fn parse_precinct_packet(
     cur: &mut Cursor<'_>,
     layer: u32,
     res: &mut ResolutionLayout,
+    prec_idx: usize,
     cod: &CodParams,
 ) -> Result<()> {
     if cod.sop_marker && cur.remaining().starts_with(&[0xFF, 0x91]) {
@@ -797,35 +951,41 @@ fn parse_precinct_packet(
 
     let header_start = cur.remaining();
     let mut bio = Bio::new(header_start);
+    // (sb_idx, global_cblk_idx, length).
     let mut pending: Vec<(usize, usize, u32)> = Vec::new();
 
     if bio.read_bit() == 0 {
         bio.inalign();
     } else {
         for sb_idx in 0..res.subbands.len() {
-            let prec = &mut res.prec_states[sb_idx];
-            let cblks_w = prec.cblks_w;
-            let cblks_h = prec.cblks_h;
-            for cy in 0..cblks_h {
-                for cx in 0..cblks_w {
-                    let cblk_idx = cy * cblks_w + cx;
+            let cblks_w_g = res.cblks_w[sb_idx];
+            let prec = &mut res.precincts[prec_idx].sb_states[sb_idx];
+            let pcw = prec.pcw;
+            let pch = prec.pch;
+            let base_cx = prec.cx0;
+            let base_cy = prec.cy0;
+            // Empty (sub-band, precinct) intersection: nothing to emit.
+            // Per §B.6 every precinct still emits a packet header; the
+            // tag-tree just isn't queried for sub-bands with no cblks.
+            if pcw == 0 || pch == 0 {
+                continue;
+            }
+            for lcy in 0..pch {
+                for lcx in 0..pcw {
+                    let g_cx = base_cx + lcx;
+                    let g_cy = base_cy + lcy;
+                    let g_idx = g_cy * cblks_w_g + g_cx;
                     let included_now;
                     let missing_msb;
-                    if !prec.cblks[cblk_idx].included {
-                        included_now = prec.inclusion.decode(cx, cy, layer + 1, &mut bio);
+                    if !res.cblk_states[sb_idx][g_idx].included {
+                        included_now = prec.inclusion.decode(lcx, lcy, layer + 1, &mut bio);
                         if !included_now {
                             continue;
                         }
                         // Missing-MSB (zero bitplanes) tag tree.
-                        // OpenJPEG starts at i=0 and iterates `while
-                        // !decode(i)` until the decoder reports the
-                        // leaf value is below the threshold. On break,
-                        // cblk->numbps = band->numbps + 1 - i. Our
-                        // `missing_msb` stores the zero-bitplane count
-                        // in the same scale as OpenJPEG's `i`.
                         let mut i = 0u32;
                         loop {
-                            if prec.zero_bitplanes.decode(cx, cy, i, &mut bio) {
+                            if prec.zero_bitplanes.decode(lcx, lcy, i, &mut bio) {
                                 break;
                             }
                             i += 1;
@@ -841,18 +1001,19 @@ fn parse_precinct_packet(
                         if !included_now {
                             continue;
                         }
-                        missing_msb = prec.cblks[cblk_idx].missing_msb;
+                        missing_msb = res.cblk_states[sb_idx][g_idx].missing_msb;
                     }
                     let num_passes = read_num_passes(&mut bio);
                     while bio.read_bit() == 1 {
-                        prec.cblks[cblk_idx].lblock += 1;
+                        res.cblk_states[sb_idx][g_idx].lblock += 1;
                     }
-                    let len_bits = prec.cblks[cblk_idx].lblock + ilog2(num_passes);
+                    let len_bits = res.cblk_states[sb_idx][g_idx].lblock + ilog2(num_passes);
                     let length = bio.read(len_bits);
-                    prec.cblks[cblk_idx].included = true;
-                    prec.cblks[cblk_idx].total_passes += num_passes;
-                    prec.cblks[cblk_idx].missing_msb = missing_msb;
-                    pending.push((sb_idx, cblk_idx, length));
+                    let st = &mut res.cblk_states[sb_idx][g_idx];
+                    st.included = true;
+                    st.total_passes += num_passes;
+                    st.missing_msb = missing_msb;
+                    pending.push((sb_idx, g_idx, length));
                 }
             }
         }
@@ -863,11 +1024,138 @@ fn parse_precinct_packet(
     if cod.eph_marker && cur.remaining().starts_with(&[0xFF, 0x92]) {
         cur.consume(2)?;
     }
-    for (sb_idx, cblk_idx, length) in pending {
+    for (sb_idx, g_idx, length) in pending {
         let bytes = cur.consume(length as usize)?.to_vec();
-        res.prec_states[sb_idx].cblks[cblk_idx]
+        res.cblk_states[sb_idx][g_idx]
             .data
             .extend_from_slice(&bytes);
+    }
+    Ok(())
+}
+
+/// Walk the tier-2 packet stream in the order signalled by `cod.progression_order`.
+/// All five Part-1 progression orders are handled (T.800 §B.12.1).
+#[allow(clippy::needless_range_loop)]
+fn walk_packets(
+    cur: &mut Cursor<'_>,
+    cod: &CodParams,
+    layouts: &mut [Vec<ResolutionLayout>],
+    num_res: usize,
+    num_comps: usize,
+) -> Result<()> {
+    let num_layers = cod.num_layers as u32;
+    match cod.progression_order {
+        // LRCP — §B.12.1.1.
+        0 => {
+            for layer in 0..num_layers {
+                for resno in 0..num_res {
+                    for comp in 0..num_comps {
+                        let nprec = layouts[comp][resno].precincts.len();
+                        for prec in 0..nprec {
+                            parse_precinct_packet(
+                                cur,
+                                layer,
+                                &mut layouts[comp][resno],
+                                prec,
+                                cod,
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+        // RLCP — §B.12.1.2.
+        1 => {
+            for resno in 0..num_res {
+                for layer in 0..num_layers {
+                    for comp in 0..num_comps {
+                        let nprec = layouts[comp][resno].precincts.len();
+                        for prec in 0..nprec {
+                            parse_precinct_packet(
+                                cur,
+                                layer,
+                                &mut layouts[comp][resno],
+                                prec,
+                                cod,
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+        // RPCL — §B.12.1.3. Per-resolution (y, x) walk over the
+        // reference grid; the spec note (§B.12.1.3 "NOTE") says we may
+        // iterate precincts directly. Group by resolution; sort
+        // (component, precinct) pairs by (ref_y, ref_x, comp) to
+        // emulate the (y, x) walk efficiently.
+        2 => {
+            for resno in 0..num_res {
+                let mut order: Vec<(u32, u32, usize, usize)> = Vec::new();
+                for comp in 0..num_comps {
+                    let layout = &layouts[comp][resno];
+                    for (prec_idx, prec) in layout.precincts.iter().enumerate() {
+                        order.push((prec.ref_y, prec.ref_x, comp, prec_idx));
+                    }
+                }
+                order.sort();
+                for (_, _, comp, prec_idx) in order {
+                    for layer in 0..num_layers {
+                        parse_precinct_packet(
+                            cur,
+                            layer,
+                            &mut layouts[comp][resno],
+                            prec_idx,
+                            cod,
+                        )?;
+                    }
+                }
+            }
+        }
+        // PCRL — §B.12.1.4. Outer (y, x) over the ref grid; inner
+        // component, resolution, layer.
+        3 => {
+            let mut order: Vec<(u32, u32, usize, usize, usize)> = Vec::new();
+            for comp in 0..num_comps {
+                for resno in 0..num_res {
+                    let layout = &layouts[comp][resno];
+                    for (prec_idx, prec) in layout.precincts.iter().enumerate() {
+                        order.push((prec.ref_y, prec.ref_x, comp, resno, prec_idx));
+                    }
+                }
+            }
+            // Spec order: (y, x, comp, r). We sort by that tuple.
+            order.sort();
+            for (_, _, comp, resno, prec_idx) in order {
+                for layer in 0..num_layers {
+                    parse_precinct_packet(cur, layer, &mut layouts[comp][resno], prec_idx, cod)?;
+                }
+            }
+        }
+        // CPRL — §B.12.1.5. Outer component, then (y, x), then r, then layer.
+        4 => {
+            for comp in 0..num_comps {
+                let mut order: Vec<(u32, u32, usize, usize)> = Vec::new();
+                for resno in 0..num_res {
+                    let layout = &layouts[comp][resno];
+                    for (prec_idx, prec) in layout.precincts.iter().enumerate() {
+                        order.push((prec.ref_y, prec.ref_x, resno, prec_idx));
+                    }
+                }
+                order.sort();
+                for (_, _, resno, prec_idx) in order {
+                    for layer in 0..num_layers {
+                        parse_precinct_packet(
+                            cur,
+                            layer,
+                            &mut layouts[comp][resno],
+                            prec_idx,
+                            cod,
+                        )?;
+                    }
+                }
+            }
+        }
+        _ => unreachable!(),
     }
     Ok(())
 }
@@ -898,13 +1186,10 @@ fn ilog2(n: u32) -> u32 {
     }
 }
 
-/// Round-6 diagnostic helper. Decodes a single-tile `.j2k` codestream
-/// and returns the per-sub-band tier-1 output (already `/ 2`) for LL,
-/// HL, LH, HH at resolution 1 (for a 1-level 5/3 codestream). Each
-/// returned buffer is flat `hw * hh` = quarter of the image. Used to
-/// pin which sub-band our decoder disagrees with the OPJ fixture on.
-#[allow(clippy::needless_range_loop, clippy::type_complexity)]
-pub fn decode_subbands_round6(j2k: &[u8]) -> Result<(Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>)> {
+/// Build per-component `Vec<ResolutionLayout>`s for a parsed J2K
+/// codestream and run the tier-2 walker. Shared between the
+/// round-6 diagnostic helpers below.
+fn round6_walk_layouts(j2k: &[u8]) -> Result<(CodParams, QcdParams, Vec<Vec<ResolutionLayout>>)> {
     let cs = crate::codestream::parse(j2k)?;
     let cod = parse_cod(cs.cod.as_ref().ok_or_else(|| Error::invalid("no cod"))?)?;
     let qcd = parse_qcd(
@@ -912,22 +1197,20 @@ pub fn decode_subbands_round6(j2k: &[u8]) -> Result<(Vec<i32>, Vec<i32>, Vec<i32
         cod.num_decomp,
     )?;
     let (w, h) = (cs.siz.image_width(), cs.siz.image_height());
-    let subbands = build_subbands(0, 0, w, h, cod.num_decomp);
     let num_comps = cs.siz.num_components();
     let num_res = (cod.num_decomp as usize) + 1;
-    if num_res != 2 {
-        return Err(Error::unsupported(
-            "decode_subbands_round6: expects 1 decomposition level",
-        ));
-    }
     let mut layouts: Vec<Vec<ResolutionLayout>> = Vec::with_capacity(num_comps);
     for _ in 0..num_comps {
-        let sb = subbands.clone();
+        let sb = build_subbands(0, 0, w, h, cod.num_decomp);
         layouts.push(build_resolutions(
             sb,
             cod.num_decomp,
             cod.cblk_w_log2,
             cod.cblk_h_log2,
+            &cod.precincts,
+            (0, 0, w, h),
+            1,
+            1,
         ));
     }
     let mut body = Vec::new();
@@ -935,26 +1218,23 @@ pub fn decode_subbands_round6(j2k: &[u8]) -> Result<(Vec<i32>, Vec<i32>, Vec<i32
         body.extend_from_slice(&j2k[tp.sod_offset..tp.sod_offset + tp.sod_length]);
     }
     let mut cursor = Cursor::new(&body);
-    match cod.progression_order {
-        0 => {
-            for layer in 0..cod.num_layers as u32 {
-                for resno in 0..num_res {
-                    for comp in 0..num_comps {
-                        parse_precinct_packet(&mut cursor, layer, &mut layouts[comp][resno], &cod)?;
-                    }
-                }
-            }
-        }
-        1 => {
-            for resno in 0..num_res {
-                for layer in 0..cod.num_layers as u32 {
-                    for comp in 0..num_comps {
-                        parse_precinct_packet(&mut cursor, layer, &mut layouts[comp][resno], &cod)?;
-                    }
-                }
-            }
-        }
-        _ => return Err(Error::unsupported("progression order")),
+    walk_packets(&mut cursor, &cod, &mut layouts, num_res, num_comps)?;
+    Ok((cod, qcd, layouts))
+}
+
+/// Round-6 diagnostic helper. Decodes a single-tile `.j2k` codestream
+/// and returns the per-sub-band tier-1 output (already `/ 2`) for LL,
+/// HL, LH, HH at resolution 1 (for a 1-level 5/3 codestream). Each
+/// returned buffer is flat `hw * hh` = quarter of the image. Used to
+/// pin which sub-band our decoder disagrees with the OPJ fixture on.
+#[allow(clippy::needless_range_loop, clippy::type_complexity)]
+pub fn decode_subbands_round6(j2k: &[u8]) -> Result<(Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>)> {
+    let (cod, qcd, layouts) = round6_walk_layouts(j2k)?;
+    let num_res = (cod.num_decomp as usize) + 1;
+    if num_res != 2 {
+        return Err(Error::unsupported(
+            "decode_subbands_round6: expects 1 decomposition level",
+        ));
     }
     let mut subband_results: Vec<Vec<i32>> = Vec::with_capacity(4);
     for resno in 0..num_res {
@@ -963,11 +1243,13 @@ pub fn decode_subbands_round6(j2k: &[u8]) -> Result<(Vec<i32>, Vec<i32>, Vec<i32
             let bw = (sb.x1 - sb.x0) as usize;
             let bh = (sb.y1 - sb.y0) as usize;
             let mut buf = vec![0i32; bw * bh];
-            let prec = &layout.prec_states[sb_idx];
-            for cy in 0..prec.cblks_h {
-                for cx in 0..prec.cblks_w {
-                    let idx = cy * prec.cblks_w + cx;
-                    let st = &prec.cblks[idx];
+            let cblks = &layout.cblk_states[sb_idx];
+            let cblks_w = layout.cblks_w[sb_idx];
+            let cblks_h = layout.cblks_h[sb_idx];
+            for cy in 0..cblks_h {
+                for cx in 0..cblks_w {
+                    let idx = cy * cblks_w + cx;
+                    let st = &cblks[idx];
                     if !st.included || st.total_passes == 0 {
                         continue;
                     }
@@ -1002,8 +1284,6 @@ pub fn decode_subbands_round6(j2k: &[u8]) -> Result<(Vec<i32>, Vec<i32>, Vec<i32
             subband_results.push(buf);
         }
     }
-    let _ = h;
-    let _ = w;
     Ok((
         subband_results[0].clone(),
         subband_results[1].clone(),
@@ -1020,52 +1300,7 @@ pub fn extract_sb_cblk_round6(
     j2k: &[u8],
     band_kind: u8,
 ) -> Result<(usize, usize, i32, i32, u32, Vec<u8>)> {
-    let cs = crate::codestream::parse(j2k)?;
-    let cod = parse_cod(cs.cod.as_ref().ok_or_else(|| Error::invalid("no cod"))?)?;
-    let qcd = parse_qcd(
-        cs.qcd.as_ref().ok_or_else(|| Error::invalid("no qcd"))?,
-        cod.num_decomp,
-    )?;
-    let (w, h) = (cs.siz.image_width(), cs.siz.image_height());
-    let subbands = build_subbands(0, 0, w, h, cod.num_decomp);
-    let num_comps = cs.siz.num_components();
-    let num_res = (cod.num_decomp as usize) + 1;
-    let mut layouts: Vec<Vec<ResolutionLayout>> = Vec::with_capacity(num_comps);
-    for _ in 0..num_comps {
-        let sb = subbands.clone();
-        layouts.push(build_resolutions(
-            sb,
-            cod.num_decomp,
-            cod.cblk_w_log2,
-            cod.cblk_h_log2,
-        ));
-    }
-    let mut body = Vec::new();
-    for tp in &cs.tile_parts {
-        body.extend_from_slice(&j2k[tp.sod_offset..tp.sod_offset + tp.sod_length]);
-    }
-    let mut cursor = Cursor::new(&body);
-    match cod.progression_order {
-        0 => {
-            for layer in 0..cod.num_layers as u32 {
-                for resno in 0..num_res {
-                    for comp in 0..num_comps {
-                        parse_precinct_packet(&mut cursor, layer, &mut layouts[comp][resno], &cod)?;
-                    }
-                }
-            }
-        }
-        1 => {
-            for resno in 0..num_res {
-                for layer in 0..cod.num_layers as u32 {
-                    for comp in 0..num_comps {
-                        parse_precinct_packet(&mut cursor, layer, &mut layouts[comp][resno], &cod)?;
-                    }
-                }
-            }
-        }
-        _ => return Err(Error::unsupported("progression order")),
-    }
+    let (_cod, qcd, layouts) = round6_walk_layouts(j2k)?;
     // Pick sb_idx in resno=1 by band_kind. subbands at res=1 are stored
     // in order HL, LH, HH (band_kind 1, 2, 3).
     let sb_idx = match band_kind {
@@ -1080,8 +1315,7 @@ pub fn extract_sb_cblk_round6(
     let bh = (sb.y1 - sb.y0) as usize;
     let (eps, _mant) = qcd.bands[sb.band_idx];
     let band_numbps = qcd.guard_bits as i32 + eps as i32 - 1;
-    let prec = &layout.prec_states[sb_idx];
-    let st = &prec.cblks[0];
+    let st = &layout.cblk_states[sb_idx][0];
     let bpno = band_numbps + 1 - st.missing_msb as i32;
     Ok((bw, bh, band_numbps, bpno, st.total_passes, st.data.clone()))
 }
@@ -1093,62 +1327,14 @@ pub fn extract_sb_cblk_round6(
 /// the `opj_t1_mqtrace` diagnostic test.
 #[allow(clippy::needless_range_loop)]
 pub fn extract_ll_cblk_round6(j2k: &[u8]) -> Result<(usize, usize, i32, i32, u32, Vec<u8>)> {
-    let cs = crate::codestream::parse(j2k)?;
-    let cod = parse_cod(cs.cod.as_ref().ok_or_else(|| Error::invalid("no cod"))?)?;
-    let qcd = parse_qcd(
-        cs.qcd.as_ref().ok_or_else(|| Error::invalid("no qcd"))?,
-        cod.num_decomp,
-    )?;
-    let (w, h) = (cs.siz.image_width(), cs.siz.image_height());
-    let subbands = build_subbands(0, 0, w, h, cod.num_decomp);
-    let num_comps = cs.siz.num_components();
-    let num_res = (cod.num_decomp as usize) + 1;
-    let mut layouts: Vec<Vec<ResolutionLayout>> = Vec::with_capacity(num_comps);
-    for _ in 0..num_comps {
-        let sb = subbands.clone();
-        layouts.push(build_resolutions(
-            sb,
-            cod.num_decomp,
-            cod.cblk_w_log2,
-            cod.cblk_h_log2,
-        ));
-    }
-    let mut body = Vec::new();
-    for tp in &cs.tile_parts {
-        body.extend_from_slice(&j2k[tp.sod_offset..tp.sod_offset + tp.sod_length]);
-    }
-    let mut cursor = Cursor::new(&body);
-    // LRCP: resolution-major.
-    match cod.progression_order {
-        0 => {
-            for layer in 0..cod.num_layers as u32 {
-                for resno in 0..num_res {
-                    for comp in 0..num_comps {
-                        parse_precinct_packet(&mut cursor, layer, &mut layouts[comp][resno], &cod)?;
-                    }
-                }
-            }
-        }
-        1 => {
-            for resno in 0..num_res {
-                for layer in 0..cod.num_layers as u32 {
-                    for comp in 0..num_comps {
-                        parse_precinct_packet(&mut cursor, layer, &mut layouts[comp][resno], &cod)?;
-                    }
-                }
-            }
-        }
-        _ => return Err(Error::unsupported("progression order")),
-    }
-    // LL resolution 0 is layouts[0][0].subbands[0].
+    let (_cod, qcd, layouts) = round6_walk_layouts(j2k)?;
     let layout0 = &layouts[0][0];
     let sb = &layout0.subbands[0];
     let bw = (sb.x1 - sb.x0) as usize;
     let bh = (sb.y1 - sb.y0) as usize;
     let (eps, _mant) = qcd.bands[sb.band_idx];
     let band_numbps = qcd.guard_bits as i32 + eps as i32 - 1;
-    let prec = &layout0.prec_states[0];
-    let st = &prec.cblks[0];
+    let st = &layout0.cblk_states[0][0];
     let bpno = band_numbps + 1 - st.missing_msb as i32;
     Ok((bw, bh, band_numbps, bpno, st.total_passes, st.data.clone()))
 }
