@@ -29,4 +29,7 @@ pub mod mqc;
 pub mod t1;
 pub mod tile;
 
-pub use codestream::{encode_frame, extract_jp2_codestream, EncodeOptions, TransformMode};
+pub use codestream::{
+    encode_frame, extract_jp2_codestream, EncodeOptions, PacketHeaderPlacement, ProgressionOrder,
+    TransformMode,
+};

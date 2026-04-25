@@ -9,7 +9,7 @@
 
 use super::dwt::{fdwt_53, fdwt_97};
 use super::t1::{encode_cblk, EncodedCblk};
-use crate::decode::tile::{build_subbands, SubbandInfo};
+use crate::decode::tile::{build_subbands, PocProgression, SubbandInfo};
 use oxideav_core::{Error, Result};
 
 /// Wavelet transform kind selected by the caller.
@@ -58,6 +58,11 @@ pub struct EncodedTile {
 /// - `num_decomp`: number of DWT decomposition levels (5/3 default 5).
 /// - `cblk_w_log2`, `cblk_h_log2`: code-block dimensions in log2.
 /// - `guard_bits`: guard bits from QCD (2 is the default).
+/// - `progression_order`: COD `SGcod` value (T.800 Table A.16) — 0 LRCP,
+///   1 RLCP, 2 RPCL, 3 PCRL, 4 CPRL.
+/// - `poc`: optional progression-order-change schedule (T.800 §A.6.6).
+///   When non-empty the packet emit loop iterates each progression
+///   volume in turn instead of `progression_order`.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_tile(
     comp_planes: &[Vec<i32>],
@@ -67,6 +72,8 @@ pub fn encode_tile(
     cblk_h_log2: u8,
     guard_bits: u8,
     precision: u32,
+    progression_order: u8,
+    poc: &[PocProgression],
 ) -> Result<EncodedTile> {
     if comp_planes.len() != comp_sizes.len() {
         return Err(Error::invalid(
@@ -274,13 +281,16 @@ pub fn encode_tile(
         per_comp.push(res_out);
     }
 
-    // Tier-2: emit packets in LRCP order (single layer).
+    // Tier-2: emit packets in the requested progression order.
     let mut body: Vec<u8> = Vec::new();
-    for resno in 0..num_res {
-        for per_comp_entry in per_comp.iter_mut().take(num_comps) {
-            emit_packet(&mut body, &mut per_comp_entry[resno])?;
-        }
-    }
+    emit_packets_progression(
+        &mut body,
+        &mut per_comp,
+        num_comps,
+        num_res,
+        progression_order,
+        poc,
+    )?;
 
     Ok(EncodedTile { body })
 }
@@ -294,6 +304,7 @@ pub fn encode_tile(
 ///   the canonical band order (LL of resolution 0, then HL/LH/HH per
 ///   resolution). Must have `3 * num_decomp + 1` entries.
 /// - `band_eps`: matching `eps_b` values for the QCD. Same ordering.
+/// - `progression_order` / `poc`: see [`encode_tile`].
 #[allow(clippy::too_many_arguments)]
 pub fn encode_tile_97(
     comp_planes_f32: &[Vec<f32>],
@@ -304,6 +315,8 @@ pub fn encode_tile_97(
     guard_bits: u8,
     band_stepsizes: &[f32],
     band_eps: &[u8],
+    progression_order: u8,
+    poc: &[PocProgression],
 ) -> Result<EncodedTile> {
     if comp_planes_f32.len() != comp_sizes.len() {
         return Err(Error::invalid(
@@ -474,12 +487,127 @@ pub fn encode_tile_97(
 
     // Tier-2.
     let mut body: Vec<u8> = Vec::new();
-    for resno in 0..num_res {
-        for per_comp_entry in per_comp.iter_mut().take(num_comps) {
-            emit_packet(&mut body, &mut per_comp_entry[resno])?;
+    emit_packets_progression(
+        &mut body,
+        &mut per_comp,
+        num_comps,
+        num_res,
+        progression_order,
+        poc,
+    )?;
+    Ok(EncodedTile { body })
+}
+
+/// Drive the tier-2 packet emit loop in the order requested by
+/// `progression_order` (T.800 §B.12.1.1–§B.12.1.5), optionally
+/// sequenced through a POC schedule (§A.6.6 / §B.12.2 / §B.12.3).
+///
+/// The encoder produces a single quality layer with one precinct per
+/// resolution (default `PPx = PPy = 15` partition); under those
+/// constraints each progression order collapses to either a
+/// resolution-outer (LRCP / RLCP / RPCL) or a component-outer
+/// (PCRL / CPRL) (component, resolution) walk. The dispatch below
+/// mirrors the decoder's [`crate::decode::tile::walk_packets`] shape so
+/// the bytes a downstream decoder produces from this body match the
+/// schedule we signalled in COD / POC.
+///
+/// `per_comp[c][r]` holds one [`EncResolution`] per (component,
+/// resolution); we mutate it as we emit so the per-(component,
+/// resolution) "next layer" counter advances across POC volumes.
+fn emit_packets_progression(
+    body: &mut Vec<u8>,
+    per_comp: &mut [Vec<EncResolution>],
+    num_comps: usize,
+    num_res: usize,
+    progression_order: u8,
+    poc: &[PocProgression],
+) -> Result<()> {
+    // The encoder always writes one quality layer.
+    let num_layers: u32 = 1;
+
+    // Build the progression-order volume list. Either we honour the
+    // user-supplied POC schedule, or we synthesise a single volume
+    // covering the whole tile with `progression_order`.
+    let progressions: Vec<PocProgression> = if poc.is_empty() {
+        vec![PocProgression {
+            res_start: 0,
+            comp_start: 0,
+            layer_end: num_layers as u16,
+            res_end: num_res as u8,
+            comp_end: num_comps as u16,
+            progression: progression_order,
+        }]
+    } else {
+        poc.to_vec()
+    };
+
+    // Per-(comp, res) "next layer to emit" counter (§B.12.2). With one
+    // precinct per resolution and one layer total this is effectively a
+    // boolean "have we emitted this (c, r) yet?".
+    let mut next_layer: Vec<Vec<u32>> = (0..num_comps).map(|_| vec![0u32; num_res]).collect();
+
+    for prog in &progressions {
+        if prog.progression > 4 {
+            return Err(Error::unsupported(format!(
+                "jpeg2000: encoder: POC progression order {} > 4",
+                prog.progression
+            )));
+        }
+        let comp_lo = (prog.comp_start as usize).min(num_comps);
+        let comp_hi = (prog.comp_end as usize).min(num_comps);
+        let res_lo = (prog.res_start as usize).min(num_res);
+        let res_hi = (prog.res_end as usize).min(num_res);
+        let layer_hi = (prog.layer_end as u32).min(num_layers);
+        if comp_lo >= comp_hi || res_lo >= res_hi || layer_hi == 0 {
+            continue;
+        }
+
+        // For all five orders, with 1 precinct/res and 1 layer, the
+        // walks reduce to either (R, C) or (C, R). RPCL/PCRL/CPRL sort
+        // by precinct (ref_y, ref_x) but with a single precinct at
+        // (0, 0) the sort key collapses; the spec walk order then
+        // matches LRCP for resolution-outer (RPCL) and CPRL for
+        // component-outer (PCRL/CPRL).
+        match prog.progression {
+            // LRCP — §B.12.1.1: layer outermost, then R, C, P.
+            // RLCP — §B.12.1.2: R outermost, then layer, C, P.
+            // RPCL — §B.12.1.3: R outermost, then position-sorted (C, P).
+            //   With one precinct per (C, R), position sort is stable
+            //   on the natural (C) order.
+            0..=2 => {
+                for layer in 0..layer_hi {
+                    for resno in res_lo..res_hi {
+                        for comp in comp_lo..comp_hi {
+                            if next_layer[comp][resno] != layer {
+                                continue;
+                            }
+                            emit_packet(body, &mut per_comp[comp][resno])?;
+                            next_layer[comp][resno] = layer + 1;
+                        }
+                    }
+                }
+            }
+            // PCRL — §B.12.1.4: position outermost, then C, R, layer.
+            // CPRL — §B.12.1.5: C outermost, then position, R, layer.
+            //   Both collapse to component-outer (C, R) for our
+            //   single-precinct, single-layer encoder.
+            3..=4 => {
+                for comp in comp_lo..comp_hi {
+                    for resno in res_lo..res_hi {
+                        for layer in 0..layer_hi {
+                            if next_layer[comp][resno] != layer {
+                                continue;
+                            }
+                            emit_packet(body, &mut per_comp[comp][resno])?;
+                            next_layer[comp][resno] = layer + 1;
+                        }
+                    }
+                }
+            }
+            _ => unreachable!("progression order range checked above"),
         }
     }
-    Ok(EncodedTile { body })
+    Ok(())
 }
 
 /// Emit one packet (LRCP, single layer, single precinct-per-band).

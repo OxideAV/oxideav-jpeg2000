@@ -56,16 +56,23 @@
 //!   tier-1 passes, tier-2 packet construction (inclusion +
 //!   zero-bitplane tag trees, adaptive Lblock, comma-coded pass
 //!   count), and the SOC / SIZ / COD / QCD / SOT / SOD / EOC marker
-//!   chain. Setting `EncodeOptions::jp2_wrapper` additionally emits
-//!   the ISOBMFF `jP  ` + `ftyp` + `jp2h` + `jp2c` boxes from
-//!   ISO/IEC 15444-1 Annex I; the decoder auto-detects and strips the
-//!   wrapper on input.
+//!   chain. The encoder honours
+//!   [`encode::EncodeOptions::progression`] for all five Part-1
+//!   progression orders, optionally schedules them via
+//!   [`encode::EncodeOptions::poc`] (POC marker, T.800 §A.6.6), and
+//!   can pack packet headers into a main-header `PPM` segment or a
+//!   per-tile-part `PPT` segment via
+//!   [`encode::EncodeOptions::packet_header_placement`]
+//!   (T.800 §A.7.4 / §A.7.5). Setting `EncodeOptions::jp2_wrapper`
+//!   additionally emits the ISOBMFF `jP  ` + `ftyp` + `jp2h` + `jp2c`
+//!   boxes from ISO/IEC 15444-1 Annex I; the decoder auto-detects and
+//!   strips the wrapper on input.
 //!
 //! What is not here yet:
 //!
 //! - Encoder input pixel formats beyond `Gray8` / `Rgb24` 8-bit, and
-//!   the encoder still emits LRCP only (no POC, no PPM/PPT, no
-//!   user-precinct knobs).
+//!   the encoder still emits a single quality layer with default
+//!   precincts (one packet per (component, resolution)).
 //! - RGB input whose RCT chroma excursions go outside the 8-bit
 //!   signed range (requires 9-bit signed chroma in the SIZ).
 

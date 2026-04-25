@@ -8,6 +8,7 @@
 //! `.jp2` files.
 
 use super::tile::{encode_tile, encode_tile_97};
+use crate::decode::tile::{parse_cod, parse_poc, parse_qcd, split_packet_headers, PocProgression};
 use oxideav_core::{Error, Frame, PixelFormat, Result};
 
 /// Wavelet transform selector.
@@ -17,6 +18,59 @@ pub enum TransformMode {
     Reversible53,
     /// 9/7 irreversible float with scalar quantisation (lossy).
     Irreversible97,
+}
+
+/// Progression order encoded in COD's `SGcod` byte (T.800 Table A.16).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgressionOrder {
+    /// Layer-Resolution-Component-Position (Part-1 default).
+    Lrcp = 0,
+    /// Resolution-Layer-Component-Position.
+    Rlcp = 1,
+    /// Resolution-Position-Component-Layer.
+    Rpcl = 2,
+    /// Position-Component-Resolution-Layer.
+    Pcrl = 3,
+    /// Component-Position-Resolution-Layer.
+    Cprl = 4,
+}
+
+impl ProgressionOrder {
+    pub(crate) fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    /// Parse the lowercase short string ("lrcp" / "rlcp" / "rpcl" /
+    /// "pcrl" / "cprl"). Returns `None` for any unknown value so the
+    /// caller can produce a meaningful error message.
+    pub fn from_short_str(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "lrcp" => Some(ProgressionOrder::Lrcp),
+            "rlcp" => Some(ProgressionOrder::Rlcp),
+            "rpcl" => Some(ProgressionOrder::Rpcl),
+            "pcrl" => Some(ProgressionOrder::Pcrl),
+            "cprl" => Some(ProgressionOrder::Cprl),
+            _ => None,
+        }
+    }
+}
+
+/// Choice of where the per-tile packet headers live in the emitted
+/// codestream (T.800 §A.7.4 / §A.7.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PacketHeaderPlacement {
+    /// Inline — packet header bytes precede each packet body in the
+    /// SOD payload (the historical layout the rest of the encoder
+    /// produces by default).
+    #[default]
+    Inline,
+    /// Packed in a `PPM` segment in the main header. Each tile-part
+    /// SOD body then carries packet bodies only. We emit a single PPM
+    /// segment with all per-tile-part header runs concatenated.
+    PackedMainHeader,
+    /// Packed per tile-part in a `PPT` segment that precedes SOD in
+    /// each tile-part header. We emit one PPT per tile-part.
+    PackedPerTilePart,
 }
 
 /// Encoder knobs.
@@ -40,6 +94,21 @@ pub struct EncodeOptions {
     /// RCT / ICT component transform from RGB to YCbCr and signal it
     /// via `MCT = 1` in the COD. Ignored for single-component input.
     pub use_color_transform: bool,
+    /// Progression order signalled in the COD `SGcod` byte (T.800
+    /// §A.6.1 / Table A.16). Default `Lrcp`.
+    pub progression: ProgressionOrder,
+    /// Optional progression-order change schedule (T.800 §A.6.6 POC).
+    /// When non-empty the encoder emits a POC marker in the main
+    /// header carrying these progression-order volumes; the tier-2
+    /// packet walker then iterates each volume in turn instead of the
+    /// single COD progression.
+    ///
+    /// Each entry is `(RSpoc, CSpoc, LYEpoc, REpoc, CEpoc, Ppoc)`,
+    /// matching the wire layout when `Csiz < 257`.
+    pub poc: Vec<PocProgression>,
+    /// Where the per-tile packet header bytes live in the emitted
+    /// codestream (T.800 §A.7.4 / §A.7.5).
+    pub packet_header_placement: PacketHeaderPlacement,
 }
 
 impl Default for EncodeOptions {
@@ -52,6 +121,9 @@ impl Default for EncodeOptions {
             transform: TransformMode::Reversible53,
             jp2_wrapper: false,
             use_color_transform: true,
+            progression: ProgressionOrder::Lrcp,
+            poc: Vec::new(),
+            packet_header_placement: PacketHeaderPlacement::Inline,
         }
     }
 }
@@ -222,6 +294,8 @@ pub fn encode_frame(frame: &Frame, opts: &EncodeOptions) -> Result<Vec<u8>> {
                 opts.cblk_h_log2,
                 opts.guard_bits,
                 precision,
+                opts.progression.as_u8(),
+                &opts.poc,
             )?
         }
         TransformMode::Irreversible97 => {
@@ -251,9 +325,65 @@ pub fn encode_frame(frame: &Frame, opts: &EncodeOptions) -> Result<Vec<u8>> {
                 opts.guard_bits,
                 &stepsizes,
                 &band_eps,
+                opts.progression.as_u8(),
+                &opts.poc,
             )?
         }
     };
+
+    // If PPM/PPT was requested, split the inline-header tile body into
+    // a header / body pair using the decoder's parser. The encoder emits
+    // an inline-header body; the splitter re-arranges those bytes — no
+    // re-encoding is necessary, so the resulting codestream is bit-
+    // equivalent at the per-packet level.
+    let (inline_body, packed_headers): (Vec<u8>, Option<Vec<u8>>) =
+        match opts.packet_header_placement {
+            PacketHeaderPlacement::Inline => (tile_bytes.body, None),
+            PacketHeaderPlacement::PackedMainHeader | PacketHeaderPlacement::PackedPerTilePart => {
+                // Build the COD/QCD that the splitter expects by re-parsing
+                // the encoder's emitted segments. This avoids drift between
+                // the two sides of the split — if the encoder ever signals
+                // user precincts the splitter sees them too.
+                let mut tmp_cod = Vec::new();
+                write_cod(&mut tmp_cod, opts, apply_mct)?;
+                // tmp_cod now holds `FF 52 [Lcod] [body]`; skip the marker
+                // (2) + Lcod (2) so we're left with the COD payload.
+                let cod_payload = &tmp_cod[4..];
+                let cod_parsed = parse_cod(cod_payload)?;
+
+                let mut tmp_qcd = Vec::new();
+                match opts.transform {
+                    TransformMode::Reversible53 => {
+                        write_qcd_reversible(&mut tmp_qcd, opts.guard_bits, opts.num_decomp)?;
+                    }
+                    TransformMode::Irreversible97 => {
+                        let (_, band_eps) = build_97_band_params(opts.num_decomp, precision as u8);
+                        write_qcd_irreversible(
+                            &mut tmp_qcd,
+                            opts.guard_bits,
+                            opts.num_decomp,
+                            &band_eps,
+                        )?;
+                    }
+                }
+                let qcd_payload = &tmp_qcd[4..];
+                let qcd_parsed = parse_qcd(qcd_payload, opts.num_decomp)?;
+                let poc_parsed = if opts.poc.is_empty() {
+                    None
+                } else {
+                    let payload = build_poc_payload(&opts.poc);
+                    Some(parse_poc(&payload, num_comps as u16)?)
+                };
+                let (headers, body_only) = split_packet_headers(
+                    &tile_bytes.body,
+                    &comp_sizes,
+                    &cod_parsed,
+                    &qcd_parsed,
+                    poc_parsed.as_ref(),
+                )?;
+                (body_only, Some(headers))
+            }
+        };
 
     // Assemble the codestream.
     let mut cs: Vec<u8> = Vec::new();
@@ -273,6 +403,26 @@ pub fn encode_frame(frame: &Frame, opts: &EncodeOptions) -> Result<Vec<u8>> {
             write_qcd_irreversible(&mut cs, opts.guard_bits, opts.num_decomp, &band_eps)?;
         }
     }
+    // POC — main-header progression-order change schedule (T.800 §A.6.6).
+    if !opts.poc.is_empty() {
+        write_poc_marker(&mut cs, &opts.poc)?;
+    }
+    // PPM — main-header packed packet headers (T.800 §A.7.4). Single
+    // PPM segment with one tile-part run (this encoder still emits a
+    // single tile / single tile-part).
+    if matches!(
+        opts.packet_header_placement,
+        PacketHeaderPlacement::PackedMainHeader
+    ) {
+        let headers = packed_headers
+            .as_ref()
+            .expect("PackedMainHeader requested but no headers split");
+        let payload = build_ppm_payload(std::slice::from_ref(headers));
+        let lppm = (payload.len() + 2) as u16;
+        cs.extend_from_slice(&[0xFF, 0x60]);
+        cs.extend_from_slice(&lppm.to_be_bytes());
+        cs.extend_from_slice(&payload);
+    }
     // SOT — fill Psot after body length is known.
     let sot_off = cs.len();
     cs.extend_from_slice(&[0xFF, 0x90]);
@@ -281,9 +431,20 @@ pub fn encode_frame(frame: &Frame, opts: &EncodeOptions) -> Result<Vec<u8>> {
     let psot_off = cs.len();
     cs.extend_from_slice(&0u32.to_be_bytes()); // placeholder Psot
     cs.extend_from_slice(&[0, 1]); // TPsot = 0, TNsot = 1
-                                   // SOD
+                                   // PPT — per-tile-part packed packet headers (T.800 §A.7.5). For
+                                   // single-tile-part output this is one PPT segment per tile.
+    if matches!(
+        opts.packet_header_placement,
+        PacketHeaderPlacement::PackedPerTilePart
+    ) {
+        let headers = packed_headers
+            .as_ref()
+            .expect("PackedPerTilePart requested but no headers split");
+        write_ppt_marker(&mut cs, headers)?;
+    }
+    // SOD
     cs.extend_from_slice(&[0xFF, 0x93]);
-    cs.extend_from_slice(&tile_bytes.body);
+    cs.extend_from_slice(&inline_body);
     let tile_part_end = cs.len();
     let psot = (tile_part_end - sot_off) as u32;
     cs[psot_off..psot_off + 4].copy_from_slice(&psot.to_be_bytes());
@@ -356,7 +517,7 @@ fn write_cod(out: &mut Vec<u8>, opts: &EncodeOptions, apply_mct: bool) -> Result
     out.extend_from_slice(&[0xFF, 0x52]);
     out.extend_from_slice(&12u16.to_be_bytes());
     out.push(0); // Scod — no SOP, no EPH, default precincts
-    out.push(0); // SGcod progression order = LRCP
+    out.push(opts.progression.as_u8()); // SGcod progression order
     out.extend_from_slice(&1u16.to_be_bytes()); // num layers
     out.push(if apply_mct { 1 } else { 0 }); // MCT flag
     out.push(opts.num_decomp);
@@ -368,6 +529,73 @@ fn write_cod(out: &mut Vec<u8>, opts: &EncodeOptions, apply_mct: bool) -> Result
         TransformMode::Irreversible97 => 0u8,
     };
     out.push(transform_byte);
+    Ok(())
+}
+
+/// Serialise a POC marker segment payload (T.800 §A.6.6). Assumes the
+/// 8-bit component-field encoding (`Csiz < 257`); each progression-order
+/// volume occupies 7 bytes. The returned bytes do **not** include the
+/// marker code or the leading length field — see [`write_poc_marker`].
+fn build_poc_payload(progs: &[PocProgression]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(progs.len() * 7);
+    for p in progs {
+        out.push(p.res_start);
+        // CSpoc — 1 byte for Csiz < 257.
+        out.push(p.comp_start as u8);
+        out.extend_from_slice(&p.layer_end.to_be_bytes());
+        out.push(p.res_end);
+        // CEpoc — wire `0` represents 256 per Table A.32 when Csiz < 257.
+        let ce = if p.comp_end >= 256 {
+            0u8
+        } else {
+            p.comp_end as u8
+        };
+        out.push(ce);
+        out.push(p.progression);
+    }
+    out
+}
+
+/// Write a POC marker segment (`FF 5F` + Lpoc + payload).
+fn write_poc_marker(out: &mut Vec<u8>, progs: &[PocProgression]) -> Result<()> {
+    if progs.is_empty() {
+        return Err(Error::invalid("jpeg2000: POC requires >= 1 progression"));
+    }
+    let payload = build_poc_payload(progs);
+    let lpoc = (payload.len() + 2) as u16;
+    out.extend_from_slice(&[0xFF, 0x5F]);
+    out.extend_from_slice(&lpoc.to_be_bytes());
+    out.extend_from_slice(&payload);
+    Ok(())
+}
+
+/// Write a PPM marker segment (`FF 60` + Lppm + payload).
+///
+/// The payload layout per T.800 §A.7.4 is `Zppm` (1 byte) followed by a
+/// sequence of `(Nppmi, Ippmi)` records — `Nppmi` is the BE u32 length
+/// of the `Ippmi` packet header byte run for tile-part `i`. We emit one
+/// PPM segment with `Zppm = 0` containing every tile-part's headers in
+/// order.
+fn build_ppm_payload(per_tile_headers: &[Vec<u8>]) -> Vec<u8> {
+    let mut payload =
+        Vec::with_capacity(1 + per_tile_headers.iter().map(|h| 4 + h.len()).sum::<usize>());
+    payload.push(0u8); // Zppm = 0
+    for h in per_tile_headers {
+        payload.extend_from_slice(&(h.len() as u32).to_be_bytes());
+        payload.extend_from_slice(h);
+    }
+    payload
+}
+
+/// Write a PPT marker segment (`FF 61` + Lppt + payload). Payload is
+/// `Zppt` (1 byte) followed by raw `Ippti` packet header bytes per
+/// T.800 §A.7.5.
+fn write_ppt_marker(out: &mut Vec<u8>, headers: &[u8]) -> Result<()> {
+    let lppt = (1 + headers.len() + 2) as u16;
+    out.extend_from_slice(&[0xFF, 0x61]);
+    out.extend_from_slice(&lppt.to_be_bytes());
+    out.push(0u8); // Zppt = 0
+    out.extend_from_slice(headers);
     Ok(())
 }
 
