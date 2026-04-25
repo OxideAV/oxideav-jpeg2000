@@ -1483,6 +1483,352 @@ fn round6_walk_layouts(j2k: &[u8]) -> Result<(CodParams, QcdParams, Vec<Vec<Reso
     Ok((cod, qcd, layouts))
 }
 
+/// Split the in-line packet headers out of a single tile's body.
+///
+/// Walks the same tier-2 progression as [`walk_packets`] over `body`
+/// (which is one tile's concatenated tile-part bodies, headers in line —
+/// the historical layout) and returns:
+///
+/// - `headers`: the concatenated per-packet header bytes (each ending
+///   in an `EPH` marker when `cod.eph_marker` is set, exactly as they
+///   would appear inside a PPM/PPT packed-header stream per
+///   T.800 §A.7.4 / §A.7.5).
+/// - `body_only`: the concatenated per-packet bodies, with `SOP` markers
+///   preserved in their original position (per §A.8.1, SOP belongs to
+///   the SOD stream regardless of PPM/PPT).
+///
+/// Together these support the "header / body splitter" used by the
+/// PPM and PPT round-trip tests: the decoder reading
+/// `body = body_only` plus `packet_headers = headers` must produce the
+/// same image as decoding the original `body` directly. The split is
+/// purely a re-arrangement of bytes — no decoding is performed.
+///
+/// `comp_sizes`, `cod`, `qcd`, `poc` must match the parameters used by
+/// the decoder for the same tile; the tier-2 layout is recomputed from
+/// scratch so the splitter does not share state with `decode_tile_*`.
+#[allow(clippy::needless_range_loop)]
+pub fn split_packet_headers(
+    body: &[u8],
+    comp_sizes: &[(u32, u32, u32, u32)],
+    cod: &CodParams,
+    qcd: &QcdParams,
+    poc: Option<&PocParams>,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let _ = qcd; // tier-2 walker doesn't need QCD; included for API symmetry.
+    if cod.num_layers == 0 {
+        return Err(Error::invalid(
+            "jpeg2000: COD signals zero quality layers (must be >= 1)",
+        ));
+    }
+    if !matches!(cod.progression_order, 0..=4) {
+        return Err(Error::unsupported(
+            "jpeg2000: progression order must be 0..=4 (LRCP/RLCP/RPCL/PCRL/CPRL)",
+        ));
+    }
+
+    let num_comps = comp_sizes.len();
+    let num_res = (cod.num_decomp as usize) + 1;
+    let mut layouts: Vec<Vec<ResolutionLayout>> = Vec::with_capacity(num_comps);
+    for &(x0, y0, x1, y1) in comp_sizes {
+        let subbands = build_subbands(x0, y0, x1, y1, cod.num_decomp);
+        layouts.push(build_resolutions(
+            subbands,
+            cod.num_decomp,
+            cod.cblk_w_log2,
+            cod.cblk_h_log2,
+            &cod.precincts,
+            (x0, y0, x1, y1),
+            1,
+            1,
+        ));
+    }
+
+    let mut cursor = Cursor::new(body);
+    let mut headers_out: Vec<u8> = Vec::new();
+    let mut body_out: Vec<u8> = Vec::new();
+    walk_packets_split(
+        &mut cursor,
+        cod,
+        poc,
+        &mut headers_out,
+        &mut body_out,
+        &mut layouts,
+        num_res,
+        num_comps,
+    )?;
+    // Any trailing bytes between the last packet and the end of the
+    // tile-part body (rare, but legal padding) are appended to the body
+    // output verbatim.
+    body_out.extend_from_slice(cursor.remaining());
+    Ok((headers_out, body_out))
+}
+
+/// Mirror of `walk_packets` that extracts header bytes into
+/// `headers_out` and body bytes into `body_out` instead of decoding.
+#[allow(clippy::needless_range_loop, clippy::too_many_arguments)]
+fn walk_packets_split(
+    cur: &mut Cursor<'_>,
+    cod: &CodParams,
+    poc: Option<&PocParams>,
+    headers_out: &mut Vec<u8>,
+    body_out: &mut Vec<u8>,
+    layouts: &mut [Vec<ResolutionLayout>],
+    num_res: usize,
+    num_comps: usize,
+) -> Result<()> {
+    let num_layers = cod.num_layers as u32;
+    let progressions: Vec<PocProgression> = if let Some(poc) = poc {
+        poc.progressions.clone()
+    } else {
+        vec![PocProgression {
+            res_start: 0,
+            comp_start: 0,
+            layer_end: cod.num_layers,
+            res_end: num_res as u8,
+            comp_end: num_comps as u16,
+            progression: cod.progression_order,
+        }]
+    };
+
+    let mut next_layer: Vec<Vec<Vec<u32>>> = (0..num_comps)
+        .map(|c| {
+            (0..num_res)
+                .map(|r| vec![0u32; layouts[c][r].precincts.len()])
+                .collect()
+        })
+        .collect();
+
+    macro_rules! emit {
+        ($cur:expr, $layer:expr, $layout:expr, $prec:expr, $cod:expr) => {{
+            split_one_packet($cur, headers_out, body_out, $layer, $layout, $prec, $cod)?
+        }};
+    }
+
+    for prog in &progressions {
+        let comp_lo = (prog.comp_start as usize).min(num_comps);
+        let comp_hi = (prog.comp_end as usize).min(num_comps);
+        let res_lo = (prog.res_start as usize).min(num_res);
+        let res_hi = (prog.res_end as usize).min(num_res);
+        let layer_hi = (prog.layer_end as u32).min(num_layers);
+        if comp_lo >= comp_hi || res_lo >= res_hi || layer_hi == 0 {
+            continue;
+        }
+        match prog.progression {
+            0 => {
+                for layer in 0..layer_hi {
+                    for resno in res_lo..res_hi {
+                        for comp in comp_lo..comp_hi {
+                            let nprec = layouts[comp][resno].precincts.len();
+                            for prec in 0..nprec {
+                                if next_layer[comp][resno][prec] != layer {
+                                    continue;
+                                }
+                                emit!(cur, layer, &mut layouts[comp][resno], prec, cod);
+                                next_layer[comp][resno][prec] = layer + 1;
+                            }
+                        }
+                    }
+                }
+            }
+            1 => {
+                for resno in res_lo..res_hi {
+                    for layer in 0..layer_hi {
+                        for comp in comp_lo..comp_hi {
+                            let nprec = layouts[comp][resno].precincts.len();
+                            for prec in 0..nprec {
+                                if next_layer[comp][resno][prec] != layer {
+                                    continue;
+                                }
+                                emit!(cur, layer, &mut layouts[comp][resno], prec, cod);
+                                next_layer[comp][resno][prec] = layer + 1;
+                            }
+                        }
+                    }
+                }
+            }
+            2 => {
+                for resno in res_lo..res_hi {
+                    let mut order: Vec<(u32, u32, usize, usize)> = Vec::new();
+                    for comp in comp_lo..comp_hi {
+                        let layout = &layouts[comp][resno];
+                        for (prec_idx, prec) in layout.precincts.iter().enumerate() {
+                            order.push((prec.ref_y, prec.ref_x, comp, prec_idx));
+                        }
+                    }
+                    order.sort();
+                    for (_, _, comp, prec_idx) in order {
+                        for layer in 0..layer_hi {
+                            if next_layer[comp][resno][prec_idx] != layer {
+                                continue;
+                            }
+                            emit!(cur, layer, &mut layouts[comp][resno], prec_idx, cod);
+                            next_layer[comp][resno][prec_idx] = layer + 1;
+                        }
+                    }
+                }
+            }
+            3 => {
+                let mut order: Vec<(u32, u32, usize, usize, usize)> = Vec::new();
+                for comp in comp_lo..comp_hi {
+                    for resno in res_lo..res_hi {
+                        let layout = &layouts[comp][resno];
+                        for (prec_idx, prec) in layout.precincts.iter().enumerate() {
+                            order.push((prec.ref_y, prec.ref_x, comp, resno, prec_idx));
+                        }
+                    }
+                }
+                order.sort();
+                for (_, _, comp, resno, prec_idx) in order {
+                    for layer in 0..layer_hi {
+                        if next_layer[comp][resno][prec_idx] != layer {
+                            continue;
+                        }
+                        emit!(cur, layer, &mut layouts[comp][resno], prec_idx, cod);
+                        next_layer[comp][resno][prec_idx] = layer + 1;
+                    }
+                }
+            }
+            4 => {
+                for comp in comp_lo..comp_hi {
+                    let mut order: Vec<(u32, u32, usize, usize)> = Vec::new();
+                    for resno in res_lo..res_hi {
+                        let layout = &layouts[comp][resno];
+                        for (prec_idx, prec) in layout.precincts.iter().enumerate() {
+                            order.push((prec.ref_y, prec.ref_x, resno, prec_idx));
+                        }
+                    }
+                    order.sort();
+                    for (_, _, resno, prec_idx) in order {
+                        for layer in 0..layer_hi {
+                            if next_layer[comp][resno][prec_idx] != layer {
+                                continue;
+                            }
+                            emit!(cur, layer, &mut layouts[comp][resno], prec_idx, cod);
+                            next_layer[comp][resno][prec_idx] = layer + 1;
+                        }
+                    }
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+    Ok(())
+}
+
+/// Header/body splitter for a single packet — runs the same tag-tree
+/// and Bio bookkeeping as `parse_precinct_packet` (without the body
+/// payload extraction) so the exact `(header_bytes, body)` slices can
+/// be copied into the splitter outputs.
+fn split_one_packet(
+    cur: &mut Cursor<'_>,
+    headers_out: &mut Vec<u8>,
+    body_out: &mut Vec<u8>,
+    layer: u32,
+    res: &mut ResolutionLayout,
+    prec_idx: usize,
+    cod: &CodParams,
+) -> Result<()> {
+    // SOP — copied verbatim into body_out; per §A.8.1 the SOP marker
+    // is part of the SOD stream regardless of PPM/PPT.
+    if cod.sop_marker && cur.remaining().starts_with(&[0xFF, 0x91]) {
+        if cur.remaining().len() < 6 {
+            return Err(Error::invalid("jpeg2000: truncated SOP"));
+        }
+        let sop = cur.consume(6)?;
+        body_out.extend_from_slice(sop);
+    }
+
+    // Header: parse with Bio just enough to learn `numbytes_read` and
+    // to update tag-tree / cblk-state for downstream packets. Body
+    // length needed too because we must skip past the body in `cur`.
+    let header_start = cur.pos;
+    let header_slice = cur.remaining();
+    let mut bio = Bio::new(header_slice);
+    let mut pending_lengths: Vec<u32> = Vec::new();
+
+    if bio.read_bit() == 0 {
+        bio.inalign();
+    } else {
+        for sb_idx in 0..res.subbands.len() {
+            let cblks_w_g = res.cblks_w[sb_idx];
+            let prec = &mut res.precincts[prec_idx].sb_states[sb_idx];
+            let pcw = prec.pcw;
+            let pch = prec.pch;
+            let base_cx = prec.cx0;
+            let base_cy = prec.cy0;
+            if pcw == 0 || pch == 0 {
+                continue;
+            }
+            for lcy in 0..pch {
+                for lcx in 0..pcw {
+                    let g_cx = base_cx + lcx;
+                    let g_cy = base_cy + lcy;
+                    let g_idx = g_cy * cblks_w_g + g_cx;
+                    let included_now;
+                    let missing_msb;
+                    if !res.cblk_states[sb_idx][g_idx].included {
+                        included_now = prec.inclusion.decode(lcx, lcy, layer + 1, &mut bio);
+                        if !included_now {
+                            continue;
+                        }
+                        let mut i = 0u32;
+                        loop {
+                            if prec.zero_bitplanes.decode(lcx, lcy, i, &mut bio) {
+                                break;
+                            }
+                            i += 1;
+                            if i > 64 {
+                                return Err(Error::invalid(
+                                    "jpeg2000: missing-MSB tag tree runaway",
+                                ));
+                            }
+                        }
+                        missing_msb = i;
+                    } else {
+                        included_now = bio.read_bit() != 0;
+                        if !included_now {
+                            continue;
+                        }
+                        missing_msb = res.cblk_states[sb_idx][g_idx].missing_msb;
+                    }
+                    let num_passes = read_num_passes(&mut bio);
+                    while bio.read_bit() == 1 {
+                        res.cblk_states[sb_idx][g_idx].lblock += 1;
+                    }
+                    let len_bits = res.cblk_states[sb_idx][g_idx].lblock + ilog2(num_passes);
+                    let length = bio.read(len_bits);
+                    let st = &mut res.cblk_states[sb_idx][g_idx];
+                    st.included = true;
+                    st.total_passes += num_passes;
+                    st.missing_msb = missing_msb;
+                    pending_lengths.push(length);
+                }
+            }
+        }
+        bio.inalign();
+    }
+    let header_bytes_used = bio.numbytes_read();
+    cur.consume(header_bytes_used)?;
+    // EPH belongs to the packet header per §A.8.2 — when the splitter
+    // emits to a PPM/PPT stream the EPH must accompany the header.
+    let mut header_with_eph_end = header_start + header_bytes_used;
+    if cod.eph_marker && cur.remaining().starts_with(&[0xFF, 0x92]) {
+        cur.consume(2)?;
+        header_with_eph_end += 2;
+    }
+    headers_out.extend_from_slice(&cur.buf[header_start..header_with_eph_end]);
+
+    // Body — concatenate the bytes claimed by every (sb, cblk) length
+    // we recorded, in the same order they were parsed.
+    let mut total_body: usize = 0;
+    for length in &pending_lengths {
+        total_body += *length as usize;
+    }
+    let body_slice = cur.consume(total_body)?;
+    body_out.extend_from_slice(body_slice);
+    Ok(())
+}
+
 /// Round-6 diagnostic helper. Decodes a single-tile `.j2k` codestream
 /// and returns the per-sub-band tier-1 output (already `/ 2`) for LL,
 /// HL, LH, HH at resolution 1 (for a 1-level 5/3 codestream). Each
