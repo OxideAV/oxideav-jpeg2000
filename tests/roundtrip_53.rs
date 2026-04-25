@@ -4,7 +4,7 @@
 //! then verifies the resulting bytes reload through the matching
 //! decoder into a bit-exact copy of the original planar image.
 
-use oxideav_codec::CodecRegistry;
+use oxideav_core::CodecRegistry;
 use oxideav_core::{
     CodecId, CodecParameters, Frame, Packet, PixelFormat, TimeBase, VideoFrame, VideoPlane,
 };

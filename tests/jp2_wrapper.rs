@@ -4,7 +4,7 @@
 //! inner `.j2k` codestream via `extract_jp2_codestream`, and decodes
 //! it through our own decoder for an end-to-end sanity check.
 
-use oxideav_codec::CodecRegistry;
+use oxideav_core::CodecRegistry;
 use oxideav_core::{
     CodecId, CodecParameters, Frame, Packet, PixelFormat, TimeBase, VideoFrame, VideoPlane,
 };

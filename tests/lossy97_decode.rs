@@ -6,7 +6,7 @@
 //! tier-2 packets → EBCOT bit-planes → float dequantisation → 9/7 float
 //! IDWT → level shift.
 
-use oxideav_codec::CodecRegistry;
+use oxideav_core::CodecRegistry;
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, PixelFormat, TimeBase};
 
 const LOSSY97_J2K: &[u8] = include_bytes!("fixtures/lossy97.j2k");

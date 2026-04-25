@@ -7,7 +7,7 @@
 //! discards sub-stepsize information — but the reconstruction must
 //! still be perceptually close.
 
-use oxideav_codec::CodecRegistry;
+use oxideav_core::CodecRegistry;
 use oxideav_core::{
     CodecId, CodecParameters, Frame, Packet, PixelFormat, TimeBase, VideoFrame, VideoPlane,
 };

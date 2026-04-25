@@ -23,7 +23,7 @@
 //! - `opj16_l1.j2k` — 16×16 ffmpeg `testsrc`, 1 decomposition level.
 //! - `opj32.j2k` — 32×32 `testsrc`, default 5-level decomposition.
 
-use oxideav_codec::CodecRegistry;
+use oxideav_core::CodecRegistry;
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 
 const CONST_J2K: &[u8] = include_bytes!("fixtures/const32.j2k");

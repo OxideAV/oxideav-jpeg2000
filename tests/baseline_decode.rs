@@ -6,7 +6,7 @@
 //! complete pipeline: marker parse → tier-2 packets → EBCOT bit-planes
 //! → IDWT → level shift.
 
-use oxideav_codec::CodecRegistry;
+use oxideav_core::CodecRegistry;
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, PixelFormat, TimeBase};
 
 const BASELINE_J2K: &[u8] = include_bytes!("fixtures/baseline.j2k");

@@ -55,8 +55,8 @@ pub mod codestream;
 pub mod decode;
 pub mod encode;
 
-use oxideav_codec::{CodecInfo, CodecRegistry, Decoder, Encoder};
 use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, Error, Frame, Packet, Result};
+use oxideav_core::{CodecInfo, CodecRegistry, Decoder, Encoder};
 
 pub use codestream::{Codestream, ComponentInfo, Marker, Siz, TilePart};
 
