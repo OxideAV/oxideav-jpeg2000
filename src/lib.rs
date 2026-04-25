@@ -73,8 +73,6 @@
 //! - Encoder input pixel formats beyond `Gray8` / `Rgb24` 8-bit, and
 //!   the encoder still emits a single quality layer with default
 //!   precincts (one packet per (component, resolution)).
-//! - RGB input whose RCT chroma excursions go outside the 8-bit
-//!   signed range (requires 9-bit signed chroma in the SIZ).
 
 pub mod codestream;
 pub mod decode;

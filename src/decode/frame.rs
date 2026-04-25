@@ -252,12 +252,19 @@ pub fn decode_frame(cs: &Codestream, buf: &[u8]) -> Result<Frame> {
             poc: tile_poc.as_ref(),
             packet_headers: tile_packet_headers.as_deref(),
         };
-        let planes = decode_tile_with_params(&tile_body, &comp_sizes_rel, &cod, &qcd, &params)?;
+        let mut planes = decode_tile_with_params(&tile_body, &comp_sizes_rel, &cod, &qcd, &params)?;
 
-        // DC level-shift + clip, then per-tile inverse component transform
-        // (RCT / ICT) if MCT=1. Paste into the assembled image planes.
-        let mut shifted = dc_shift_and_pack(&planes, &comp_sizes_rel, &cs.siz)?;
-        apply_per_tile_mct(&mut shifted, &comp_sizes_rel, &cod)?;
+        // Per spec T.800 §G.1 (Figure G.1) the decoder MUST apply the
+        // inverse component transform (RCT / ICT) BEFORE the inverse DC
+        // level shift — the inverse RCT operates on the signed
+        // (un-shifted) wavelet output, then the inverse DC level shift
+        // is applied to the unsigned components only. Doing it the
+        // other way round (a) clips the chroma excursions of the RCT
+        // to ±128 (Y1, Y2 are signed and can reach ±255 for 8-bit
+        // input — see G.2.1 NOTE) and (b) applies +2^(Ssiz) to the
+        // chroma planes which the spec never asks for.
+        apply_per_tile_mct_i32(&mut planes, &comp_sizes_rel, &cod, &cs.siz)?;
+        let shifted = dc_shift_and_pack(&planes, &comp_sizes_rel, &cs.siz)?;
 
         for ci in 0..num_comps {
             let (cx0, cy0, cx1, cy1) = comp_sizes_abs[ci];
@@ -473,19 +480,29 @@ fn dc_shift_and_pack(
     Ok(shifted)
 }
 
-/// Apply the inverse RCT (§G.1) or ICT (§G.2) per-tile. Requires three
-/// components with matching sub-sampling — which is a SIZ-level guarantee
-/// when MCT=1 (see §A.6.1). No-op for 1-component streams or when the
-/// decoder's COD reports MCT=0.
-fn apply_per_tile_mct(
-    planes: &mut [Vec<u8>],
+/// Apply the inverse RCT (§G.2.2) or ICT (§G.3.2) per-tile, in place
+/// on the signed wavelet-output `i32` planes — that is, BEFORE the
+/// inverse DC level shift (Figure G.1). Requires three components with
+/// matching sub-sampling, which is a SIZ-level guarantee when MCT=1
+/// (see §A.6.1). No-op for 1-component streams or when the COD reports
+/// MCT=0.
+///
+/// The §G.1 ordering matters: the chroma outputs of the forward RCT
+/// (Y1 = I2 - I1, Y2 = I0 - I1, see §G.2.1) span one bit more than
+/// the original component precision (NOTE under (G-5)). At 8-bit they
+/// reach ±255, so any "treat as unsigned-shifted u8" hack that runs
+/// the inverse RCT on already-clipped 0..255 chroma loses information.
+fn apply_per_tile_mct_i32(
+    planes: &mut [Vec<i32>],
     comp_sizes_rel: &[(u32, u32, u32, u32)],
     cod: &CodParams,
+    siz: &Siz,
 ) -> Result<()> {
     if planes.len() != 3 || cod.mct == 0 {
         return Ok(());
     }
-    // All three sub-bands must share dimensions when MCT=1.
+    // All three sub-bands must share dimensions when MCT=1 (§G.2 / §G.3
+    // both require equal separation on the reference grid).
     let (_, _, w0, h0) = comp_sizes_rel[0];
     let (_, _, w1, h1) = comp_sizes_rel[1];
     let (_, _, w2, h2) = comp_sizes_rel[2];
@@ -494,55 +511,97 @@ fn apply_per_tile_mct(
             "jpeg2000: MCT=1 requires matching component dimensions",
         ));
     }
+    let n = (w0 as usize) * (h0 as usize);
+    if planes[0].len() != n || planes[1].len() != n || planes[2].len() != n {
+        return Err(Error::invalid(
+            "jpeg2000: MCT=1 plane size disagrees with comp_sizes_rel",
+        ));
+    }
     if cod.transform == 1 {
-        apply_rct_inverse(planes, w0 as usize, h0 as usize);
+        apply_rct_inverse_i32(planes, n);
     } else {
-        apply_ict_inverse(planes, w0 as usize, h0 as usize);
+        // §G.3 ICT requires a common bit-depth for the three input
+        // components — same restriction as §G.2 RCT. The float pipeline
+        // we operate on here level-shifted Y0 by -2^(Ssiz-1) on the
+        // encoder side; mirror that on the decoder by passing the
+        // luma's component precision so the inverse can re-add it.
+        let depth = siz.components[0].bit_depth();
+        apply_ict_inverse_i32(planes, n, depth);
     }
     Ok(())
 }
 
-/// Reverse the JPEG 2000 reversible component transform (RCT), mapping
-/// Y/Cb/Cr back into R/G/B. Operates in place on the three 8-bit planes.
-fn apply_rct_inverse(planes: &mut [Vec<u8>], w: usize, h: usize) {
-    for y in 0..h {
-        for x in 0..w {
-            let i = y * w + x;
-            let y_v = planes[0][i] as i32;
-            let cb = planes[1][i] as i32 - 128;
-            let cr = planes[2][i] as i32 - 128;
-            let g = y_v - ((cb + cr) >> 2);
-            let r = cr + g;
-            let b = cb + g;
-            planes[0][i] = r.clamp(0, 255) as u8;
-            planes[1][i] = g.clamp(0, 255) as u8;
-            planes[2][i] = b.clamp(0, 255) as u8;
-        }
+/// Reverse the JPEG 2000 reversible component transform (RCT) per
+/// T.800 §G.2.2 equations (G-6) … (G-8):
+///
+/// ```text
+///   I1 = Y0 - floor((Y2 + Y1) / 4)      // G
+///   I0 = Y2 + I1                        // R
+///   I2 = Y1 + I1                        // B
+/// ```
+///
+/// Operates on the signed wavelet output. The inverse DC level shift
+/// (§G.1.2) is applied separately afterwards by [`dc_shift_and_pack`].
+///
+/// The spec's `floor(... / 4)` matches Rust's `>> 2` on `i32` (which
+/// is an arithmetic shift / floor division), provided we keep the
+/// values as `i32`. Care: `(-3) / 4 == 0` in Rust (truncation toward
+/// zero), but `(-3) >> 2 == -1` (floor) — so we use `>> 2` and not
+/// `/ 4` here. (G.2.2 says floor explicitly.)
+fn apply_rct_inverse_i32(planes: &mut [Vec<i32>], n: usize) {
+    // The loop indexes three sibling planes simultaneously, so the
+    // standard `iter_mut().take(n)` rewrite that clippy proposes does
+    // not apply — splitting the borrows would obscure the §G.2.2
+    // formula and slow the inner loop down.
+    #[allow(clippy::needless_range_loop)]
+    for i in 0..n {
+        let y_v = planes[0][i];
+        let y1 = planes[1][i];
+        let y2 = planes[2][i];
+        let g = y_v - ((y2 + y1) >> 2);
+        let r = y2 + g;
+        let b = y1 + g;
+        planes[0][i] = r;
+        planes[1][i] = g;
+        planes[2][i] = b;
     }
 }
 
-/// Reverse the JPEG 2000 irreversible component transform (ICT),
-/// mapping YCbCr back into RGB per T.800 §G.2 (identical matrix to ITU-R
-/// BT.601 JPEG YCbCr):
+/// Reverse the JPEG 2000 irreversible component transform (ICT) per
+/// T.800 §G.3.2 equations (G-12) … (G-14):
 ///
 /// ```text
-///   R = Y              + 1.402   * (Cr - 128)
-///   G = Y - 0.34413 * (Cb - 128) - 0.71414 * (Cr - 128)
-///   B = Y + 1.772   * (Cb - 128)
+///   I0 = Y0           + 1.402   * Y2     // R
+///   I1 = Y0 - 0.34413 * Y1 - 0.71414 * Y2// G
+///   I2 = Y0           + 1.772   * Y1     // B
 /// ```
-fn apply_ict_inverse(planes: &mut [Vec<u8>], w: usize, h: usize) {
-    for y in 0..h {
-        for x in 0..w {
-            let i = y * w + x;
-            let yf = planes[0][i] as f32;
-            let cb = planes[1][i] as f32 - 128.0;
-            let cr = planes[2][i] as f32 - 128.0;
-            let r = yf + 1.402 * cr;
-            let g = yf - 0.344_13 * cb - 0.714_14 * cr;
-            let b = yf + 1.772 * cb;
-            planes[0][i] = r.round().clamp(0.0, 255.0) as u8;
-            planes[1][i] = g.round().clamp(0.0, 255.0) as u8;
-            planes[2][i] = b.round().clamp(0.0, 255.0) as u8;
-        }
+///
+/// Operates on the signed wavelet output before the inverse DC level
+/// shift (§G.1, Figure G.1). The encoder only level-shifted the luma
+/// `Y0` (subtracted `2^(prec-1)` per (G-1)), because the ICT chroma
+/// rows in (G-10) and (G-11) sum to zero on the input components and
+/// therefore produce zero-centered `Y1`, `Y2` directly — no DC level
+/// shift is applied to chroma either side. After the inverse ICT the
+/// three outputs are all in the same "centered on `-2^(prec-1)`" frame
+/// as the input luma was on the encoder side; the downstream
+/// [`dc_shift_and_pack`] adds `2^(prec-1)` to each unsigned component,
+/// restoring R/G/B to the unsigned `0..2^prec-1` range.
+///
+/// `_luma_depth` is unused at present — kept for API symmetry with
+/// the RCT path and as documentation that the ICT inverse MUST honour
+/// the luma component's bit depth when the encoder ever supports
+/// non-8-bit precision.
+fn apply_ict_inverse_i32(planes: &mut [Vec<i32>], n: usize, _luma_depth: u32) {
+    #[allow(clippy::needless_range_loop)]
+    for i in 0..n {
+        let yf = planes[0][i] as f32;
+        let y1 = planes[1][i] as f32;
+        let y2 = planes[2][i] as f32;
+        let r = yf + 1.402 * y2;
+        let g = yf - 0.344_13 * y1 - 0.714_14 * y2;
+        let b = yf + 1.772 * y1;
+        planes[0][i] = r.round() as i32;
+        planes[1][i] = g.round() as i32;
+        planes[2][i] = b.round() as i32;
     }
 }

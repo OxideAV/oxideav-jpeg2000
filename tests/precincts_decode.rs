@@ -35,6 +35,38 @@ const RGB_RPCL_J2K: &[u8] = include_bytes!("fixtures/opj128_rgb_prec_rpcl.j2k");
 const RGB_PCRL_J2K: &[u8] = include_bytes!("fixtures/opj128_rgb_prec_pcrl.j2k");
 const RGB_CPRL_J2K: &[u8] = include_bytes!("fixtures/opj128_rgb_prec_cprl.j2k");
 
+/// Parse a PPM (P6, binary RGB) header → (w, h, interleaved-RGB-bytes).
+fn parse_ppm(bytes: &[u8]) -> (u32, u32, Vec<u8>) {
+    assert_eq!(&bytes[0..2], b"P6", "expected P6 (binary RGB)");
+    let mut i = 2usize;
+    let mut toks: Vec<String> = Vec::new();
+    while toks.len() < 3 {
+        while i < bytes.len() && (bytes[i] == b'\n' || bytes[i] == b' ' || bytes[i] == b'\t') {
+            i += 1;
+        }
+        if i < bytes.len() && bytes[i] == b'#' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        let start = i;
+        while i < bytes.len()
+            && bytes[i] != b'\n'
+            && bytes[i] != b' '
+            && bytes[i] != b'\t'
+            && bytes[i] != b'#'
+        {
+            i += 1;
+        }
+        toks.push(String::from_utf8_lossy(&bytes[start..i]).into_owned());
+    }
+    i += 1;
+    let w: u32 = toks[0].parse().unwrap();
+    let h: u32 = toks[1].parse().unwrap();
+    (w, h, bytes[i..].to_vec())
+}
+
 fn parse_pgm(bytes: &[u8]) -> (u32, u32, Vec<u8>) {
     assert_eq!(&bytes[0..2], b"P5");
     let mut i = 2usize;
@@ -119,13 +151,11 @@ fn opj_user_precincts_cprl_decodes_bit_exactly() {
 // component, so the precinct walker must also handle non-degenerate
 // component interleaving in the position-driven progression orders.
 
-// For the 3-component fixtures we use a relative cross-check: all five
-// progression orders encode the *same* image, so their decoded planes
-// must be identical to one another regardless of how the
-// (component, resolution, precinct) tuples were interleaved in the
-// codestream. Pure absolute equality with the OPJ-decoded PPM would
-// also test our DC-shift / inverse-RCT path, which the dedicated
-// `roundtrip_53` and existing OPJ interop tests already cover.
+// For the 3-component fixtures we use both a relative cross-check
+// (all five progression orders encode the *same* image, so their
+// decoded planes must be identical) and an absolute bit-exact check
+// against `opj_decompress` (sanity-tests the DC-shift + inverse-RCT
+// pipeline together with the per-tile precinct walker).
 
 fn decode_planes(bytes: &[u8]) -> Vec<Vec<u8>> {
     let vf = decode_j2k(bytes);
@@ -158,6 +188,46 @@ fn opj_rgb_precincts_all_orders_agree() {
     }
 }
 
+const RGB_PREC_PPM: &[u8] = include_bytes!("fixtures/opj128_rgb_prec.ppm");
+
+fn assert_rgb_bit_exact(name: &str, j2k: &[u8], ppm: &[u8], expect_w: u32, expect_h: u32) {
+    let (w, h, expected) = parse_ppm(ppm);
+    assert_eq!((w, h), (expect_w, expect_h), "{name}: dims");
+    assert_eq!(expected.len(), (w * h * 3) as usize, "{name}: payload");
+    let vf = decode_j2k(j2k);
+    let wu = w as usize;
+    let hu = h as usize;
+    let mut got = vec![0u8; wu * hu * 3];
+    for y in 0..hu {
+        for x in 0..wu {
+            for c in 0..3 {
+                got[(y * wu + x) * 3 + c] = vf.planes[c].data[y * vf.planes[c].stride + x];
+            }
+        }
+    }
+    let nm = expected
+        .iter()
+        .zip(got.iter())
+        .filter(|(a, b)| a != b)
+        .count();
+    assert_eq!(nm, 0, "{name}: not bit-exact ({nm} sample diffs)");
+}
+
+#[test]
+fn opj_rgb_precincts_all_orders_match_opj_decompress() {
+    // Absolute bit-exact check against `opj_decompress -i ...`. All
+    // five progression orders encode the same image.
+    for (name, j2k) in [
+        ("lrcp", RGB_LRCP_J2K),
+        ("rlcp", RGB_RLCP_J2K),
+        ("rpcl", RGB_RPCL_J2K),
+        ("pcrl", RGB_PCRL_J2K),
+        ("cprl", RGB_CPRL_J2K),
+    ] {
+        assert_rgb_bit_exact(name, j2k, RGB_PREC_PPM, 128, 128);
+    }
+}
+
 // --- 128x128 RGB, 64x64 tiles, user precincts ---
 // Exercises the multi-tile decode path (`decode_frame` walks four tiles
 // and re-applies the per-tile precinct partition for each one) jointly
@@ -180,6 +250,24 @@ fn opj_tiled_rgb_precincts_all_orders_agree() {
     ] {
         let other = decode_planes(j2k);
         assert_planes_equal(name, &lrcp, &other);
+    }
+}
+
+const TILED_RGB_PREC_PPM: &[u8] = include_bytes!("fixtures/opj128_tiled_prec.ppm");
+
+#[test]
+fn opj_tiled_rgb_precincts_all_orders_match_opj_decompress() {
+    // Multi-tile (4 tiles) RGB with user precincts and forward RCT,
+    // bit-exact against `opj_decompress`. Joint coverage of the
+    // per-tile MCT post-processing and the multi-tile assembly path.
+    for (name, j2k) in [
+        ("lrcp", TILED_LRCP_J2K),
+        ("rlcp", TILED_RLCP_J2K),
+        ("rpcl", TILED_RPCL_J2K),
+        ("pcrl", TILED_PCRL_J2K),
+        ("cprl", TILED_CPRL_J2K),
+    ] {
+        assert_rgb_bit_exact(name, j2k, TILED_RGB_PREC_PPM, 128, 128);
     }
 }
 
