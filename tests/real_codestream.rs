@@ -30,7 +30,7 @@ fn parses_real_openjpeg_codestream() {
         1,
         "single-tile image must have one tile-part"
     );
-    let tp = cs.tile_parts[0];
+    let tp = &cs.tile_parts[0];
     assert_eq!(tp.tile_index, 0);
     assert_eq!(tp.tile_part_index, 0);
     assert!(tp.sod_length > 0, "tile-part must carry compressed data");

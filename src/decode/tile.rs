@@ -104,6 +104,112 @@ pub fn parse_cod(bytes: &[u8]) -> Result<CodParams> {
     })
 }
 
+/// One progression-order volume from a POC marker segment
+/// (T.800 §A.6.6, §B.12.2). The volume covers all packets in the box
+/// `[res_start, res_end) × [comp_start, comp_end) × [0, layer_end)`,
+/// emitted in order `progression`.
+#[derive(Debug, Clone, Copy)]
+pub struct PocProgression {
+    /// `RSpoc` — start resolution, inclusive.
+    pub res_start: u8,
+    /// `CSpoc` — start component, inclusive.
+    pub comp_start: u16,
+    /// `LYEpoc` — end layer, exclusive (always >= 1).
+    pub layer_end: u16,
+    /// `REpoc` — end resolution, exclusive (always > `res_start`).
+    pub res_end: u8,
+    /// `CEpoc` — end component, exclusive (always > `comp_start`).
+    /// A wire value of `0` is interpreted as `256` per Table A.32.
+    pub comp_end: u16,
+    /// `Ppoc` — progression order for this volume (Table A.16).
+    pub progression: u8,
+}
+
+/// Parsed POC marker payload (T.800 §A.6.6).
+#[derive(Debug, Clone)]
+pub struct PocParams {
+    pub progressions: Vec<PocProgression>,
+}
+
+/// Decode a POC marker segment payload (without the leading length).
+///
+/// The number of progressions is derived from the segment length: each
+/// progression occupies 7 bytes when `Csiz < 257` (8-bit component
+/// fields) or 9 bytes when `Csiz >= 257` (16-bit component fields).
+/// See Equation A-6.
+pub fn parse_poc(bytes: &[u8], num_components: u16) -> Result<PocParams> {
+    let csiz_wide = num_components >= 257;
+    let entry_size = if csiz_wide { 9 } else { 7 };
+    if bytes.is_empty() || bytes.len() % entry_size != 0 {
+        return Err(Error::invalid(format!(
+            "jpeg2000: POC segment length {} not divisible by {}",
+            bytes.len(),
+            entry_size
+        )));
+    }
+    let n = bytes.len() / entry_size;
+    let mut progressions = Vec::with_capacity(n);
+    for i in 0..n {
+        let off = i * entry_size;
+        let res_start = bytes[off];
+        let (comp_start, off2) = if csiz_wide {
+            (
+                u16::from_be_bytes([bytes[off + 1], bytes[off + 2]]),
+                off + 3,
+            )
+        } else {
+            (bytes[off + 1] as u16, off + 2)
+        };
+        let layer_end = u16::from_be_bytes([bytes[off2], bytes[off2 + 1]]);
+        let res_end = bytes[off2 + 2];
+        let (comp_end_raw, off3) = if csiz_wide {
+            (
+                u16::from_be_bytes([bytes[off2 + 3], bytes[off2 + 4]]),
+                off2 + 5,
+            )
+        } else {
+            (bytes[off2 + 3] as u16, off2 + 4)
+        };
+        // Per Table A.32: a CEpoc value of 0 means "256" (when Csiz < 257)
+        // — the maximum component count in that mode.
+        let comp_end = if comp_end_raw == 0 && !csiz_wide {
+            256
+        } else {
+            comp_end_raw
+        };
+        let progression = bytes[off3];
+        if progression > 4 {
+            return Err(Error::unsupported(
+                "jpeg2000: POC progression order > 4 (Part-1 supports 0..=4)",
+            ));
+        }
+        if res_end <= res_start {
+            return Err(Error::invalid(format!(
+                "jpeg2000: POC entry {i}: REpoc ({res_end}) must exceed RSpoc ({res_start})"
+            )));
+        }
+        if comp_end <= comp_start {
+            return Err(Error::invalid(format!(
+                "jpeg2000: POC entry {i}: CEpoc ({comp_end}) must exceed CSpoc ({comp_start})"
+            )));
+        }
+        if layer_end == 0 {
+            return Err(Error::invalid(format!(
+                "jpeg2000: POC entry {i}: LYEpoc must be >= 1"
+            )));
+        }
+        progressions.push(PocProgression {
+            res_start,
+            comp_start,
+            layer_end,
+            res_end,
+            comp_end,
+            progression,
+        });
+    }
+    Ok(PocParams { progressions })
+}
+
 #[derive(Debug, Clone)]
 pub struct QcdParams {
     pub guard_bits: u8,
@@ -544,6 +650,16 @@ fn build_resolutions(
 /// — fine for 8-bit components but deeper ones will skew.
 pub struct DecodeParams<'a> {
     pub comp_precisions: &'a [u32],
+    /// Optional per-tile progression-order override (T.800 §A.6.6 /
+    /// §B.12.3). When `Some`, the tier-2 walker iterates each
+    /// progression-order volume in sequence; when `None`, it uses the
+    /// single progression order from `cod`.
+    pub poc: Option<&'a PocParams>,
+    /// Optional packed packet headers for this tile (T.800 §A.7.4 PPM /
+    /// §A.7.5 PPT). When `Some`, the tier-2 walker reads packet header
+    /// bytes from this slice and packet bodies from `body`. When
+    /// `None`, both come from `body` (the historical layout).
+    pub packet_headers: Option<&'a [u8]>,
 }
 
 #[allow(clippy::needless_range_loop)]
@@ -557,6 +673,8 @@ pub fn decode_tile(
     let precisions: Vec<u32> = vec![8u32; comp_sizes.len()];
     let params = DecodeParams {
         comp_precisions: &precisions,
+        poc: None,
+        packet_headers: None,
     };
     decode_tile_with_params(body, comp_sizes, cod, qcd, &params)
 }
@@ -606,7 +724,15 @@ pub fn decode_tile_with_params(
     }
 
     let mut cursor = Cursor::new(body);
-    walk_packets(&mut cursor, cod, &mut layouts, num_res, num_comps)?;
+    walk_packets(
+        &mut cursor,
+        cod,
+        params.poc,
+        params.packet_headers,
+        &mut layouts,
+        num_res,
+        num_comps,
+    )?;
 
     // Per-component IDWT using per-subband buffers.
     let mut out = Vec::with_capacity(num_comps);
@@ -935,13 +1061,23 @@ impl<'a> Cursor<'a> {
 /// Parse one packet header + body for a single (resolution, precinct,
 /// layer) tuple. The packet covers all sub-bands of `res` whose
 /// code-blocks fall inside the chosen precinct (§B.6 / §B.9 / §B.10).
+///
+/// `header_cur` is `Some` when the packet header bytes come from a
+/// PPM (main header) or PPT (tile-part header) buffer per §A.7.4 /
+/// §A.7.5; the packet body is still read from `cur` (the SOD body).
+/// When `header_cur` is `None` both header and body come from `cur`.
 fn parse_precinct_packet(
     cur: &mut Cursor<'_>,
+    header_cur: Option<&mut Cursor<'_>>,
     layer: u32,
     res: &mut ResolutionLayout,
     prec_idx: usize,
     cod: &CodParams,
 ) -> Result<()> {
+    // SOP markers (§A.8.1) are only emitted in the body stream; with
+    // PPM/PPT they still appear in the body before the (now empty)
+    // packet header, between header bytes and body — so we skip SOP
+    // from the body cursor regardless of where headers come from.
     if cod.sop_marker && cur.remaining().starts_with(&[0xFF, 0x91]) {
         if cur.remaining().len() < 6 {
             return Err(Error::invalid("jpeg2000: truncated SOP"));
@@ -949,8 +1085,17 @@ fn parse_precinct_packet(
         cur.consume(6)?;
     }
 
-    let header_start = cur.remaining();
-    let mut bio = Bio::new(header_start);
+    // The header source: an external PPM/PPT cursor if supplied, else
+    // the body cursor itself. We always operate on a `Bio` reading the
+    // raw header byte slice — `numbytes_read` then tells us how many
+    // bytes the header consumed so we can advance the underlying
+    // source cursor after the bit-aligned read.
+    let (header_slice, from_external) = if let Some(c) = &header_cur {
+        (c.remaining(), true)
+    } else {
+        (cur.remaining(), false)
+    };
+    let mut bio = Bio::new(header_slice);
     // (sb_idx, global_cblk_idx, length).
     let mut pending: Vec<(usize, usize, u32)> = Vec::new();
 
@@ -1020,9 +1165,21 @@ fn parse_precinct_packet(
         bio.inalign();
     }
     let header_bytes_used = bio.numbytes_read();
-    cur.consume(header_bytes_used)?;
-    if cod.eph_marker && cur.remaining().starts_with(&[0xFF, 0x92]) {
-        cur.consume(2)?;
+    if from_external {
+        // Advance the PPM/PPT cursor; do not touch the body cursor for
+        // header bytes. EPH markers (when emitted) are still part of
+        // the PPM/PPT stream per §A.8.2, so we consume them from the
+        // header source as well.
+        let header_cur = header_cur.expect("from_external implies header_cur is Some");
+        header_cur.consume(header_bytes_used)?;
+        if cod.eph_marker && header_cur.remaining().starts_with(&[0xFF, 0x92]) {
+            header_cur.consume(2)?;
+        }
+    } else {
+        cur.consume(header_bytes_used)?;
+        if cod.eph_marker && cur.remaining().starts_with(&[0xFF, 0x92]) {
+            cur.consume(2)?;
+        }
     }
     for (sb_idx, g_idx, length) in pending {
         let bytes = cur.consume(length as usize)?.to_vec();
@@ -1033,129 +1190,225 @@ fn parse_precinct_packet(
     Ok(())
 }
 
-/// Walk the tier-2 packet stream in the order signalled by `cod.progression_order`.
-/// All five Part-1 progression orders are handled (T.800 §B.12.1).
+/// Walk the tier-2 packet stream in the order signalled by `cod.progression_order`,
+/// optionally overridden by a POC marker (T.800 §A.6.6 / §B.12.2 / §B.12.3).
+///
+/// When `poc` is `None` the walker emits one progression covering the
+/// full `(comp, res, layer)` cube with `cod.progression_order`. When
+/// `poc` is `Some` each progression-order volume is processed in turn,
+/// with each `(comp, res, prec)` tuple's per-progression layer counter
+/// advancing across volumes (the spec rule "the layer always starts
+/// with the next one for a given tile-component, resolution level and
+/// precinct"). Packets that have already been emitted are skipped.
+///
+/// `packet_headers` is `Some` when the tile uses PPM/PPT (T.800 §A.7.4
+/// / §A.7.5): the bytes contain every packet header for this tile in
+/// progression order (the same order the walker visits them). The
+/// packet bodies still come from `cur`.
 #[allow(clippy::needless_range_loop)]
 fn walk_packets(
     cur: &mut Cursor<'_>,
     cod: &CodParams,
+    poc: Option<&PocParams>,
+    packet_headers: Option<&[u8]>,
     layouts: &mut [Vec<ResolutionLayout>],
     num_res: usize,
     num_comps: usize,
 ) -> Result<()> {
     let num_layers = cod.num_layers as u32;
-    match cod.progression_order {
-        // LRCP — §B.12.1.1.
-        0 => {
-            for layer in 0..num_layers {
-                for resno in 0..num_res {
-                    for comp in 0..num_comps {
-                        let nprec = layouts[comp][resno].precincts.len();
-                        for prec in 0..nprec {
-                            parse_precinct_packet(
-                                cur,
-                                layer,
-                                &mut layouts[comp][resno],
-                                prec,
-                                cod,
-                            )?;
+    let progressions: Vec<PocProgression> = if let Some(poc) = poc {
+        poc.progressions.clone()
+    } else {
+        vec![PocProgression {
+            res_start: 0,
+            comp_start: 0,
+            layer_end: cod.num_layers,
+            res_end: num_res as u8,
+            comp_end: num_comps as u16,
+            progression: cod.progression_order,
+        }]
+    };
+
+    // Local owned cursor over the packed packet headers (PPM/PPT). We
+    // build it as a `Box`-owned cursor so we can pass `&mut` references
+    // into `parse_precinct_packet` without lifetime gymnastics across
+    // the dispatch loop.
+    let mut header_cursor: Option<Cursor<'_>> = packet_headers.map(Cursor::new);
+
+    // Helper to invoke `parse_precinct_packet` with the right header
+    // source. Inlined as a closure-like macro because Rust closures
+    // can't easily borrow disjoint slots from `layouts`.
+    macro_rules! emit_packet {
+        ($cur:expr, $hdr:expr, $layer:expr, $layout:expr, $prec:expr, $cod:expr) => {{
+            let hdr_ref: Option<&mut Cursor<'_>> = $hdr.as_mut();
+            parse_precinct_packet($cur, hdr_ref, $layer, $layout, $prec, $cod)?
+        }};
+    }
+
+    // Per-(comp, res, prec) "next layer to emit" counter (§B.12.2).
+    // Indexed `[comp][res][prec_idx]`. Initialised to 0; each emitted
+    // packet for tuple `(c, r, k)` bumps the counter by 1.
+    let mut next_layer: Vec<Vec<Vec<u32>>> = (0..num_comps)
+        .map(|c| {
+            (0..num_res)
+                .map(|r| vec![0u32; layouts[c][r].precincts.len()])
+                .collect()
+        })
+        .collect();
+
+    for prog in &progressions {
+        // Clamp progression bounds to actual tile geometry — POC volumes
+        // are allowed to over-specify (e.g. CEpoc of 256 for a 3-comp
+        // image; REpoc beyond actual resolutions). We silently clip.
+        let comp_lo = (prog.comp_start as usize).min(num_comps);
+        let comp_hi = (prog.comp_end as usize).min(num_comps);
+        let res_lo = (prog.res_start as usize).min(num_res);
+        let res_hi = (prog.res_end as usize).min(num_res);
+        let layer_hi = (prog.layer_end as u32).min(num_layers);
+        if comp_lo >= comp_hi || res_lo >= res_hi || layer_hi == 0 {
+            continue;
+        }
+        match prog.progression {
+            // LRCP — §B.12.1.1.
+            0 => {
+                for layer in 0..layer_hi {
+                    for resno in res_lo..res_hi {
+                        for comp in comp_lo..comp_hi {
+                            let nprec = layouts[comp][resno].precincts.len();
+                            for prec in 0..nprec {
+                                if next_layer[comp][resno][prec] != layer {
+                                    continue;
+                                }
+                                emit_packet!(
+                                    cur,
+                                    header_cursor,
+                                    layer,
+                                    &mut layouts[comp][resno],
+                                    prec,
+                                    cod
+                                );
+                                next_layer[comp][resno][prec] = layer + 1;
+                            }
                         }
                     }
                 }
             }
-        }
-        // RLCP — §B.12.1.2.
-        1 => {
-            for resno in 0..num_res {
-                for layer in 0..num_layers {
-                    for comp in 0..num_comps {
-                        let nprec = layouts[comp][resno].precincts.len();
-                        for prec in 0..nprec {
-                            parse_precinct_packet(
-                                cur,
-                                layer,
-                                &mut layouts[comp][resno],
-                                prec,
-                                cod,
-                            )?;
+            // RLCP — §B.12.1.2.
+            1 => {
+                for resno in res_lo..res_hi {
+                    for layer in 0..layer_hi {
+                        for comp in comp_lo..comp_hi {
+                            let nprec = layouts[comp][resno].precincts.len();
+                            for prec in 0..nprec {
+                                if next_layer[comp][resno][prec] != layer {
+                                    continue;
+                                }
+                                emit_packet!(
+                                    cur,
+                                    header_cursor,
+                                    layer,
+                                    &mut layouts[comp][resno],
+                                    prec,
+                                    cod
+                                );
+                                next_layer[comp][resno][prec] = layer + 1;
+                            }
                         }
                     }
                 }
             }
-        }
-        // RPCL — §B.12.1.3. Per-resolution (y, x) walk over the
-        // reference grid; the spec note (§B.12.1.3 "NOTE") says we may
-        // iterate precincts directly. Group by resolution; sort
-        // (component, precinct) pairs by (ref_y, ref_x, comp) to
-        // emulate the (y, x) walk efficiently.
-        2 => {
-            for resno in 0..num_res {
-                let mut order: Vec<(u32, u32, usize, usize)> = Vec::new();
-                for comp in 0..num_comps {
-                    let layout = &layouts[comp][resno];
-                    for (prec_idx, prec) in layout.precincts.iter().enumerate() {
-                        order.push((prec.ref_y, prec.ref_x, comp, prec_idx));
+            // RPCL — §B.12.1.3. Per-resolution (y, x) walk over the
+            // reference grid; the spec note (§B.12.1.3 "NOTE") says we
+            // may iterate precincts directly.
+            2 => {
+                for resno in res_lo..res_hi {
+                    let mut order: Vec<(u32, u32, usize, usize)> = Vec::new();
+                    for comp in comp_lo..comp_hi {
+                        let layout = &layouts[comp][resno];
+                        for (prec_idx, prec) in layout.precincts.iter().enumerate() {
+                            order.push((prec.ref_y, prec.ref_x, comp, prec_idx));
+                        }
+                    }
+                    order.sort();
+                    for (_, _, comp, prec_idx) in order {
+                        for layer in 0..layer_hi {
+                            if next_layer[comp][resno][prec_idx] != layer {
+                                continue;
+                            }
+                            emit_packet!(
+                                cur,
+                                header_cursor,
+                                layer,
+                                &mut layouts[comp][resno],
+                                prec_idx,
+                                cod
+                            );
+                            next_layer[comp][resno][prec_idx] = layer + 1;
+                        }
+                    }
+                }
+            }
+            // PCRL — §B.12.1.4. Outer (y, x) over the ref grid; inner
+            // component, resolution, layer.
+            3 => {
+                let mut order: Vec<(u32, u32, usize, usize, usize)> = Vec::new();
+                for comp in comp_lo..comp_hi {
+                    for resno in res_lo..res_hi {
+                        let layout = &layouts[comp][resno];
+                        for (prec_idx, prec) in layout.precincts.iter().enumerate() {
+                            order.push((prec.ref_y, prec.ref_x, comp, resno, prec_idx));
+                        }
                     }
                 }
                 order.sort();
-                for (_, _, comp, prec_idx) in order {
-                    for layer in 0..num_layers {
-                        parse_precinct_packet(
+                for (_, _, comp, resno, prec_idx) in order {
+                    for layer in 0..layer_hi {
+                        if next_layer[comp][resno][prec_idx] != layer {
+                            continue;
+                        }
+                        emit_packet!(
                             cur,
+                            header_cursor,
                             layer,
                             &mut layouts[comp][resno],
                             prec_idx,
-                            cod,
-                        )?;
+                            cod
+                        );
+                        next_layer[comp][resno][prec_idx] = layer + 1;
                     }
                 }
             }
+            // CPRL — §B.12.1.5. Outer component, then (y, x), then r, then layer.
+            4 => {
+                for comp in comp_lo..comp_hi {
+                    let mut order: Vec<(u32, u32, usize, usize)> = Vec::new();
+                    for resno in res_lo..res_hi {
+                        let layout = &layouts[comp][resno];
+                        for (prec_idx, prec) in layout.precincts.iter().enumerate() {
+                            order.push((prec.ref_y, prec.ref_x, resno, prec_idx));
+                        }
+                    }
+                    order.sort();
+                    for (_, _, resno, prec_idx) in order {
+                        for layer in 0..layer_hi {
+                            if next_layer[comp][resno][prec_idx] != layer {
+                                continue;
+                            }
+                            emit_packet!(
+                                cur,
+                                header_cursor,
+                                layer,
+                                &mut layouts[comp][resno],
+                                prec_idx,
+                                cod
+                            );
+                            next_layer[comp][resno][prec_idx] = layer + 1;
+                        }
+                    }
+                }
+            }
+            _ => unreachable!(),
         }
-        // PCRL — §B.12.1.4. Outer (y, x) over the ref grid; inner
-        // component, resolution, layer.
-        3 => {
-            let mut order: Vec<(u32, u32, usize, usize, usize)> = Vec::new();
-            for comp in 0..num_comps {
-                for resno in 0..num_res {
-                    let layout = &layouts[comp][resno];
-                    for (prec_idx, prec) in layout.precincts.iter().enumerate() {
-                        order.push((prec.ref_y, prec.ref_x, comp, resno, prec_idx));
-                    }
-                }
-            }
-            // Spec order: (y, x, comp, r). We sort by that tuple.
-            order.sort();
-            for (_, _, comp, resno, prec_idx) in order {
-                for layer in 0..num_layers {
-                    parse_precinct_packet(cur, layer, &mut layouts[comp][resno], prec_idx, cod)?;
-                }
-            }
-        }
-        // CPRL — §B.12.1.5. Outer component, then (y, x), then r, then layer.
-        4 => {
-            for comp in 0..num_comps {
-                let mut order: Vec<(u32, u32, usize, usize)> = Vec::new();
-                for resno in 0..num_res {
-                    let layout = &layouts[comp][resno];
-                    for (prec_idx, prec) in layout.precincts.iter().enumerate() {
-                        order.push((prec.ref_y, prec.ref_x, resno, prec_idx));
-                    }
-                }
-                order.sort();
-                for (_, _, resno, prec_idx) in order {
-                    for layer in 0..num_layers {
-                        parse_precinct_packet(
-                            cur,
-                            layer,
-                            &mut layouts[comp][resno],
-                            prec_idx,
-                            cod,
-                        )?;
-                    }
-                }
-            }
-        }
-        _ => unreachable!(),
     }
     Ok(())
 }
@@ -1218,7 +1471,15 @@ fn round6_walk_layouts(j2k: &[u8]) -> Result<(CodParams, QcdParams, Vec<Vec<Reso
         body.extend_from_slice(&j2k[tp.sod_offset..tp.sod_offset + tp.sod_length]);
     }
     let mut cursor = Cursor::new(&body);
-    walk_packets(&mut cursor, &cod, &mut layouts, num_res, num_comps)?;
+    walk_packets(
+        &mut cursor,
+        &cod,
+        None,
+        None,
+        &mut layouts,
+        num_res,
+        num_comps,
+    )?;
     Ok((cod, qcd, layouts))
 }
 

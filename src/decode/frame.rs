@@ -34,7 +34,9 @@
 
 use oxideav_core::{Error, Frame, PixelFormat, Result, TimeBase, VideoFrame, VideoPlane};
 
-use super::tile::{decode_tile_with_params, parse_cod, parse_qcd, CodParams, DecodeParams};
+use super::tile::{
+    decode_tile_with_params, parse_cod, parse_poc, parse_qcd, CodParams, DecodeParams, PocParams,
+};
 use crate::codestream::{Codestream, Siz};
 
 /// Decode one JPEG 2000 still into an uncompressed video frame.
@@ -49,6 +51,25 @@ pub fn decode_frame(cs: &Codestream, buf: &[u8]) -> Result<Frame> {
         .ok_or_else(|| Error::invalid("jpeg2000: missing QCD segment"))?;
     let cod = parse_cod(cod_bytes)?;
     let qcd = parse_qcd(qcd_bytes, cod.num_decomp)?;
+    // Main-header POC (T.800 §A.6.6) — applies to every tile unless the
+    // tile-part header carries its own POC override.
+    let main_poc: Option<PocParams> = if let Some(b) = &cs.poc {
+        Some(parse_poc(b, cs.siz.components.len() as u16)?)
+    } else {
+        None
+    };
+
+    // PPM packed packet headers from the main header (T.800 §A.7.4).
+    // When present, every tile's packet headers live in PPM rather
+    // than in the tile-part bodies. We unpack the (Zppm-sorted,
+    // concatenated) PPM stream into one packet-header buffer per
+    // tile-part, indexed in the order tile-parts appear in the
+    // codestream.
+    let ppm_per_tile_part: Option<Vec<Vec<u8>>> = if !cs.ppm.is_empty() {
+        Some(unpack_ppm(&cs.ppm, cs.tile_parts.len())?)
+    } else {
+        None
+    };
 
     if cs.tile_parts.is_empty() {
         return Err(Error::invalid("jpeg2000: no tile-parts in codestream"));
@@ -162,8 +183,74 @@ pub fn decode_frame(cs: &Codestream, buf: &[u8]) -> Result<Frame> {
             tile_body.extend_from_slice(&buf[start..end]);
         }
 
+        // Per-tile POC override (T.800 §A.6.6). The spec allows POC
+        // marker segments to appear in any tile-part header of a tile
+        // (the first segment must precede the first packet of the
+        // affected progression). We aggregate every POC found in the
+        // tile's tile-parts into a single concatenated progression list.
+        // Per the precedence rule "Tile-part POC > Main POC > Tile-part
+        // COD > Main COD" any tile-part POC fully overrides the main POC.
+        let mut tile_poc_bytes: Vec<u8> = Vec::new();
+        for &tp_ix in &by_tile[tile_idx] {
+            if let Some(b) = &cs.tile_parts[tp_ix].poc {
+                tile_poc_bytes.extend_from_slice(b);
+            }
+        }
+        let tile_poc: Option<PocParams> = if !tile_poc_bytes.is_empty() {
+            Some(parse_poc(&tile_poc_bytes, cs.siz.components.len() as u16)?)
+        } else {
+            main_poc.clone()
+        };
+
+        // Per-tile packet headers from PPM or PPT (T.800 §A.7.4 / §A.7.5).
+        // When PPM is present, concatenate the per-tile-part chunks in
+        // the order this tile's tile-parts appear in the codestream.
+        // Else if any tile-part carries PPT segments, sort the PPT
+        // payloads by Zppt across all tile-parts of this tile and
+        // concatenate Ippt bodies. Else, no packed headers — the body
+        // contains its own headers (the historical case).
+        let tile_packet_headers: Option<Vec<u8>> = if let Some(per_tp) = &ppm_per_tile_part {
+            let mut buf = Vec::new();
+            for &tp_ix in &by_tile[tile_idx] {
+                if let Some(b) = per_tp.get(tp_ix) {
+                    buf.extend_from_slice(b);
+                }
+            }
+            Some(buf)
+        } else {
+            // Aggregate PPT segments. Spec: "The sequence of (Ippti)
+            // parameters from this marker segment is concatenated, in
+            // the order of increasing Zppt". We aggregate PPTs from all
+            // tile-parts of this tile, sorted by Zppt within each
+            // tile-part header (the spec doesn't explicitly say PPTs
+            // can span tile-parts, but it's safe to walk in tile-part
+            // order then by Zppt).
+            let mut all_ppt: Vec<(u8, &[u8])> = Vec::new();
+            for &tp_ix in &by_tile[tile_idx] {
+                for ppt_seg in &cs.tile_parts[tp_ix].ppt {
+                    if ppt_seg.is_empty() {
+                        continue;
+                    }
+                    let zppt = ppt_seg[0];
+                    all_ppt.push((zppt, &ppt_seg[1..]));
+                }
+            }
+            if all_ppt.is_empty() {
+                None
+            } else {
+                all_ppt.sort_by_key(|&(z, _)| z);
+                let mut buf = Vec::new();
+                for (_, body) in all_ppt {
+                    buf.extend_from_slice(body);
+                }
+                Some(buf)
+            }
+        };
+
         let params = DecodeParams {
             comp_precisions: &comp_precisions,
+            poc: tile_poc.as_ref(),
+            packet_headers: tile_packet_headers.as_deref(),
         };
         let planes = decode_tile_with_params(&tile_body, &comp_sizes_rel, &cod, &qcd, &params)?;
 
@@ -277,6 +364,79 @@ fn div_ceil(a: u32, b: u32) -> u32 {
         return 0;
     }
     a.div_ceil(b)
+}
+
+/// Unpack the main-header PPM segments (T.800 §A.7.4) into a
+/// per-tile-part packet-header buffer.
+///
+/// PPM payload layout (across all PPM segments, sorted by Zppm and
+/// concatenated):
+///
+/// ```text
+///   [Nppm_0 (4 bytes)] [packet headers for tile-part 0 — Nppm_0 bytes]
+///   [Nppm_1 (4 bytes)] [packet headers for tile-part 1 — Nppm_1 bytes]
+///   ...
+/// ```
+///
+/// The `Nppm` boundaries are not aligned with PPM segment boundaries —
+/// a single packet-header block may span PPM segments. The spec's
+/// ordering rule ("kth entry in the resulting list contains the number
+/// of bytes and packet headers for the kth tile-part appearing in the
+/// codestream") tells us tile-part indices in the unpacked output
+/// correspond directly to the order tile-parts appear in the SOT chain.
+fn unpack_ppm(ppm_segments: &[Vec<u8>], num_tile_parts: usize) -> Result<Vec<Vec<u8>>> {
+    // Sort by Zppm (first byte of each segment payload).
+    let mut sorted: Vec<&[u8]> = Vec::with_capacity(ppm_segments.len());
+    {
+        let mut tmp: Vec<(u8, &[u8])> = ppm_segments
+            .iter()
+            .map(|s| {
+                if s.is_empty() {
+                    (0u8, s.as_slice())
+                } else {
+                    (s[0], &s[1..])
+                }
+            })
+            .collect();
+        tmp.sort_by_key(|&(z, _)| z);
+        for (_, body) in tmp {
+            sorted.push(body);
+        }
+    }
+
+    // Concatenate the trailing bytes (after Zppm) into one stream,
+    // then walk the (Nppm, headers) records.
+    let mut stream: Vec<u8> = Vec::new();
+    for body in sorted {
+        stream.extend_from_slice(body);
+    }
+
+    let mut out: Vec<Vec<u8>> = Vec::with_capacity(num_tile_parts);
+    let mut i = 0usize;
+    while i < stream.len() && out.len() < num_tile_parts {
+        if i + 4 > stream.len() {
+            return Err(Error::invalid(
+                "jpeg2000: PPM stream truncated reading Nppm",
+            ));
+        }
+        let n =
+            u32::from_be_bytes([stream[i], stream[i + 1], stream[i + 2], stream[i + 3]]) as usize;
+        i += 4;
+        if i + n > stream.len() {
+            return Err(Error::invalid(format!(
+                "jpeg2000: PPM stream truncated: need {n} bytes, have {}",
+                stream.len() - i
+            )));
+        }
+        out.push(stream[i..i + n].to_vec());
+        i += n;
+    }
+    while out.len() < num_tile_parts {
+        // Fewer Nppm entries than tile-parts — leave the rest empty so
+        // the per-tile-part lookup falls back gracefully.
+        out.push(Vec::new());
+    }
+    Ok(out)
 }
 
 /// Apply DC level shift + per-component bit-depth clip, then pack to 8-bit.

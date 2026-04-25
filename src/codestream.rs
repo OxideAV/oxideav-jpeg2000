@@ -17,8 +17,9 @@
 //! | COC    | FF 53  | Coding style (per-component)      | raw segment    |
 //! | QCC    | FF 5D  | Quantisation (per-component)      | raw segment    |
 //! | RGN    | FF 5E  | Region of interest                | raw segment    |
-//! | POC    | FF 5F  | Progression order change          | raw segment    |
-//! | PPM    | FF 60  | Packed packet headers, main       | raw segment    |
+//! | POC    | FF 5F  | Progression order change          | main + per-tile-part raw payload |
+//! | PPM    | FF 60  | Packed packet headers, main       | per-segment raw payload list |
+//! | PPT    | FF 61  | Packed packet headers, tile-part  | per-tile-part raw payload list |
 //! | TLM    | FF 55  | Tile-part lengths                 | raw segment    |
 //! | PLM    | FF 57  | Packet lengths, main              | raw segment    |
 //! | CRG    | FF 63  | Component registration            | raw segment    |
@@ -121,7 +122,7 @@ impl Siz {
 }
 
 /// Records a single tile-part's position + length inside the codestream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TilePart {
     /// Tile index (Isot).
     pub tile_index: u16,
@@ -136,6 +137,21 @@ pub struct TilePart {
     pub sod_offset: usize,
     /// Number of compressed data bytes following SOD for this tile-part.
     pub sod_length: usize,
+    /// Raw POC segment payload appearing in this tile-part's header
+    /// (T.800 §A.6.6). When set, the tile uses these progressions
+    /// instead of the main-header POC / COD progression order.
+    /// Per §A.6.6, all POC marker segments for a given tile must appear
+    /// in tile-part headers of that tile; we accumulate any additional
+    /// POC found in subsequent tile-parts of the same tile in the order
+    /// encountered.
+    pub poc: Option<Vec<u8>>,
+    /// Raw PPT segment payloads from this tile-part header
+    /// (T.800 §A.7.5), in the order encountered. Each entry is the
+    /// body of one PPT segment (after Zppt: just `Ippti` packet header
+    /// bytes). The decoder concatenates all PPT payloads of a tile
+    /// (across its tile-parts) and reads packet headers from the
+    /// resulting buffer.
+    pub ppt: Vec<Vec<u8>>,
 }
 
 /// Full parse result for one J2K codestream.
@@ -146,6 +162,16 @@ pub struct Codestream {
     pub cod: Option<Vec<u8>>,
     /// Raw QCD segment payload (after Lqcd). `None` if absent.
     pub qcd: Option<Vec<u8>>,
+    /// Raw POC segment payload from the main header, if present
+    /// (T.800 §A.6.6). When present, it overrides the COD progression
+    /// order for all tiles unless they carry their own tile-part POC.
+    pub poc: Option<Vec<u8>>,
+    /// Raw PPM segment payloads from the main header (T.800 §A.7.4),
+    /// in the order encountered. Each entry is the body of one PPM
+    /// segment (after Zppm + concatenated `(Nppmi, Ippmi)` records).
+    /// When non-empty, every tile's packet headers are stored here
+    /// instead of inside the tile-part bodies.
+    pub ppm: Vec<Vec<u8>>,
     pub tile_parts: Vec<TilePart>,
     /// Byte offset of the EOC marker, or `None` if the stream was truncated.
     pub eoc_offset: Option<usize>,
@@ -179,6 +205,11 @@ pub fn parse(buf: &[u8]) -> Result<Codestream> {
 
     let mut cod: Option<Vec<u8>> = None;
     let mut qcd: Option<Vec<u8>> = None;
+    let mut poc: Option<Vec<u8>> = None;
+    // PPM main-header segments accumulate by Zppm order. We collect the
+    // raw payloads here in the order encountered; downstream tier-2
+    // setup re-sorts by Zppm and concatenates per §A.7.4.
+    let mut ppm: Vec<Vec<u8>> = Vec::new();
     let mut tile_parts: Vec<TilePart> = Vec::new();
     let mut eoc_offset: Option<usize> = None;
 
@@ -197,11 +228,22 @@ pub fn parse(buf: &[u8]) -> Result<Codestream> {
                 let seg = cur.read_len_segment()?;
                 qcd = Some(seg.to_vec());
             }
+            Marker::POC => {
+                let seg = cur.read_len_segment()?;
+                poc = Some(seg.to_vec());
+            }
+            Marker::PPM => {
+                // §A.7.4: PPM payload starts with `Zppm` (1 byte).
+                // We retain the full segment (including Zppm) here; the
+                // decoder sorts by Zppm and concatenates the trailing
+                // bytes when setting up the per-tile-part header
+                // streams.
+                let seg = cur.read_len_segment()?;
+                ppm.push(seg.to_vec());
+            }
             Marker::COC
             | Marker::QCC
             | Marker::RGN
-            | Marker::POC
-            | Marker::PPM
             | Marker::PPT
             | Marker::TLM
             | Marker::PLM
@@ -223,12 +265,53 @@ pub fn parse(buf: &[u8]) -> Result<Codestream> {
                 let tile_part_index = seg[6];
                 let tile_part_count = seg[7];
 
-                let sod_m = cur.read_marker()?;
-                if sod_m != Marker::SOD {
-                    return Err(Error::invalid(format!(
-                        "jpeg2000: expected SOD (FF93) after SOT, got {:04X}",
-                        sod_m.0
-                    )));
+                // Tile-part header: any number of marker segments can
+                // appear between SOT and SOD per §A.4.2 (COD, COC, QCD,
+                // QCC, RGN, POC, PPT, PLT, COM). We capture POC + PPT;
+                // the other tile-part-header segments are skipped
+                // (their values would override main-header settings for
+                // this tile, which is not yet supported).
+                let mut tp_poc: Option<Vec<u8>> = None;
+                let mut tp_ppt: Vec<Vec<u8>> = Vec::new();
+                loop {
+                    let next = cur.read_marker()?;
+                    match next {
+                        Marker::SOD => break,
+                        Marker::POC => {
+                            let s = cur.read_len_segment()?;
+                            // §A.6.6 allows multiple POC markers across
+                            // tile-parts of the same tile; for the first
+                            // tile-part we store the payload, additional
+                            // POC payloads are appended to the same tile's
+                            // record so the walker sees one merged list
+                            // (the per-tile aggregation happens later).
+                            tp_poc = Some(s.to_vec());
+                        }
+                        Marker::PPT => {
+                            // §A.7.5: PPT payload starts with `Zppt`
+                            // (1 byte) followed by Ippt header bytes.
+                            // We retain the full segment; the decoder
+                            // sorts by Zppt and concatenates Ippt
+                            // tails per the spec.
+                            let s = cur.read_len_segment()?;
+                            tp_ppt.push(s.to_vec());
+                        }
+                        Marker::COD
+                        | Marker::COC
+                        | Marker::QCD
+                        | Marker::QCC
+                        | Marker::RGN
+                        | Marker::PLT
+                        | Marker::COM => {
+                            let _ = cur.read_len_segment()?;
+                        }
+                        other => {
+                            return Err(Error::invalid(format!(
+                                "jpeg2000: unexpected marker {:04X} in tile-part header",
+                                other.0
+                            )));
+                        }
+                    }
                 }
                 let sod_offset = cur.pos();
 
@@ -253,6 +336,8 @@ pub fn parse(buf: &[u8]) -> Result<Codestream> {
                     psot,
                     sod_offset,
                     sod_length,
+                    poc: tp_poc,
+                    ppt: tp_ppt,
                 });
                 cur.skip(sod_length)?;
             }
@@ -278,6 +363,8 @@ pub fn parse(buf: &[u8]) -> Result<Codestream> {
         siz,
         cod,
         qcd,
+        poc,
+        ppm,
         tile_parts,
         eoc_offset,
     })
@@ -501,7 +588,7 @@ mod tests {
         assert!(cs.cod.is_some());
         assert!(cs.qcd.is_some());
         assert_eq!(cs.tile_parts.len(), 1);
-        let tp = cs.tile_parts[0];
+        let tp = &cs.tile_parts[0];
         assert_eq!(tp.tile_index, 0);
         assert_eq!(tp.tile_part_index, 0);
         assert_eq!(tp.tile_part_count, 1);

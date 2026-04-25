@@ -129,6 +129,8 @@ fn diag_opj16_sub_band_values() {
     let precisions = vec![8u32];
     let params = DecodeParams {
         comp_precisions: &precisions,
+        poc: None,
+        packet_headers: None,
     };
     let planes = decode_tile_with_params(&body, &comp_sizes, &cod, &qcd, &params).expect("tile");
 

@@ -20,10 +20,26 @@
 //!   - DC level-shift, clipping, reversible component transform (RCT)
 //!     for 3-component 5/3 streams and irreversible component
 //!     transform (ICT) for 3-component 9/7 streams.
-//!   - LRCP, RLCP, and RPCL progression orders. Multiple quality
+//!   - All five Part-1 progression orders — LRCP, RLCP, RPCL, PCRL,
+//!     CPRL (§B.12.1.1–B.12.1.5). User-defined precinct partitions
+//!     (§A.6.1 / §B.6) honoured for every order. Multiple quality
 //!     layers (per T.800 §B.10 — accumulated coding-pass contributions
-//!     across packets). Default precinct size only (one precinct per
-//!     resolution); RPCL is rejected for user-precinct codestreams.
+//!     across packets).
+//!   - **POC marker** (§A.6.6 / §B.12.2 / §B.12.3): mid-stream
+//!     progression-order changes. Each progression-order volume
+//!     specifies `(RSpoc, CSpoc, LYEpoc, REpoc, CEpoc, Ppoc)` and is
+//!     processed in order; per-(component, resolution, precinct) layer
+//!     counters advance across volumes per the spec rule "the layer
+//!     always starts with the next one for a given tile-component,
+//!     resolution level and precinct". POC may appear in the main
+//!     header (applies to all tiles) or per-tile-part-header (override).
+//!   - **Packed packet headers** — PPM (§A.7.4, main header) and PPT
+//!     (§A.7.5, tile-part header). When present, the tier-2 walker
+//!     reads packet headers from the packed buffer instead of from the
+//!     compressed body. PPM segments are sorted by Zppm and the
+//!     resulting concatenated stream is split into per-tile-part
+//!     header chunks (`Nppm`-prefixed). PPT segments are sorted by
+//!     Zppt within each tile.
 //!   - Multi-tile decode (§B.3): the frame-level driver walks the
 //!     tile grid, groups tile-parts by `Isot`, decodes each tile in
 //!     isolation (per-tile RCT / ICT per §G.1 / §G.2), and pastes
@@ -47,9 +63,9 @@
 //!
 //! What is not here yet:
 //!
-//! - User-defined precinct grids, the CPRL / PCRL progression orders,
-//!   and POC-driven progression overrides.
-//! - Encoder input pixel formats beyond `Gray8` / `Rgb24` 8-bit.
+//! - Encoder input pixel formats beyond `Gray8` / `Rgb24` 8-bit, and
+//!   the encoder still emits LRCP only (no POC, no PPM/PPT, no
+//!   user-precinct knobs).
 //! - RGB input whose RCT chroma excursions go outside the 8-bit
 //!   signed range (requires 9-bit signed chroma in the SIZ).
 
