@@ -20,8 +20,10 @@
 //!   - DC level-shift, clipping, reversible component transform (RCT)
 //!     for 3-component 5/3 streams and irreversible component
 //!     transform (ICT) for 3-component 9/7 streams.
-//!   - LRCP + RLCP progression orders. Single quality layer. Default
-//!     precinct size (one precinct per resolution).
+//!   - LRCP, RLCP, and RPCL progression orders. Multiple quality
+//!     layers (per T.800 §B.10 — accumulated coding-pass contributions
+//!     across packets). Default precinct size only (one precinct per
+//!     resolution); RPCL is rejected for user-precinct codestreams.
 //!   - Multi-tile decode (§B.3): the frame-level driver walks the
 //!     tile grid, groups tile-parts by `Isot`, decodes each tile in
 //!     isolation (per-tile RCT / ICT per §G.1 / §G.2), and pastes
@@ -45,8 +47,8 @@
 //!
 //! What is not here yet:
 //!
-//! - Multi-layer (progressive quality) streams, user-defined precinct
-//!   grids, and the CPRL / PCRL progression orders.
+//! - User-defined precinct grids, the CPRL / PCRL progression orders,
+//!   and POC-driven progression overrides.
 //! - Encoder input pixel formats beyond `Gray8` / `Rgb24` 8-bit.
 //! - RGB input whose RCT chroma excursions go outside the 8-bit
 //!   signed range (requires 9-bit signed chroma in the SIZ).
@@ -89,9 +91,11 @@ fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     Ok(Box::new(J2kEncoder::new(params.codec_id.clone())))
 }
 
-/// JPEG 2000 sample encoder — 5/3 integer reversible (lossless),
-/// single-tile, single-layer, default precincts. See
+/// JPEG 2000 sample encoder — 5/3 integer reversible (lossless) or 9/7
+/// irreversible, single-tile, single-layer, default precincts. See
 /// [`encode::EncodeOptions`] for the knobs this implementation honours.
+/// (The decoder side accepts multi-layer codestreams; the encoder
+/// emits one layer for now.)
 pub struct J2kEncoder {
     output_params: CodecParameters,
     opts: encode::EncodeOptions,

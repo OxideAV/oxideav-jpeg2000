@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- decoder: multi-layer (progressive quality) codestreams (T.800 §B.10).
+  Per-code-block coding-pass contributions accumulate across packets;
+  the tier-1 decoder runs once at the end on the concatenated MQ
+  stream (valid under Table D.8 default termination).
+- decoder: RPCL progression order (T.800 §B.12.1.3) for codestreams
+  using the default precinct geometry. User-precinct streams are
+  rejected up front rather than silently mis-walked.
+- tests: 6 new OPJ-interop fixtures covering 3- and 5-layer LRCP /
+  RLCP / RPCL variants, plus a 9/7 irreversible 3-layer fixture; all
+  decode bit-exactly against `opj_decompress`.
+
 ## [0.0.4](https://github.com/OxideAV/oxideav-jpeg2000/compare/v0.0.3...v0.0.4) - 2026-04-25
 
 ### Fixed

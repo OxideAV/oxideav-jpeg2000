@@ -7,8 +7,14 @@
 //!
 //! - **5/3 integer reversible** wavelet (Part-1 lossless default) and
 //!   **9/7 irreversible** float wavelet (lossy).
-//! - **LRCP** and **RLCP** progression orders only.
-//! - One layer only (baseline output).
+//! - **LRCP**, **RLCP**, and **RPCL** progression orders. RPCL only
+//!   under default precincts (where the position dimension collapses
+//!   — see the dispatch in `decode_tile_with_params` below).
+//! - **Multiple quality layers** — each layer accumulates extra coding
+//!   passes per code-block. Per T.800 Table D.8 default ("termination
+//!   only on last pass"), the MQ stream is not broken at intermediate
+//!   layer boundaries, so the per-code-block byte segments concatenate
+//!   into one codeword segment that the tier-1 decoder runs once.
 //! - One precinct per resolution (PPx = PPy = 15 in the COD).
 //!
 //! Decodes a single tile. The multi-tile walk lives in
@@ -368,9 +374,9 @@ pub fn decode_tile_with_params(
     qcd: &QcdParams,
     params: &DecodeParams<'_>,
 ) -> Result<Vec<Vec<i32>>> {
-    if cod.num_layers != 1 {
-        return Err(Error::unsupported(
-            "jpeg2000: only one quality layer is currently supported",
+    if cod.num_layers == 0 {
+        return Err(Error::invalid(
+            "jpeg2000: COD signals zero quality layers (must be >= 1)",
         ));
     }
     if cod.transform > 1 {
@@ -378,9 +384,23 @@ pub fn decode_tile_with_params(
             "jpeg2000: unknown transform id (must be 0 or 1)",
         ));
     }
-    if !(cod.progression_order == 0 || cod.progression_order == 1) {
+    if !matches!(cod.progression_order, 0..=2) {
         return Err(Error::unsupported(
-            "jpeg2000: only LRCP / RLCP progression orders are supported",
+            "jpeg2000: only LRCP / RLCP / RPCL progression orders are supported",
+        ));
+    }
+    // RPCL (T.800 §B.12.1.3) iterates outer in (y, x) over the reference
+    // grid. Under our current "one precinct per resolution" assumption
+    // (default `(15, 15)` precinct geometry — see §A.6.1 / Table A.21),
+    // every resolution has exactly one precinct that aligns with the
+    // top-left of the tile. The (y, x) loop therefore degenerates to
+    // emitting that single precinct's packets in component-then-layer
+    // order, i.e. `for r { for comp { for layer ... } }`. User-specified
+    // precincts would change that flow — refuse them up front so the
+    // decoder doesn't silently mis-walk the codestream.
+    if cod.progression_order == 2 && cod.precincts.iter().any(|&(px, py)| (px, py) != (15, 15)) {
+        return Err(Error::unsupported(
+            "jpeg2000: RPCL with user-specified precincts is not supported yet",
         ));
     }
 
@@ -399,6 +419,9 @@ pub fn decode_tile_with_params(
 
     let mut cursor = Cursor::new(body);
     match cod.progression_order {
+        // LRCP — T.800 §B.12.1.1. Layer-major: every layer's packets are
+        // emitted across all (resolution, component, precinct) tuples
+        // before the next layer begins.
         0 => {
             for layer in 0..cod.num_layers as u32 {
                 for resno in 0..num_res {
@@ -408,10 +431,29 @@ pub fn decode_tile_with_params(
                 }
             }
         }
+        // RLCP — T.800 §B.12.1.2. Resolution-major outer; layer-major
+        // inside.
         1 => {
             for resno in 0..num_res {
                 for layer in 0..cod.num_layers as u32 {
                     for comp in 0..num_comps {
+                        parse_precinct_packet(&mut cursor, layer, &mut layouts[comp][resno], cod)?;
+                    }
+                }
+            }
+        }
+        // RPCL — T.800 §B.12.1.3. Resolution-position-component-layer.
+        // Under default precincts (one precinct per resolution per
+        // component) the position dimension collapses to a single
+        // precinct per (resolution, component), and the spec's
+        // alignment gating fires only once per resolution — at the
+        // top-left of the tile. So the effective walk degenerates to
+        // `for r { for comp { for layer } }`. The check above refuses
+        // user-precinct codestreams to keep this assumption sound.
+        2 => {
+            for resno in 0..num_res {
+                for comp in 0..num_comps {
+                    for layer in 0..cod.num_layers as u32 {
                         parse_precinct_packet(&mut cursor, layer, &mut layouts[comp][resno], cod)?;
                     }
                 }
