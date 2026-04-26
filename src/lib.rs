@@ -109,7 +109,7 @@ fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
 }
 
 fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
-    Ok(Box::new(J2kEncoder::new(params.codec_id.clone())))
+    Ok(Box::new(J2kEncoder::new_from_params(params)))
 }
 
 /// JPEG 2000 sample encoder — 5/3 integer reversible (lossless) or 9/7
@@ -134,6 +134,19 @@ impl J2kEncoder {
         }
     }
 
+    /// Build an encoder from full `CodecParameters`. Stashes width /
+    /// height / pixel format in `output_params` so `send_frame` can read
+    /// them when calling [`encode::encode_frame`] (the slim
+    /// `VideoFrame` no longer carries them).
+    pub fn new_from_params(params: &CodecParameters) -> Self {
+        Self {
+            output_params: params.clone(),
+            opts: encode::EncodeOptions::default(),
+            pending: None,
+            seq_counter: 0,
+        }
+    }
+
     /// Replace the encode parameters. Call before any `send_frame`.
     pub fn set_options(&mut self, opts: encode::EncodeOptions) {
         self.opts = opts;
@@ -150,7 +163,19 @@ impl Encoder for J2kEncoder {
     }
 
     fn send_frame(&mut self, frame: &Frame) -> Result<()> {
-        let bytes = encode::encode_frame(frame, &self.opts)?;
+        let width = self
+            .output_params
+            .width
+            .ok_or_else(|| Error::invalid("jpeg2000 encoder: missing width in params"))?;
+        let height = self
+            .output_params
+            .height
+            .ok_or_else(|| Error::invalid("jpeg2000 encoder: missing height in params"))?;
+        let pix = self
+            .output_params
+            .pixel_format
+            .ok_or_else(|| Error::invalid("jpeg2000 encoder: missing pixel_format in params"))?;
+        let bytes = encode::encode_frame(frame, width, height, pix, &self.opts)?;
         let pkt = Packet::new(0u32, oxideav_core::TimeBase::new(1, 1), bytes);
         self.seq_counter = self.seq_counter.wrapping_add(1);
         self.pending = Some(pkt);

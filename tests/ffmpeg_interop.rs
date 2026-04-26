@@ -38,11 +38,7 @@ fn encode_opj16_decodes_with_ffmpeg() {
     let pixels = parse_pgm(pgm);
     assert_eq!(pixels.len(), 16 * 16);
     let vf = VideoFrame {
-        format: PixelFormat::Gray8,
-        width: 16,
-        height: 16,
         pts: None,
-        time_base: TimeBase::new(1, 1),
         planes: vec![VideoPlane {
             stride: 16,
             data: pixels.clone(),
@@ -50,7 +46,7 @@ fn encode_opj16_decodes_with_ffmpeg() {
     };
     let frame = Frame::Video(vf);
     let opts = EncodeOptions::default();
-    let j2k = encode_frame(&frame, &opts).unwrap();
+    let j2k = encode_frame(&frame, 16, 16, PixelFormat::Gray8, &opts).unwrap();
     let tmp_j2k = "/tmp/our_opj16.j2k";
     let tmp_dec = "/tmp/our_opj16_dec.pgm";
     std::fs::write(tmp_j2k, &j2k).unwrap();

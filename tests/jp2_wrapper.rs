@@ -21,11 +21,7 @@ fn build_gray(w: u32, h: u32) -> VideoFrame {
         }
     }
     VideoFrame {
-        format: PixelFormat::Gray8,
-        width: w,
-        height: h,
         pts: None,
-        time_base: TimeBase::new(1, 1),
         planes: vec![VideoPlane {
             stride: w as usize,
             data,
@@ -58,7 +54,7 @@ fn jp2_wrapper_has_required_boxes() {
         jp2_wrapper: true,
         ..Default::default()
     };
-    let bytes = encode_frame(&Frame::Video(src.clone()), &opts).expect("encode");
+    let bytes = encode_frame(&Frame::Video(src.clone()), 64, 64, PixelFormat::Gray8, &opts).expect("encode");
 
     // The first 12 bytes must be the JP2 signature box:
     //   00 00 00 0C 6A 50 20 20 0D 0A 87 0A
@@ -124,7 +120,7 @@ fn jp2_inner_codestream_decodes_back() {
         jp2_wrapper: true,
         ..Default::default()
     };
-    let bytes = encode_frame(&Frame::Video(src.clone()), &opts).expect("encode");
+    let bytes = encode_frame(&Frame::Video(src.clone()), 64, 64, PixelFormat::Gray8, &opts).expect("encode");
 
     // Extract and feed the inner j2k to the decoder.
     let cs = extract_jp2_codestream(&bytes).expect("extract jp2c");
@@ -145,9 +141,6 @@ fn jp2_inner_codestream_decodes_back() {
         Frame::Video(v) => v,
         _ => panic!("expected video frame"),
     };
-    assert_eq!(vf.width, 64);
-    assert_eq!(vf.height, 64);
-    assert_eq!(vf.format, PixelFormat::Gray8);
     assert_eq!(vf.planes[0].data, src.planes[0].data);
 }
 
@@ -161,7 +154,7 @@ fn jp2_full_wrapper_decodes_transparently() {
         jp2_wrapper: true,
         ..Default::default()
     };
-    let bytes = encode_frame(&Frame::Video(src.clone()), &opts).expect("encode");
+    let bytes = encode_frame(&Frame::Video(src.clone()), 64, 64, PixelFormat::Gray8, &opts).expect("encode");
 
     let mut reg = CodecRegistry::new();
     oxideav_jpeg2000::register(&mut reg);
@@ -189,11 +182,7 @@ fn jp2_wrapper_on_9p7_rgb_encodes_and_decodes() {
         }
     }
     let src = VideoFrame {
-        format: PixelFormat::Rgb24,
-        width: 32,
-        height: 32,
         pts: None,
-        time_base: TimeBase::new(1, 1),
         planes: vec![VideoPlane {
             stride: 32 * 3,
             data,
@@ -204,7 +193,8 @@ fn jp2_wrapper_on_9p7_rgb_encodes_and_decodes() {
         jp2_wrapper: true,
         ..Default::default()
     };
-    let bytes = encode_frame(&Frame::Video(src), &opts).expect("encode");
+    let bytes =
+        encode_frame(&Frame::Video(src), 32, 32, PixelFormat::Rgb24, &opts).expect("encode");
     assert_eq!(
         &bytes[..12],
         &[0, 0, 0, 12, b'j', b'P', b' ', b' ', 0x0D, 0x0A, 0x87, 0x0A]
@@ -223,6 +213,4 @@ fn jp2_wrapper_on_9p7_rgb_encodes_and_decodes() {
         Frame::Video(v) => v,
         _ => panic!("expected video frame"),
     };
-    assert_eq!(vf.width, 32);
-    assert_eq!(vf.height, 32);
 }

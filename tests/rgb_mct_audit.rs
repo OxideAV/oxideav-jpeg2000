@@ -67,8 +67,6 @@ fn assert_rgb_bit_exact(name: &str, j2k: &[u8], ppm: &[u8], expected_w: u32, exp
     );
 
     let vf = decode_j2k(j2k);
-    assert_eq!(vf.width, w);
-    assert_eq!(vf.height, h);
     assert_eq!(vf.planes.len(), 3, "{name}: RGB → 3 planes");
 
     let wu = w as usize;

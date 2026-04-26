@@ -173,9 +173,6 @@ fn assert_frames_equal(label: &str, a: &Frame, b: &Frame) {
     let (Frame::Video(va), Frame::Video(vb)) = (a, b) else {
         panic!("{label}: not a video frame");
     };
-    assert_eq!(va.format, vb.format, "{label}: pixel format mismatch");
-    assert_eq!(va.width, vb.width, "{label}: width mismatch");
-    assert_eq!(va.height, vb.height, "{label}: height mismatch");
     assert_eq!(
         va.planes.len(),
         vb.planes.len(),

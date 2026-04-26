@@ -20,11 +20,7 @@ fn build_gradient(w: u32, h: u32) -> VideoFrame {
         }
     }
     VideoFrame {
-        format: PixelFormat::Gray8,
-        width: w,
-        height: h,
         pts: None,
-        time_base: TimeBase::new(1, 1),
         planes: vec![VideoPlane {
             stride: w as usize,
             data,
@@ -34,11 +30,7 @@ fn build_gradient(w: u32, h: u32) -> VideoFrame {
 
 fn build_constant(w: u32, h: u32, value: u8) -> VideoFrame {
     VideoFrame {
-        format: PixelFormat::Gray8,
-        width: w,
-        height: h,
         pts: None,
-        time_base: TimeBase::new(1, 1),
         planes: vec![VideoPlane {
             stride: w as usize,
             data: vec![value; (w * h) as usize],
@@ -63,11 +55,8 @@ fn decode(bytes: &[u8]) -> VideoFrame {
 fn roundtrip_constant_gray_is_bit_exact() {
     let src = build_constant(64, 64, 137);
     let bytes =
-        encode_frame(&Frame::Video(src.clone()), &EncodeOptions::default()).expect("encode");
+        encode_frame(&Frame::Video(src.clone()), 64, 64, PixelFormat::Gray8, &EncodeOptions::default()).expect("encode");
     let dec = decode(&bytes);
-    assert_eq!(dec.width, src.width);
-    assert_eq!(dec.height, src.height);
-    assert_eq!(dec.format, PixelFormat::Gray8);
     assert_eq!(dec.planes.len(), 1);
     assert_eq!(
         dec.planes[0].data, src.planes[0].data,
@@ -85,7 +74,8 @@ fn roundtrip_16x16_one_decomp_level_is_bit_exact() {
         num_decomp: 1,
         ..EncodeOptions::default()
     };
-    let bytes = encode_frame(&Frame::Video(src.clone()), &opts).expect("encode");
+    let bytes =
+        encode_frame(&Frame::Video(src.clone()), 16, 16, PixelFormat::Gray8, &opts).expect("encode");
     let dec = decode(&bytes);
     assert_eq!(
         dec.planes[0].data, src.planes[0].data,
@@ -97,14 +87,12 @@ fn roundtrip_16x16_one_decomp_level_is_bit_exact() {
 fn roundtrip_gradient_is_bit_exact() {
     let src = build_gradient(64, 64);
     let bytes =
-        encode_frame(&Frame::Video(src.clone()), &EncodeOptions::default()).expect("encode");
+        encode_frame(&Frame::Video(src.clone()), 64, 64, PixelFormat::Gray8, &EncodeOptions::default()).expect("encode");
     let dec = decode(&bytes);
-    assert_eq!(dec.width, src.width);
-    assert_eq!(dec.height, src.height);
     // Compare a few sample points first — makes failures easier to
     // read than a giant `assert_eq` on 4096 bytes.
-    for y in (0..src.height as usize).step_by(8) {
-        for x in (0..src.width as usize).step_by(8) {
+    for y in (0..64usize).step_by(8) {
+        for x in (0..64usize).step_by(8) {
             let i = y * src.planes[0].stride + x;
             assert_eq!(
                 dec.planes[0].data[i], src.planes[0].data[i],

@@ -206,19 +206,29 @@ pub(crate) fn forward_ict_u8(
 /// - `Gray8` → single component, 8-bit, DC-level-shifted.
 /// - `Rgb24` → three components, 8-bit, optionally passed through the
 ///   forward RCT (for 5/3) or ICT (for 9/7) component transform.
-pub fn encode_frame(frame: &Frame, opts: &EncodeOptions) -> Result<Vec<u8>> {
+///
+/// Width / height / pixel format moved off the slim `VideoFrame`; pass
+/// them explicitly. Callers typically read them from their own
+/// `CodecParameters`.
+pub fn encode_frame(
+    frame: &Frame,
+    width: u32,
+    height: u32,
+    pix: PixelFormat,
+    opts: &EncodeOptions,
+) -> Result<Vec<u8>> {
     let vf = match frame {
         Frame::Video(v) => v,
         _ => return Err(Error::unsupported("jpeg2000: only video frames supported")),
     };
 
-    let w = vf.width;
-    let h = vf.height;
+    let w = width;
+    let h = height;
     let num_pixels = w as usize * h as usize;
     let precision = 8u32; // Ssiz ≤ 8 — scope restricted to 8-bit samples.
 
     // Extract per-channel u8 planes for the supported pixel formats.
-    let (channels_u8, num_comps, is_color) = match vf.format {
+    let (channels_u8, num_comps, is_color) = match pix {
         PixelFormat::Gray8 => {
             if vf.planes.len() != 1 {
                 return Err(Error::invalid("jpeg2000: Gray8 frame must have one plane"));
@@ -253,7 +263,7 @@ pub fn encode_frame(frame: &Frame, opts: &EncodeOptions) -> Result<Vec<u8>> {
         _ => {
             return Err(Error::unsupported(format!(
                 "jpeg2000: encoder: unsupported pixel format {:?}",
-                vf.format
+                pix
             )));
         }
     };

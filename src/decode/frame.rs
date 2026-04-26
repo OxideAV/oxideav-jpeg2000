@@ -32,7 +32,7 @@
 //! otherwise contain at least one tile-part for at least one tile —
 //! an empty codestream is rejected.
 
-use oxideav_core::{Error, Frame, PixelFormat, Result, TimeBase, VideoFrame, VideoPlane};
+use oxideav_core::{Error, Frame, PixelFormat, Result, VideoFrame, VideoPlane};
 
 use super::tile::{
     decode_tile_with_params, parse_cod, parse_poc, parse_qcd, CodParams, DecodeParams, PocParams,
@@ -322,14 +322,10 @@ pub fn decode_frame(cs: &Codestream, buf: &[u8]) -> Result<Frame> {
         }
     };
 
-    Ok(Frame::Video(VideoFrame {
-        format: pixel_format,
-        width: img_w,
-        height: img_h,
-        pts: None,
-        time_base: TimeBase::new(1, 1),
-        planes,
-    }))
+    let _ = pixel_format;
+    let _ = img_w;
+    let _ = img_h;
+    Ok(Frame::Video(VideoFrame { pts: None, planes }))
 }
 
 /// Number of tiles in the grid along X and Y. T.800 §B.3:

@@ -26,11 +26,7 @@ fn build_rgb_gradient(w: u32, h: u32) -> VideoFrame {
         }
     }
     VideoFrame {
-        format: PixelFormat::Rgb24,
-        width: w,
-        height: h,
         pts: None,
-        time_base: TimeBase::new(1, 1),
         planes: vec![VideoPlane {
             stride: (w * 3) as usize,
             data,
@@ -47,11 +43,7 @@ fn build_gray_gradient(w: u32, h: u32) -> VideoFrame {
         }
     }
     VideoFrame {
-        format: PixelFormat::Gray8,
-        width: w,
-        height: h,
         pts: None,
-        time_base: TimeBase::new(1, 1),
         planes: vec![VideoPlane {
             stride: w as usize,
             data,
@@ -95,11 +87,8 @@ fn roundtrip_97_gray_psnr_above_30db() {
         transform: TransformMode::Irreversible97,
         ..Default::default()
     };
-    let bytes = encode_frame(&Frame::Video(src.clone()), &opts).expect("encode");
+    let bytes = encode_frame(&Frame::Video(src.clone()), 64, 64, PixelFormat::Gray8, &opts).expect("encode");
     let dec = decode(&bytes);
-    assert_eq!(dec.width, 64);
-    assert_eq!(dec.height, 64);
-    assert_eq!(dec.format, PixelFormat::Gray8);
     let psnr = psnr_u8(&src.planes[0].data, &dec.planes[0].data);
     println!("9/7 gray PSNR: {:.2} dB", psnr);
     assert!(
@@ -116,26 +105,17 @@ fn roundtrip_97_rgb_psnr_above_30db() {
         transform: TransformMode::Irreversible97,
         ..Default::default()
     };
-    let bytes = encode_frame(&Frame::Video(src.clone()), &opts).expect("encode");
+    let bytes =
+        encode_frame(&Frame::Video(src.clone()), 64, 64, PixelFormat::Rgb24, &opts).expect("encode");
     let dec = decode(&bytes);
-    assert_eq!(dec.width, 64);
-    assert_eq!(dec.height, 64);
     // Decoder emits planar YUV444 / RGB when MCT is applied — the
-    // decoder inverts ICT and writes per-plane output. Reconstruct a
-    // packed RGB24 buffer for comparison with the source.
-    assert!(
-        matches!(
-            dec.format,
-            PixelFormat::Yuv444P | PixelFormat::Rgb24 | PixelFormat::Yuv420P
-        ),
-        "unexpected pixel format: {:?}",
-        dec.format
-    );
+    // pixel format moved off VideoFrame; the codec stream params on
+    // the decoder side carry it now.
     assert_eq!(dec.planes.len(), 3);
     // Reassemble packed RGB24 from three 64×64 planes for PSNR
     // comparison.
-    let w = dec.width as usize;
-    let h = dec.height as usize;
+    let w = 64usize;
+    let h = 64usize;
     let mut decoded_packed = Vec::with_capacity(w * h * 3);
     for y in 0..h {
         for x in 0..w {
@@ -176,11 +156,7 @@ fn build_rgb_near_neutral(w: u32, h: u32) -> VideoFrame {
         }
     }
     VideoFrame {
-        format: PixelFormat::Rgb24,
-        width: w,
-        height: h,
         pts: None,
-        time_base: TimeBase::new(1, 1),
         planes: vec![VideoPlane {
             stride: (w * 3) as usize,
             data,
@@ -194,10 +170,11 @@ fn roundtrip_53_rgb_bit_exact() {
     // chroma stays in the 8-bit signed range.
     let src = build_rgb_near_neutral(64, 64);
     let opts = EncodeOptions::default(); // 5/3 reversible, MCT on
-    let bytes = encode_frame(&Frame::Video(src.clone()), &opts).expect("encode");
+    let bytes =
+        encode_frame(&Frame::Video(src.clone()), 64, 64, PixelFormat::Rgb24, &opts).expect("encode");
     let dec = decode(&bytes);
-    let w = dec.width as usize;
-    let h = dec.height as usize;
+    let w = 64usize;
+    let h = 64usize;
     let mut decoded_packed = Vec::with_capacity(w * h * 3);
     for y in 0..h {
         for x in 0..w {
@@ -248,11 +225,7 @@ fn build_rgb_full_saturation(w: u32, h: u32) -> VideoFrame {
         }
     }
     VideoFrame {
-        format: PixelFormat::Rgb24,
-        width: w,
-        height: h,
         pts: None,
-        time_base: TimeBase::new(1, 1),
         planes: vec![VideoPlane {
             stride: (w * 3) as usize,
             data,
@@ -264,10 +237,11 @@ fn build_rgb_full_saturation(w: u32, h: u32) -> VideoFrame {
 fn roundtrip_53_rgb_full_saturation_bit_exact() {
     let src = build_rgb_full_saturation(32, 32);
     let opts = EncodeOptions::default(); // 5/3 reversible, MCT on
-    let bytes = encode_frame(&Frame::Video(src.clone()), &opts).expect("encode");
+    let bytes =
+        encode_frame(&Frame::Video(src.clone()), 32, 32, PixelFormat::Rgb24, &opts).expect("encode");
     let dec = decode(&bytes);
-    let w = dec.width as usize;
-    let h = dec.height as usize;
+    let w = 32usize;
+    let h = 32usize;
     let mut decoded_packed = Vec::with_capacity(w * h * 3);
     for y in 0..h {
         for x in 0..w {

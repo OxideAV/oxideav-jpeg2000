@@ -99,7 +99,11 @@ fn our_decode_gray(bytes: &[u8]) -> (u32, u32, Vec<u8>) {
         _ => panic!("expected video frame"),
     };
     assert_eq!(vf.planes.len(), 1, "expected single-plane (gray)");
-    (vf.width, vf.height, vf.planes[0].data.clone())
+    // Width / height moved off VideoFrame — recover from the plane's
+    // stride and data length (Gray8 single-plane: stride == width).
+    let w = vf.planes[0].stride as u32;
+    let h = (vf.planes[0].data.len() / vf.planes[0].stride) as u32;
+    (w, h, vf.planes[0].data.clone())
 }
 
 fn pgm_data_offset(buf: &[u8]) -> Option<usize> {
