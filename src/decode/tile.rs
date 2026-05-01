@@ -455,7 +455,7 @@ pub fn build_subbands(tx0: u32, ty0: u32, tx1: u32, ty1: u32, num_decomp: u8) ->
 /// LL_r coordinates back to reference-grid coordinates for the
 /// position-driven progression orders.
 #[allow(clippy::too_many_arguments)]
-fn build_resolutions(
+pub(crate) fn build_resolutions(
     subbands: Vec<SubbandInfo>,
     num_decomp: u8,
     cblk_w_log2: u8,
@@ -1413,7 +1413,7 @@ fn walk_packets(
     Ok(())
 }
 
-fn read_num_passes(bio: &mut Bio<'_>) -> u32 {
+pub(crate) fn read_num_passes(bio: &mut Bio<'_>) -> u32 {
     if bio.read_bit() == 0 {
         return 1;
     }
@@ -1431,7 +1431,7 @@ fn read_num_passes(bio: &mut Bio<'_>) -> u32 {
     37 + bio.read(7)
 }
 
-fn ilog2(n: u32) -> u32 {
+pub(crate) fn ilog2(n: u32) -> u32 {
     if n == 0 {
         0
     } else {

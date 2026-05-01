@@ -68,11 +68,30 @@
 //!   boxes from ISO/IEC 15444-1 Annex I; the decoder auto-detects and
 //!   strips the wrapper on input.
 //!
+//! HTJ2K (ISO/IEC 15444-15) — opt-in via the `htj2k` Cargo feature:
+//!
+//! - **CAP / CPF / PRF marker parsing** in [`codestream::parse`]:
+//!   `Pcap15` (mask `0x0002_0000`) discriminates HT codestreams from
+//!   classic Part-1 ones, and the `Ccap15` sub-profile bits + `CPFnum`
+//!   are surfaced via [`Probe`] / [`Cap`] / [`Cpf`].
+//! - **FBCOT entropy decoder** in
+//!   [`decode::htj2k::decode_codeblock`] — the three HT passes
+//!   (cleanup + SigProp + MagRef) per Annex B of 15444-15, with both
+//!   CxtVLC tables of Annex C transcribed verbatim.
+//! - **Tier-2 packet walker** in [`decode::htj2k::decode_frame_htj2k`]
+//!   that reuses the Part-1 packet header syntax (T.800 §B.10) and
+//!   routes each codeblock's bytes through the FBCOT decoder. Handles
+//!   single-tile, single-layer, LRCP-only HT codestreams; HT cleanup
+//!   + 5/3 reversible inverse DWT round-trip end-to-end. Multi-layer,
+//!   POC, PPM/PPT, and 9/7 irreversible HT support is on the round-4
+//!   roadmap.
+//!
 //! What is not here yet:
 //!
 //! - Encoder input pixel formats beyond `Gray8` / `Rgb24` 8-bit, and
 //!   the encoder still emits a single quality layer with default
 //!   precincts (one packet per (component, resolution)).
+//! - HTJ2K encoder. Round 3 only ships the decoder side.
 
 pub mod codestream;
 pub mod decode;
@@ -317,27 +336,20 @@ impl Decoder for J2kDecoder {
             packet.data.clone()
         };
         let cs = codestream::parse(&data)?;
-        // HTJ2K stub gate (ISO/IEC 15444-15). The classic EBCOT
-        // tier-1 path cannot decode HT code-blocks: the FBCOT
-        // entropy decoder (Annex B of 15444-15) is a wholly different
-        // bitstream syntax. With the `htj2k` feature, we explicitly
-        // surface this as `Error::Unsupported` so callers get a
-        // clear signal instead of a confusing tier-1 failure deep
-        // inside the classic decoder.
-        //
-        // Round 2 status: the per-codeblock FBCOT entropy decoder
-        // ([`decode::htj2k::decode_codeblock`]) is implemented and
-        // tested against hand-built fixtures, but the tier-2 packet
-        // header walker that would carve up a real HTJ2K codestream
-        // into per-codeblock HT cleanup / refinement segments is
-        // round 3 work. Until that lands, we still return
-        // `Unsupported` here so callers get a clear signal.
+        // HTJ2K dispatch (ISO/IEC 15444-15). The classic EBCOT tier-1
+        // path cannot decode HT code-blocks: the FBCOT entropy decoder
+        // (Annex B of 15444-15) is a wholly different bitstream syntax.
+        // With the `htj2k` feature enabled, route HT codestreams
+        // through [`decode::htj2k::decode_frame_htj2k`], which reuses
+        // the Part-1 packet-header tier-2 walker but dispatches per
+        // codeblock to the FBCOT decoder.
         #[cfg(feature = "htj2k")]
         if cs.is_htj2k() {
+            let frame_res = decode::htj2k::decode_frame_htj2k(&cs, &data);
             self.last_parsed = Some(cs);
-            return Err(Error::unsupported(
-                "HTJ2K block decode not yet implemented: tier-2 dispatch pending",
-            ));
+            let frame = frame_res?;
+            self.pending = Some(frame);
+            return Ok(());
         }
         let frame = decode::frame::decode_frame(&cs, &data)?;
         self.last_parsed = Some(cs);

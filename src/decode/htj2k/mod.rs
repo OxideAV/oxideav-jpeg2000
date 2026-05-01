@@ -28,10 +28,12 @@ mod magref;
 mod mel;
 mod sigprop;
 mod streams;
+mod tier2;
 mod uvlc;
 
 pub use cleanup::CleanupOutput;
 pub use sigprop::SigPropOutput;
+pub use tier2::decode_frame_htj2k;
 
 use oxideav_core::{Error, Result};
 

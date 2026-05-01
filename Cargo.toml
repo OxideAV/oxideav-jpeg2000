@@ -16,3 +16,11 @@ categories = ["multimedia::encoding", "multimedia::images"]
 [dependencies]
 oxideav-core = "0.1"
 
+[features]
+# High-Throughput JPEG 2000 (ISO/IEC 15444-15) decoder. Enables the
+# FBCOT block-coding entropy decoder and the tier-2 packet walker that
+# routes per-codeblock segments through it. When the feature is off the
+# decoder still parses CAP/CPF markers and reports HTJ2K via `probe()`,
+# but `J2kDecoder::send_packet` falls through to the classic-only path.
+htj2k = []
+
