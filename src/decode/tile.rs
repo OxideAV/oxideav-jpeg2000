@@ -292,6 +292,14 @@ pub struct CblkState {
     pub lblock: u32,
     pub data: Vec<u8>,
     pub missing_msb: u32,
+    /// HTJ2K-only auxiliary buffer for the HT refinement segment
+    /// (`Dref`, length `Lref`) when a packet contains both an HT
+    /// cleanup pass *and* SigProp/MagRef passes (Z_blk in {2, 3}).
+    /// Per ISO/IEC 15444-15 §B.3 each such packet emits TWO codeword
+    /// segments: the cleanup terminating at pass index 0 (which is in
+    /// the T set), and the refinement terminating at the last included
+    /// pass. The classic Part-1 walker leaves this empty.
+    pub data_ref: Vec<u8>,
 }
 
 /// Per-(precinct, sub-band) tier-2 decoder state. Holds the inclusion

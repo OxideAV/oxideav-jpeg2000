@@ -81,10 +81,10 @@
 //! - **Tier-2 packet walker** in [`decode::htj2k::decode_frame_htj2k`]
 //!   that reuses the Part-1 packet header syntax (T.800 §B.10) and
 //!   routes each codeblock's bytes through the FBCOT decoder. Handles
-//!   single-tile, single-layer, LRCP-only HT codestreams; HT cleanup
-//!   + 5/3 reversible inverse DWT round-trip end-to-end. Multi-layer,
-//!   POC, PPM/PPT, and 9/7 irreversible HT support is on the round-4
-//!   roadmap.
+//!   single-tile, single-layer, LRCP-only HT codestreams. Round 4
+//!   adds multi-pass codeblock dispatch (Z_blk in {2, 3} → Lcup/Lref
+//!   split) and routes the existing 9/7 irreversible IDWT through
+//!   the FBCOT path.
 //!
 //! What is not here yet:
 //!

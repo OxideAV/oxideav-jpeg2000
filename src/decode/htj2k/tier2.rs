@@ -272,8 +272,13 @@ fn parse_packet(
     }
     let header_slice = cur.remaining();
     let mut bio = Bio::new(header_slice);
-    // (sb_idx, global_cblk_idx, length).
-    let mut pending: Vec<(usize, usize, u32)> = Vec::new();
+    // Per HTJ2K §B.3 a packet contribution to one code-block consists of
+    // either 1 codeword segment (Z_blk = 1: cleanup only) or 2 codeword
+    // segments (Z_blk in {2, 3}: cleanup terminates at pass index 0 ∈ T,
+    // and the SigProp+MagRef refinement segment terminates at the last
+    // included pass). We capture per-codeblock pending state as
+    // `(sb_idx, g_idx, lcup, lref)`; `lref == 0` covers Z_blk = 1.
+    let mut pending: Vec<(usize, usize, u32, u32)> = Vec::new();
 
     if bio.read_bit() == 0 {
         bio.inalign();
@@ -322,13 +327,33 @@ fn parse_packet(
                     while bio.read_bit() == 1 {
                         res.cblk_states[sb_idx][g_idx].lblock += 1;
                     }
-                    let len_bits = res.cblk_states[sb_idx][g_idx].lblock + ilog2(num_passes);
-                    let length = bio.read(len_bits);
+                    // Per T.800 §B.10.7.2 "multiple codeword segments" +
+                    // ISO/IEC 15444-15 §B.3, an HTJ2K packet contribution
+                    // produces 1 codeword segment when num_passes == 1
+                    // (cleanup only) and 2 codeword segments when
+                    // num_passes ∈ {2, 3} — the cleanup terminates at
+                    // pass index 0 ∈ T, the refinement segment at the
+                    // last included pass. Each length field uses
+                    // `Lblock + ⌊log2(passes_added_in_segment)⌋` bits.
+                    //
+                    //   N=1: K=1, lengths = [log2(1)] bits  → [Lblock]
+                    //   N=2: K=2, lengths = [log2(1), log2(1)]
+                    //   N=3: K=2, lengths = [log2(1), log2(2)]
+                    let lblock = res.cblk_states[sb_idx][g_idx].lblock;
+                    let (lcup, lref) = if num_passes <= 1 {
+                        (bio.read(lblock + ilog2(num_passes)), 0u32)
+                    } else {
+                        // First segment: 1 pass added (the cleanup pass).
+                        let l1 = bio.read(lblock + ilog2(1));
+                        // Second segment: (num_passes - 1) passes added.
+                        let l2 = bio.read(lblock + ilog2(num_passes - 1));
+                        (l1, l2)
+                    };
                     let st = &mut res.cblk_states[sb_idx][g_idx];
                     st.included = true;
                     st.total_passes += num_passes;
                     st.missing_msb = missing_msb;
-                    pending.push((sb_idx, g_idx, length));
+                    pending.push((sb_idx, g_idx, lcup, lref));
                 }
             }
         }
@@ -339,11 +364,17 @@ fn parse_packet(
     if cod.eph_marker && cur.remaining().starts_with(&[0xFF, 0x92]) {
         cur.consume(2)?;
     }
-    for (sb_idx, g_idx, length) in pending {
-        let bytes = cur.consume(length as usize)?.to_vec();
+    for (sb_idx, g_idx, lcup, lref) in pending {
+        let cleanup_bytes = cur.consume(lcup as usize)?.to_vec();
         res.cblk_states[sb_idx][g_idx]
             .data
-            .extend_from_slice(&bytes);
+            .extend_from_slice(&cleanup_bytes);
+        if lref > 0 {
+            let ref_bytes = cur.consume(lref as usize)?.to_vec();
+            res.cblk_states[sb_idx][g_idx]
+                .data_ref
+                .extend_from_slice(&ref_bytes);
+        }
     }
     Ok(())
 }
@@ -438,6 +469,18 @@ fn synth_component_htj2k_53(
     Ok(ll)
 }
 
+/// 9/7 irreversible HTJ2K synthesis.
+///
+/// Mirrors `crate::decode::tile::synth_component_97` but routes per-
+/// codeblock byte segments through the FBCOT decoder. Samples emerge
+/// from the cleanup / SigProp / MagRef passes as signed integer
+/// magnitudes at the band's M_b bit-depth (with the +0.5 oneplushalf
+/// embedded — see `decode_subband_htj2k_97`); we dequantise them to
+/// floats with the T.800 §E.1.1.2 stepsize formula
+/// `0.5 * (1 + mant/2048) * 2^(Rb - eps)` (where `Rb = precision`,
+/// matching OpenJPEG's `BUG_WEIRD_TWO_INVK` convention so the K /
+/// 2/K gain in `idwt_97_1d` cancels the per-band `log2_gain_b`).
+#[allow(clippy::needless_range_loop)]
 fn synth_component_htj2k_97(
     layouts: &[ResolutionLayout],
     num_res: usize,
@@ -446,34 +489,111 @@ fn synth_component_htj2k_97(
     qcd: &QcdParams,
     precision: u32,
 ) -> Result<Vec<i32>> {
-    // Round 3 only ships the reversible transform end-to-end. The 9/7
-    // path needs the same per-band stepsize machinery as the classic
-    // `synth_component_97` — left as a future-round task.
-    let _ = (layouts, num_res, comp_w, comp_h, qcd, precision);
-    Err(Error::unsupported(
-        "HTJ2K: 9/7 irreversible transform not yet wired (round 4+)",
-    ))
+    let mut band_bufs: Vec<Vec<f32>> = Vec::with_capacity(num_res * 3 + 1);
+    for resno in 0..num_res {
+        let layout = &layouts[resno];
+        for (sb_idx, sb) in layout.subbands.iter().enumerate() {
+            let bw = (sb.x1 - sb.x0) as usize;
+            let bh = (sb.y1 - sb.y0) as usize;
+            let mut buf = vec![0f32; bw * bh];
+            decode_subband_htj2k_97(
+                layout,
+                sb_idx,
+                sb.band_idx,
+                qcd,
+                &mut buf,
+                bw,
+                bh,
+                precision,
+            )?;
+            band_bufs.push(buf);
+        }
+    }
+
+    let mut ll = band_bufs[0].clone();
+    let layout0 = &layouts[0];
+    let (mut ll_w, mut ll_h) = (
+        (layout0.subbands[0].x1 - layout0.subbands[0].x0) as usize,
+        (layout0.subbands[0].y1 - layout0.subbands[0].y0) as usize,
+    );
+
+    for resno in 1..num_res {
+        let layout = &layouts[resno];
+        let hl = &band_bufs[1 + (resno - 1) * 3];
+        let lh = &band_bufs[1 + (resno - 1) * 3 + 1];
+        let hh = &band_bufs[1 + (resno - 1) * 3 + 2];
+        let hl_sb = &layout.subbands[0];
+        let lh_sb = &layout.subbands[1];
+        let hh_sb = &layout.subbands[2];
+        let hl_w = (hl_sb.x1 - hl_sb.x0) as usize;
+        let hl_h = (hl_sb.y1 - hl_sb.y0) as usize;
+        let lh_w = (lh_sb.x1 - lh_sb.x0) as usize;
+        let lh_h = (lh_sb.y1 - lh_sb.y0) as usize;
+        let hh_w = (hh_sb.x1 - hh_sb.x0) as usize;
+        let hh_h = (hh_sb.y1 - hh_sb.y0) as usize;
+        let canvas_w = ll_w + hl_w;
+        let canvas_h = ll_h + lh_h;
+        debug_assert_eq!(canvas_w, lh_w + hh_w);
+        debug_assert_eq!(canvas_h, hl_h + hh_h);
+        let mut canvas = vec![0f32; canvas_w * canvas_h];
+        for y in 0..ll_h {
+            for x in 0..ll_w {
+                canvas[y * canvas_w + x] = ll[y * ll_w + x];
+            }
+        }
+        for y in 0..hl_h {
+            for x in 0..hl_w {
+                canvas[y * canvas_w + (ll_w + x)] = hl[y * hl_w + x];
+            }
+        }
+        for y in 0..lh_h {
+            for x in 0..lh_w {
+                canvas[(ll_h + y) * canvas_w + x] = lh[y * lh_w + x];
+            }
+        }
+        for y in 0..hh_h {
+            for x in 0..hh_w {
+                canvas[(ll_h + y) * canvas_w + (ll_w + x)] = hh[y * hh_w + x];
+            }
+        }
+        dwt::idwt_97(&mut canvas, canvas_w, canvas_h, canvas_w);
+        ll = canvas;
+        ll_w = canvas_w;
+        ll_h = canvas_h;
+    }
+
+    debug_assert_eq!(ll.len(), comp_w * comp_h);
+    Ok(ll.into_iter().map(|v| v.round() as i32).collect())
 }
 
 /// Decode every code-block of one sub-band via FBCOT and write the
-/// signed sample magnitudes into `buf` (raster order, width `bw`).
+/// signed integer sample magnitudes into `buf` (raster order, width
+/// `bw`). Used by the 5/3 reversible synthesis path.
 ///
-/// `is_lossy` selects whether the magnitudes get an extra `>> 1` shift
-/// (mirrors the classic 5/3 path's `v / 2`). For HTJ2K reversible
-/// (5/3) the convention is the same: the cleanup pass output `μ` is
-/// the "M_b-bit" magnitude and we keep parity with the encoder by
-/// dividing by 2 — this matches `synth_component_53` in the classic
-/// driver.
+/// Per ISO/IEC 15444-15 §7.6 the *signed integer* sample value at the
+/// band's M_b precision is reconstructed from the per-sample tuple
+/// `(μ_n, s_n, z_n, r_n)`:
+///
+/// - cleanup-significant samples (`σ_n = 1`) contribute `±μ_n`,
+///   optionally shifted left by 1 and OR-d with `r_n` when MagRef
+///   added a refinement bit (`z_n = 1`);
+/// - SigProp-newly-significant samples (cleanup `σ_n = 0`, SigProp
+///   `z_n = 1`) contribute `±r_n` at the band LSB, where the sign
+///   was set by `decodeSigPropSign`.
+///
+/// We then divide by 2 for the lossless 5/3 path to undo the
+/// `oneplushalf` scaling — same convention as
+/// `crate::decode::tile::synth_component_53`.
 #[allow(clippy::too_many_arguments)]
 fn decode_subband_htj2k(
     layout: &ResolutionLayout,
     sb_idx: usize,
-    band_idx: usize,
-    qcd: &QcdParams,
+    _band_idx: usize,
+    _qcd: &QcdParams,
     buf: &mut [i32],
     bw: usize,
     _bh: usize,
-    is_lossy: bool,
+    _is_lossy: bool,
 ) -> Result<()> {
     let cblks = &layout.cblk_states[sb_idx];
     let cblks_w = layout.cblks_w[sb_idx];
@@ -493,87 +613,185 @@ fn decode_subband_htj2k(
                 continue;
             }
             let zblk = match st.total_passes {
+                0 => ZBlk::Zero,
                 1 => ZBlk::One,
                 2 => ZBlk::Two,
                 3 => ZBlk::Three,
                 _ => {
                     return Err(Error::unsupported(
-                        "HTJ2K: more than 3 coding passes per code-block (round 4+)",
+                        "HTJ2K: more than 3 coding passes per code-block (round 5+)",
                     ));
                 }
             };
-            // For Z_blk == 1 the entire codeblock byte segment is the
-            // cleanup segment; no refinement bytes. For Z_blk in
-            // {2, 3} the segment also carries an HT refinement segment
-            // appended after Lcup. Splitting Lcup vs Lref requires the
-            // tier-2 termination model (one length per terminated
-            // segment), which the encoder side hasn't produced for HTJ2K
-            // yet — for now we surface multi-pass codeblocks as
-            // Unsupported. The round-3 fixture exercises Z_blk = 1.
-            let (dcup, dref): (&[u8], &[u8]) = match zblk {
-                ZBlk::Zero => (&[][..], &[][..]),
-                ZBlk::One => (&st.data[..], &[][..]),
-                _ => {
-                    return Err(Error::unsupported(
-                        "HTJ2K: SigProp/MagRef refinement segments need tier-2 termination split (round 4+)",
-                    ));
-                }
-            };
+            let dcup: &[u8] = &st.data[..];
+            let dref: &[u8] = &st.data_ref[..];
             let out = decode_codeblock(w as u32, h as u32, zblk, dcup, dref)?;
 
-            // Compute the band's bit-depth M_b for sign reconstruction.
-            // For HT cleanup, sample value = sign ? -mag : mag, then
-            // shifted right by `M_b - bpno - 1` to land at the correct
-            // bit-plane. For lossless 5/3 with `Z_blk = 1` the cleanup
-            // covers all bit-planes so no extra shift is needed past
-            // the missing-MSB accounting baked into the encoder.
-            let (eps, _mant) = qcd.bands[band_idx];
-            let band_numbps = qcd.guard_bits as i32 + eps as i32 - 1;
-            let bpno = band_numbps + 1 - st.missing_msb as i32;
-            if bpno < 1 {
-                continue;
-            }
-
-            // Map quad-scan output → raster.
+            // Need the FBCOT cleanup output to know `σ_n` separately
+            // from `z_n` so we can decide whether `r_n` extends an
+            // existing magnitude (z extends μ left-shift) or *is* the
+            // magnitude (newly-significant via SigProp). `out.mag != 0`
+            // is a sufficient proxy for σ_n in the M_b > 0 case the
+            // round-4 codestreams exercise.
             let qw = (w as u32).div_ceil(2);
             let rel_x = (bx0 - sb.x0) as usize;
             let rel_y = (by0 - sb.y0) as usize;
             for ly in 0..h {
                 for lx in 0..w {
-                    let qx = (lx as u32) / 2;
-                    let qy = (ly as u32) / 2;
-                    let dx = (lx as u32) & 1;
-                    let dy = (ly as u32) & 1;
-                    let j = match (dx, dy) {
-                        (0, 0) => 0,
-                        (0, 1) => 1,
-                        (1, 0) => 2,
-                        (1, 1) => 3,
-                        _ => unreachable!(),
-                    };
-                    let q = (qy as usize) * (qw as usize) + qx as usize;
-                    let n = 4 * q + j;
-                    let mag = out.mag[n] as i32;
+                    let n = quad_scan_index(qw, lx as u32, ly as u32);
+                    let mu = out.mag[n] as i64;
                     let sign = out.sign[n];
-                    let mut v = if sign != 0 { -mag } else { mag };
-                    // The cleanup pass returns `μ_n` which is the
-                    // unsigned bit-pattern at the band's number of bits
-                    // M_b (counting the MSB as the implicit "1"). For
-                    // 5/3 reversible the convention here matches the
-                    // classic decoder which divides by 2 to undo the
-                    // `oneplushalf` factor.
-                    if is_lossy {
-                        // 9/7 not yet wired; placeholder.
+                    let z = out.z[n];
+                    let r = out.refinement[n];
+                    let raw_unsigned: i64 = if mu != 0 {
+                        // Cleanup-significant. MagRef may have added
+                        // one finer LSB → shift left by z (=1 if MagRef
+                        // refined this sample, else 0) and OR-in r.
+                        if z != 0 {
+                            (mu << 1) | r as i64
+                        } else {
+                            mu
+                        }
+                    } else if z != 0 {
+                        // SigProp newly-significant: bit pattern is
+                        // just r at the band LSB. Multiply by 2 to put
+                        // it on the same scale as μ_n which already
+                        // includes the +0.5 oneplushalf bit.
+                        (r as i64) << 1
                     } else {
-                        v >>= 1;
-                    }
-                    buf[(rel_y + ly) * bw + (rel_x + lx)] = v;
+                        0
+                    };
+                    let mut v = if sign != 0 {
+                        -raw_unsigned
+                    } else {
+                        raw_unsigned
+                    };
+                    // 5/3 lossless: divide by 2 to undo oneplushalf.
+                    v >>= 1;
+                    buf[(rel_y + ly) * bw + (rel_x + lx)] = v as i32;
                 }
             }
-            let _ = (bpno, sb);
+            let _ = sb;
         }
     }
     Ok(())
+}
+
+/// 9/7 irreversible variant of [`decode_subband_htj2k`]. Same FBCOT +
+/// μ/r/z reconstruction, but emits dequantised float samples per
+/// T.800 §E.1.1.2.
+#[allow(clippy::too_many_arguments)]
+fn decode_subband_htj2k_97(
+    layout: &ResolutionLayout,
+    sb_idx: usize,
+    band_idx: usize,
+    qcd: &QcdParams,
+    buf: &mut [f32],
+    bw: usize,
+    _bh: usize,
+    precision: u32,
+) -> Result<()> {
+    let cblks = &layout.cblk_states[sb_idx];
+    let cblks_w = layout.cblks_w[sb_idx];
+    let cblks_h = layout.cblks_h[sb_idx];
+    let sb = &layout.subbands[sb_idx];
+    let (eps, mant) = qcd.bands[band_idx];
+    // T.800 Eq E-3 with `Rb = precision` (BUG_WEIRD_TWO_INVK; see the
+    // classic `synth_component_97`). The 0.5 factor matches OpenJPEG's
+    // `0.5 * band->stepsize`: our μ_n carries a baked-in factor of 2
+    // (the "+0.5" oneplushalf bit), so halving it cancels.
+    let rb = precision as i32;
+    let stepsize = (1.0f64 + (mant as f64) / 2048.0) * 2f64.powi(rb - eps as i32);
+    let scale = 0.5f64 * stepsize;
+
+    for cy in 0..cblks_h {
+        for cx in 0..cblks_w {
+            let idx = cy * cblks_w + cx;
+            let st = &cblks[idx];
+            if !st.included || st.total_passes == 0 || st.data.is_empty() {
+                continue;
+            }
+            let (bx0, by0, bx1, by1) = layout.cblk_rects[sb_idx][idx];
+            let w = (bx1 - bx0) as usize;
+            let h = (by1 - by0) as usize;
+            if w == 0 || h == 0 {
+                continue;
+            }
+            let zblk = match st.total_passes {
+                0 => ZBlk::Zero,
+                1 => ZBlk::One,
+                2 => ZBlk::Two,
+                3 => ZBlk::Three,
+                _ => {
+                    return Err(Error::unsupported(
+                        "HTJ2K: more than 3 coding passes per code-block (round 5+)",
+                    ));
+                }
+            };
+            let dcup: &[u8] = &st.data[..];
+            let dref: &[u8] = &st.data_ref[..];
+            let out = decode_codeblock(w as u32, h as u32, zblk, dcup, dref)?;
+
+            let qw = (w as u32).div_ceil(2);
+            let rel_x = (bx0 - sb.x0) as usize;
+            let rel_y = (by0 - sb.y0) as usize;
+            for ly in 0..h {
+                for lx in 0..w {
+                    let n = quad_scan_index(qw, lx as u32, ly as u32);
+                    let mu = out.mag[n] as i64;
+                    let sign = out.sign[n];
+                    let z = out.z[n];
+                    let r = out.refinement[n];
+                    let raw_unsigned: i64 = if mu != 0 {
+                        if z != 0 {
+                            (mu << 1) | r as i64
+                        } else {
+                            mu
+                        }
+                    } else if z != 0 {
+                        (r as i64) << 1
+                    } else {
+                        0
+                    };
+                    let signed = if sign != 0 {
+                        -raw_unsigned
+                    } else {
+                        raw_unsigned
+                    };
+                    let mut dequant = (signed as f64) * scale;
+                    // When MagRef / SigProp extended the magnitude by
+                    // one extra LSB (z_n != 0), the integer was scaled
+                    // up by 2 above; halve to undo so the dequantised
+                    // value lives on the same band grid as cleanup-only
+                    // samples.
+                    if z != 0 {
+                        dequant *= 0.5;
+                    }
+                    buf[(rel_y + ly) * bw + (rel_x + lx)] = dequant as f32;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Map (lx, ly) inside a code-block into the FBCOT quad-scan sample
+/// index `n = 4q + j`.
+#[inline]
+fn quad_scan_index(qw: u32, lx: u32, ly: u32) -> usize {
+    let qx = lx / 2;
+    let qy = ly / 2;
+    let dx = lx & 1;
+    let dy = ly & 1;
+    let j = match (dx, dy) {
+        (0, 0) => 0,
+        (0, 1) => 1,
+        (1, 0) => 2,
+        (1, 1) => 3,
+        _ => unreachable!(),
+    };
+    let q = (qy as usize) * (qw as usize) + qx as usize;
+    4 * q + j
 }
 
 /// 5/3 inverse RCT (T.800 §G.2.2). Same algorithm as the classic
