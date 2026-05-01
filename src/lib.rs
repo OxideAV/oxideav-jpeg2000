@@ -81,11 +81,93 @@ pub mod encode;
 use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, Error, Frame, Packet, Result};
 use oxideav_core::{CodecInfo, CodecRegistry, Decoder, Encoder};
 
-pub use codestream::{Codestream, ComponentInfo, Marker, Siz, TilePart};
+pub use codestream::{Cap, Codestream, ComponentInfo, Cpf, Marker, Siz, TilePart};
 
 /// Public codec id string. Matches the Cargo features `jpeg2000` / `jp2`
 /// in the aggregator crate.
+///
+/// Note: HTJ2K (ISO/IEC 15444-15) reuses this codec id — the
+/// distinction is signalled inside the codestream via the `CAP` marker
+/// (Pcap bit 15). See [`probe`] for run-time discrimination.
 pub const CODEC_ID_STR: &str = "jpeg2000";
+
+/// Result of [`probe`]: a quick classification of a JPEG 2000 buffer
+/// (raw `.j2k` codestream or JP2 ISOBMFF wrapper) without running the
+/// full sample decoder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Probe {
+    /// Image canvas width in pixels (`Xsiz - XOsiz`).
+    pub width: u32,
+    /// Image canvas height in pixels (`Ysiz - YOsiz`).
+    pub height: u32,
+    /// Number of image components.
+    pub num_components: usize,
+    /// Block-coding flavour signalled by the codestream.
+    pub flavour: J2kFlavour,
+    /// `Pcap` value from the `CAP` marker, if present. `None` for
+    /// classic Part-1 streams that omit `CAP` entirely.
+    pub pcap: Option<u32>,
+    /// `Ccap15` (HTJ2K sub-profile bits) when `flavour == HighThroughput`.
+    pub ccap15: Option<u16>,
+    /// `CPFnum` value from the `CPF` marker, if present
+    /// (HTJ2K only, ISO/IEC 15444-15 §A.6).
+    pub cpfnum: Option<u128>,
+}
+
+/// JPEG 2000 block-coding flavour reported by [`probe`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum J2kFlavour {
+    /// Classic Part-1 EBCOT block coder (ISO/IEC 15444-1, T.800).
+    /// Either no `CAP` marker is present, or `CAP` is present but
+    /// `Pcap15` is 0.
+    ClassicPart1,
+    /// High-Throughput JPEG 2000 (ISO/IEC 15444-15, T.814) — `CAP`
+    /// marker is present and `Pcap15` is 1, indicating the FBCOT
+    /// block coder is in use for at least some code-blocks.
+    HighThroughput,
+}
+
+/// Quickly classify a JPEG 2000 buffer.
+///
+/// The buffer may be a raw `.j2k` codestream (starting with `FF 4F`
+/// SOC) or a JP2 ISOBMFF container (starting with the 12-byte JP2
+/// signature box). Returns the image geometry, component count, and
+/// the block-coding flavour (classic Part-1 vs HTJ2K). HTJ2K
+/// detection follows ISO/IEC 15444-15 §A.3.1: the `CAP` marker
+/// segment must be present and `Pcap15` (mask `0x0002_0000` —
+/// the 15th most-significant bit of the 32-bit `Pcap`) must be 1.
+///
+/// This is decoder-side only — it parses the marker chain but does
+/// not touch the compressed sample data, and is therefore safe and
+/// fast to call on untrusted input.
+pub fn probe(buf: &[u8]) -> Result<Probe> {
+    let jp2_signature = [
+        0x00, 0x00, 0x00, 0x0C, b'j', b'P', b' ', b' ', 0x0D, 0x0A, 0x87, 0x0A,
+    ];
+    let data: Vec<u8> = if buf.len() >= 12 && buf[..12] == jp2_signature {
+        encode::codestream::extract_jp2_codestream(buf)?
+    } else {
+        buf.to_vec()
+    };
+    let cs = codestream::parse(&data)?;
+    let flavour = if cs.is_htj2k() {
+        J2kFlavour::HighThroughput
+    } else {
+        J2kFlavour::ClassicPart1
+    };
+    let pcap = cs.cap.as_ref().map(|c| c.pcap);
+    let ccap15 = cs.cap.as_ref().and_then(|c| c.ccap15());
+    let cpfnum = cs.cpf.as_ref().map(|c| c.cpfnum);
+    Ok(Probe {
+        width: cs.siz.image_width(),
+        height: cs.siz.image_height(),
+        num_components: cs.siz.num_components(),
+        flavour,
+        pcap,
+        ccap15,
+        cpfnum,
+    })
+}
 
 /// Register the JPEG 2000 decoder + encoder factories.
 ///
@@ -235,6 +317,28 @@ impl Decoder for J2kDecoder {
             packet.data.clone()
         };
         let cs = codestream::parse(&data)?;
+        // HTJ2K stub gate (ISO/IEC 15444-15). The classic EBCOT
+        // tier-1 path cannot decode HT code-blocks: the FBCOT
+        // entropy decoder (Annex B of 15444-15) is a wholly different
+        // bitstream syntax. With the `htj2k` feature, we explicitly
+        // surface this as `Error::Unsupported` so callers get a
+        // clear signal instead of a confusing tier-1 failure deep
+        // inside the classic decoder.
+        //
+        // Round 2 status: the per-codeblock FBCOT entropy decoder
+        // ([`decode::htj2k::decode_codeblock`]) is implemented and
+        // tested against hand-built fixtures, but the tier-2 packet
+        // header walker that would carve up a real HTJ2K codestream
+        // into per-codeblock HT cleanup / refinement segments is
+        // round 3 work. Until that lands, we still return
+        // `Unsupported` here so callers get a clear signal.
+        #[cfg(feature = "htj2k")]
+        if cs.is_htj2k() {
+            self.last_parsed = Some(cs);
+            return Err(Error::unsupported(
+                "HTJ2K block decode not yet implemented: tier-2 dispatch pending",
+            ));
+        }
         let frame = decode::frame::decode_frame(&cs, &data)?;
         self.last_parsed = Some(cs);
         self.pending = Some(frame);

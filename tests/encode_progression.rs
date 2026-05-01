@@ -190,7 +190,14 @@ fn assert_progression_round_trip(progression: ProgressionOrder, label: &str) {
         progression,
         ..EncodeOptions::default()
     };
-    let bytes = encode_frame(&Frame::Video(src.clone()), 64, 64, PixelFormat::Gray8, &opts).expect("encode");
+    let bytes = encode_frame(
+        &Frame::Video(src.clone()),
+        64,
+        64,
+        PixelFormat::Gray8,
+        &opts,
+    )
+    .expect("encode");
 
     // The COD's progression byte must reflect the chosen order.
     let cs = codestream::parse(&bytes).expect("parse encoded");
@@ -275,8 +282,14 @@ fn encoder_pcrl_rgb_round_trip_bit_exact() {
         use_color_transform: false,
         ..EncodeOptions::default()
     };
-    let bytes =
-        encode_frame(&Frame::Video(src.clone()), 48, 48, PixelFormat::Rgb24, &opts).expect("encode");
+    let bytes = encode_frame(
+        &Frame::Video(src.clone()),
+        48,
+        48,
+        PixelFormat::Rgb24,
+        &opts,
+    )
+    .expect("encode");
     let decoded = decode_with_us(&bytes);
     assert_eq!(decoded.planes.len(), 3, "three planes for RGB-no-MCT");
     let expected = rgb24_to_planar(&src, 48, 48);
@@ -330,8 +343,14 @@ fn encoder_cprl_rgb_with_rct_round_trip_bit_exact() {
         use_color_transform: true,
         ..EncodeOptions::default()
     };
-    let bytes =
-        encode_frame(&Frame::Video(src.clone()), 48, 48, PixelFormat::Rgb24, &opts).expect("encode");
+    let bytes = encode_frame(
+        &Frame::Video(src.clone()),
+        48,
+        48,
+        PixelFormat::Rgb24,
+        &opts,
+    )
+    .expect("encode");
     let decoded = decode_with_us(&bytes);
     // Three planes after the decoder's inverse RCT (T.800 §G.1).
     assert_eq!(decoded.planes.len(), 3);
@@ -364,7 +383,14 @@ fn encoder_poc_identity_lrcp_decodes_bit_exactly() {
         }],
         ..EncodeOptions::default()
     };
-    let bytes = encode_frame(&Frame::Video(src.clone()), 64, 64, PixelFormat::Gray8, &opts).expect("encode");
+    let bytes = encode_frame(
+        &Frame::Video(src.clone()),
+        64,
+        64,
+        PixelFormat::Gray8,
+        &opts,
+    )
+    .expect("encode");
     let cs = codestream::parse(&bytes).expect("parse encoded");
     let poc = cs.poc.as_ref().expect("POC marker present");
     // 7 bytes per progression (Csiz < 257) — single volume.
@@ -396,8 +422,14 @@ fn encoder_poc_pcrl_volume_decodes_bit_exactly() {
         }],
         ..EncodeOptions::default()
     };
-    let bytes =
-        encode_frame(&Frame::Video(src.clone()), 48, 48, PixelFormat::Rgb24, &opts).expect("encode");
+    let bytes = encode_frame(
+        &Frame::Video(src.clone()),
+        48,
+        48,
+        PixelFormat::Rgb24,
+        &opts,
+    )
+    .expect("encode");
     let cs = codestream::parse(&bytes).expect("parse encoded");
     assert!(cs.poc.is_some(), "POC marker must be present");
     let decoded = decode_with_us(&bytes);
@@ -433,7 +465,14 @@ fn encoder_ppm_main_header_round_trip_bit_exact() {
         packet_header_placement: PacketHeaderPlacement::PackedMainHeader,
         ..EncodeOptions::default()
     };
-    let bytes = encode_frame(&Frame::Video(src.clone()), 64, 64, PixelFormat::Gray8, &opts).expect("encode");
+    let bytes = encode_frame(
+        &Frame::Video(src.clone()),
+        64,
+        64,
+        PixelFormat::Gray8,
+        &opts,
+    )
+    .expect("encode");
     let cs = codestream::parse(&bytes).expect("parse encoded");
     assert_eq!(cs.ppm.len(), 1, "exactly one PPM segment in main header");
     for tp in &cs.tile_parts {
@@ -466,7 +505,14 @@ fn encoder_ppt_per_tile_part_round_trip_bit_exact() {
         packet_header_placement: PacketHeaderPlacement::PackedPerTilePart,
         ..EncodeOptions::default()
     };
-    let bytes = encode_frame(&Frame::Video(src.clone()), 64, 64, PixelFormat::Gray8, &opts).expect("encode");
+    let bytes = encode_frame(
+        &Frame::Video(src.clone()),
+        64,
+        64,
+        PixelFormat::Gray8,
+        &opts,
+    )
+    .expect("encode");
     let cs = codestream::parse(&bytes).expect("parse encoded");
     assert!(cs.ppm.is_empty(), "PPM must be empty for PPT mode");
     for tp in &cs.tile_parts {
@@ -498,7 +544,14 @@ fn encoder_ppt_lossy_decodes_above_30db() {
         packet_header_placement: PacketHeaderPlacement::PackedPerTilePart,
         ..EncodeOptions::default()
     };
-    let bytes = encode_frame(&Frame::Video(src.clone()), 64, 64, PixelFormat::Gray8, &opts).expect("encode");
+    let bytes = encode_frame(
+        &Frame::Video(src.clone()),
+        64,
+        64,
+        PixelFormat::Gray8,
+        &opts,
+    )
+    .expect("encode");
     let cs = codestream::parse(&bytes).expect("parse encoded");
     assert_eq!(cs.tile_parts.len(), 1);
     assert_eq!(cs.tile_parts[0].ppt.len(), 1);

@@ -54,7 +54,14 @@ fn jp2_wrapper_has_required_boxes() {
         jp2_wrapper: true,
         ..Default::default()
     };
-    let bytes = encode_frame(&Frame::Video(src.clone()), 64, 64, PixelFormat::Gray8, &opts).expect("encode");
+    let bytes = encode_frame(
+        &Frame::Video(src.clone()),
+        64,
+        64,
+        PixelFormat::Gray8,
+        &opts,
+    )
+    .expect("encode");
 
     // The first 12 bytes must be the JP2 signature box:
     //   00 00 00 0C 6A 50 20 20 0D 0A 87 0A
@@ -120,7 +127,14 @@ fn jp2_inner_codestream_decodes_back() {
         jp2_wrapper: true,
         ..Default::default()
     };
-    let bytes = encode_frame(&Frame::Video(src.clone()), 64, 64, PixelFormat::Gray8, &opts).expect("encode");
+    let bytes = encode_frame(
+        &Frame::Video(src.clone()),
+        64,
+        64,
+        PixelFormat::Gray8,
+        &opts,
+    )
+    .expect("encode");
 
     // Extract and feed the inner j2k to the decoder.
     let cs = extract_jp2_codestream(&bytes).expect("extract jp2c");
@@ -154,7 +168,14 @@ fn jp2_full_wrapper_decodes_transparently() {
         jp2_wrapper: true,
         ..Default::default()
     };
-    let bytes = encode_frame(&Frame::Video(src.clone()), 64, 64, PixelFormat::Gray8, &opts).expect("encode");
+    let bytes = encode_frame(
+        &Frame::Video(src.clone()),
+        64,
+        64,
+        PixelFormat::Gray8,
+        &opts,
+    )
+    .expect("encode");
 
     let mut reg = CodecRegistry::new();
     oxideav_jpeg2000::register(&mut reg);

@@ -54,8 +54,14 @@ fn decode(bytes: &[u8]) -> VideoFrame {
 #[test]
 fn roundtrip_constant_gray_is_bit_exact() {
     let src = build_constant(64, 64, 137);
-    let bytes =
-        encode_frame(&Frame::Video(src.clone()), 64, 64, PixelFormat::Gray8, &EncodeOptions::default()).expect("encode");
+    let bytes = encode_frame(
+        &Frame::Video(src.clone()),
+        64,
+        64,
+        PixelFormat::Gray8,
+        &EncodeOptions::default(),
+    )
+    .expect("encode");
     let dec = decode(&bytes);
     assert_eq!(dec.planes.len(), 1);
     assert_eq!(
@@ -74,8 +80,14 @@ fn roundtrip_16x16_one_decomp_level_is_bit_exact() {
         num_decomp: 1,
         ..EncodeOptions::default()
     };
-    let bytes =
-        encode_frame(&Frame::Video(src.clone()), 16, 16, PixelFormat::Gray8, &opts).expect("encode");
+    let bytes = encode_frame(
+        &Frame::Video(src.clone()),
+        16,
+        16,
+        PixelFormat::Gray8,
+        &opts,
+    )
+    .expect("encode");
     let dec = decode(&bytes);
     assert_eq!(
         dec.planes[0].data, src.planes[0].data,
@@ -86,8 +98,14 @@ fn roundtrip_16x16_one_decomp_level_is_bit_exact() {
 #[test]
 fn roundtrip_gradient_is_bit_exact() {
     let src = build_gradient(64, 64);
-    let bytes =
-        encode_frame(&Frame::Video(src.clone()), 64, 64, PixelFormat::Gray8, &EncodeOptions::default()).expect("encode");
+    let bytes = encode_frame(
+        &Frame::Video(src.clone()),
+        64,
+        64,
+        PixelFormat::Gray8,
+        &EncodeOptions::default(),
+    )
+    .expect("encode");
     let dec = decode(&bytes);
     // Compare a few sample points first — makes failures easier to
     // read than a giant `assert_eq` on 4096 bytes.

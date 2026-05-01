@@ -12,6 +12,9 @@
 //! |--------|--------|-----------------------------------|----------------|
 //! | SOC    | FF 4F  | Start of codestream               | presence       |
 //! | SIZ    | FF 51  | Image + tile sizes                | geometry + component list |
+//! | CAP    | FF 50  | Extended capabilities             | Pcap + Ccap_i list (HTJ2K detection) |
+//! | PRF    | FF 56  | Profile                           | raw segment    |
+//! | CPF    | FF 59  | Corresponding profile (HTJ2K)     | Pcpf_i list    |
 //! | COD    | FF 52  | Coding style (default)            | raw segment    |
 //! | QCD    | FF 5C  | Quantisation (default)            | raw segment    |
 //! | COC    | FF 53  | Coding style (per-component)      | raw segment    |
@@ -28,6 +31,15 @@
 //! | SOD    | FF 93  | Start of data (no length field)   | offset/length of compressed body |
 //! | EOC    | FF D9  | End of codestream                 | presence       |
 //!
+//! HTJ2K detection (ISO/IEC 15444-15, §A.3): an HTJ2K codestream is
+//! identified by the presence of a `CAP` marker segment whose `Pcap`
+//! field has bit 15 set (counted from the MSB, i.e. `Pcap & 0x0002_0000`).
+//! When this bit is set, the corresponding `Ccap15` 16-bit value
+//! describes the HT block-coding sub-profile (HTONLY / HTDECLARED /
+//! MIXED, single vs multi HT-set, RGN presence, irreversible-transform
+//! support, magnitude bound). [`Cap::is_htj2k`] / [`Cap::ccap15`]
+//! expose the parsed bits.
+//!
 //! All marker segments except SOC / SOD / EOC carry a big-endian `Lseg`
 //! length that includes its own two bytes. SOD has no length — the
 //! compressed data runs to the next SOT or EOC.
@@ -40,12 +52,16 @@ pub struct Marker(pub u16);
 
 impl Marker {
     pub const SOC: Marker = Marker(0xFF4F);
+    pub const CAP: Marker = Marker(0xFF50);
     pub const SIZ: Marker = Marker(0xFF51);
     pub const COD: Marker = Marker(0xFF52);
     pub const COC: Marker = Marker(0xFF53);
     pub const TLM: Marker = Marker(0xFF55);
+    pub const PRF: Marker = Marker(0xFF56);
     pub const PLM: Marker = Marker(0xFF57);
     pub const PLT: Marker = Marker(0xFF58);
+    /// Corresponding profile (HTJ2K, ISO/IEC 15444-15 §A.6).
+    pub const CPF: Marker = Marker(0xFF59);
     pub const QCD: Marker = Marker(0xFF5C);
     pub const QCC: Marker = Marker(0xFF5D);
     pub const RGN: Marker = Marker(0xFF5E);
@@ -121,6 +137,73 @@ impl Siz {
     }
 }
 
+/// Parsed `CAP` (Extended Capabilities) marker segment.
+///
+/// Per ISO/IEC 15444-1 §A.5.2 / §A.7bis: `CAP` carries a 32-bit `Pcap`
+/// bitmap (one bit per Part-N capability index, MSB = Pcap1, LSB =
+/// Pcap32) and a variable-length list of 16-bit `Ccap_i` values (one
+/// per `Pcap_i = 1` bit, in MSB-to-LSB order). Each `Ccap_i` is defined
+/// by the extension that owns that bit. For HTJ2K (Part 15), `Pcap15`
+/// (the 15th most-significant bit, mask `0x0002_0000`) shall be 1 and
+/// `Ccap15` carries the HT sub-profile bits described in
+/// ISO/IEC 15444-15 §A.3.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cap {
+    /// 32-bit `Pcap` bitmap. Bit `i` (1-based, MSB = bit 1) maps to
+    /// Part-`i` capabilities.
+    pub pcap: u32,
+    /// `Ccap_i` values in the same order as set bits of `Pcap`
+    /// (MSB → LSB). Length equals `pcap.count_ones() as usize`.
+    pub ccaps: Vec<u16>,
+}
+
+impl Cap {
+    /// True when `Pcap15` (the 15th MSB, mask `0x0002_0000`) is set —
+    /// signalling that the codestream uses HT block coding per
+    /// ISO/IEC 15444-15.
+    pub fn is_htj2k(&self) -> bool {
+        (self.pcap & PCAP15_MASK) != 0
+    }
+
+    /// Returns the `Ccap15` value if `Pcap15` is set. The position of
+    /// `Ccap15` inside `ccaps` is the popcount of the bits *strictly
+    /// more significant* than bit 15 (i.e. `Pcap1..Pcap14`).
+    pub fn ccap15(&self) -> Option<u16> {
+        if !self.is_htj2k() {
+            return None;
+        }
+        // Bits more significant than Pcap15 inside the 32-bit Pcap
+        // word are bit-positions 31 down to 17 (since Pcap15 sits at
+        // bit-position 17 = 32 - 15). Mask off everything at or below
+        // Pcap15 and count the surviving 1-bits.
+        let higher_mask = !((PCAP15_MASK << 1).wrapping_sub(1));
+        let idx = (self.pcap & higher_mask).count_ones() as usize;
+        self.ccaps.get(idx).copied()
+    }
+}
+
+/// Bit mask for `Pcap15` inside the 32-bit `Pcap` field.
+///
+/// Per ISO/IEC 15444-1 §A.5.2 Table A.11ter, `Pcap_i` corresponds to
+/// the `i`-th most-significant bit of the 32-bit `Pcap` word, with
+/// `Pcap1 = MSB` (bit-position 31, LSB = 0) and `Pcap32 = LSB`
+/// (bit-position 0). `Pcap15` therefore lives at bit-position
+/// `32 - 15 = 17`, i.e. mask `0x0002_0000`.
+const PCAP15_MASK: u32 = 1u32 << (32 - 15);
+
+/// Parsed `CPF` (Corresponding Profile) marker segment from
+/// ISO/IEC 15444-15 §A.6. Records the raw `Pcpf_i` 16-bit words plus
+/// the reconstructed `CPFnum` integer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cpf {
+    /// Raw `Pcpf_i` values (one or more 16-bit integers).
+    pub pcpf: Vec<u16>,
+    /// `CPFnum = -1 + Σ Pcpf_i · 2^(16·(i-1))`. Stored as `u128` to
+    /// admit up to ~7 `Pcpf_i` words without overflow; longer encodings
+    /// are rejected at parse time.
+    pub cpfnum: u128,
+}
+
 /// Records a single tile-part's position + length inside the codestream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TilePart {
@@ -158,6 +241,13 @@ pub struct TilePart {
 #[derive(Debug, Clone)]
 pub struct Codestream {
     pub siz: Siz,
+    /// Parsed `CAP` segment, if the codestream carries one. When
+    /// `cap.is_htj2k()` returns true, the stream uses the HT block
+    /// coding algorithm of ISO/IEC 15444-15.
+    pub cap: Option<Cap>,
+    /// Parsed `CPF` (Corresponding Profile) segment from
+    /// ISO/IEC 15444-15 §A.6, if present.
+    pub cpf: Option<Cpf>,
     /// Raw COD segment payload (after Lcod). `None` if absent (malformed).
     pub cod: Option<Vec<u8>>,
     /// Raw QCD segment payload (after Lqcd). `None` if absent.
@@ -175,6 +265,15 @@ pub struct Codestream {
     pub tile_parts: Vec<TilePart>,
     /// Byte offset of the EOC marker, or `None` if the stream was truncated.
     pub eoc_offset: Option<usize>,
+}
+
+impl Codestream {
+    /// Convenience: true when the codestream signals HTJ2K block coding
+    /// (CAP marker present with `Pcap15` set, per ISO/IEC 15444-15
+    /// §A.3.1). Returns false for classic Part-1 codestreams.
+    pub fn is_htj2k(&self) -> bool {
+        self.cap.as_ref().is_some_and(Cap::is_htj2k)
+    }
 }
 
 /// Parse a raw `.j2k` codestream.
@@ -203,6 +302,8 @@ pub fn parse(buf: &[u8]) -> Result<Codestream> {
     }
     let siz = parse_siz(&mut cur)?;
 
+    let mut cap: Option<Cap> = None;
+    let mut cpf: Option<Cpf> = None;
     let mut cod: Option<Vec<u8>> = None;
     let mut qcd: Option<Vec<u8>> = None;
     let mut poc: Option<Vec<u8>> = None;
@@ -220,6 +321,14 @@ pub fn parse(buf: &[u8]) -> Result<Codestream> {
         let marker_off = cur.pos();
         let m = cur.read_marker()?;
         match m {
+            Marker::CAP => {
+                let seg = cur.read_len_segment()?;
+                cap = Some(parse_cap(seg)?);
+            }
+            Marker::CPF => {
+                let seg = cur.read_len_segment()?;
+                cpf = Some(parse_cpf(seg)?);
+            }
             Marker::COD => {
                 let seg = cur.read_len_segment()?;
                 cod = Some(seg.to_vec());
@@ -246,6 +355,7 @@ pub fn parse(buf: &[u8]) -> Result<Codestream> {
             | Marker::RGN
             | Marker::PPT
             | Marker::TLM
+            | Marker::PRF
             | Marker::PLM
             | Marker::PLT
             | Marker::CRG
@@ -361,6 +471,8 @@ pub fn parse(buf: &[u8]) -> Result<Codestream> {
 
     Ok(Codestream {
         siz,
+        cap,
+        cpf,
         cod,
         qcd,
         poc,
@@ -368,6 +480,103 @@ pub fn parse(buf: &[u8]) -> Result<Codestream> {
         tile_parts,
         eoc_offset,
     })
+}
+
+/// Parse a `CAP` (Extended Capabilities) marker segment body.
+///
+/// Per ISO/IEC 15444-1 §A.5.2, the payload (after `Lcap`) is:
+///   * `Pcap`: 32-bit big-endian capability bitmap
+///   * `Ccap_i`: 16-bit big-endian per-capability values, one per
+///     set bit in `Pcap`, in MSB→LSB order.
+///
+/// The total segment length must satisfy `Lcap = 6 + 2·n` where `n`
+/// is `Pcap.count_ones()` (segment-length parameter range 8..=70).
+fn parse_cap(seg: &[u8]) -> Result<Cap> {
+    if seg.len() < 4 {
+        return Err(Error::invalid(format!(
+            "jpeg2000: CAP segment too short ({} bytes, need >= 4)",
+            seg.len()
+        )));
+    }
+    let pcap = u32::from_be_bytes([seg[0], seg[1], seg[2], seg[3]]);
+    let n = pcap.count_ones() as usize;
+    // Bound: per Table A.11bis, Lcap range is 8..=70 → at most 32 set
+    // bits. `count_ones` on a 32-bit word is naturally bounded; we
+    // additionally check the segment carries enough bytes for n
+    // 16-bit Ccap_i values.
+    let need = 4usize
+        .checked_add(
+            n.checked_mul(2)
+                .ok_or_else(|| Error::invalid("jpeg2000: CAP Pcap bit count overflow"))?,
+        )
+        .ok_or_else(|| Error::invalid("jpeg2000: CAP length overflow"))?;
+    if seg.len() < need {
+        return Err(Error::invalid(format!(
+            "jpeg2000: CAP segment truncated: have {} bytes, need {} for Pcap+{} Ccap values",
+            seg.len(),
+            need,
+            n
+        )));
+    }
+    let mut ccaps = Vec::with_capacity(n);
+    for i in 0..n {
+        let off = 4 + i * 2;
+        ccaps.push(u16::from_be_bytes([seg[off], seg[off + 1]]));
+    }
+    Ok(Cap { pcap, ccaps })
+}
+
+/// Parse a `CPF` (Corresponding Profile) marker segment body.
+///
+/// Per ISO/IEC 15444-15 §A.6, the payload (after `Lcpf`) is `N`
+/// 16-bit `Pcpf_i` values, where
+///   * `Lcpf = 2 + 2·N`,
+///   * `Pcpf_N` is non-zero,
+///   * `CPFnum = -1 + Σ_{i=1..N} Pcpf_i · 2^(16·(i-1))`.
+///
+/// Bound: we cap `N` at 8 (CPFnum representable in `u128`); larger
+/// segments are rejected as `InvalidData` to keep downstream
+/// allocations bounded.
+fn parse_cpf(seg: &[u8]) -> Result<Cpf> {
+    if seg.is_empty() || seg.len() % 2 != 0 {
+        return Err(Error::invalid(format!(
+            "jpeg2000: CPF segment length must be a positive multiple of 2, got {}",
+            seg.len()
+        )));
+    }
+    let n = seg.len() / 2;
+    const MAX_PCPF: usize = 8;
+    if n > MAX_PCPF {
+        return Err(Error::invalid(format!(
+            "jpeg2000: CPF Pcpf count {n} exceeds bound {MAX_PCPF}"
+        )));
+    }
+    let mut pcpf = Vec::with_capacity(n);
+    for i in 0..n {
+        pcpf.push(u16::from_be_bytes([seg[i * 2], seg[i * 2 + 1]]));
+    }
+    if *pcpf.last().unwrap() == 0 {
+        return Err(Error::invalid(
+            "jpeg2000: CPF Pcpf_N (last word) must be non-zero",
+        ));
+    }
+    // CPFnum = -1 + Σ Pcpf_i · 2^(16·(i-1))
+    let mut sum: u128 = 0;
+    for (i, w) in pcpf.iter().enumerate() {
+        let shift = 16u32 * i as u32;
+        // shift <= 16 * (MAX_PCPF - 1) = 112 < 128 → never overflows.
+        let term = (*w as u128) << shift;
+        sum = sum
+            .checked_add(term)
+            .ok_or_else(|| Error::invalid("jpeg2000: CPF CPFnum sum overflow"))?;
+    }
+    if sum == 0 {
+        return Err(Error::invalid(
+            "jpeg2000: CPF CPFnum underflow (sum was 0, would yield -1)",
+        ));
+    }
+    let cpfnum = sum - 1;
+    Ok(Cpf { pcpf, cpfnum })
 }
 
 fn parse_siz(cur: &mut Cursor<'_>) -> Result<Siz> {

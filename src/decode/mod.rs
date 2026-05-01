@@ -21,6 +21,8 @@
 pub mod bio;
 pub mod dwt;
 pub mod frame;
+#[cfg(feature = "htj2k")]
+pub mod htj2k;
 pub mod mqc;
 pub mod t1;
 pub mod tagtree;

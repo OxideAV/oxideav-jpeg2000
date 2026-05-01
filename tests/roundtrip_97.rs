@@ -87,7 +87,14 @@ fn roundtrip_97_gray_psnr_above_30db() {
         transform: TransformMode::Irreversible97,
         ..Default::default()
     };
-    let bytes = encode_frame(&Frame::Video(src.clone()), 64, 64, PixelFormat::Gray8, &opts).expect("encode");
+    let bytes = encode_frame(
+        &Frame::Video(src.clone()),
+        64,
+        64,
+        PixelFormat::Gray8,
+        &opts,
+    )
+    .expect("encode");
     let dec = decode(&bytes);
     let psnr = psnr_u8(&src.planes[0].data, &dec.planes[0].data);
     println!("9/7 gray PSNR: {:.2} dB", psnr);
@@ -105,8 +112,14 @@ fn roundtrip_97_rgb_psnr_above_30db() {
         transform: TransformMode::Irreversible97,
         ..Default::default()
     };
-    let bytes =
-        encode_frame(&Frame::Video(src.clone()), 64, 64, PixelFormat::Rgb24, &opts).expect("encode");
+    let bytes = encode_frame(
+        &Frame::Video(src.clone()),
+        64,
+        64,
+        PixelFormat::Rgb24,
+        &opts,
+    )
+    .expect("encode");
     let dec = decode(&bytes);
     // Decoder emits planar YUV444 / RGB when MCT is applied — the
     // pixel format moved off VideoFrame; the codec stream params on
@@ -170,8 +183,14 @@ fn roundtrip_53_rgb_bit_exact() {
     // chroma stays in the 8-bit signed range.
     let src = build_rgb_near_neutral(64, 64);
     let opts = EncodeOptions::default(); // 5/3 reversible, MCT on
-    let bytes =
-        encode_frame(&Frame::Video(src.clone()), 64, 64, PixelFormat::Rgb24, &opts).expect("encode");
+    let bytes = encode_frame(
+        &Frame::Video(src.clone()),
+        64,
+        64,
+        PixelFormat::Rgb24,
+        &opts,
+    )
+    .expect("encode");
     let dec = decode(&bytes);
     let w = 64usize;
     let h = 64usize;
@@ -237,8 +256,14 @@ fn build_rgb_full_saturation(w: u32, h: u32) -> VideoFrame {
 fn roundtrip_53_rgb_full_saturation_bit_exact() {
     let src = build_rgb_full_saturation(32, 32);
     let opts = EncodeOptions::default(); // 5/3 reversible, MCT on
-    let bytes =
-        encode_frame(&Frame::Video(src.clone()), 32, 32, PixelFormat::Rgb24, &opts).expect("encode");
+    let bytes = encode_frame(
+        &Frame::Video(src.clone()),
+        32,
+        32,
+        PixelFormat::Rgb24,
+        &opts,
+    )
+    .expect("encode");
     let dec = decode(&bytes);
     let w = 32usize;
     let h = 32usize;
