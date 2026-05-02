@@ -90,7 +90,21 @@ irreversible path produces a lossy bitstream with round-trip PSNR
 - **Multi-layer (progressive quality) streams** — single layer only.
 - **User-defined precinct grids**, **CPRL / PCRL / RPCL progression
   orders**, **PPT / PPM packed headers**, **region-of-interest
-  (RGN)**, the **HT block coder** (Part 15).
+  (RGN)**.
+- The **HT block coder** (Part 15, ISO/IEC 15444-15 / ITU-T T.814) is
+  partially implemented behind the `htj2k` Cargo feature. CAP marker
+  parsing, the FBCOT cleanup pass with both Annex C CxtVLC tables,
+  the SigProp / MagRef refinement passes, and the LRCP single-tile
+  single-layer tier-2 walker are in place. As of round 6 the cleanup
+  pass does **not** thread the per-codeblock significant-bitplane
+  shift `p` into magnitude reconstruction, so non-AZC codeblocks
+  decode at the wrong scale; this gates byte-exact decode of
+  trace-doc §12.2 / §12.3 and the OpenJPH 5/3 32×32 interop fixture.
+  The two `CXT_VLC_TABLE_0` Annex C transcription typos that round 6
+  fixed (rows 28 and 354 of the 444-row table) remain a hard
+  precondition for any future `p`-shift wiring to converge on the
+  right pixels. Round 7+ will land the wiring fix and un-ignore the
+  pinned tests.
 - **RGB input beyond 8-bit unsigned chroma** — the decoder's RCT
   inverse currently clamps chroma to unsigned 8-bit before the
   inverse transform, so encoder inputs with chroma excursions outside

@@ -22,14 +22,21 @@
 //! fixture uses 5/3 reversible. The reference outputs come from
 //! `opj_decompress` decoding the same codestreams.
 //!
-//! NOTE (round 4): both fixture-driven decode tests are currently
-//! `#[ignore]`d because of a pre-existing bug in the round-2 HT
-//! cleanup pass that affects every code-block whose CxtVLC stream is
-//! exercised (the round-3 fixture coverage was AZC-only — every quad
-//! short-circuited via the MEL `c_q == 0` path, which never engaged
-//! the CxtVLC tables nor the `cq_non_first_linepair` formula). When
-//! the cleanup decoder is hardened against non-AZC payloads (a
-//! round-5 task) these tests should be unignored and pass.
+//! NOTE (round 6): both fixture-driven decode tests remain
+//! `#[ignore]`d. Round 6 fixed two transcription typos in the Annex C
+//! `CXT_VLC_TABLE_0` (a hard precondition for any non-AZC HT decode
+//! reaching the right answer), but a separate decoder bug remains:
+//! the per-codeblock significant-bitplane shift (the `p` parameter)
+//! is not threaded into the cleanup magnitude reconstruction, so the
+//! absolute magnitudes come out at the wrong scale for any block
+//! whose `p` differs from the assumed default. That fix (a wiring
+//! change to thread the per-codeblock `p` into `decode_cleanup`) is
+//! deferred to round 7+; once it lands these tests should unignore
+//! and pass.
+//!
+//! The 9/7 irreversible variant has an additional float-arithmetic
+//! drift (round-3 baseline mean-absolute-deviation ≈ 22 LSB) on top
+//! of the `p`-shift bug; that is a separate round-7+ deliverable.
 
 #![cfg(feature = "htj2k")]
 
@@ -78,7 +85,7 @@ fn decode_htj2k(buf: &[u8]) -> oxideav_core::VideoFrame {
 }
 
 #[test]
-#[ignore = "blocked on non-AZC HT cleanup decoder fix (round 5+)"]
+#[ignore = "blocked on per-codeblock p-shift plumbing in decode_cleanup (round 7+)"]
 fn htj2k_lossy97_decodes_close_to_opj_reference() {
     let frame = decode_htj2k(HT_LOSSY97_J2C);
     assert_eq!(frame.planes.len(), 1, "single-component grayscale");
@@ -106,7 +113,7 @@ fn htj2k_lossy97_decodes_close_to_opj_reference() {
 }
 
 #[test]
-#[ignore = "blocked on non-AZC HT cleanup decoder fix (round 5+)"]
+#[ignore = "blocked on per-codeblock p-shift plumbing in decode_cleanup (round 7+)"]
 fn htj2k_rev53_decodes_bit_exactly_to_input_gradient() {
     let frame = decode_htj2k(HT_REV53_J2C);
     assert_eq!(frame.planes.len(), 1);
