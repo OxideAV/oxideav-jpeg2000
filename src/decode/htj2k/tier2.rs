@@ -31,7 +31,7 @@
 //!    de-quantised + IDWT-synthesised + DC-level-shifted exactly as in
 //!    the classic-EBCOT path.
 
-use super::{decode_codeblock, ZBlk};
+use super::{decode_codeblock, decode_codeblock_with_shift, ZBlk};
 use crate::codestream::{Codestream, Siz};
 use crate::decode::bio::Bio;
 use crate::decode::dwt;
@@ -88,10 +88,30 @@ pub fn decode_frame_htj2k(cs: &Codestream, buf: &[u8]) -> Result<Frame> {
             "HTJ2K: multi-layer codestreams (round 4+)",
         ));
     }
-    if cod.progression_order != 0 {
+    // LRCP (=0) and RPCL (=2) are accepted. With single-layer + single-
+    // precinct (the round-6 trace-doc fixture regime) the two
+    // progression orders collapse to the same packet order — both walk
+    // (resolution, component) — so the existing resolution-component
+    // walker is byte-correct. We still reject RPCL when multiple
+    // precincts could re-order packets relative to LRCP.
+    let allowed = matches!(cod.progression_order, 0 | 2);
+    if !allowed {
         return Err(Error::unsupported(
-            "HTJ2K: only LRCP progression supported in round 3",
+            "HTJ2K: only LRCP and RPCL progressions supported in round 6",
         ));
+    }
+    if cod.progression_order == 2 {
+        // RPCL must collapse to LRCP for the walker to be correct.
+        // The precincts array is always populated (defaulting to
+        // PPx=PPy=15, i.e. one precinct per resolution); only when an
+        // entry uses a smaller log2 are there multiple precincts.
+        let multi_precinct_resolutions =
+            cod.precincts.iter().any(|&(ppx, ppy)| ppx < 15 || ppy < 15);
+        if multi_precinct_resolutions {
+            return Err(Error::unsupported(
+                "HTJ2K: RPCL with multi-precinct resolutions (round 7+)",
+            ));
+        }
     }
 
     let img_w = cs.siz.image_width();
@@ -588,8 +608,8 @@ fn synth_component_htj2k_97(
 fn decode_subband_htj2k(
     layout: &ResolutionLayout,
     sb_idx: usize,
-    _band_idx: usize,
-    _qcd: &QcdParams,
+    band_idx: usize,
+    qcd: &QcdParams,
     buf: &mut [i32],
     bw: usize,
     _bh: usize,
@@ -599,6 +619,11 @@ fn decode_subband_htj2k(
     let cblks_w = layout.cblks_w[sb_idx];
     let cblks_h = layout.cblks_h[sb_idx];
     let sb = &layout.subbands[sb_idx];
+    let (eps, _mant) = qcd.bands[band_idx];
+    // M_b per ISO/IEC 15444-1 Annex E: number of bit planes for the
+    // band's max coefficient. Used to derive the cleanup-pass shift
+    // `p_shift = M_b + 1 - missing_msbs`.
+    let m_b = (qcd.guard_bits as i32 + eps as i32 - 1) as u32;
     for cy in 0..cblks_h {
         for cx in 0..cblks_w {
             let idx = cy * cblks_w + cx;
@@ -625,14 +650,24 @@ fn decode_subband_htj2k(
             };
             let dcup: &[u8] = &st.data[..];
             let dref: &[u8] = &st.data_ref[..];
-            let out = decode_codeblock(w as u32, h as u32, zblk, dcup, dref)?;
+            // p_shift = M_b + 1 - missing_msbs (OpenJPEG/OpenJPH HTJ2K
+            // block-decoder convention, round 6.5). Keep at zero when
+            // missing_msbs > M_b (encoder declared all bit planes zero
+            // — block trivially decodes to all-zero magnitudes anyway).
+            let p_shift = (m_b + 1).saturating_sub(st.missing_msb);
+            let out = decode_codeblock_with_shift(
+                w as u32,
+                h as u32,
+                zblk,
+                dcup,
+                dref,
+                p_shift,
+            )?;
 
             // Need the FBCOT cleanup output to know `σ_n` separately
             // from `z_n` so we can decide whether `r_n` extends an
             // existing magnitude (z extends μ left-shift) or *is* the
-            // magnitude (newly-significant via SigProp). `out.mag != 0`
-            // is a sufficient proxy for σ_n in the M_b > 0 case the
-            // round-4 codestreams exercise.
+            // magnitude (newly-significant via SigProp).
             let qw = (w as u32).div_ceil(2);
             let rel_x = (bx0 - sb.x0) as usize;
             let rel_y = (by0 - sb.y0) as usize;
@@ -644,30 +679,24 @@ fn decode_subband_htj2k(
                     let z = out.z[n];
                     let r = out.refinement[n];
                     let raw_unsigned: i64 = if mu != 0 {
-                        // Cleanup-significant. MagRef may have added
-                        // one finer LSB → shift left by z (=1 if MagRef
-                        // refined this sample, else 0) and OR-in r.
                         if z != 0 {
                             (mu << 1) | r as i64
                         } else {
                             mu
                         }
                     } else if z != 0 {
-                        // SigProp newly-significant: bit pattern is
-                        // just r at the band LSB. Multiply by 2 to put
-                        // it on the same scale as μ_n which already
-                        // includes the +0.5 oneplushalf bit.
                         (r as i64) << 1
                     } else {
                         0
                     };
-                    let mut v = if sign != 0 {
+                    // With p_shift > 0 the cleanup already places
+                    // `mag[n]` at the band-LSB scale (the OpenJPEG
+                    // `M_n / 2` form). No further /2 needed.
+                    let v = if sign != 0 {
                         -raw_unsigned
                     } else {
                         raw_unsigned
                     };
-                    // 5/3 lossless: divide by 2 to undo oneplushalf.
-                    v >>= 1;
                     buf[(rel_y + ly) * bw + (rel_x + lx)] = v as i32;
                 }
             }

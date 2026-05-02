@@ -22,14 +22,26 @@
 //! fixture uses 5/3 reversible. The reference outputs come from
 //! `opj_decompress` decoding the same codestreams.
 //!
-//! NOTE (round 4): both fixture-driven decode tests are currently
-//! `#[ignore]`d because of a pre-existing bug in the round-2 HT
-//! cleanup pass that affects every code-block whose CxtVLC stream is
-//! exercised (the round-3 fixture coverage was AZC-only — every quad
-//! short-circuited via the MEL `c_q == 0` path, which never engaged
-//! the CxtVLC tables nor the `cq_non_first_linepair` formula). When
-//! the cleanup decoder is hardened against non-AZC payloads (a
-//! round-5 task) these tests should be unignored and pass.
+//! NOTE (round 5): the round-4 cleanup-pass blockers are fixed
+//! (`cq_non_first_linepair` now uses Formula 2's `(σ^w | σ^sw)` term;
+//! `exponent_predictor_non_first_linepair` applies `γ_q`; the U-VLC
+//! suffix/extension bits are now interleaved per Figure 4 of §7.3.4).
+//! Both fixture decodes now run end-to-end without the round-4
+//! "MagSgn read past end of segment" trap.
+//!
+//! HOWEVER both tests still `#[ignore]` because the decoded HF bands
+//! reproduce the input gradient with a SYSTEMATIC ±2 error in the
+//! rightmost column (5/3 fixture → 40/1024 pixels off by 2-5; 9/7 →
+//! MAD ≈ 22 vs threshold 8). Investigation in round 5 confirmed:
+//! the LL band matches T.800 forward 5/3 exactly per our analysis,
+//! and the IDWT path is the same one the Part-1 decoder uses (which
+//! works for non-HT codestreams). The remaining mismatch comes from
+//! the encoded HL band MagSgn bytes (`0xAA AA AA AA` for the 16x16
+//! HL block) decoding to alternating ±2 values where T.800 forward
+//! would have produced constant +4. OpenJPEG decodes the same
+//! codestream losslessly, so there's an OpenJPH/OpenJPEG-specific
+//! HF-band magnitude convention we don't yet replicate. Round 6 task
+//! (#137): identify the missing scale/shift on HF bands.
 
 #![cfg(feature = "htj2k")]
 
@@ -78,7 +90,12 @@ fn decode_htj2k(buf: &[u8]) -> oxideav_core::VideoFrame {
 }
 
 #[test]
-#[ignore = "blocked on non-AZC HT cleanup decoder fix (round 5+)"]
+#[ignore = "round 6.5 closed the 5/3 reversible interop (CxtVLC table typo) but \
+    the 9/7 irreversible path still has MAD ≈ 22 vs opj_decompress. The 9/7 \
+    sub-band decoder uses the legacy bin-centre `μ_n = (val>>1)+1` path with a \
+    `0.5 * stepsize` dequant scale; it does NOT yet wire `p_shift` through. \
+    Probably needs the same `(v_n + 2) << (p − 1)` magnitude formula as the 5/3 \
+    path, but with the irreversible stepsize wired in. Round 7 task."]
 fn htj2k_lossy97_decodes_close_to_opj_reference() {
     let frame = decode_htj2k(HT_LOSSY97_J2C);
     assert_eq!(frame.planes.len(), 1, "single-component grayscale");
@@ -106,7 +123,6 @@ fn htj2k_lossy97_decodes_close_to_opj_reference() {
 }
 
 #[test]
-#[ignore = "blocked on non-AZC HT cleanup decoder fix (round 5+)"]
 fn htj2k_rev53_decodes_bit_exactly_to_input_gradient() {
     let frame = decode_htj2k(HT_REV53_J2C);
     assert_eq!(frame.planes.len(), 1);

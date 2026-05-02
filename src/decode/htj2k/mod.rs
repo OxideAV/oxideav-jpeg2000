@@ -31,7 +31,7 @@ mod streams;
 mod tier2;
 mod uvlc;
 
-pub use cleanup::CleanupOutput;
+pub use cleanup::{decode_cleanup_with_shift, CleanupOutput};
 pub use sigprop::SigPropOutput;
 pub use tier2::decode_frame_htj2k;
 
@@ -76,12 +76,34 @@ pub struct CodeblockOutput {
 /// * `dref` — HT refinement segment bytes (`Lref` bytes). May be
 ///   empty when `zblk` is `One` or when the SigProp/MagRef passes are
 ///   placeholders.
+///
+/// Defaults `p_shift = 0` — see [`decode_codeblock_with_shift`] for
+/// the round-6.5 magnitude-scale wiring. Existing per-block unit tests
+/// continue to use this entry point so their bin-centre `μ_n = (val>>1)+1`
+/// expectations hold.
 pub fn decode_codeblock(
     width: u32,
     height: u32,
     zblk: ZBlk,
     dcup: &[u8],
     dref: &[u8],
+) -> Result<CodeblockOutput> {
+    decode_codeblock_with_shift(width, height, zblk, dcup, dref, 0)
+}
+
+/// Variant of [`decode_codeblock`] that takes the band's bit-plane
+/// shift `p_shift = M_b + 1 - missing_msbs` (per OpenJPEG/OpenJPH
+/// HTJ2K block decoder). When `p_shift > 0` the cleanup output
+/// `mag[n]` is the integer band coefficient at the band's LSB scale
+/// (i.e. directly drivable by `dwt::idwt_53`); when `p_shift == 0` the
+/// legacy bin-centre form is preserved.
+pub fn decode_codeblock_with_shift(
+    width: u32,
+    height: u32,
+    zblk: ZBlk,
+    dcup: &[u8],
+    dref: &[u8],
+    p_shift: u32,
 ) -> Result<CodeblockOutput> {
     let nsamples = (width as usize).div_ceil(2) * (height as usize).div_ceil(2) * 4;
     if zblk == ZBlk::Zero {
@@ -101,7 +123,7 @@ pub fn decode_codeblock(
             "HTJ2K: cleanup segment cannot be empty when Z_blk > 0",
         ));
     }
-    let cleanup = cleanup::decode_cleanup(width, height, dcup)?;
+    let cleanup = cleanup::decode_cleanup_with_shift(width, height, dcup, p_shift)?;
 
     let (sigprop_out, magref_out) = match zblk {
         ZBlk::Zero => unreachable!(),

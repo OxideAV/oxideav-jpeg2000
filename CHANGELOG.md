@@ -7,6 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- decoder (HTJ2K, round 6.5): **§12.2 8×8 + §12.3 7×7 byte-exact
+  decode** of the trace-doc reference fixtures, and **un-ignore** the
+  `htj2k_rev53_decodes_bit_exactly_to_input_gradient` opj-interop test
+  (it now passes against `opj_decompress`). Three changes worked
+  together to close the long-standing right-column / bottom-row drift:
+  - **CxtVLC table-0 transcription typo #1 at row {0, 0xC, 0x1, 0xC,
+    ?, 0x17, 7}**: the spec entry's `ε^1_q` (`emb_1`) nibble is `0xC`,
+    not `0x0`. The dropped digit silently neutralised the embedded-1
+    bits for samples j=2,3 of any first-line-pair quad whose right
+    column was significant — the cleanup decoded magnitude 2 instead
+    of magnitude 4 there. Fixed by restoring the spec value (Annex C
+    line 1985 of the searchable PDF). Cross-checked against
+    `OpenJPEG`'s `vlc_tbl0[23]` = 0xCCCF, which encodes the same
+    `(rho=0xC, u_off=1, emb_k=0xC, emb_1=0xC)` 4-tuple.
+  - **CxtVLC table-0 transcription typo #2 at row {6, 0xD, 0x1, 0x5,
+    0x5, 0x33, ?}**: the codeword length is `7` bits, not `6`. The
+    earlier transcription would have greedy-accepted at length 6
+    (cwd 0x33) before reaching the real 7-bit entry at the same prefix.
+    Cross-checked against `OpenJPEG`'s `vlc_tbl0[(6 << 7) | 51]` =
+    `0x5573`, decoding to length 7. Both tables now match OpenJPEG's
+    `vlc_tbl0` / `vlc_tbl1` 444 + 358 unique entries bit-exactly.
+  - **Magnitude reconstruction wired to `(v_n + 2) << (p − 1)`** with
+    `p = M_b + 1 − missing_msbs` per OpenJPEG/OpenJPH HT block decoder
+    (round-6.5 plumbing). The legacy bin-centre `μ_n = (val>>1)+1`
+    formula is preserved for SigProp/MagRef per-bit unit tests via the
+    `decode_codeblock` API; the tier-2 walker uses the new
+    `decode_codeblock_with_shift` with the correct `p_shift` derived
+    from QCD `M_b` and the per-cblk `missing_msbs`. For p_shift = 1
+    (cleanup-only at 1 bit per sample) the new formula collapses to
+    the same integer answer as the legacy one — the table-typo fixes
+    drove the actual ramp-decode improvement.
+  - `tests/htj2k_trace_doc_fixtures.rs` adds §12.2 and §12.3 byte-exact
+    pinning tests, plus per-block unpack diagnostics.
+  - `tests/htj2k_opj_interop.rs::htj2k_rev53_decodes_bit_exactly_to_input_gradient`
+    is un-ignored. The 9/7 irreversible interop test stays ignored —
+    its `decode_subband_htj2k_97` still uses the legacy bin-centre
+    formula and will need separate `p_shift` wiring + irreversible
+    stepsize plumbing in round 7.
+- decoder (HTJ2K, round 5): non-AZC HT cleanup pass. The round-4
+  fixture decoder errored out with `MagSgn: read past end of segment`
+  on every code-block whose CxtVLC stream was actually exercised
+  (round-3 coverage was AZC-only). Three real bugs were uncovered:
+  - `cq_non_first_linepair` collapsed Formula 2's middle term to a
+    duplicate of the first, producing only contexts {0, 3, 7}
+    instead of the full 0..=7 range. Now reads `(σ^w | σ^sw)` from
+    the same-row left-neighbour quad per Figure 5 of §7.3.5.
+  - `exponent_predictor_non_first_linepair` ignored `γ_q` from
+    Formula 6, inflating κ_q wherever ρ_q ∈ {0, 1, 2, 4, 8}.
+  - U-VLC suffix and extension bits were decoded sequentially per
+    quad rather than interleaved per Figure 4 of §7.3.4 (prefix(q1),
+    prefix(q2), suffix(q1), suffix(q2), ext(q1), ext(q2)).
+  Both fixture decodes now run end-to-end without a "read past end"
+  trap; the LL band reproduces T.800 forward 5/3 output exactly.
+  The `htj2k_lossy97_decodes_close_to_opj_reference` and
+  `htj2k_rev53_decodes_bit_exactly_to_input_gradient` interop tests
+  remain `#[ignore]`'d due to a residual ±2 boundary-column drift
+  on HF bands (40/1024 mismatches for 5/3, MAD ≈ 22 vs threshold 8
+  for 9/7) — round 6 task.
+
 ### Added
 
 - decoder: multi-layer (progressive quality) codestreams (T.800 §B.10).

@@ -88,9 +88,19 @@ irreversible path produces a lossy bitstream with round-trip PSNR
   bit-exact on the 5/3 path.
 - **Multi-tile codestreams** — single-tile only for now.
 - **Multi-layer (progressive quality) streams** — single layer only.
-- **User-defined precinct grids**, **CPRL / PCRL / RPCL progression
+- **User-defined precinct grids**, **CPRL / PCRL progression
   orders**, **PPT / PPM packed headers**, **region-of-interest
-  (RGN)**, the **HT block coder** (Part 15).
+  (RGN)**.
+
+The **HT block coder** (Part 15, ISO/IEC 15444-15) is functional for
+the trace-doc reference fixtures — `tests/htj2k_trace_doc_fixtures.rs`
+pins byte-exact decode of the §12.2 8×8 single-decomp ramp and the
+§12.3 7×7 boundary-parity 2-decomp ramp, both produced by
+`ojph_compress`. The HT cleanup pass implements the OpenJPEG/OpenJPH
+`(v_n + 2) << (p − 1)` magnitude formula with `p = M_b + 1 −
+missing_msbs`, and the CxtVLC tables are transcribed from
+ISO/IEC 15444-15:2019 Annex C. SigProp and MagRef passes decode but
+have not yet been pinned against multi-pass real-world streams.
 - **RGB input beyond 8-bit unsigned chroma** — the decoder's RCT
   inverse currently clamps chroma to unsigned 8-bit before the
   inverse transform, so encoder inputs with chroma excursions outside
