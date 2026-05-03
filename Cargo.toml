@@ -24,3 +24,12 @@ oxideav-core = "0.1"
 # but `J2kDecoder::send_packet` falls through to the classic-only path.
 htj2k = []
 
+[dev-dependencies]
+# `dlopen` probe for libopenjp2 in `tests/external_roundtrip.rs`. The
+# actual encode / decode is shelled out to `opj_compress` /
+# `opj_decompress` (workspace policy bars OpenJPEG source from the dep
+# tree; the CLI binaries are explicitly allowed as black-box
+# validators). The dlopen check just confirms the library is installed
+# so the test skips silently on hosts without OpenJPEG.
+libloading = "0.8"
+
