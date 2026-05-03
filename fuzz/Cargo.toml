@@ -1,0 +1,51 @@
+[package]
+name = "oxideav-jpeg2000-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+oxideav-core = "0.1"
+# libloading is the only OpenJPEG interop: each cross-decode harness
+# `dlopen`s the system-installed libopenjp2 at startup to confirm
+# availability, then drives encode / decode through the bundled
+# `opj_compress` / `opj_decompress` CLI binaries. No `*-sys` crate,
+# no OpenJPEG source pulled into the dep tree. Harnesses skip silently
+# when libopenjp2 isn't installed (see fuzz/src/lib.rs).
+libloading = "0.8"
+
+[dependencies.oxideav-jpeg2000]
+path = ".."
+
+[lib]
+name = "oxideav_jpeg2000_fuzz"
+path = "src/lib.rs"
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "jp2_lossless_self_roundtrip"
+path = "fuzz_targets/jp2_lossless_self_roundtrip.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "openjpeg_encode_oxideav_decode"
+path = "fuzz_targets/openjpeg_encode_oxideav_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "oxideav_encode_openjpeg_decode"
+path = "fuzz_targets/oxideav_encode_openjpeg_decode.rs"
+test = false
+doc = false
