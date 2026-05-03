@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/OxideAV/oxideav-jpeg2000/compare/v0.0.5...v0.0.6) - 2026-05-03
+
+### Added
+
+- standalone-friendly Cargo feature shape ([#359](https://github.com/OxideAV/oxideav-jpeg2000/pull/359))
+
+### Other
+
+- *(ppm_ppt)* adapt to Jpeg2000Image return type from decode_frame
+- external opj_compress / opj_decompress lossless RGB roundtrip ([#314](https://github.com/OxideAV/oxideav-jpeg2000/pull/314))
+- cargo-fuzz harnesses + daily Fuzz workflow (task #296)
+
 ### Added
 
 - Standalone-friendly Cargo feature shape: `oxideav-core` is now an
