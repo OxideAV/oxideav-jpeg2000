@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/OxideAV/oxideav-jpeg2000/compare/v0.0.4...v0.0.5) - 2026-05-03
+
+### Other
+
+- drop unused PixelFormat import from baseline + lossy97
+- silence unused import + variable from clippy CI
+- replace never-match regex with semver_check = false
+- HTJ2K round 6 — fix two CxtVLC table-0 transcription typos
+- migrate to centralized OxideAV/.github reusable workflows
+- HTJ2K round 4 — multi-pass dispatch + 9/7 wiring
+- HTJ2K round 3 — tier-2 walker + 8x8 end-to-end fixture
+- HTJ2K rounds 1 + 2 + Frame API update
+- adopt slim VideoFrame shape
+- round 16 — fix RGB MCT bit-exactness (T.800 §G.1)
+- round 15 — encoder POC + progression order + PPM/PPT
+- round 14 — end-to-end PPM/PPT decode via splitter
+- round 13 — POC marker + PPM/PPT plumbing
+- round 12 — user precincts + PCRL/CPRL progression decode
+- round 11 — multi-layer + RPCL progression decode
+- pin release-plz to patch-only bumps
+
 ### Added
 
 - decoder: multi-layer (progressive quality) codestreams (T.800 §B.10).
