@@ -39,14 +39,17 @@ use crate::decode::tile::{
     build_resolutions, build_subbands, ilog2, parse_cod, parse_qcd, read_num_passes, CodParams,
     QcdParams, ResolutionLayout,
 };
-use oxideav_core::{Error, Frame, PixelFormat, Result, VideoFrame, VideoPlane};
+use crate::error::{Jpeg2000Error as Error, Result};
+use crate::image::{
+    Jpeg2000Image, Jpeg2000PixelFormat as PixelFormat, Jpeg2000Plane as VideoPlane,
+};
 
-/// Decode an HTJ2K codestream end-to-end into a `Frame`.
+/// Decode an HTJ2K codestream end-to-end into a [`Jpeg2000Image`].
 ///
 /// Mirrors the public [`crate::decode::frame::decode_frame`] entry
 /// point but routes per-codeblock bytes through the FBCOT decoder
 /// instead of the classic EBCOT MQ tier-1.
-pub fn decode_frame_htj2k(cs: &Codestream, buf: &[u8]) -> Result<Frame> {
+pub fn decode_frame_htj2k(cs: &Codestream, buf: &[u8]) -> Result<Jpeg2000Image> {
     let cod_bytes = cs
         .cod
         .as_ref()
@@ -212,7 +215,6 @@ pub fn decode_frame_htj2k(cs: &Codestream, buf: &[u8]) -> Result<Frame> {
             } else {
                 PixelFormat::Yuv444P
             };
-            let _ = pf;
             let planes = shifted
                 .into_iter()
                 .enumerate()
@@ -225,8 +227,13 @@ pub fn decode_frame_htj2k(cs: &Codestream, buf: &[u8]) -> Result<Frame> {
         }
         _ => unreachable!(),
     };
-    let _ = pixel_format;
-    Ok(Frame::Video(VideoFrame { pts: None, planes }))
+    Ok(Jpeg2000Image {
+        width: cs.siz.image_width(),
+        height: cs.siz.image_height(),
+        pixel_format,
+        planes,
+        pts: None,
+    })
 }
 
 /// Walk the LRCP single-layer tier-2 stream, capturing each

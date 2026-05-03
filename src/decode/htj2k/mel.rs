@@ -13,7 +13,7 @@
 //! Table 2 (page 13 of the FDIS).
 
 use super::streams::MelReader;
-use oxideav_core::Result;
+use crate::error::Result;
 
 /// Table 2 of §7.3.3 (page 13): MEL adaptive-state exponents.
 /// Indexed by `MEL_k`, range `0..=12`.

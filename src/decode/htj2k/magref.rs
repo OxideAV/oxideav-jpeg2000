@@ -10,7 +10,7 @@
 use super::cleanup::CleanupOutput;
 use super::sigprop::SigPropOutput;
 use super::streams::MagRefReader;
-use oxideav_core::Result;
+use crate::error::Result;
 
 /// Run the MagRef pass on top of cleanup + SigProp output. `dref` is
 /// the *same* HT refinement segment as feeds the SigProp reader; the

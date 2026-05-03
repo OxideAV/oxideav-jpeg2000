@@ -92,15 +92,31 @@
 //!   the encoder still emits a single quality layer with default
 //!   precincts (one packet per (component, resolution)).
 //! - HTJ2K encoder. Round 3 only ships the decoder side.
+//!
+//! ## Standalone vs registry-integrated
+//!
+//! The crate's default `registry` Cargo feature pulls in `oxideav-core`
+//! and exposes the `Decoder`/`Encoder` trait surface plus a
+//! [`registry::register`] entry point. Disable the feature
+//! (`default-features = false`) for an oxideav-core-free build that
+//! still exposes the standalone [`decode_jpeg2000`] / [`encode_jpeg2000`]
+//! API plus the underlying `codestream` / `decode` / `encode` modules.
 
 pub mod codestream;
 pub mod decode;
 pub mod encode;
+pub mod error;
+pub mod image;
 
-use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, Error, Frame, Packet, Result};
-use oxideav_core::{CodecInfo, CodecRegistry, Decoder, Encoder};
+#[cfg(feature = "registry")]
+pub mod registry;
+
+#[cfg(feature = "registry")]
+pub use registry::{register, J2kDecoder, J2kEncoder};
 
 pub use codestream::{Cap, Codestream, ComponentInfo, Cpf, Marker, Siz, TilePart};
+pub use error::{Jpeg2000Error, Result};
+pub use image::{Jpeg2000Image, Jpeg2000PixelFormat, Jpeg2000Plane};
 
 /// Public codec id string. Matches the Cargo features `jpeg2000` / `jp2`
 /// in the aggregator crate.
@@ -188,190 +204,38 @@ pub fn probe(buf: &[u8]) -> Result<Probe> {
     })
 }
 
-/// Register the JPEG 2000 decoder + encoder factories.
+/// Standalone decode entry point.
 ///
-/// The decoder factory constructs a full Part-1 sample decoder. The
-/// encoder factory is still a stub — writing JPEG 2000 bitstreams is
-/// not in scope for this crate yet.
-pub fn register(reg: &mut CodecRegistry) {
-    let caps = CodecCapabilities::video("jpeg2000")
-        .with_lossy(true)
-        .with_intra_only(true);
-    reg.register(
-        CodecInfo::new(CodecId::new(CODEC_ID_STR))
-            .capabilities(caps)
-            .decoder(make_decoder)
-            .encoder(make_encoder),
-    );
+/// Accepts either a raw `.j2k` codestream (starting with `FF 4F` SOC)
+/// or a JP2 ISOBMFF container (starting with the 12-byte JP2 signature
+/// box) and returns the decoded image. With the default `registry`
+/// feature on, [`registry::J2kDecoder`] wraps this for the
+/// `oxideav-core` `Decoder` trait surface.
+pub fn decode_jpeg2000(buf: &[u8]) -> Result<Jpeg2000Image> {
+    let jp2_signature = [
+        0x00, 0x00, 0x00, 0x0C, b'j', b'P', b' ', b' ', 0x0D, 0x0A, 0x87, 0x0A,
+    ];
+    let data: Vec<u8> = if buf.len() >= 12 && buf[..12] == jp2_signature {
+        encode::codestream::extract_jp2_codestream(buf)?
+    } else {
+        buf.to_vec()
+    };
+    let cs = codestream::parse(&data)?;
+    #[cfg(feature = "htj2k")]
+    if cs.is_htj2k() {
+        return decode::htj2k::decode_frame_htj2k(&cs, &data);
+    }
+    decode::frame::decode_frame(&cs, &data)
 }
 
-fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
-    Ok(Box::new(J2kDecoder::new(params.codec_id.clone())))
-}
-
-fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
-    Ok(Box::new(J2kEncoder::new_from_params(params)))
-}
-
-/// JPEG 2000 sample encoder — 5/3 integer reversible (lossless) or 9/7
-/// irreversible, single-tile, single-layer, default precincts. See
-/// [`encode::EncodeOptions`] for the knobs this implementation honours.
-/// (The decoder side accepts multi-layer codestreams; the encoder
-/// emits one layer for now.)
-pub struct J2kEncoder {
-    output_params: CodecParameters,
-    opts: encode::EncodeOptions,
-    pending: Option<Packet>,
-    seq_counter: u64,
-}
-
-impl J2kEncoder {
-    pub fn new(codec_id: CodecId) -> Self {
-        Self {
-            output_params: CodecParameters::video(codec_id),
-            opts: encode::EncodeOptions::default(),
-            pending: None,
-            seq_counter: 0,
-        }
-    }
-
-    /// Build an encoder from full `CodecParameters`. Stashes width /
-    /// height / pixel format in `output_params` so `send_frame` can read
-    /// them when calling [`encode::encode_frame`] (the slim
-    /// `VideoFrame` no longer carries them).
-    pub fn new_from_params(params: &CodecParameters) -> Self {
-        Self {
-            output_params: params.clone(),
-            opts: encode::EncodeOptions::default(),
-            pending: None,
-            seq_counter: 0,
-        }
-    }
-
-    /// Replace the encode parameters. Call before any `send_frame`.
-    pub fn set_options(&mut self, opts: encode::EncodeOptions) {
-        self.opts = opts;
-    }
-}
-
-impl Encoder for J2kEncoder {
-    fn codec_id(&self) -> &CodecId {
-        &self.output_params.codec_id
-    }
-
-    fn output_params(&self) -> &CodecParameters {
-        &self.output_params
-    }
-
-    fn send_frame(&mut self, frame: &Frame) -> Result<()> {
-        let width = self
-            .output_params
-            .width
-            .ok_or_else(|| Error::invalid("jpeg2000 encoder: missing width in params"))?;
-        let height = self
-            .output_params
-            .height
-            .ok_or_else(|| Error::invalid("jpeg2000 encoder: missing height in params"))?;
-        let pix = self
-            .output_params
-            .pixel_format
-            .ok_or_else(|| Error::invalid("jpeg2000 encoder: missing pixel_format in params"))?;
-        let bytes = encode::encode_frame(frame, width, height, pix, &self.opts)?;
-        let pkt = Packet::new(0u32, oxideav_core::TimeBase::new(1, 1), bytes);
-        self.seq_counter = self.seq_counter.wrapping_add(1);
-        self.pending = Some(pkt);
-        Ok(())
-    }
-
-    fn receive_packet(&mut self) -> Result<Packet> {
-        self.pending
-            .take()
-            .ok_or_else(|| Error::invalid("jpeg2000: no packet pending"))
-    }
-
-    fn flush(&mut self) -> Result<()> {
-        Ok(())
-    }
-}
-
-/// JPEG 2000 sample decoder.
-pub struct J2kDecoder {
-    codec_id: CodecId,
-    /// The last parsed codestream, retained for geometry inspection.
-    last_parsed: Option<Codestream>,
-    /// The pending decoded frame, if `send_packet` produced one.
-    pending: Option<Frame>,
-}
-
-impl J2kDecoder {
-    pub fn new(codec_id: CodecId) -> Self {
-        Self {
-            codec_id,
-            last_parsed: None,
-            pending: None,
-        }
-    }
-
-    pub fn last_parsed(&self) -> Option<&Codestream> {
-        self.last_parsed.as_ref()
-    }
-}
-
-impl Decoder for J2kDecoder {
-    fn codec_id(&self) -> &CodecId {
-        &self.codec_id
-    }
-
-    fn send_packet(&mut self, packet: &Packet) -> Result<()> {
-        // Auto-detect JP2 ISOBMFF wrapper: a jp2 file starts with the
-        // 12-byte signature box `00 00 00 0C 6A 50 20 20 0D 0A 87 0A`.
-        // Raw j2k codestreams start with SOC = FF 4F. If we see the JP2
-        // magic, extract the inner `.j2k` codestream before parsing.
-        let jp2_signature = [
-            0x00, 0x00, 0x00, 0x0C, b'j', b'P', b' ', b' ', 0x0D, 0x0A, 0x87, 0x0A,
-        ];
-        let data: Vec<u8> = if packet.data.len() >= 12 && packet.data[..12] == jp2_signature {
-            encode::codestream::extract_jp2_codestream(&packet.data)?
-        } else {
-            packet.data.clone()
-        };
-        let cs = codestream::parse(&data)?;
-        // HTJ2K dispatch (ISO/IEC 15444-15). The classic EBCOT tier-1
-        // path cannot decode HT code-blocks: the FBCOT entropy decoder
-        // (Annex B of 15444-15) is a wholly different bitstream syntax.
-        // With the `htj2k` feature enabled, route HT codestreams
-        // through [`decode::htj2k::decode_frame_htj2k`], which reuses
-        // the Part-1 packet-header tier-2 walker but dispatches per
-        // codeblock to the FBCOT decoder.
-        #[cfg(feature = "htj2k")]
-        if cs.is_htj2k() {
-            let frame_res = decode::htj2k::decode_frame_htj2k(&cs, &data);
-            self.last_parsed = Some(cs);
-            let frame = frame_res?;
-            self.pending = Some(frame);
-            return Ok(());
-        }
-        let frame = decode::frame::decode_frame(&cs, &data)?;
-        self.last_parsed = Some(cs);
-        self.pending = Some(frame);
-        Ok(())
-    }
-
-    fn receive_frame(&mut self) -> Result<Frame> {
-        self.pending
-            .take()
-            .ok_or_else(|| Error::invalid("jpeg2000: no frame pending"))
-    }
-
-    fn flush(&mut self) -> Result<()> {
-        Ok(())
-    }
-
-    fn reset(&mut self) -> Result<()> {
-        self.last_parsed = None;
-        self.pending = None;
-        Ok(())
-    }
+/// Standalone encode entry point.
+///
+/// Encodes the image into a `.j2k` codestream (or `.jp2` container if
+/// `opts.jp2_wrapper` is true). With the default `registry` feature on,
+/// [`registry::J2kEncoder`] wraps this for the `oxideav-core` `Encoder`
+/// trait surface.
+pub fn encode_jpeg2000(image: &Jpeg2000Image, opts: &encode::EncodeOptions) -> Result<Vec<u8>> {
+    encode::codestream::encode_image(image, opts)
 }
 
 #[cfg(test)]
@@ -379,32 +243,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn direct_decoder_reports_geometry_on_tiny() {
+    fn standalone_probe_reports_geometry_on_tiny() {
         let buf = build_tiny_j2k();
-        let mut dec = J2kDecoder::new(CodecId::new(CODEC_ID_STR));
-        let pkt = Packet::new(0, oxideav_core::TimeBase::new(1, 1), buf);
-        // The tiny hand-crafted stream has no valid tier-1 payload —
-        // decoding will fail somewhere past the parser. That's fine;
-        // this test just ensures the parser + decoder plumbing wires
-        // together without panicking.
-        let _ = dec.send_packet(&pkt);
-        // The parser-only branch should have recorded geometry even if
-        // the decode attempt errored.
-        if let Some(cs) = dec.last_parsed() {
-            assert_eq!(cs.siz.image_width(), 4);
-            assert_eq!(cs.siz.image_height(), 3);
-            assert_eq!(cs.siz.num_components(), 1);
-            assert_eq!(cs.tile_parts.len(), 1);
-        }
-    }
-
-    #[test]
-    fn encoder_factory_builds_live_encoder() {
-        let mut reg = CodecRegistry::new();
-        register(&mut reg);
-        let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
-        let enc = reg.make_encoder(&params).expect("factory returns encoder");
-        assert_eq!(enc.codec_id().as_str(), CODEC_ID_STR);
+        // The hand-crafted stream has valid markers but no useful
+        // payload, so probe (which is marker-only) should succeed.
+        let p = probe(&buf).expect("probe");
+        assert_eq!(p.width, 4);
+        assert_eq!(p.height, 3);
+        assert_eq!(p.num_components, 1);
+        assert_eq!(p.flavour, J2kFlavour::ClassicPart1);
     }
 
     fn build_tiny_j2k() -> Vec<u8> {

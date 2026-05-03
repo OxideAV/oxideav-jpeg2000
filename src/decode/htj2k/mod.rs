@@ -35,7 +35,7 @@ pub use cleanup::CleanupOutput;
 pub use sigprop::SigPropOutput;
 pub use tier2::decode_frame_htj2k;
 
-use oxideav_core::{Error, Result};
+use crate::error::{Jpeg2000Error as Error, Result};
 
 /// Number of FBCOT passes encoded for one HT code-block (per Annex B
 /// of ISO/IEC 15444-15). Matches the spec symbol `Z_blk`.

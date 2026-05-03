@@ -41,7 +41,7 @@ use super::bio::Bio;
 use super::dwt;
 use super::t1::{self, Orient};
 use super::tagtree::TagTree;
-use oxideav_core::{Error, Result};
+use crate::error::{Jpeg2000Error as Error, Result};
 
 #[derive(Debug, Clone)]
 pub struct CodParams {

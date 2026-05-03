@@ -11,7 +11,7 @@
 //! per Formula (3) of §7.3.6.
 
 use super::streams::VlcReader;
-use oxideav_core::Result;
+use crate::error::Result;
 
 /// `decodeUPrefix` — Table 3 column "Prefix" decoded from the VLC
 /// stream LSB-first.

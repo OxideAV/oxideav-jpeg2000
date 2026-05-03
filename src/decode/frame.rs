@@ -1,5 +1,6 @@
 //! Public frame decoder entry point: take a parsed codestream and the
-//! raw tile-part body bytes, return a fully decoded `oxideav_core::Frame`.
+//! raw tile-part body bytes, return a fully decoded
+//! [`crate::Jpeg2000Image`].
 //!
 //! Multi-tile decode
 //! -----------------
@@ -32,15 +33,18 @@
 //! otherwise contain at least one tile-part for at least one tile —
 //! an empty codestream is rejected.
 
-use oxideav_core::{Error, Frame, PixelFormat, Result, VideoFrame, VideoPlane};
+use crate::error::{Jpeg2000Error as Error, Result};
+use crate::image::{
+    Jpeg2000Image, Jpeg2000PixelFormat as PixelFormat, Jpeg2000Plane as VideoPlane,
+};
 
 use super::tile::{
     decode_tile_with_params, parse_cod, parse_poc, parse_qcd, CodParams, DecodeParams, PocParams,
 };
 use crate::codestream::{Codestream, Siz};
 
-/// Decode one JPEG 2000 still into an uncompressed video frame.
-pub fn decode_frame(cs: &Codestream, buf: &[u8]) -> Result<Frame> {
+/// Decode one JPEG 2000 still into a [`Jpeg2000Image`].
+pub fn decode_frame(cs: &Codestream, buf: &[u8]) -> Result<Jpeg2000Image> {
     let cod_bytes = cs
         .cod
         .as_ref()
@@ -322,10 +326,13 @@ pub fn decode_frame(cs: &Codestream, buf: &[u8]) -> Result<Frame> {
         }
     };
 
-    let _ = pixel_format;
-    let _ = img_w;
-    let _ = img_h;
-    Ok(Frame::Video(VideoFrame { pts: None, planes }))
+    Ok(Jpeg2000Image {
+        width: img_w,
+        height: img_h,
+        pixel_format,
+        planes,
+        pts: None,
+    })
 }
 
 /// Number of tiles in the grid along X and Y. T.800 §B.3:

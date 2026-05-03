@@ -14,7 +14,7 @@
 use super::cxt_vlc_tables::{Entry, CXT_VLC_TABLE_0, CXT_VLC_TABLE_1};
 use super::mel::MelDecoder;
 use super::streams::{MelReader, VlcReader};
-use oxideav_core::{Error, Result};
+use crate::error::{Jpeg2000Error as Error, Result};
 
 /// Tuple returned by `decodeCxtVLC` / `decodeSigEMB`:
 /// `(ρ_q, u_q^off, ε^k_q, ε^1_q)`.

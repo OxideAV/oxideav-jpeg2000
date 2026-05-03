@@ -18,7 +18,7 @@
 
 use super::cleanup::CleanupOutput;
 use super::streams::SigPropReader;
-use oxideav_core::Result;
+use crate::error::Result;
 
 /// Decoded SigProp state: `z_n` (refinement indicator) and
 /// `r_n` (refinement value), one per sample.

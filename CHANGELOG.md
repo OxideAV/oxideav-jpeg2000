@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Standalone-friendly Cargo feature shape: `oxideav-core` is now an
+  optional dep behind a default-on `registry` feature. With the feature
+  off the crate exposes a pure-decode/encode API
+  (`decode_jpeg2000` / `encode_jpeg2000`) returning the new crate-local
+  `Jpeg2000Image` / `Jpeg2000Error` / `Jpeg2000PixelFormat` /
+  `Jpeg2000Plane` types — no `oxideav-core` types in the public surface.
+- Gated `registry` module hosting the `Decoder` / `Encoder` trait impls,
+  the `register()` factory entry point, and `From` conversions
+  (`Jpeg2000Error → oxideav_core::Error`,
+  `Jpeg2000PixelFormat → oxideav_core::PixelFormat`,
+  `Jpeg2000Image → oxideav_core::Frame`). Re-exported from the crate
+  root as before when the default `registry` feature is on.
+
+### Changed
+
+- Internal pipeline modules (`codestream`, `decode/*`, `encode/*`) now
+  use the crate-local `Jpeg2000Error` / `Result` instead of
+  `oxideav_core::{Error, Result}`. No behaviour change; the surface
+  visible to downstream consumers is identical.
+- `encode::codestream::encode_image(&Jpeg2000Image, &EncodeOptions)` is
+  the new pure-encode entry point. The pre-existing
+  `encode::codestream::encode_frame(&Frame, w, h, pix, &opts)` shape
+  remains, gated behind the `registry` feature, as a thin wrapper.
+
 ## [0.0.5](https://github.com/OxideAV/oxideav-jpeg2000/compare/v0.0.4...v0.0.5) - 2026-05-03
 
 ### Other

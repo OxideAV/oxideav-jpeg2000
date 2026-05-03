@@ -44,7 +44,7 @@
 //! length that includes its own two bytes. SOD has no length — the
 //! compressed data runs to the next SOT or EOC.
 
-use oxideav_core::{Error, Result};
+use crate::error::{Jpeg2000Error as Error, Result};
 
 /// Two-byte JPEG 2000 marker code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

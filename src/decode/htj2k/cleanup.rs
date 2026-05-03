@@ -23,7 +23,7 @@ use super::cxt_vlc::{decode_sig_emb, SigEmb};
 use super::mel::MelDecoder;
 use super::streams::{MagSgnReader, MelReader, VlcReader};
 use super::uvlc::{decode_u_extension, decode_u_prefix, decode_u_suffix};
-use oxideav_core::{Error, Result};
+use crate::error::{Jpeg2000Error as Error, Result};
 
 /// Decoded HT cleanup state: magnitudes and signs in quad-scan order.
 ///

@@ -31,7 +31,7 @@
 //! behaviour is preserved here so callers don't need to oversize
 //! their buffers.
 
-use oxideav_core::{Error, Result};
+use crate::error::{Jpeg2000Error as Error, Result};
 
 /// `modDcup` accessor from §7.1.1: reads byte `pos` of the HT cleanup
 /// segment after virtually overwriting the trailing two bytes used by

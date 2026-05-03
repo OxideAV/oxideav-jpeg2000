@@ -16,7 +16,7 @@
 //!   sweep, tier-1 decode for every participating code-block, IDWT per
 //!   resolution level, DC level-shift, component transform.
 //! - [`frame`] — public API turning a parsed [`crate::Codestream`]
-//!   into a decoded `oxideav_core::Frame`.
+//!   into a decoded [`crate::Jpeg2000Image`].
 
 pub mod bio;
 pub mod dwt;

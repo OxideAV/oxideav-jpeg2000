@@ -10,7 +10,7 @@
 use super::dwt::{fdwt_53, fdwt_97};
 use super::t1::{encode_cblk, EncodedCblk};
 use crate::decode::tile::{build_subbands, PocProgression, SubbandInfo};
-use oxideav_core::{Error, Result};
+use crate::error::{Jpeg2000Error as Error, Result};
 
 /// Wavelet transform kind selected by the caller.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

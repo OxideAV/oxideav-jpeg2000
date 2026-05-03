@@ -9,7 +9,13 @@
 
 use super::tile::{encode_tile, encode_tile_97};
 use crate::decode::tile::{parse_cod, parse_poc, parse_qcd, split_packet_headers, PocProgression};
-use oxideav_core::{Error, Frame, PixelFormat, Result};
+use crate::error::{Jpeg2000Error as Error, Result};
+use crate::image::{Jpeg2000Image, Jpeg2000PixelFormat as PixelFormat};
+
+#[cfg(feature = "registry")]
+use crate::image::Jpeg2000Plane;
+#[cfg(feature = "registry")]
+use oxideav_core::{Frame, PixelFormat as CorePixelFormat};
 
 /// Wavelet transform selector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,40 +206,26 @@ pub(crate) fn forward_ict_u8(
     (y, cb, cr)
 }
 
-/// Encode a single `Frame::Video` as a `.j2k` (or `.jp2`) codestream.
+/// Encode a single [`Jpeg2000Image`] as a `.j2k` (or `.jp2`) codestream.
 ///
 /// Supported pixel formats:
 /// - `Gray8` → single component, 8-bit, DC-level-shifted.
 /// - `Rgb24` → three components, 8-bit, optionally passed through the
 ///   forward RCT (for 5/3) or ICT (for 9/7) component transform.
-///
-/// Width / height / pixel format moved off the slim `VideoFrame`; pass
-/// them explicitly. Callers typically read them from their own
-/// `CodecParameters`.
-pub fn encode_frame(
-    frame: &Frame,
-    width: u32,
-    height: u32,
-    pix: PixelFormat,
-    opts: &EncodeOptions,
-) -> Result<Vec<u8>> {
-    let vf = match frame {
-        Frame::Video(v) => v,
-        _ => return Err(Error::unsupported("jpeg2000: only video frames supported")),
-    };
-
-    let w = width;
-    let h = height;
+pub fn encode_image(image: &Jpeg2000Image, opts: &EncodeOptions) -> Result<Vec<u8>> {
+    let w = image.width;
+    let h = image.height;
+    let pix = image.pixel_format;
     let num_pixels = w as usize * h as usize;
     let precision = 8u32; // Ssiz ≤ 8 — scope restricted to 8-bit samples.
 
     // Extract per-channel u8 planes for the supported pixel formats.
     let (channels_u8, num_comps, is_color) = match pix {
         PixelFormat::Gray8 => {
-            if vf.planes.len() != 1 {
+            if image.planes.len() != 1 {
                 return Err(Error::invalid("jpeg2000: Gray8 frame must have one plane"));
             }
-            let p = &vf.planes[0];
+            let p = &image.planes[0];
             let mut gray = Vec::with_capacity(num_pixels);
             for y in 0..h as usize {
                 for x in 0..w as usize {
@@ -243,10 +235,10 @@ pub fn encode_frame(
             (vec![gray], 1usize, false)
         }
         PixelFormat::Rgb24 => {
-            if vf.planes.len() != 1 {
+            if image.planes.len() != 1 {
                 return Err(Error::invalid("jpeg2000: Rgb24 frame must have one plane"));
             }
-            let p = &vf.planes[0];
+            let p = &image.planes[0];
             let mut r = Vec::with_capacity(num_pixels);
             let mut g = Vec::with_capacity(num_pixels);
             let mut b = Vec::with_capacity(num_pixels);
@@ -759,4 +751,54 @@ pub fn extract_jp2_codestream(buf: &[u8]) -> Result<Vec<u8>> {
         i = end;
     }
     Err(Error::invalid("jpeg2000: no jp2c box found"))
+}
+
+/// Backward-compatible `oxideav-core` `Frame`-based encode entry point.
+///
+/// Bridges from an `oxideav_core::Frame::Video` plus its (width, height,
+/// pixel format) tuple to the standalone [`encode_image`] entry point.
+/// Gated behind the default-on `registry` feature; disable that feature
+/// and use [`encode_image`] / [`crate::encode_jpeg2000`] for the
+/// `oxideav-core`-free path.
+#[cfg(feature = "registry")]
+pub fn encode_frame(
+    frame: &Frame,
+    width: u32,
+    height: u32,
+    pix: CorePixelFormat,
+    opts: &EncodeOptions,
+) -> Result<Vec<u8>> {
+    let vf = match frame {
+        Frame::Video(v) => v,
+        _ => return Err(Error::unsupported("jpeg2000: only video frames supported")),
+    };
+    let local_pix = match pix {
+        CorePixelFormat::Gray8 => PixelFormat::Gray8,
+        CorePixelFormat::Rgb24 => PixelFormat::Rgb24,
+        CorePixelFormat::Yuv444P => PixelFormat::Yuv444P,
+        CorePixelFormat::Yuv422P => PixelFormat::Yuv422P,
+        CorePixelFormat::Yuv420P => PixelFormat::Yuv420P,
+        other => {
+            return Err(Error::unsupported(format!(
+                "jpeg2000: encoder: unsupported pixel format {:?}",
+                other
+            )))
+        }
+    };
+    let planes = vf
+        .planes
+        .iter()
+        .map(|p| Jpeg2000Plane {
+            stride: p.stride,
+            data: p.data.clone(),
+        })
+        .collect();
+    let img = Jpeg2000Image {
+        width,
+        height,
+        pixel_format: local_pix,
+        planes,
+        pts: vf.pts,
+    };
+    encode_image(&img, opts)
 }
