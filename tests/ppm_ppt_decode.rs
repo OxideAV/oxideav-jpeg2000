@@ -12,10 +12,10 @@
 //!   the resulting codestream is decoded and compared sample-for-sample
 //!   against the original fixture's decoded output.
 
-use oxideav_core::Frame;
 use oxideav_jpeg2000::codestream;
 use oxideav_jpeg2000::decode::frame::decode_frame;
 use oxideav_jpeg2000::decode::tile::{parse_cod, parse_poc, parse_qcd, split_packet_headers};
+use oxideav_jpeg2000::Jpeg2000Image;
 
 const J2K_3LYR: &[u8] = include_bytes!("fixtures/opj32_3lyr.j2k");
 
@@ -158,28 +158,20 @@ fn parser_no_ppm_or_ppt_in_baseline_fixture() {
 
 const J2K_TILED_GRAY: &[u8] = include_bytes!("fixtures/opj128_gray_tiled_prec_lrcp.j2k");
 
-/// Pull a frame's flat sample buffer for comparison. Asserts both
-/// frames have identical geometry and pixel format and returns one
-/// bag of bytes per plane.
-fn frame_planes(frame: &Frame) -> Vec<Vec<u8>> {
-    match frame {
-        Frame::Video(v) => v.planes.iter().map(|p| p.data.clone()).collect(),
-        _ => panic!("expected video frame"),
-    }
+/// Pull an image's flat sample buffers for comparison.
+fn image_planes(img: &Jpeg2000Image) -> Vec<Vec<u8>> {
+    img.planes.iter().map(|p| p.data.clone()).collect()
 }
 
-/// Assert two decoded frames are sample-for-sample identical.
-fn assert_frames_equal(label: &str, a: &Frame, b: &Frame) {
-    let (Frame::Video(va), Frame::Video(vb)) = (a, b) else {
-        panic!("{label}: not a video frame");
-    };
+/// Assert two decoded images are sample-for-sample identical.
+fn assert_frames_equal(label: &str, a: &Jpeg2000Image, b: &Jpeg2000Image) {
     assert_eq!(
-        va.planes.len(),
-        vb.planes.len(),
+        a.planes.len(),
+        b.planes.len(),
         "{label}: plane count mismatch"
     );
-    let pa = frame_planes(a);
-    let pb = frame_planes(b);
+    let pa = image_planes(a);
+    let pb = image_planes(b);
     for (i, (la, lb)) in pa.iter().zip(pb.iter()).enumerate() {
         assert_eq!(la, lb, "{label}: plane {i} sample mismatch");
     }
