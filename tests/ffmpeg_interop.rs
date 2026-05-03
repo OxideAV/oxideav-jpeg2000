@@ -5,7 +5,7 @@
 
 use std::process::Command;
 
-use oxideav_core::{Frame, PixelFormat, TimeBase, VideoFrame, VideoPlane};
+use oxideav_core::{Frame, PixelFormat, VideoFrame, VideoPlane};
 use oxideav_jpeg2000::encode::{encode_frame, EncodeOptions};
 
 fn parse_pgm(bytes: &[u8]) -> Vec<u8> {

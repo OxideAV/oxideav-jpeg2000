@@ -230,7 +230,7 @@ fn jp2_wrapper_on_9p7_rgb_encodes_and_decodes() {
     let pkt = Packet::new(0, TimeBase::new(1, 1), cs);
     dec.send_packet(&pkt).expect("send_packet");
     let frame = dec.receive_frame().expect("receive_frame");
-    let vf = match frame {
+    let _vf = match frame {
         Frame::Video(v) => v,
         _ => panic!("expected video frame"),
     };
