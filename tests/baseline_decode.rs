@@ -7,7 +7,7 @@
 //! → IDWT → level shift.
 
 use oxideav_core::CodecRegistry;
-use oxideav_core::{CodecId, CodecParameters, Frame, Packet, PixelFormat, TimeBase};
+use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 
 const BASELINE_J2K: &[u8] = include_bytes!("fixtures/baseline.j2k");
 
