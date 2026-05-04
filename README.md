@@ -92,19 +92,21 @@ irreversible path produces a lossy bitstream with round-trip PSNR
   orders**, **PPT / PPM packed headers**, **region-of-interest
   (RGN)**.
 - The **HT block coder** (Part 15, ISO/IEC 15444-15 / ITU-T T.814) is
-  partially implemented behind the `htj2k` Cargo feature. CAP marker
-  parsing, the FBCOT cleanup pass with both Annex C CxtVLC tables,
-  the SigProp / MagRef refinement passes, and the LRCP single-tile
-  single-layer tier-2 walker are in place. As of round 6 the cleanup
-  pass does **not** thread the per-codeblock significant-bitplane
-  shift `p` into magnitude reconstruction, so non-AZC codeblocks
-  decode at the wrong scale; this gates byte-exact decode of
-  trace-doc §12.2 / §12.3 and the OpenJPH 5/3 32×32 interop fixture.
-  The two `CXT_VLC_TABLE_0` Annex C transcription typos that round 6
-  fixed (rows 28 and 354 of the 444-row table) remain a hard
-  precondition for any future `p`-shift wiring to converge on the
-  right pixels. Round 7+ will land the wiring fix and un-ignore the
-  pinned tests.
+  decoder-side functional behind the `htj2k` Cargo feature for
+  single-tile single-layer LRCP codestreams. CAP marker parsing, the
+  FBCOT cleanup pass (both Annex C CxtVLC tables), the SigProp /
+  MagRef refinement passes, the per-codeblock bit-plane shift
+  `pblk = M_b − S_blk − 1` (T.800 Eq E-1) on both the 5/3 integer
+  and 9/7 float reconstruction paths, and the LRCP tier-2 walker are
+  all in place. The 32×32 OpenJPH 5/3 reversible fixture is bit-exact
+  against the OpenJPH-binary reference; the 32×32 9/7 lossy fixture
+  decodes within MAD ≤ 8 LSB; the 64×64 5-decomposition-level 9/7
+  multi-band fixture (every HF band populated) decodes at MAD ≈ 0.47
+  with max-deviation 2 against the OpenJPH-binary reference. The
+  pblk > 0 / pblk < 0 / `z = 1` algebraic cases on the 9/7 float
+  path are unit-tested against the closed-form Eq E-1. Encoder side,
+  multi-tile, multi-layer, PPM/PPT, region-of-interest, multi-set HT
+  (T.814 §B), and constrained sets (T.814 §8) are not yet wired.
 - **RGB input beyond 8-bit unsigned chroma** — the decoder's RCT
   inverse currently clamps chroma to unsigned 8-bit before the
   inverse transform, so encoder inputs with chroma excursions outside

@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- decoder (HTJ2K, round 9): multi-band 64×64 5-decomposition-level 9/7
+  fixture (`htj2k_lossy97_64x64_nl5_lrcp.j2c`, with paired
+  `_input.pgm` + `_opj_ref.pgm`) closes the integration-test gap left
+  by round 4: the previous 32×32 NL=1 fixture had `included = false`
+  on every HF code-block, so the 9/7 float decode path was only
+  exercised on the LL band. The new fixture populates all 16 sub-bands
+  (LL_5 + 5×{HL,LH,HH}) and decodes at MAD ≈ 0.47 / max-deviation 2
+  vs. the OpenJPH-binary reference.
+- decoder (HTJ2K, round 9): per-codeblock M_b-grid reconstruction
+  (T.800 Eq E-1 with `N_b = S_blk + 1 + z_n`) extracted into a
+  reviewable `mb_grid_value_97` helper plus a unit-test sweep covering
+  the `pblk = 0` / `pblk > 0` / `pblk < 0` / `z = 0` / `z = 1` /
+  `μ = 0, r = 1` algebraic cases — the half-step refinement (`pblk = 0,
+  z = 1` ⇒ 0.5 multiplier) and the SigProp-only LSB
+  (`μ = 0, r = 1`) are exercised directly. Both the 5/3 integer
+  fixture and the 9/7 float multi-band fixture continue to round-trip;
+  the unit tests close the algebraic-coverage gap that the OpenJPH
+  fixtures (single-cleanup-pass, `missing_msb = M_b`) cannot hit by
+  design.
+
 ### Fixed
 
 - decoder (HTJ2K, round 7): three cleanup-pass bugs that prevented HF

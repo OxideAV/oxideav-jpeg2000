@@ -785,28 +785,11 @@ fn decode_subband_htj2k_97(
             for ly in 0..h {
                 for lx in 0..w {
                     let n = quad_scan_index(qw, lx as u32, ly as u32);
-                    let mu = out.mag[n] as i64;
+                    let mu = out.mag[n];
                     let sign = out.sign[n];
                     let z = out.z[n];
                     let r = out.refinement[n];
-                    // μ_extended scaled to the band's M_b grid as a
-                    // float. Mirrors the 5/3 integer ladder but uses
-                    // `2.0_f64.powi(pblk_eff)` so the half-step case
-                    // (z != 0, pblk == 0 ⇒ pblk_eff = −1) survives as
-                    // a multiplicative 0.5 instead of being truncated.
-                    let unsigned_mb: f64 = if mu != 0 {
-                        if z != 0 {
-                            let mext = ((mu << 1) | r as i64) as f64;
-                            mext * 2.0f64.powi(pblk - 1)
-                        } else {
-                            (mu as f64) * 2.0f64.powi(pblk)
-                        }
-                    } else if z != 0 {
-                        (r as f64) * 2.0f64.powi(pblk - 1)
-                    } else {
-                        0.0
-                    };
-                    let signed_mb = if sign != 0 { -unsigned_mb } else { unsigned_mb };
+                    let signed_mb = mb_grid_value_97(mu, sign, z, r, pblk);
                     let dequant = signed_mb * scale;
                     buf[(rel_y + ly) * bw + (rel_x + lx)] = dequant as f32;
                 }
@@ -814,6 +797,45 @@ fn decode_subband_htj2k_97(
         }
     }
     Ok(())
+}
+
+/// Reconstruct the signed value of one HTJ2K sample at the band's
+/// **M_b grid** (as a float) per T.800 Eq E-1 with the FBCOT
+/// (`μ_n`, `s_n`, `z_n`, `r_n`) tuple.
+///
+/// `pblk = M_b − S_blk − 1 = band_numbps − missing_msb` is the
+/// per-codeblock left-shift required to align the cleanup magnitude
+/// (whose LSB sits at S_blk) onto the M_b grid where the dequant
+/// stepsize Δ_b is meaningful (Eq E-3). When MagRef / SigProp
+/// contribute an extra LSB (`z_n = 1`), the extended magnitude
+/// `μ_extended = (μ_n << 1) | r_n` already carries a factor of 2, so
+/// the effective shift drops to `pblk − 1`. Float arithmetic preserves
+/// the half-step refinement (`pblk − 1 = −1` ⇒ multiplicative 0.5)
+/// that the integer 5/3 path has to truncate (Eq E-7, r = 0).
+///
+/// pblk can be negative when the encoder picks `missing_msb > M_b`
+/// — the cleanup magnitude is then truncated by `−pblk` LSBs, which
+/// is a bit-rate / quality trade the encoder owns. We honour the
+/// sign of `pblk` symmetrically on both branches.
+#[inline]
+pub(crate) fn mb_grid_value_97(mu: u64, sign: u8, z: u8, r: u8, pblk: i32) -> f64 {
+    let unsigned_mb: f64 = if mu != 0 {
+        if z != 0 {
+            let mext = ((mu << 1) | r as u64) as f64;
+            mext * 2.0f64.powi(pblk - 1)
+        } else {
+            (mu as f64) * 2.0f64.powi(pblk)
+        }
+    } else if z != 0 {
+        (r as f64) * 2.0f64.powi(pblk - 1)
+    } else {
+        0.0
+    };
+    if sign != 0 {
+        -unsigned_mb
+    } else {
+        unsigned_mb
+    }
 }
 
 /// Map (lx, ly) inside a code-block into the FBCOT quad-scan sample
@@ -926,5 +948,119 @@ impl<'a> Cursor<'a> {
         let s = &self.buf[self.pos..self.pos + n];
         self.pos += n;
         Ok(s)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Direct exercises of the per-codeblock M_b-grid reconstruction
+    //! formula on the 9/7 float path (`mb_grid_value_97`).
+    //!
+    //! The fixture-driven `htj2k_lossy97_*` interop tests only ever
+    //! hit `pblk == 0` because OpenJPH (the binary used to author the
+    //! fixtures) emits one cleanup pass per codeblock and sets
+    //! `missing_msb = M_b` — making `pblk = M_b − missing_msb = 0`.
+    //! The pblk > 0 / pblk < 0 / z = 1 cases are therefore checked
+    //! here as direct calls into the helper, anchored on T.800 Eq E-1
+    //! and T.814 §7.6 / Figure 4.
+    use super::mb_grid_value_97;
+
+    /// pblk = 0, z = 0, sign = 0: the cleanup magnitude is the M_b
+    /// value verbatim (no shift).
+    #[test]
+    fn pblk0_z0_is_identity() {
+        let v = mb_grid_value_97(7, 0, 0, 0, 0);
+        assert_eq!(v, 7.0);
+    }
+
+    /// pblk = 0, z = 0, sign = 1: M_b value is negated.
+    #[test]
+    fn pblk0_z0_sign_flips() {
+        let v = mb_grid_value_97(7, 1, 0, 0, 0);
+        assert_eq!(v, -7.0);
+    }
+
+    /// pblk > 0, z = 0: cleanup magnitude left-shifted by `pblk`.
+    #[test]
+    fn pblk_positive_left_shifts_cleanup() {
+        // M_b = 13, missing_msb = 11 ⇒ pblk = 2, μ = 5.
+        // Expected: 5 * 2^2 = 20.
+        let v = mb_grid_value_97(5, 0, 0, 0, 2);
+        assert_eq!(v, 20.0);
+    }
+
+    /// pblk > 0, z = 1: extended magnitude `(μ << 1) | r` left-shifted
+    /// by `pblk − 1`. Verifies that the SigProp/MagRef LSB lives one
+    /// plane below the cleanup plane (T.800 Eq E-1 with N_b = S_blk +
+    /// 1 + z_n).
+    #[test]
+    fn pblk_positive_z1_uses_extended_mag() {
+        // μ = 5, r = 1 ⇒ μ_ext = (5 << 1) | 1 = 11.
+        // pblk = 2 ⇒ shift = 1 ⇒ 11 * 2 = 22.
+        let v = mb_grid_value_97(5, 0, 1, 1, 2);
+        assert_eq!(v, 22.0);
+    }
+
+    /// pblk = 0, z = 1: half-step refinement survives in float as 0.5
+    /// multiplier (the integer 5/3 path truncates this case to 0).
+    #[test]
+    fn pblk0_z1_preserves_half_step_in_float() {
+        // μ = 3, r = 1 ⇒ μ_ext = 7. shift = -1 ⇒ 7 * 0.5 = 3.5.
+        let v = mb_grid_value_97(3, 0, 1, 1, 0);
+        assert_eq!(v, 3.5);
+    }
+
+    /// μ = 0, z = 1: r contributes a half-step LSB even when the
+    /// cleanup magnitude was zero (newly-significant via SigProp).
+    #[test]
+    fn mu_zero_z1_emits_half_step_lsb() {
+        let v = mb_grid_value_97(0, 0, 1, 1, 1);
+        // r=1 -> 1 * 2^0 = 1.0
+        assert_eq!(v, 1.0);
+        // pblk = 0, half-step:
+        let v = mb_grid_value_97(0, 0, 1, 1, 0);
+        assert_eq!(v, 0.5);
+        // pblk = 0, r = 0: zero.
+        let v = mb_grid_value_97(0, 0, 1, 0, 0);
+        assert_eq!(v, 0.0);
+    }
+
+    /// pblk < 0 (encoder picks missing_msb > M_b): negative shift —
+    /// i.e. multiply by 2^pblk = a fraction. The float path keeps
+    /// the precise value where the integer path would truncate.
+    #[test]
+    fn pblk_negative_shrinks_magnitude() {
+        // μ = 8, pblk = −1 ⇒ 8 * 0.5 = 4.0
+        let v = mb_grid_value_97(8, 0, 0, 0, -1);
+        assert_eq!(v, 4.0);
+    }
+
+    /// Multi-band sweep: a representative span of (μ, z, r, sign,
+    /// pblk) tuples that the 9/7 path encounters when decoding a
+    /// real multi-decomposition codestream. Each tuple is checked
+    /// against the closed-form Eq E-1 expectation.
+    #[test]
+    fn multi_band_sweep_matches_eq_e1() {
+        // (mu, sign, z, r, pblk, expected)
+        let cases: &[(u64, u8, u8, u8, i32, f64)] = &[
+            (1, 0, 0, 0, 0, 1.0),
+            (1, 1, 0, 0, 0, -1.0),
+            (1, 0, 0, 0, 3, 8.0),  // 1 << 3
+            (3, 0, 0, 0, 4, 48.0), // 3 << 4
+            (3, 1, 0, 0, 4, -48.0),
+            (3, 0, 1, 0, 4, 48.0), // (6 << 3) = 48
+            (3, 0, 1, 1, 4, 56.0), // (7 << 3) = 56
+            (0, 0, 1, 1, 4, 8.0),  // 1 << 3
+            (0, 0, 0, 0, 4, 0.0),
+            (15, 0, 0, 0, 0, 15.0),
+            (15, 0, 1, 1, 0, 15.5), // (31) * 0.5
+        ];
+        for &(mu, sign, z, r, pblk, expected) in cases {
+            let v = mb_grid_value_97(mu, sign, z, r, pblk);
+            assert!(
+                (v - expected).abs() < 1e-9,
+                "tuple (μ={mu}, s={sign}, z={z}, r={r}, pblk={pblk}) → {v}, expected {expected}",
+            );
+        }
     }
 }
