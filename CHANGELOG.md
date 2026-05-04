@@ -7,42 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.0.6](https://github.com/OxideAV/oxideav-jpeg2000/compare/v0.0.5...v0.0.6) - 2026-05-03
-
-### Added
-
-- standalone-friendly Cargo feature shape ([#359](https://github.com/OxideAV/oxideav-jpeg2000/pull/359))
-
-### Other
-
-- *(ppm_ppt)* adapt to Jpeg2000Image return type from decode_frame
-- external opj_compress / opj_decompress lossless RGB roundtrip ([#314](https://github.com/OxideAV/oxideav-jpeg2000/pull/314))
-- cargo-fuzz harnesses + daily Fuzz workflow (task #296)
-
-### Added
-
-- Standalone-friendly Cargo feature shape: `oxideav-core` is now an
-  optional dep behind a default-on `registry` feature. With the feature
-  off the crate exposes a pure-decode/encode API
-  (`decode_jpeg2000` / `encode_jpeg2000`) returning the new crate-local
-  `Jpeg2000Image` / `Jpeg2000Error` / `Jpeg2000PixelFormat` /
-  `Jpeg2000Plane` types — no `oxideav-core` types in the public surface.
-- Gated `registry` module hosting the `Decoder` / `Encoder` trait impls,
-  the `register()` factory entry point, and `From` conversions
-  (`Jpeg2000Error → oxideav_core::Error`,
-  `Jpeg2000PixelFormat → oxideav_core::PixelFormat`,
-  `Jpeg2000Image → oxideav_core::Frame`). Re-exported from the crate
-  root as before when the default `registry` feature is on.
-
 ### Fixed
 
 - decoder (HTJ2K, round 7): three cleanup-pass bugs that prevented HF
   sub-band magnitudes from converging to the spec-correct integers
   for non-first-line-pair quads. The 8×8 ramp fixture (§12.2 of the
   trace doc) and the 7×7 boundary-parity fixture (§12.3) now decode
-  byte-exactly, and the 9/7-encoded `ojph_compress` 32×32 reversible
-  fixture round-trips bit-exactly through `opj_decompress`-equivalent
-  reconstruction:
+  byte-exactly, and the round-4 `htj2k_rev53` 32×32 `ojph_compress`
+  fixture round-trips bit-exactly:
   1. Eq (2) of T.814 §7.3.5 was implemented as
      `c_q = (σ^nw|σ^n) + 2(σ^n|σ^nw) + 4(σ^ne|σ^nf)`. The middle
      term should be `2(σ^w|σ^sw)` per the spec; same-row left-neighbour
@@ -64,9 +36,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
      suffix was reading bits from positions intended for q2's prefix,
      yielding U_q values one bit-plane shy of what the encoder
      emitted.
-  Pinned by the §12.2 / §12.3 trace-doc fixtures (now bit-exact, no
-  longer `#[ignore]`d) and by the round-4 `htj2k_rev53` 32×32
-  `ojph_compress`-encoded fixture (now bit-exact too).
 - decoder (HTJ2K, round 7): per-block bit-plane shift `pblk =
   band_numbps − missing_msb` is now applied during signed-integer
   reconstruction in the 5/3 reversible synthesis path (T.800 Eq E-1
@@ -74,16 +43,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   written into the sub-band buffer at the wrong bit-plane whenever the
   encoder used non-zero num_zero_bitplanes.
 
-### Changed
+## [0.0.6](https://github.com/OxideAV/oxideav-jpeg2000/compare/v0.0.5...v0.0.6) - 2026-05-03
 
-- Internal pipeline modules (`codestream`, `decode/*`, `encode/*`) now
-  use the crate-local `Jpeg2000Error` / `Result` instead of
-  `oxideav_core::{Error, Result}`. No behaviour change; the surface
-  visible to downstream consumers is identical.
-- `encode::codestream::encode_image(&Jpeg2000Image, &EncodeOptions)` is
-  the new pure-encode entry point. The pre-existing
-  `encode::codestream::encode_frame(&Frame, w, h, pix, &opts)` shape
-  remains, gated behind the `registry` feature, as a thin wrapper.
+### Added
+
+- standalone-friendly Cargo feature shape ([#359](https://github.com/OxideAV/oxideav-jpeg2000/pull/359))
+
+### Other
+
+- *(ppm_ppt)* adapt to Jpeg2000Image return type from decode_frame
+- external opj_compress / opj_decompress lossless RGB roundtrip ([#314](https://github.com/OxideAV/oxideav-jpeg2000/pull/314))
+- cargo-fuzz harnesses + daily Fuzz workflow (task #296)
 
 ## [0.0.5](https://github.com/OxideAV/oxideav-jpeg2000/compare/v0.0.4...v0.0.5) - 2026-05-03
 
