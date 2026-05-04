@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/OxideAV/oxideav-jpeg2000/compare/v0.0.6...v0.0.7) - 2026-05-04
+
+### Other
+
+- HTJ2K round 9 — multi-band 9/7 fixture + pblk algebraic unit-test sweep
+- HTJ2K round 8 — wire pblk into 9/7 dequant, drop spurious 0.5 multiplier
+- move HTJ2K round 7 + standalone shape under [Unreleased]
+- HTJ2K round 7 — three cleanup-pass bugs unblocking HF-band magnitude convergence
+
 ### Added
 
 - decoder (HTJ2K, round 9): multi-band 64×64 5-decomposition-level 9/7
