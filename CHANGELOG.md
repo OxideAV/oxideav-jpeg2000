@@ -18,6 +18,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- encoder (HTJ2K, round 1): minimum-viable HT cleanup-pass encoder.
+  New `encode::htj2k::encode_image_htj2k` plus the
+  `encode::EncodeOptionsHt` knob set produce a Part-15 codestream
+  (SOC + SIZ-with-Rsiz-bit-14 + CAP/Pcap15 + COD-with-SPcod-cblk_style-bit-6
+  + QCD + SOT/SOD/EOC) for a single 32×32 Gray8 luma codeblock at
+  NL=0, 1 quality layer, LRCP. Internally:
+  - `MagSgnWriter` / `MelWriter` / `VlcWriter` mirror the §7.1
+    forward / forward / reverse bit-stream readers, including the
+    `0xFF` MSB-zero stuffing rule and the reverse-VLC `>0x8F` /
+    low-7-bits-all-1 stuffing predicate.
+  - `mel_enc` walks an internal MEL state machine to emit the long-run
+    / short-run branches of T.814 §7.3.3.
+  - `uvlc_enc::split_u` implements Table 3 prefix/suffix/extension
+    width selection (covers `u ∈ [0, 91]`).
+  - `cxt_vlc_enc::encode_cxt_vlc` looks up the Annex C codeword for
+    a `(cq, ρ, u_off, ε^k, ε^1)` tuple and emits the bits LSB-first.
+    The Annex C tables are the same `CXT_VLC_TABLE_0` / `_1` arrays
+    the decoder consumes (now `pub(crate)` for cross-side reuse) — no
+    duplication, no third-party transcription.
+  - `cleanup_enc::encode_cleanup` walks the codeblock quad-by-quad
+    in §7.3.5 row-pair scan order, computes `cq` / `κ_q` exactly as
+    the decoder does, and emits the dual MagSgn + MEL + VLC streams
+    plus the trailing 12-bit `Scup` reservoir into `Dcup`.
+  - `tile_enc` wraps the cleanup segment in the round-1 marker chain
+    plus a hand-built tier-2 packet header (1×1 inclusion + 1×1
+    zero-bit-plane tag-trees, comma-coded `num_passes = 1`, adaptive
+    `Lblock` growth).
+  Verified by `tests/htj2k_encoder.rs`: 32×32 solid-DC and 32×32
+  sparse (two ±1 samples in their own quads) self-roundtrip
+  bit-exactly, AND `ojph_expand` (binary, NOT source) cross-decodes
+  both fixtures bit-exactly. Unit-test sweep covers each substream
+  writer + every Annex C entry's codeword bit-pattern + cleanup-pass
+  small-codeblock round-trips through the FBCOT decoder.
 - decoder (HTJ2K, round 9): multi-band 64×64 5-decomposition-level 9/7
   fixture (`htj2k_lossy97_64x64_nl5_lrcp.j2c`, with paired
   `_input.pgm` + `_opj_ref.pgm`) closes the integration-test gap left

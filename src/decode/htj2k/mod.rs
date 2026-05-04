@@ -23,13 +23,13 @@
 
 mod cleanup;
 mod cxt_vlc;
-mod cxt_vlc_tables;
+pub(crate) mod cxt_vlc_tables;
 mod magref;
-mod mel;
+pub(crate) mod mel;
 mod sigprop;
-mod streams;
+pub(crate) mod streams;
 mod tier2;
-mod uvlc;
+pub(crate) mod uvlc;
 
 pub use cleanup::CleanupOutput;
 pub use sigprop::SigPropOutput;

@@ -25,6 +25,8 @@
 
 pub mod codestream;
 pub mod dwt;
+#[cfg(feature = "htj2k")]
+pub mod htj2k;
 pub mod mqc;
 pub mod t1;
 pub mod tile;
@@ -33,6 +35,9 @@ pub use codestream::{
     encode_image, extract_jp2_codestream, EncodeOptions, PacketHeaderPlacement, ProgressionOrder,
     TransformMode,
 };
+
+#[cfg(feature = "htj2k")]
+pub use htj2k::{encode_image_htj2k, EncodeOptionsHt};
 
 #[cfg(feature = "registry")]
 pub use codestream::encode_frame;

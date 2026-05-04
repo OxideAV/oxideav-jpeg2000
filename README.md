@@ -104,9 +104,16 @@ irreversible path produces a lossy bitstream with round-trip PSNR
   multi-band fixture (every HF band populated) decodes at MAD ≈ 0.47
   with max-deviation 2 against the OpenJPH-binary reference. The
   pblk > 0 / pblk < 0 / `z = 1` algebraic cases on the 9/7 float
-  path are unit-tested against the closed-form Eq E-1. Encoder side,
-  multi-tile, multi-layer, PPM/PPT, region-of-interest, multi-set HT
-  (T.814 §B), and constrained sets (T.814 §8) are not yet wired.
+  path are unit-tested against the closed-form Eq E-1. **Encoder side
+  (round 1):** `encode::htj2k::encode_image_htj2k` produces a Part-15
+  codestream for a 32×32 single-Gray8-component, NL=0 image with one
+  HT cleanup pass per codeblock. Self-roundtrip is bit-exact and
+  `ojph_expand` (binary, black-box) cross-decodes our output
+  bit-exactly on solid-DC and sparse 32×32 fixtures. Encoder
+  restrictions: at most one significant sample per quad, no
+  first-line-pair both-significant pair, no SigProp/MagRef passes,
+  no multi-tile, multi-layer, PPM/PPT, RGB/MCT, multi-set HT
+  (T.814 §B), or constrained sets (T.814 §8) yet.
 - **RGB input beyond 8-bit unsigned chroma** — the decoder's RCT
   inverse currently clamps chroma to unsigned 8-bit before the
   inverse transform, so encoder inputs with chroma excursions outside
