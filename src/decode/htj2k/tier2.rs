@@ -579,24 +579,32 @@ fn synth_component_htj2k_97(
 ///
 /// Per ISO/IEC 15444-15 §7.6 the *signed integer* sample value at the
 /// band's M_b precision is reconstructed from the per-sample tuple
-/// `(μ_n, s_n, z_n, r_n)`:
+/// `(μ_n, s_n, z_n, r_n)` according to T.800 Eq E-1 with
+/// `N_b = S_blk + 1 + z_n` and `MSB_i = bit(S_blk+1-i, μ_n)`:
 ///
-/// - cleanup-significant samples (`σ_n = 1`) contribute `±μ_n`,
-///   optionally shifted left by 1 and OR-d with `r_n` when MagRef
-///   added a refinement bit (`z_n = 1`);
-/// - SigProp-newly-significant samples (cleanup `σ_n = 0`, SigProp
-///   `z_n = 1`) contribute `±r_n` at the band LSB, where the sign
-///   was set by `decodeSigPropSign`.
+/// ```text
+///     q_b = (-1)^s · μ_extended · 2^(M_b - N_b)
+/// ```
 ///
-/// We then divide by 2 for the lossless 5/3 path to undo the
-/// `oneplushalf` scaling — same convention as
-/// `crate::decode::tile::synth_component_53`.
+/// where `μ_extended = (μ_n << 1) | r_n` when `z_n = 1` (MagRef or
+/// SigProp adds one extra LSB) and `μ_extended = μ_n` otherwise.
+///
+/// The per-block bit-plane shift `pblk = M_b - S_blk - 1` is exactly
+/// what the round-6 cleanup decoder did NOT thread into the
+/// reconstruction. The packet header's "missing-MSB" tag-tree value
+/// is stored in `CblkState::missing_msb` after the off-by-one
+/// threshold-loop convention shared with classic Part-1
+/// (`leaf_value = field - 1`), so `S_blk = missing_msb - 1` and
+/// `pblk = band_numbps - missing_msb` (since `M_b = band_numbps`).
+///
+/// For 5/3 reversible there is no Annex E reconstruction-r adjustment
+/// (we honour Eq E-7 / E-8 with `r = 0`): `Rq_b = q_b`.
 #[allow(clippy::too_many_arguments)]
 fn decode_subband_htj2k(
     layout: &ResolutionLayout,
     sb_idx: usize,
     _band_idx: usize,
-    _qcd: &QcdParams,
+    qcd: &QcdParams,
     buf: &mut [i32],
     bw: usize,
     _bh: usize,
@@ -606,6 +614,8 @@ fn decode_subband_htj2k(
     let cblks_w = layout.cblks_w[sb_idx];
     let cblks_h = layout.cblks_h[sb_idx];
     let sb = &layout.subbands[sb_idx];
+    let (eps, _mant) = qcd.bands[sb.band_idx];
+    let band_numbps = qcd.guard_bits as i32 + eps as i32 - 1; // M_b
     for cy in 0..cblks_h {
         for cx in 0..cblks_w {
             let idx = cy * cblks_w + cx;
@@ -634,12 +644,10 @@ fn decode_subband_htj2k(
             let dref: &[u8] = &st.data_ref[..];
             let out = decode_codeblock(w as u32, h as u32, zblk, dcup, dref)?;
 
-            // Need the FBCOT cleanup output to know `σ_n` separately
-            // from `z_n` so we can decide whether `r_n` extends an
-            // existing magnitude (z extends μ left-shift) or *is* the
-            // magnitude (newly-significant via SigProp). `out.mag != 0`
-            // is a sufficient proxy for σ_n in the M_b > 0 case the
-            // round-4 codestreams exercise.
+            // pblk = M_b - S_blk - 1, where S_blk = missing_msb - 1
+            // owing to the threshold-loop off-by-one in
+            // `walk_packets_htj2k` (shared with classic Part-1).
+            let pblk = band_numbps - st.missing_msb as i32;
             let qw = (w as u32).div_ceil(2);
             let rel_x = (bx0 - sb.x0) as usize;
             let rel_y = (by0 - sb.y0) as usize;
@@ -650,31 +658,38 @@ fn decode_subband_htj2k(
                     let sign = out.sign[n];
                     let z = out.z[n];
                     let r = out.refinement[n];
-                    let raw_unsigned: i64 = if mu != 0 {
-                        // Cleanup-significant. MagRef may have added
-                        // one finer LSB → shift left by z (=1 if MagRef
-                        // refined this sample, else 0) and OR-in r.
+                    // μ_extended * 2^pblk_eff, with pblk_eff = pblk when
+                    // z = 0 and pblk - 1 when z = 1 (the extra MagRef /
+                    // SigProp LSB lives one plane below the cleanup
+                    // bit-plane). For 5/3 reversible the encoder picks
+                    // missing_msb so that pblk >= 0 in the cleanup-only
+                    // case; pblk - 1 may equal -1 for z != 0, which
+                    // means a half-step refinement that the integer
+                    // 5/3 path just truncates (Eq E-7, r = 0).
+                    let unsigned = if mu != 0 {
                         if z != 0 {
-                            (mu << 1) | r as i64
+                            let mext = (mu << 1) | r as i64;
+                            if pblk >= 1 {
+                                mext << (pblk - 1)
+                            } else {
+                                mext >> (1 - pblk).max(0)
+                            }
+                        } else if pblk >= 0 {
+                            mu << pblk
                         } else {
-                            mu
+                            mu >> (-pblk)
                         }
                     } else if z != 0 {
-                        // SigProp newly-significant: bit pattern is
-                        // just r at the band LSB. Multiply by 2 to put
-                        // it on the same scale as μ_n which already
-                        // includes the +0.5 oneplushalf bit.
-                        (r as i64) << 1
+                        let v = r as i64;
+                        if pblk >= 1 {
+                            v << (pblk - 1)
+                        } else {
+                            0
+                        }
                     } else {
                         0
                     };
-                    let mut v = if sign != 0 {
-                        -raw_unsigned
-                    } else {
-                        raw_unsigned
-                    };
-                    // 5/3 lossless: divide by 2 to undo oneplushalf.
-                    v >>= 1;
+                    let v = if sign != 0 { -unsigned } else { unsigned };
                     buf[(rel_y + ly) * bw + (rel_x + lx)] = v as i32;
                 }
             }

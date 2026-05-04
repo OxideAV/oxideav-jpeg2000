@@ -80,15 +80,20 @@ fn trace_doc_12_1_1x1_117b_decodes_to_128() {
 ///
 /// Round 6 fixed two transcription typos in `CXT_VLC_TABLE_0` against
 /// the spec-PDF Annex C listing — these were a necessary precondition
-/// for byte-exact §12.2 decode. There is also a separate decoder bug
-/// in the round-4 cleanup pass: the per-codeblock significant-bitplane
-/// shift (the `p` parameter) is not threaded into the magnitude
-/// reconstruction, so the absolute magnitudes come out at the wrong
-/// scale. That second fix (a wiring change inside
-/// `decode_codeblock` / `decode_cleanup`) is intentionally deferred to
-/// round 7+ so this round stays a strict spec-PDF table-typo fix.
+/// for byte-exact §12.2 decode. Round 7 fixed three additional bugs
+/// in the cleanup pass that affected non-first-line-pair quads:
+///   1. Eq (2) of T.814 §7.3.5 was implemented with a typo —
+///      `2*(σ^n | σ^nw)` instead of `2*(σ^w | σ^sw)` — so the cq
+///      context for non-first-line-pair quads omitted the same-row
+///      left-neighbour samples.
+///   2. The exponent predictor κ_q (Eq 5 of T.814 §7.3.7) was missing
+///      the γ_q multiplier defined in Eq (6).
+///   3. The U-VLC quad-pair decoding was sequential per quad
+///      (pfx1+sfx1+ext1, then pfx2+sfx2+ext2) rather than interleaved
+///      as required by T.814 §7.3.4 / Figure 4 (pfx1, pfx2, sfx1,
+///      sfx2, ext1, ext2). This caused suffix bits for q1 to be read
+///      from positions intended for q2's prefix.
 #[test]
-#[ignore = "blocked on per-codeblock p-shift plumbing in decode_cleanup (round 7+)"]
 fn trace_doc_12_2_8x8_160b_decodes_ramp_byte_exact() {
     let frame = decode_htj2k(TRACE_8X8_160B);
     assert_eq!(frame.planes.len(), 1);
@@ -125,11 +130,7 @@ fn trace_doc_12_2_8x8_160b_decodes_ramp_byte_exact() {
 
 /// §12.3 — 7×7 ramp `pixel = 16y + 4x` decodes byte-exactly with two
 /// decomposition levels (boundary parity case).
-///
-/// Same per-codeblock p-shift dependency as §12.2 above; deferred to
-/// round 7+.
 #[test]
-#[ignore = "blocked on per-codeblock p-shift plumbing in decode_cleanup (round 7+)"]
 fn trace_doc_12_3_7x7_2decomp_decodes_ramp_byte_exact() {
     let frame = decode_htj2k(TRACE_7X7_2DECOMP);
     assert_eq!(frame.planes.len(), 1);

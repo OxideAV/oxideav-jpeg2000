@@ -123,34 +123,32 @@ pub fn decode_cleanup(width: u32, height: u32, dcup: &[u8]) -> Result<CleanupOut
             };
 
             // Decode the U-VLC residuals u_q1 and u_q2 for the
-            // quad-pair, with the special-case in §7.3.6 for the
-            // first line-pair when both quads have u_off = 1.
+            // quad-pair, following the interleaved order specified
+            // in T.814 §7.3.4 (Figure 4):
+            //
+            //   prefix(q1) → prefix(q2) → suffix(q1) → suffix(q2) →
+            //   ext(q1)    → ext(q2)
+            //
+            // (i.e. all decoders for quad q1 strictly precede the
+            // corresponding decoder for q2, but the steps for q1+q2
+            // are processed pairwise rather than serially).
+            //
+            // For quads in the first line-pair where BOTH have
+            // u_off=1 the §7.3.6 special case kicks in (Eq 4): a MEL
+            // symbol arbitrates two sub-cases.
             let (u1, u2) =
                 if is_first_linepair && q2_present && s1.u_off == 1 && s2.unwrap().u_off == 1 {
                     decode_uvlc_pair_first_linepair_both(&mut vlc, &mut mel, &mut mel_dec)?
                 } else {
-                    let u1v = if s1.u_off == 1 {
-                        decode_uvlc_quad(&mut vlc)?
-                    } else {
-                        0
-                    };
-                    let u2v = if let Some(s) = s2 {
-                        if s.u_off == 1 {
-                            decode_uvlc_quad(&mut vlc)?
-                        } else {
-                            0
-                        }
-                    } else {
-                        0
-                    };
-                    (u1v, u2v)
+                    let s2_uoff = s2.map(|s| s.u_off).unwrap_or(0);
+                    decode_uvlc_pair_interleaved(&mut vlc, s1.u_off, s2_uoff)?
                 };
 
             // Compute exponent predictor κ_q and exponent bound U_q.
             let kappa1 = if is_first_linepair {
                 1
             } else {
-                exponent_predictor_non_first_linepair(&exp, qw as usize, q)
+                exponent_predictor_non_first_linepair(&exp, qw as usize, q, &sigemb)
             };
             let bigu1 = kappa1 + u1;
             uq[q] = bigu1;
@@ -173,7 +171,7 @@ pub fn decode_cleanup(width: u32, height: u32, dcup: &[u8]) -> Result<CleanupOut
                 let kappa2 = if is_first_linepair {
                     1
                 } else {
-                    exponent_predictor_non_first_linepair(&exp, qw as usize, q + 1)
+                    exponent_predictor_non_first_linepair(&exp, qw as usize, q + 1, &sigemb)
                 };
                 let bigu2 = kappa2 + u2;
                 uq[q + 1] = bigu2;
@@ -206,13 +204,49 @@ pub fn decode_cleanup(width: u32, height: u32, dcup: &[u8]) -> Result<CleanupOut
     })
 }
 
-/// Helper: U-VLC three-step decoder for a single quad in the general
-/// case (Formula 3 of §7.3.6).
-fn decode_uvlc_quad(vlc: &mut VlcReader<'_>) -> Result<u32> {
-    let pfx = decode_u_prefix(vlc)?;
-    let sfx = decode_u_suffix(vlc, pfx)?;
-    let ext = decode_u_extension(vlc, sfx)?;
-    Ok(pfx as u32 + sfx as u32 + 4 * ext as u32)
+/// Quad-pair interleaved U-VLC decode (T.814 §7.3.4 / Figure 4).
+///
+/// Reads, in order: `prefix(q1)` → `prefix(q2)` → `suffix(q1)` →
+/// `suffix(q2)` → `ext(q1)` → `ext(q2)`. Quads with `u_off = 0`
+/// contribute zero bits at every step and the returned residual is 0.
+fn decode_uvlc_pair_interleaved(
+    vlc: &mut VlcReader<'_>,
+    u_off1: u8,
+    u_off2: u8,
+) -> Result<(u32, u32)> {
+    let pfx1 = if u_off1 == 1 {
+        decode_u_prefix(vlc)?
+    } else {
+        0
+    };
+    let pfx2 = if u_off2 == 1 {
+        decode_u_prefix(vlc)?
+    } else {
+        0
+    };
+    let sfx1 = if u_off1 == 1 {
+        decode_u_suffix(vlc, pfx1)?
+    } else {
+        0
+    };
+    let sfx2 = if u_off2 == 1 {
+        decode_u_suffix(vlc, pfx2)?
+    } else {
+        0
+    };
+    let ext1 = if u_off1 == 1 {
+        decode_u_extension(vlc, sfx1)?
+    } else {
+        0
+    };
+    let ext2 = if u_off2 == 1 {
+        decode_u_extension(vlc, sfx2)?
+    } else {
+        0
+    };
+    let u1 = pfx1 as u32 + sfx1 as u32 + 4 * ext1 as u32;
+    let u2 = pfx2 as u32 + sfx2 as u32 + 4 * ext2 as u32;
+    Ok((u1, u2))
 }
 
 /// First-line-pair quad-pair both u_off = 1 special case
@@ -225,21 +259,51 @@ fn decode_uvlc_pair_first_linepair_both(
 ) -> Result<(u32, u32)> {
     let s = mel_dec.decode_sym(mel)?;
     if s == 1 {
-        let u1 = 2 + decode_uvlc_quad(vlc)?;
-        let u2 = 2 + decode_uvlc_quad(vlc)?;
-        Ok((u1, u2))
+        // Eq (4): u = 2 + u_pfx + u_sfx + 4 * u_ext for each quad,
+        // with the standard interleaved order from §7.3.4.
+        let (u1, u2) = decode_uvlc_pair_interleaved(vlc, 1, 1)?;
+        Ok((u1 + 2, u2 + 2))
     } else {
-        let u1 = decode_uvlc_quad(vlc)?;
-        let u2 = if u1 > 2 {
-            // u_q2 prefix replaced by a single-bit import.
+        // s_mel = 0 path: u_q1 uses Formula (3) (interleaved with
+        // u_q2's u-VLC if u_q1 ≤ 2; otherwise q2's prefix collapses
+        // to a single bit). Even in this branch the spec says u_q1
+        // and u_q2 are interleaved per Figure 4, so prefix(q1) is
+        // decoded BEFORE prefix(q2). Once we know u_q1's prefix we
+        // know whether u_q1 > 2 (only true when u_pfx ∈ {3, 5} +
+        // suffix-dependent extras).
+        let pfx1 = decode_u_prefix(vlc)?;
+        // Whether q2 uses the collapsed prefix path depends on
+        // u_q1 > 2 — but u_q1 = u_pfx + u_sfx (+ 4·u_ext) and we
+        // don't know u_sfx/u_ext yet. The NOTE on page 18 clarifies:
+        // "the condition u_q1 > 2 means that the decodeUPrefix
+        // procedure for the first quad returns u_pfx > 2, or
+        // equivalently, that the first quad's U-VLC prefix has
+        // length 3". So only u_pfx is needed.
+        if pfx1 > 2 {
+            // Collapsed prefix for q2: single bit import; pfx2 = bit + 1
+            // (which is 1 or 2), no suffix (since bit+1 < 3), no ext.
+            // Then resume q1's suffix/extension after q2's collapsed bit
+            // — but per Figure 4 the order is pfx1, pfx2, sfx1, sfx2,
+            // ext1, ext2. With q2's pfx replaced by one bit we have:
+            //   pfx1 (3 bits), pfx2 (1 bit), sfx1, sfx2(0), ext1, ext2(0).
             let bit = vlc.import_bit()?;
-            // Then suffix(u_pfx=bit+1) (which is 0) and ext(0) → no
-            // further bits, but we still need to return u_q2 = bit + 1.
-            bit as u32 + 1
+            let pfx2 = bit + 1;
+            let sfx1 = decode_u_suffix(vlc, pfx1)?;
+            let ext1 = decode_u_extension(vlc, sfx1)?;
+            let u1 = pfx1 as u32 + sfx1 as u32 + 4 * ext1 as u32;
+            let u2 = pfx2 as u32;
+            Ok((u1, u2))
         } else {
-            decode_uvlc_quad(vlc)?
-        };
-        Ok((u1, u2))
+            // u_pfx ∈ {1, 2} → u_q1 ≤ 2. q2 uses normal U-VLC.
+            let pfx2 = decode_u_prefix(vlc)?;
+            let sfx1 = decode_u_suffix(vlc, pfx1)?;
+            let sfx2 = decode_u_suffix(vlc, pfx2)?;
+            let ext1 = decode_u_extension(vlc, sfx1)?;
+            let ext2 = decode_u_extension(vlc, sfx2)?;
+            let u1 = pfx1 as u32 + sfx1 as u32 + 4 * ext1 as u32;
+            let u2 = pfx2 as u32 + sfx2 as u32 + 4 * ext2 as u32;
+            Ok((u1, u2))
+        }
     }
 }
 
@@ -280,42 +344,69 @@ fn cq_first_linepair(sigemb: &[SigEmb], qw: usize, q: usize) -> u8 {
     cq.min(7)
 }
 
-/// Non-first line-pair context: cq from σ^nw, σ^n, σ^ne, σ^nf
-/// (Formula 2 of §7.3.5). All neighbours sit on the line above.
+/// Non-first line-pair context: cq from σ^nw, σ^n, σ^ne, σ^nf and
+/// σ^w, σ^sw (Formula 2 of T.814 §7.3.5):
+///
+/// ```text
+///   c_q = (σ^nw | σ^n) + 2*(σ^w | σ^sw) + 4*(σ^ne | σ^nf)
+/// ```
+///
+/// The above-row neighbours (`n`, `ne`, `nw`, `nf`) come from the
+/// quad-row immediately above (q − QW); `w`/`sw` come from the
+/// **same-row** left neighbour (q − 1), which is the right column
+/// of that quad: TR = sample 2, BR = sample 3 (per Figure 5 left
+/// panel). This is distinct from the first-line-pair case
+/// where w/sw also come from q − 1's right column but the formula
+/// uses σ^w + 4*σ^sw without the OR with sw.
 fn cq_non_first_linepair(sigemb: &[SigEmb], qw: usize, q: usize) -> u8 {
     let above = q.checked_sub(qw);
     let above_q = match above {
         Some(idx) => sigemb[idx],
         None => return 0,
     };
-    // σ^n  = sample 1 of above quad (bottom-left)
-    // σ^ne = sample 3 of above quad (bottom-right)
-    // σ^nw / σ^nf require the quads above-left and above-right.
+    // σ^n  = sample 1 of above quad (bottom-left)  = σ_{4(q-QW)+1}
+    // σ^ne = sample 3 of above quad (bottom-right) = σ_{4(q-QW)+3}
     let n = (above_q.rho >> 1) & 1;
     let ne = (above_q.rho >> 3) & 1;
+    // σ^nw = sample 3 of above-left quad if mod(q, QW) != 0, else 0.
     let nw = if q % qw != 0 {
         let above_left = sigemb[above.unwrap() - 1];
         (above_left.rho >> 3) & 1
     } else {
         0
     };
+    // σ^nf = sample 1 of above-right quad if mod(q+1, QW) != 0, else 0.
     let nf = if (q + 1) % qw != 0 {
         let above_right = sigemb[above.unwrap() + 1];
         (above_right.rho >> 1) & 1
     } else {
         0
     };
-    let cq = (nw | n) + 2 * (n | nw) + 4 * (ne | nf);
-    // The above intentionally collapses neighbour bits per Figure 5
-    // grouping; the tighter form per Formula 2 is preserved below.
-    let _ = cq;
-    let cq2 = (nw | n) + 2 * (n | nw) + 4 * (ne | nf);
-    cq2.min(7)
+    // σ^w  = sample 2 of left neighbour quad (TR) if mod(q, QW) != 0
+    // σ^sw = sample 3 of left neighbour quad (BR) if mod(q, QW) != 0
+    let (w, sw) = if q % qw != 0 {
+        let left = sigemb[q - 1];
+        (((left.rho >> 2) & 1), ((left.rho >> 3) & 1))
+    } else {
+        (0, 0)
+    };
+    let cq = (nw | n) + 2 * (w | sw) + 4 * (ne | nf);
+    cq.min(7)
 }
 
 /// Exponent predictor for non-first line-pair (Formula 5, §7.3.7).
 /// Reads sample exponents from the row above.
-fn exponent_predictor_non_first_linepair(exp: &[u8], qw: usize, q: usize) -> u32 {
+fn exponent_predictor_non_first_linepair(
+    exp: &[u8],
+    qw: usize,
+    q: usize,
+    sigemb: &[SigEmb],
+) -> u32 {
+    // Per T.814 Eq (5):
+    //   κ_q = max{1, γ_q · (max{E_nw, E_n, E_ne, E_nf} - 1)}
+    // where γ_q = 0 if ρ_q ∈ {0, 1, 2, 4, 8} (≤ 1 significant
+    // sample) else 1 — Eq (6). The current quad's ρ has just been
+    // decoded by `decode_sig_emb` and stored at `sigemb[q]`.
     let above_q_idx = match q.checked_sub(qw) {
         Some(v) => v,
         None => return 1,
@@ -334,8 +425,18 @@ fn exponent_predictor_non_first_linepair(exp: &[u8], qw: usize, q: usize) -> u32
         exps[3] = exp[4 * above_right + 1]; // bottom-left of NF quad
     }
     let max_e = exps.iter().copied().max().unwrap_or(0);
-    let kappa = max_e.saturating_sub(1).max(1);
-    kappa as u32
+    let rho = sigemb[q].rho;
+    // γ_q = 0 if ρ ∈ {0,1,2,4,8} (zero or single-bit set), else 1.
+    let gamma = !matches!(rho, 0 | 1 | 2 | 4 | 8);
+    if gamma && max_e >= 1 {
+        // γ = 1 ⇒ κ = max(1, max_e - 1).
+        let v = max_e as u32 - 1;
+        v.max(1)
+    } else {
+        // γ = 0 ⇒ κ = max(1, 0) = 1.
+        // OR γ=1 but max_e==0 ⇒ κ = max(1, -1) = 1.
+        1
+    }
 }
 
 /// Unpack the four MagSgn samples of a quad given its decoded

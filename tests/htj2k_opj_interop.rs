@@ -113,7 +113,6 @@ fn htj2k_lossy97_decodes_close_to_opj_reference() {
 }
 
 #[test]
-#[ignore = "blocked on per-codeblock p-shift plumbing in decode_cleanup (round 7+)"]
 fn htj2k_rev53_decodes_bit_exactly_to_input_gradient() {
     let frame = decode_htj2k(HT_REV53_J2C);
     assert_eq!(frame.planes.len(), 1);

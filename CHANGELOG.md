@@ -34,6 +34,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Jpeg2000Image → oxideav_core::Frame`). Re-exported from the crate
   root as before when the default `registry` feature is on.
 
+### Fixed
+
+- decoder (HTJ2K, round 7): three cleanup-pass bugs that prevented HF
+  sub-band magnitudes from converging to the spec-correct integers
+  for non-first-line-pair quads. The 8×8 ramp fixture (§12.2 of the
+  trace doc) and the 7×7 boundary-parity fixture (§12.3) now decode
+  byte-exactly, and the 9/7-encoded `ojph_compress` 32×32 reversible
+  fixture round-trips bit-exactly through `opj_decompress`-equivalent
+  reconstruction:
+  1. Eq (2) of T.814 §7.3.5 was implemented as
+     `c_q = (σ^nw|σ^n) + 2(σ^n|σ^nw) + 4(σ^ne|σ^nf)`. The middle
+     term should be `2(σ^w|σ^sw)` per the spec; same-row left-neighbour
+     samples (TR/BR of `q − 1`) were silently dropped from the cq
+     context for non-first-line-pair quads, mis-decoding ρ_q, the
+     CxtVLC table lookup, and ultimately the per-sample magnitude bits.
+  2. Eq (5) of T.814 §7.3.7 was implemented without the γ_q multiplier
+     defined in Eq (6). For multi-significant-sample quads in
+     non-first line-pairs whose neighbour exponents were uniformly 0
+     this had no visible effect, but quads with γ_q = 0 (≤ 1
+     significant sample) and γ_q = 1 (otherwise) were both treated as
+     if γ = 1, biasing κ_q by one bit-plane in the asymmetric
+     situations.
+  3. Per-quad U-VLC decoding (`prefix → suffix → extension`) was being
+     run sequentially per quad: q1's full U-VLC then q2's full U-VLC.
+     T.814 §7.3.4 (Figure 4) requires the steps to be **interleaved**
+     across the quad-pair: prefix(q1), prefix(q2), suffix(q1),
+     suffix(q2), ext(q1), ext(q2). With the sequential order, q1's
+     suffix was reading bits from positions intended for q2's prefix,
+     yielding U_q values one bit-plane shy of what the encoder
+     emitted.
+  Pinned by the §12.2 / §12.3 trace-doc fixtures (now bit-exact, no
+  longer `#[ignore]`d) and by the round-4 `htj2k_rev53` 32×32
+  `ojph_compress`-encoded fixture (now bit-exact too).
+- decoder (HTJ2K, round 7): per-block bit-plane shift `pblk =
+  band_numbps − missing_msb` is now applied during signed-integer
+  reconstruction in the 5/3 reversible synthesis path (T.800 Eq E-1
+  with N_b = S_blk + 1 + z_n). Before this fix the cleanup μ_n was
+  written into the sub-band buffer at the wrong bit-plane whenever the
+  encoder used non-zero num_zero_bitplanes.
+
 ### Changed
 
 - Internal pipeline modules (`codestream`, `decode/*`, `encode/*`) now
