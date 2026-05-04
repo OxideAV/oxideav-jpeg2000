@@ -42,6 +42,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with N_b = S_blk + 1 + z_n). Before this fix the cleanup μ_n was
   written into the sub-band buffer at the wrong bit-plane whenever the
   encoder used non-zero num_zero_bitplanes.
+- decoder (HTJ2K, round 8): same per-block `pblk` shift now wired
+  through the 9/7 irreversible synthesis (`decode_subband_htj2k_97`),
+  using float arithmetic to preserve the half-step refinement
+  (`pblk_eff = pblk − 1 = −1` ⇒ multiplicative 0.5) that the integer
+  5/3 path has to truncate per T.800 Eq E-7. In the same path the
+  dequantisation multiplier is corrected from `0.5 · stepsize` to
+  `stepsize`: T.814 §7.6 specifies μ_n as a plain integer at the M_b
+  grid, with no implicit oneplushalf bit (the half-step that the
+  classic Part-1 MQ tier-1 carries does not apply to HT cleanup
+  outputs). The `htj2k_lossy97_decodes_close_to_opj_reference`
+  fixture-based test is unignored and now passes (mean absolute
+  deviation drops from 22.87 LSB to 3.05 LSB on the 32×32 8-bit
+  gradient at qstep 0.05).
 
 ## [0.0.6](https://github.com/OxideAV/oxideav-jpeg2000/compare/v0.0.5...v0.0.6) - 2026-05-03
 

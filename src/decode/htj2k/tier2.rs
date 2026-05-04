@@ -478,15 +478,17 @@ fn synth_component_htj2k_53(
 
 /// 9/7 irreversible HTJ2K synthesis.
 ///
-/// Mirrors `crate::decode::tile::synth_component_97` but routes per-
-/// codeblock byte segments through the FBCOT decoder. Samples emerge
-/// from the cleanup / SigProp / MagRef passes as signed integer
-/// magnitudes at the band's M_b bit-depth (with the +0.5 oneplushalf
-/// embedded — see `decode_subband_htj2k_97`); we dequantise them to
-/// floats with the T.800 §E.1.1.2 stepsize formula
-/// `0.5 * (1 + mant/2048) * 2^(Rb - eps)` (where `Rb = precision`,
-/// matching OpenJPEG's `BUG_WEIRD_TWO_INVK` convention so the K /
-/// 2/K gain in `idwt_97_1d` cancels the per-band `log2_gain_b`).
+/// Routes per-codeblock byte segments through the FBCOT decoder. The
+/// cleanup / SigProp / MagRef passes produce a sample tuple
+/// (μ_n, s_n, z_n, r_n) per T.814 §7.6, which `decode_subband_htj2k_97`
+/// then converts to a float at the band's M_b grid (see Eq E-1) and
+/// multiplies by the T.800 §E.1.1.2 stepsize
+/// `(1 + mant/2048) * 2^(Rb - eps)` with `Rb = precision`, leaving the
+/// per-band `log2_gain_b` to be recovered by the K / 2/K gain in the
+/// 9/7 lifting (`dwt::idwt_97_1d`). NB: HTJ2K μ_n is a plain integer
+/// at the M_b grid — there is no oneplushalf bit baked in, so the
+/// scale is `stepsize`, not `0.5 * stepsize` like the classic Part-1
+/// MQ synth path.
 #[allow(clippy::needless_range_loop)]
 fn synth_component_htj2k_97(
     layouts: &[ResolutionLayout],
@@ -702,6 +704,19 @@ fn decode_subband_htj2k(
 /// 9/7 irreversible variant of [`decode_subband_htj2k`]. Same FBCOT +
 /// μ/r/z reconstruction, but emits dequantised float samples per
 /// T.800 §E.1.1.2.
+///
+/// The cleanup pass emits magnitudes `μ_n` whose LSB sits at the
+/// significant bit-plane `S_blk = missing_msb − 1` (per T.814 §7.3.4
+/// Figure 4 + the threshold-loop convention shared with classic
+/// Part-1). To map them onto the band's M_b grid where the dequant
+/// stepsize `Δ_b` is meaningful, every sample must be left-shifted
+/// by `pblk = M_b − S_blk − 1 = band_numbps − missing_msb` (T.800
+/// Eq E-1 with `N_b = S_blk + 1 + z_n`). When MagRef / SigProp
+/// contribute an extra LSB (`z_n = 1`), `μ_extended = (μ_n << 1) | r_n`
+/// already carries a factor of 2, so the effective shift drops to
+/// `pblk − 1`. Float arithmetic preserves the half-step refinement
+/// (`pblk − 1 = −1` ⇒ multiplicative 0.5) that the integer 5/3 path
+/// has to truncate (Eq E-7, r = 0).
 #[allow(clippy::too_many_arguments)]
 fn decode_subband_htj2k_97(
     layout: &ResolutionLayout,
@@ -718,13 +733,20 @@ fn decode_subband_htj2k_97(
     let cblks_h = layout.cblks_h[sb_idx];
     let sb = &layout.subbands[sb_idx];
     let (eps, mant) = qcd.bands[band_idx];
-    // T.800 Eq E-3 with `Rb = precision` (BUG_WEIRD_TWO_INVK; see the
-    // classic `synth_component_97`). The 0.5 factor matches OpenJPEG's
-    // `0.5 * band->stepsize`: our μ_n carries a baked-in factor of 2
-    // (the "+0.5" oneplushalf bit), so halving it cancels.
+    // Stepsize per T.800 Eq E-3, with `Rb = precision` so the per-band
+    // log2_gain factor is recovered by the IDWT lifting scale (matches
+    // the classic Part-1 9/7 synth path). The dequantised float for an
+    // integer `q_b` at the M_b grid is then `q_b * stepsize`.
+    //
+    // NOTE: the classic Part-1 MQ-coded magnitude carries an implicit
+    // half-step (oneplushalf, +0.5) bit, so its synth path multiplies
+    // by `0.5 * stepsize`. HTJ2K's μ_n (T.814 §7.6) is a plain integer
+    // at the M_b grid — no half-step is folded in — so the multiplier
+    // here is `stepsize`, not `0.5 * stepsize`.
     let rb = precision as i32;
     let stepsize = (1.0f64 + (mant as f64) / 2048.0) * 2f64.powi(rb - eps as i32);
-    let scale = 0.5f64 * stepsize;
+    let scale = stepsize;
+    let band_numbps = qcd.guard_bits as i32 + eps as i32 - 1; // M_b
 
     for cy in 0..cblks_h {
         for cx in 0..cblks_w {
@@ -754,6 +776,9 @@ fn decode_subband_htj2k_97(
             let dref: &[u8] = &st.data_ref[..];
             let out = decode_codeblock(w as u32, h as u32, zblk, dcup, dref)?;
 
+            // pblk = M_b − S_blk − 1 = band_numbps − missing_msb (same
+            // identity as the 5/3 path; see `decode_subband_htj2k`).
+            let pblk = band_numbps - st.missing_msb as i32;
             let qw = (w as u32).div_ceil(2);
             let rel_x = (bx0 - sb.x0) as usize;
             let rel_y = (by0 - sb.y0) as usize;
@@ -764,31 +789,25 @@ fn decode_subband_htj2k_97(
                     let sign = out.sign[n];
                     let z = out.z[n];
                     let r = out.refinement[n];
-                    let raw_unsigned: i64 = if mu != 0 {
+                    // μ_extended scaled to the band's M_b grid as a
+                    // float. Mirrors the 5/3 integer ladder but uses
+                    // `2.0_f64.powi(pblk_eff)` so the half-step case
+                    // (z != 0, pblk == 0 ⇒ pblk_eff = −1) survives as
+                    // a multiplicative 0.5 instead of being truncated.
+                    let unsigned_mb: f64 = if mu != 0 {
                         if z != 0 {
-                            (mu << 1) | r as i64
+                            let mext = ((mu << 1) | r as i64) as f64;
+                            mext * 2.0f64.powi(pblk - 1)
                         } else {
-                            mu
+                            (mu as f64) * 2.0f64.powi(pblk)
                         }
                     } else if z != 0 {
-                        (r as i64) << 1
+                        (r as f64) * 2.0f64.powi(pblk - 1)
                     } else {
-                        0
+                        0.0
                     };
-                    let signed = if sign != 0 {
-                        -raw_unsigned
-                    } else {
-                        raw_unsigned
-                    };
-                    let mut dequant = (signed as f64) * scale;
-                    // When MagRef / SigProp extended the magnitude by
-                    // one extra LSB (z_n != 0), the integer was scaled
-                    // up by 2 above; halve to undo so the dequantised
-                    // value lives on the same band grid as cleanup-only
-                    // samples.
-                    if z != 0 {
-                        dequant *= 0.5;
-                    }
+                    let signed_mb = if sign != 0 { -unsigned_mb } else { unsigned_mb };
+                    let dequant = signed_mb * scale;
                     buf[(rel_y + ly) * bw + (rel_x + lx)] = dequant as f32;
                 }
             }

@@ -22,21 +22,12 @@
 //! fixture uses 5/3 reversible. The reference outputs come from
 //! `opj_decompress` decoding the same codestreams.
 //!
-//! NOTE (round 6): both fixture-driven decode tests remain
-//! `#[ignore]`d. Round 6 fixed two transcription typos in the Annex C
-//! `CXT_VLC_TABLE_0` (a hard precondition for any non-AZC HT decode
-//! reaching the right answer), but a separate decoder bug remains:
-//! the per-codeblock significant-bitplane shift (the `p` parameter)
-//! is not threaded into the cleanup magnitude reconstruction, so the
-//! absolute magnitudes come out at the wrong scale for any block
-//! whose `p` differs from the assumed default. That fix (a wiring
-//! change to thread the per-codeblock `p` into `decode_cleanup`) is
-//! deferred to round 7+; once it lands these tests should unignore
-//! and pass.
-//!
-//! The 9/7 irreversible variant has an additional float-arithmetic
-//! drift (round-3 baseline mean-absolute-deviation ≈ 22 LSB) on top
-//! of the `p`-shift bug; that is a separate round-7+ deliverable.
+//! NOTE (round 8): the per-codeblock bit-plane shift `pblk = M_b −
+//! S_blk − 1` (T.800 Eq E-1) is now threaded into both the 5/3
+//! reversible and the 9/7 irreversible reconstruction paths, so both
+//! fixture tests run unignored. The 5/3 case is bit-exact against the
+//! reference; the 9/7 case is checked as a closeness bound (MAD ≤ 8
+//! LSB on the 8-bit gradient at qstep 0.05).
 
 #![cfg(feature = "htj2k")]
 
@@ -85,7 +76,6 @@ fn decode_htj2k(buf: &[u8]) -> oxideav_core::VideoFrame {
 }
 
 #[test]
-#[ignore = "blocked on per-codeblock p-shift plumbing in decode_cleanup (round 7+)"]
 fn htj2k_lossy97_decodes_close_to_opj_reference() {
     let frame = decode_htj2k(HT_LOSSY97_J2C);
     assert_eq!(frame.planes.len(), 1, "single-component grayscale");
