@@ -44,7 +44,9 @@
 
 pub mod cleanup_enc;
 pub mod cxt_vlc_enc;
+pub mod magref_enc;
 pub mod mel_enc;
+pub mod sigprop_enc;
 pub mod streams_enc;
 pub mod tile_enc;
 pub mod uvlc_enc;

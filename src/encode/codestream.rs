@@ -115,6 +115,19 @@ pub struct EncodeOptions {
     /// Where the per-tile packet header bytes live in the emitted
     /// codestream (T.800 §A.7.4 / §A.7.5).
     pub packet_header_placement: PacketHeaderPlacement,
+    /// Explicit per-resolution precinct sizes (T.800 §A.6.1 Table A.13
+    /// Scod bit 0). When `Some`, must have `num_decomp + 1` entries, one
+    /// per resolution from LL upward. Each entry is `(PPx, PPy)` where the
+    /// precinct width = `2^PPx` and height = `2^PPy` in component
+    /// coordinates of the given resolution level. Values must be in `0..=15`.
+    ///
+    /// When `None` (default), the encoder signals default precincts
+    /// (`Scod` bit 0 = 0; decoders assume `PPx = PPy = 15` = one giant
+    /// precinct per resolution). Specifying explicit precincts is
+    /// mandatory for conformant RPCL codestreams with more than one
+    /// precinct per resolution, and allows spatial-random-access
+    /// progressive decoding.
+    pub precincts: Option<Vec<(u8, u8)>>,
 }
 
 impl Default for EncodeOptions {
@@ -130,6 +143,7 @@ impl Default for EncodeOptions {
             progression: ProgressionOrder::Lrcp,
             poc: Vec::new(),
             packet_header_placement: PacketHeaderPlacement::Inline,
+            precincts: None,
         }
     }
 }
@@ -460,25 +474,40 @@ pub fn encode_image(image: &Jpeg2000Image, opts: &EncodeOptions) -> Result<Vec<u
     }
 }
 
-/// Pick per-band `(stepsize, eps)` for the 9/7 path. We use the same
-/// scheme the decoder assumes (`Rb = precision`, no log2_gain_b). For
-/// lossy compression we set `eps_b = precision` so `stepsize_b = 1` on
-/// every band; this matches OpenJPEG's `opj_dwt_encode_stepsize`
-/// default for the `USE_DERIVED_STEPSIZE` quality target.
+/// Pick per-band `(enc_stepsize, eps)` for the 9/7 path.
+///
+/// The decoder reconstructs a wavelet coefficient via (T.800 §E.1.1.2):
+///
+///   stepsize_b = (1 + mant/2048) · 2^(precision − eps_b)   [Eq E-3]
+///   decoded    = q_t1 · 0.5 · stepsize_b
+///
+/// where `q_t1` is the tier-1 decoded magnitude (= 2 · q_in, because the
+/// tier-1 encoder multiplies magnitudes by 2 to produce the "oneplushalf"
+/// representation). Substituting: `decoded = q_in · stepsize_b`.
+///
+/// For the encoder's dead-zone quantiser to be consistent with the
+/// decoder's reconstruction (`q_in · stepsize_b ≈ c`), we need:
+///
+///   enc_stepsize_b = stepsize_b = 2^(precision − eps_b)   [with mant = 0]
+///
+/// We use `eps_b = precision` uniformly across all bands, giving
+/// `enc_stepsize_b = 1.0` for every band. This matches the decoder's
+/// convention (`Rb = precision`, no `log2_gain_b`) and preserves the
+/// maximum number of significant bits for each band — the correct
+/// strategy for single-quality-layer encoding where rate-distortion
+/// optimisation across multiple layers is not applicable.
+///
+/// The QCD is emitted with these `eps` values; the decoder dequantises
+/// using the matching formula above.
 fn build_97_band_params(num_decomp: u8, precision: u8) -> (Vec<f32>, Vec<u8>) {
     let num_bands = 3 * (num_decomp as usize) + 1;
     let mut stepsizes = Vec::with_capacity(num_bands);
     let mut band_eps = Vec::with_capacity(num_bands);
-    // Band 0 = LL of resolution 0.
-    let eps = precision; // stepsize = 2^(precision - eps) = 1
-    let step = 1.0f32;
-    stepsizes.push(step);
-    band_eps.push(eps);
-    for _r in 1..=num_decomp {
-        for _ in 0..3 {
-            stepsizes.push(step);
-            band_eps.push(eps);
-        }
+    // Use eps = precision for all bands → enc_step = 1.0
+    // (stepsize_dec = 2^(precision-precision) = 1.0, matched on the encoder side).
+    for _ in 0..num_bands {
+        stepsizes.push(1.0f32);
+        band_eps.push(precision);
     }
     (stepsizes, band_eps)
 }
@@ -515,10 +544,32 @@ fn write_siz(out: &mut Vec<u8>, w: u32, h: u32, num_comps: usize, precision: u32
 }
 
 fn write_cod(out: &mut Vec<u8>, opts: &EncodeOptions, apply_mct: bool) -> Result<()> {
-    // Lcod = 12 (default precincts, no partitioning).
+    let num_res = (opts.num_decomp as usize) + 1;
+    let user_precincts = opts.precincts.is_some();
+    if let Some(ref pp) = opts.precincts {
+        if pp.len() != num_res {
+            return Err(Error::invalid(format!(
+                "jpeg2000: COD: precincts.len() ({}) != num_decomp + 1 ({})",
+                pp.len(),
+                num_res
+            )));
+        }
+        for &(ppx, ppy) in pp {
+            if ppx > 15 || ppy > 15 {
+                return Err(Error::invalid(
+                    "jpeg2000: COD: precinct PPx/PPy must be <= 15",
+                ));
+            }
+        }
+    }
+    // Lcod base = 12 (fixed header). Add num_res bytes when user precincts
+    // are signalled (Scod bit 0 = 1, T.800 §A.6.1 Table A.13).
+    let lcod: usize = 12 + if user_precincts { num_res } else { 0 };
     out.extend_from_slice(&[0xFF, 0x52]);
-    out.extend_from_slice(&12u16.to_be_bytes());
-    out.push(0); // Scod — no SOP, no EPH, default precincts
+    out.extend_from_slice(&(lcod as u16).to_be_bytes());
+    // Scod: bit 0 = user precincts, bit 1 = SOP (off), bit 2 = EPH (off).
+    let scod: u8 = if user_precincts { 1 } else { 0 };
+    out.push(scod);
     out.push(opts.progression.as_u8()); // SGcod progression order
     out.extend_from_slice(&1u16.to_be_bytes()); // num layers
     out.push(if apply_mct { 1 } else { 0 }); // MCT flag
@@ -531,6 +582,14 @@ fn write_cod(out: &mut Vec<u8>, opts: &EncodeOptions, apply_mct: bool) -> Result
         TransformMode::Irreversible97 => 0u8,
     };
     out.push(transform_byte);
+    // Per-resolution precinct sizes (T.800 §A.6.1 Table A.13): one byte
+    // per resolution in order LL_0, r=1..num_decomp. Byte layout:
+    // bits [3:0] = PPx (log2 precinct width), bits [7:4] = PPy.
+    if let Some(ref pp) = opts.precincts {
+        for &(ppx, ppy) in pp {
+            out.push((ppy << 4) | (ppx & 0x0F));
+        }
+    }
     Ok(())
 }
 

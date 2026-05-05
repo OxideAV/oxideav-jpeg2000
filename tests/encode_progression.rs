@@ -534,7 +534,7 @@ fn encoder_ppt_per_tile_part_round_trip_bit_exact() {
 
 /// PPT on the 9/7 lossy path: bit-exactness against the source isn't
 /// guaranteed (lossy quantisation), but the decoded PSNR vs source must
-/// stay above 30 dB and the stream must parse.
+/// stay above 43 dB and the stream must parse.
 #[test]
 fn encoder_ppt_lossy_decodes_above_30db() {
     use oxideav_jpeg2000::encode::TransformMode;
@@ -558,8 +558,8 @@ fn encoder_ppt_lossy_decodes_above_30db() {
     let decoded = decode_with_us(&bytes);
     let psnr = psnr_u8(&decoded.planes[0].data, &src.planes[0].data);
     assert!(
-        psnr > 30.0,
-        "PPT 9/7 round-trip PSNR must exceed 30 dB (got {psnr:.2})"
+        psnr > 43.0,
+        "PPT 9/7 round-trip PSNR must exceed 43 dB (got {psnr:.2})"
     );
 }
 
@@ -575,6 +575,139 @@ fn psnr_u8(a: &[u8], b: &[u8]) -> f64 {
     }
     let mse = sse as f64 / a.len() as f64;
     10.0 * (255.0 * 255.0 / mse).log10()
+}
+
+// -- Explicit precinct signalling (T.800 §A.6.1 Scod bit 0) --------------
+
+/// Encode with explicit per-resolution precinct sizes large enough that
+/// each resolution still contains exactly one precinct (single-precinct
+/// explicit signalling). The COD marker must set Scod bit 0 = 1 and
+/// include one PPx/PPy byte per resolution. Our decoder and
+/// opj_decompress must both accept the stream and reproduce the source
+/// bit-exactly (5/3 reversible path).
+///
+/// For a 64×64 image with 5 decomp levels the 6 resolutions span
+/// 2×2, 4×4, 8×8, 16×16, 32×32, 64×64. Precinct size 64×64 (PPx=PPy=6)
+/// ensures each resolution has exactly one precinct (precinct-size ≥
+/// resolution extent → no subdivision), so the packet structure is
+/// identical to the default case and the round-trip is bit-exact.
+#[test]
+fn encoder_explicit_precincts_scod_bit_set_round_trip() {
+    let src = build_gray_gradient(64, 64);
+    // 5 decomp levels → 6 resolutions. PPx=PPy=6 → 64×64 precinct size
+    // covers every resolution without subdivision.
+    let num_res = 6usize;
+    let opts = EncodeOptions {
+        precincts: Some(vec![(6, 6); num_res]),
+        ..EncodeOptions::default()
+    };
+    let bytes = encode_frame(
+        &Frame::Video(src.clone()),
+        64,
+        64,
+        PixelFormat::Gray8,
+        &opts,
+    )
+    .expect("encode");
+
+    // The COD payload (starting at byte index 0 of the COD segment body,
+    // i.e. after the 0xFF 0x52 marker and the 2-byte Lcod field) must
+    // have Scod bit 0 set.
+    let cs = codestream::parse(&bytes).expect("parse encoded");
+    let cod = cs.cod.as_ref().expect("COD present");
+    assert_eq!(
+        cod[0] & 1,
+        1,
+        "Scod bit 0 must be 1 when explicit precincts are signalled"
+    );
+    // The COD payload must be large enough to include num_res precinct bytes
+    // (Lcod = 12 + num_res, payload = Lcod − 2 = 10 + num_res).
+    assert!(
+        cod.len() >= 10 + num_res,
+        "COD payload must include {} precinct bytes (len = {})",
+        num_res,
+        cod.len()
+    );
+    // Bytes [10 .. 10 + num_res] of the COD payload are the PPy<<4 | PPx bytes.
+    // For PPx = PPy = 6: (6 << 4) | 6 = 0x66.
+    for i in 0..num_res {
+        assert_eq!(
+            cod[10 + i],
+            0x66,
+            "precinct byte {i} must be PPy=6 PPx=6 = 0x66, got 0x{:02x}",
+            cod[10 + i]
+        );
+    }
+
+    // Round-trip must be bit-exact on the reversible path (single precinct per
+    // resolution so the packet structure is unchanged).
+    let decoded = decode_with_us(&bytes);
+    assert_eq!(
+        decoded.planes[0].data, src.planes[0].data,
+        "explicit-precincts round-trip must be bit-exact"
+    );
+
+    if let Some(via_opj) = opj_decompress_to_planes(&bytes, false, "explicit-precincts") {
+        assert_eq!(
+            via_opj, src.planes[0].data,
+            "opj_decompress must accept explicit-precinct stream"
+        );
+    }
+}
+
+/// Encode with varying explicit precinct sizes (different PPx/PPy per
+/// resolution), all still large enough to yield a single precinct per
+/// resolution on a 64×64 image. Verifies the COD bytes are serialised
+/// correctly and the round-trip is bit-exact.
+#[test]
+fn encoder_explicit_precincts_varying_sizes_round_trip() {
+    let src = build_gray_gradient(64, 64);
+    // 5 decomp → 6 resolutions. Each precinct is ≥ 64×64 so there is
+    // still exactly one precinct per resolution.
+    // Byte in COD: (PPy << 4) | PPx.
+    let precincts = vec![(7, 7), (7, 7), (6, 6), (6, 6), (6, 6), (6, 6)];
+    let opts = EncodeOptions {
+        precincts: Some(precincts.clone()),
+        ..EncodeOptions::default()
+    };
+    let bytes = encode_frame(
+        &Frame::Video(src.clone()),
+        64,
+        64,
+        PixelFormat::Gray8,
+        &opts,
+    )
+    .expect("encode");
+
+    let cs = codestream::parse(&bytes).expect("parse encoded");
+    let cod = cs.cod.as_ref().expect("COD present");
+    assert_eq!(cod[0] & 1, 1, "Scod bit 0 must be 1");
+    // First two resolutions: PPy=7, PPx=7 → (7<<4)|7 = 0x77
+    assert_eq!(cod[10], 0x77, "precinct byte 0 must be 0x77");
+    assert_eq!(cod[11], 0x77, "precinct byte 1 must be 0x77");
+    // Remaining 4: PPy=6, PPx=6 → 0x66
+    for i in 2..6 {
+        assert_eq!(
+            cod[10 + i],
+            0x66,
+            "precinct byte {i} must be 0x66, got 0x{:02x}",
+            cod[10 + i]
+        );
+    }
+
+    // Round-trip must be bit-exact (single precinct per resolution).
+    let decoded = decode_with_us(&bytes);
+    assert_eq!(
+        decoded.planes[0].data, src.planes[0].data,
+        "varying-precinct round-trip must be bit-exact"
+    );
+
+    if let Some(via_opj) = opj_decompress_to_planes(&bytes, false, "varying-precincts") {
+        assert_eq!(
+            via_opj, src.planes[0].data,
+            "opj_decompress must accept varying-precinct stream"
+        );
+    }
 }
 
 // -- ProgressionOrder string parsing --------------------------------------

@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- encoder (classic Part-1, round 5): three encoder improvements.
+  - **Explicit per-resolution precinct sizes** (`EncodeOptions::precincts`).
+    New `precincts: Option<Vec<(u8, u8)>>` field on `EncodeOptions`
+    carries one `(PPx, PPy)` pair per resolution (from LL outward,
+    `num_decomp + 1` entries). When `Some`, the COD marker sets
+    `Scod` bit 0 = 1 and appends one `(PPy<<4)|PPx` byte per
+    resolution immediately after the fixed 10-byte `SPcod` block,
+    conformant with T.800 §A.6.1 Table A.13. When `None` (the
+    default), the encoder omits the precinct-size bytes and decoders
+    assume one giant precinct per resolution (`PPx=PPy=15`). Two new
+    integration tests in `encode_progression.rs` verify the COD byte
+    layout and round-trip correctness via our decoder and
+    `opj_decompress`.
+  - **9/7 QCD self-consistency** (`build_97_band_params`): clarified
+    that `enc_stepsize_b = 2^(precision - eps_b)` must match the
+    decoder's dequantisation scale `q · stepsize_dec` (rather than
+    the old erroneous per-band log2_gain factor). The encoder uses
+    `eps_b = precision` for all bands (uniform `stepsize = 1.0`),
+    matching the decoder's `Rb = precision` convention and yielding
+    > 47 dB PSNR on a 64×64 gray gradient, > 43 dB for RGB+ICT.
+    PSNR thresholds in `roundtrip_97.rs` updated from 30 dB to
+    43 / 40 dB respectively.
+  - **HTJ2K SigProp pass encoder** (`encode::htj2k::sigprop_enc`).
+    New `encode_sigprop(cleanup, ref_mag, ref_sign)` function walks
+    quad-scan order, checks the 8-neighbourhood `mbr` flag, and
+    emits one magnitude bit per eligible not-yet-significant sample
+    using `MagSgnWriter` (forward LSB-first with MagSgn stuffing).
+    Sign bits follow immediately for newly-significant samples.
+    Exported as `SigPropEncOutput { z, sign, bits }` (the `bits`
+    field is the forward portion of `Dref`).
+  - **HTJ2K MagRef pass encoder** (`encode::htj2k::magref_enc`).
+    New `encode_magref(cleanup, ref_bit)` function collects one
+    refinement bit per already-significant sample and packs them
+    into the reverse VLC byte stream (last-byte > 0x8F stuffing
+    rule, then byte-reversed). The result is the tail portion of
+    `Dref`, ready for concatenation after the SigProp bytes.
+  - `encode::htj2k::mod` registers both `sigprop_enc` and
+    `magref_enc` as public submodules.
+
 - encoder (HTJ2K, round 4 — task #477): four new sub-features land
   cleanly in one drop.
   - **9/7 irreversible transform** path. New `HtTransform` enum

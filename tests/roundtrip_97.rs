@@ -1,11 +1,11 @@
 //! 9/7 irreversible encode → decode round-trip test.
 //!
-//! Emits a 64×64 RGB image through the 9/7 encoder with forward ICT,
-//! decodes it back through our own decoder, and checks the per-pixel
-//! PSNR is above 30 dB. Unlike the 5/3 round-trip this is *not* bit-
-//! exact — the 9/7 wavelet is floating-point and the scalar quantiser
-//! discards sub-stepsize information — but the reconstruction must
-//! still be perceptually close.
+//! Emits a 64×64 gradient image through the 9/7 encoder and decodes it
+//! back through our own decoder. Unlike the 5/3 round-trip this is *not*
+//! bit-exact — the 9/7 wavelet is floating-point and the scalar quantiser
+//! discards sub-stepsize information — but the reconstruction must be
+//! high-quality: > 43 dB for grayscale, > 40 dB for RGB (ICT colour
+//! transform introduces a small additional rounding contribution).
 
 use oxideav_core::CodecRegistry;
 use oxideav_core::{
@@ -99,8 +99,8 @@ fn roundtrip_97_gray_psnr_above_30db() {
     let psnr = psnr_u8(&src.planes[0].data, &dec.planes[0].data);
     println!("9/7 gray PSNR: {:.2} dB", psnr);
     assert!(
-        psnr > 30.0,
-        "9/7 gray roundtrip PSNR {:.2} dB, expected > 30",
+        psnr > 43.0,
+        "9/7 gray roundtrip PSNR {:.2} dB, expected > 43",
         psnr
     );
 }
@@ -140,8 +140,8 @@ fn roundtrip_97_rgb_psnr_above_30db() {
     let psnr = psnr_u8(&src.planes[0].data, &decoded_packed);
     println!("9/7 rgb PSNR: {:.2} dB", psnr);
     assert!(
-        psnr > 30.0,
-        "9/7 rgb roundtrip PSNR {:.2} dB, expected > 30",
+        psnr > 40.0,
+        "9/7 rgb roundtrip PSNR {:.2} dB, expected > 40",
         psnr
     );
 }
