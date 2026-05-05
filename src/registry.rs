@@ -314,7 +314,7 @@ mod tests {
         let mut reg = CodecRegistry::new();
         register_codecs(&mut reg);
         let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
-        let enc = reg.make_encoder(&params).expect("factory returns encoder");
+        let enc = reg.first_encoder(&params).expect("factory returns encoder");
         assert_eq!(enc.codec_id().as_str(), CODEC_ID_STR);
     }
 
@@ -368,7 +368,7 @@ mod tests {
         let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
         let dec = ctx
             .codecs
-            .make_decoder(&params)
+            .first_decoder(&params)
             .expect("jpeg2000 decoder factory");
         assert_eq!(dec.codec_id().as_str(), CODEC_ID_STR);
         // The unified entry point also wires the .j2k / .jp2 / etc.

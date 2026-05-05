@@ -147,7 +147,7 @@ fn jp2_inner_codestream_decodes_back() {
     let mut reg = CodecRegistry::new();
     oxideav_jpeg2000::register_codecs(&mut reg);
     let params = CodecParameters::video(CodecId::new(oxideav_jpeg2000::CODEC_ID_STR));
-    let mut dec = reg.make_decoder(&params).expect("factory");
+    let mut dec = reg.first_decoder(&params).expect("factory");
     let pkt = Packet::new(0, TimeBase::new(1, 1), cs);
     dec.send_packet(&pkt).expect("send_packet");
     let frame = dec.receive_frame().expect("receive_frame");
@@ -180,7 +180,7 @@ fn jp2_full_wrapper_decodes_transparently() {
     let mut reg = CodecRegistry::new();
     oxideav_jpeg2000::register_codecs(&mut reg);
     let params = CodecParameters::video(CodecId::new(oxideav_jpeg2000::CODEC_ID_STR));
-    let mut dec = reg.make_decoder(&params).expect("factory");
+    let mut dec = reg.first_decoder(&params).expect("factory");
     let pkt = Packet::new(0, TimeBase::new(1, 1), bytes);
     dec.send_packet(&pkt).expect("send_packet");
     let frame = dec.receive_frame().expect("receive_frame");
@@ -226,7 +226,7 @@ fn jp2_wrapper_on_9p7_rgb_encodes_and_decodes() {
     let mut reg = CodecRegistry::new();
     oxideav_jpeg2000::register_codecs(&mut reg);
     let params = CodecParameters::video(CodecId::new(oxideav_jpeg2000::CODEC_ID_STR));
-    let mut dec = reg.make_decoder(&params).expect("factory");
+    let mut dec = reg.first_decoder(&params).expect("factory");
     let pkt = Packet::new(0, TimeBase::new(1, 1), cs);
     dec.send_packet(&pkt).expect("send_packet");
     let frame = dec.receive_frame().expect("receive_frame");

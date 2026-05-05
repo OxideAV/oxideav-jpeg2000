@@ -48,7 +48,7 @@ fn decode_j2k(bytes: &[u8]) -> oxideav_core::VideoFrame {
     let mut reg = CodecRegistry::new();
     oxideav_jpeg2000::register_codecs(&mut reg);
     let params = CodecParameters::video(CodecId::new(oxideav_jpeg2000::CODEC_ID_STR));
-    let mut dec = reg.make_decoder(&params).expect("factory");
+    let mut dec = reg.first_decoder(&params).expect("factory");
     let pkt = Packet::new(0, TimeBase::new(1, 1), bytes.to_vec());
     dec.send_packet(&pkt).expect("send_packet");
     match dec.receive_frame().expect("receive_frame") {

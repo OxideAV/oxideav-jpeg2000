@@ -90,7 +90,7 @@ fn our_decode_gray(bytes: &[u8]) -> (u32, u32, Vec<u8>) {
     let mut reg = CodecRegistry::new();
     oxideav_jpeg2000::register_codecs(&mut reg);
     let params = CodecParameters::video(CodecId::new(oxideav_jpeg2000::CODEC_ID_STR));
-    let mut dec = reg.make_decoder(&params).expect("factory");
+    let mut dec = reg.first_decoder(&params).expect("factory");
     let pkt = Packet::new(0, TimeBase::new(1, 1), bytes.to_vec());
     dec.send_packet(&pkt).expect("our send_packet");
     let frame = dec.receive_frame().expect("our receive_frame");

@@ -81,7 +81,7 @@ fn decode_with_oxideav(bytes: &[u8]) -> Option<VideoFrame> {
     let mut reg = CodecRegistry::new();
     oxideav_jpeg2000::register(&mut reg);
     let params = CodecParameters::video(CodecId::new(oxideav_jpeg2000::CODEC_ID_STR));
-    let mut dec = reg.make_decoder(&params).ok()?;
+    let mut dec = reg.first_decoder(&params).ok()?;
     let pkt = Packet::new(0u32, TimeBase::new(1, 1), bytes.to_vec());
     dec.send_packet(&pkt).ok()?;
     match dec.receive_frame().ok()? {
