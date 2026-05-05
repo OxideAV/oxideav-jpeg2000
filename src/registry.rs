@@ -10,7 +10,8 @@
 
 use oxideav_core::{
     frame::VideoPlane, CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecRegistry,
-    Decoder, Encoder, Error, Frame, Packet, PixelFormat, Result, TimeBase, VideoFrame,
+    ContainerRegistry, Decoder, Encoder, Error, Frame, Packet, PixelFormat, Result, TimeBase,
+    VideoFrame,
 };
 
 use crate::error::Jpeg2000Error;
@@ -69,6 +70,35 @@ pub fn register(reg: &mut CodecRegistry) {
             .decoder(make_decoder)
             .encoder(make_encoder),
     );
+}
+
+/// Register the JPEG 2000 file-extension hints. All standard codestream
+/// and container extensions are mapped to the `"jpeg2000"` container
+/// name so the framework can resolve them to this codec from a path:
+///
+/// - `.j2k` / `.j2c` / `.jpc` — raw Part-1 codestreams (T.800).
+/// - `.jp2` — JP2 ISOBMFF wrapper (ISO/IEC 15444-1 Annex I).
+/// - `.jpf` / `.jpx` — JPX extended container (ISO/IEC 15444-2).
+/// - `.jpm` — JPM compound-image container (ISO/IEC 15444-6).
+///
+/// The crate's decoder transparently handles both raw codestreams and
+/// the JP2 box wrapper; JPX / JPM are JP2-derived ISOBMFF formats whose
+/// embedded `jp2c` codestream(s) the same decoder can consume.
+///
+/// Extensions are stored case-insensitively by [`ContainerRegistry`]
+/// itself, so `.JP2`, `.Jp2`, etc. resolve identically.
+pub fn register_containers(reg: &mut ContainerRegistry) {
+    // Raw Part-1 codestream extensions.
+    reg.register_extension("j2k", "jpeg2000");
+    reg.register_extension("j2c", "jpeg2000");
+    reg.register_extension("jpc", "jpeg2000");
+    // JP2 box format (ISO/IEC 15444-1 Annex I).
+    reg.register_extension("jp2", "jpeg2000");
+    // JPX extended container (ISO/IEC 15444-2).
+    reg.register_extension("jpf", "jpeg2000");
+    reg.register_extension("jpx", "jpeg2000");
+    // JPM compound-image container (ISO/IEC 15444-6).
+    reg.register_extension("jpm", "jpeg2000");
 }
 
 fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
@@ -271,6 +301,49 @@ mod tests {
         let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
         let enc = reg.make_encoder(&params).expect("factory returns encoder");
         assert_eq!(enc.codec_id().as_str(), CODEC_ID_STR);
+    }
+
+    #[test]
+    fn register_containers_maps_all_standard_extensions() {
+        let mut reg = ContainerRegistry::new();
+        register_containers(&mut reg);
+        for ext in ["j2k", "j2c", "jpc", "jp2", "jpf", "jpx", "jpm"] {
+            assert_eq!(
+                reg.container_for_extension(ext),
+                Some("jpeg2000"),
+                "extension .{ext} must resolve to \"jpeg2000\"",
+            );
+        }
+    }
+
+    #[test]
+    fn register_containers_is_case_insensitive() {
+        let mut reg = ContainerRegistry::new();
+        register_containers(&mut reg);
+        // Mixed-case + all-uppercase variants must resolve identically.
+        for ext in [
+            "J2K", "J2C", "JPC", "JP2", "JPF", "JPX", "JPM", "Jp2", "jPx",
+        ] {
+            assert_eq!(
+                reg.container_for_extension(ext),
+                Some("jpeg2000"),
+                "extension .{ext} (mixed case) must resolve to \"jpeg2000\"",
+            );
+        }
+    }
+
+    #[test]
+    fn register_containers_rejects_unrelated_extensions() {
+        let mut reg = ContainerRegistry::new();
+        register_containers(&mut reg);
+        // Sanity: unrelated extensions must NOT resolve to jpeg2000.
+        for ext in ["png", "jpg", "jpeg", "gif", "webp", "bmp"] {
+            assert_eq!(
+                reg.container_for_extension(ext),
+                None,
+                "extension .{ext} must not be claimed by jpeg2000",
+            );
+        }
     }
 
     fn build_tiny_j2k() -> Vec<u8> {
