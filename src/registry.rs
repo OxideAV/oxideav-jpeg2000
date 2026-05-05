@@ -85,6 +85,8 @@ pub fn register(ctx: &mut RuntimeContext) {
     register_containers(&mut ctx.containers);
 }
 
+oxideav_core::register!("jpeg2000", register);
+
 /// Register the JPEG 2000 file-extension hints. All standard codestream
 /// and container extensions are mapped to the `"jpeg2000"` container
 /// name so the framework can resolve them to this codec from a path:
