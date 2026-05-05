@@ -105,15 +105,19 @@ irreversible path produces a lossy bitstream with round-trip PSNR
   with max-deviation 2 against the OpenJPH-binary reference. The
   pblk > 0 / pblk < 0 / `z = 1` algebraic cases on the 9/7 float
   path are unit-tested against the closed-form Eq E-1. **Encoder side
-  (round 1):** `encode::htj2k::encode_image_htj2k` produces a Part-15
-  codestream for a 32×32 single-Gray8-component, NL=0 image with one
-  HT cleanup pass per codeblock. Self-roundtrip is bit-exact and
-  `ojph_expand` (binary, black-box) cross-decodes our output
-  bit-exactly on solid-DC and sparse 32×32 fixtures. Encoder
-  restrictions: at most one significant sample per quad, no
-  first-line-pair both-significant pair, no SigProp/MagRef passes,
-  no multi-tile, multi-layer, PPM/PPT, RGB/MCT, multi-set HT
-  (T.814 §B), or constrained sets (T.814 §8) yet.
+  (round 2):** `encode::htj2k::encode_image_htj2k` produces a Part-15
+  codestream for single-Gray8-component, lossless 5/3 with
+  `NL ∈ [0, 5]` decomposition levels. Multi-significance per quad
+  (ρ ∈ {3, 5, 6, 7, 9..15}), the §7.3.6 Eq-4 first-line-pair
+  both-`u_off=1` special case, and per-resolution tier-2 packets are
+  all wired. Self-roundtrip is bit-exact and `ojph_expand` (binary,
+  black-box) cross-decodes our output bit-exactly on the round-1
+  32×32 NL=0 sparse + solid fixtures plus the round-2 NL=1 32×32
+  sparse and NL=2 64×64 bright-square fixtures. Compression vs raw:
+  64×64 8-bit gradient → 4516 bytes at NL=0, **596 bytes at NL=2,
+  444 bytes at NL=3** (~90% reduction). Encoder gaps: SigProp/MagRef
+  refinement passes, multi-tile, multi-layer, PPM/PPT, RGB/MCT,
+  multi-set HT (T.814 §B), constrained sets (T.814 §8).
 - **RGB input beyond 8-bit unsigned chroma** — the decoder's RCT
   inverse currently clamps chroma to unsigned 8-bit before the
   inverse transform, so encoder inputs with chroma excursions outside

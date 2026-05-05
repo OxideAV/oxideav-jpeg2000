@@ -1,28 +1,27 @@
 //! HT cleanup pass encoder (inverse of
 //! [`crate::decode::htj2k::cleanup`]).
 //!
-//! Round 1 scope:
+//! Round 2 scope:
 //!
 //! * Single HT cleanup pass per code-block (Z_blk = 1). SigProp /
-//!   MagRef are deferred to round 2.
-//! * The encoder requires that **every quad has at most one
-//!   significant sample**. Multi-significant quads (ρ ∈ {3, 5, 6, 7,
-//!   9, 10, 11, 12, 13, 14, 15}) are rejected with
-//!   [`Error::Unsupported`] so the round-2 work can extend the
-//!   per-quad EMB selection logic to handle them.
-//! * Single significance per quad means the encoder can always pick
-//!   the table row `(u_off=1, emb_k=ρ, emb_1=ρ)` for ρ ∈ {1, 2, 4, 8}
-//!   plus the `(u_off=0, emb_k=0, emb_1=0)` row for ρ = 0 — both
-//!   guaranteed to exist in Annex C tables 0 and 1 (verified by the
-//!   `table0_codewords_match_after_encode` /
-//!   `table1_codewords_match_after_encode` round-trips).
-//! * The MEL stream is used only for the ρ=0, cq=0 short-circuit
-//!   (AZC fall-through when the previous quad had cq=0 and the current
-//!   quad is also AZC).
+//!   MagRef are deferred to a later round.
+//! * Multi-significance per quad (ρ ∈ {3, 5, 6, 7, 9..15}) is
+//!   supported by [`super::cxt_vlc_enc::pick_emb_for_uoff1`] which
+//!   searches Annex C for a row whose `(emb_k, emb_1)` pattern is
+//!   compatible with the per-sample MagSgn values.
+//! * The encoder prefers the `(u_off=0, emb_k=0, emb_1=0)` row when
+//!   `bigu <= kappa` (universally available across all `cq` × `ρ`
+//!   combinations); otherwise falls back to the matching u_off=1 row.
+//! * The first-line-pair both-u_off=1 special case (T.814 §7.3.6
+//!   Eq 4) is handled: when both quads in a first-line-pair quad-pair
+//!   need u_off=1, the encoder emits the MEL `s = 1` symbol and
+//!   subtracts 2 from each `u` before splitting into prefix/suffix/ext.
+//! * The MEL stream is used both for the ρ=0, cq=0 AZC short-circuit
+//!   and for the §7.3.6 Eq-4 arbitration.
 //! * Output is the assembled `Dcup` byte sequence ready to splice into
 //!   a tier-2 packet body.
 
-use super::cxt_vlc_enc::encode_cxt_vlc;
+use super::cxt_vlc_enc::{encode_cxt_vlc, pick_emb_for_uoff1};
 use super::mel_enc::encode_mel_symbols;
 use super::streams_enc::{MagSgnWriter, VlcWriter};
 use super::uvlc_enc::{encode_u_extension, encode_u_prefix, encode_u_suffix, split_u};
@@ -102,13 +101,6 @@ pub fn encode_cleanup(width: u32, height: u32, samples: &[SampleHt]) -> Result<V
                 };
                 ee[j as usize] = e_n;
             }
-            // Round-1 restriction: at most one significant sample per
-            // quad.
-            if rho.count_ones() > 1 {
-                return Err(Error::unsupported(
-                    "HTJ2K encode: multi-significant-sample quad (round 2+)",
-                ));
-            }
             quads[q] = QuadEnc {
                 rho,
                 bigu,
@@ -161,30 +153,22 @@ pub fn encode_cleanup(width: u32, height: u32, samples: &[SampleHt]) -> Result<V
             } else {
                 exponent_predictor_non_first_linepair(&quads, qw, q1_idx)
             };
-            // Decide u_off and effective bigu for q1.
-            // Use u_off=0 when bigu fits in kappa (no residual needed).
-            // Else use u_off=1 with emb_k=ρ, emb_1=ρ (only valid for
-            // single-significance quads — guarded above).
-            let q1_has_u = q1.rho != 0 && q1.bigu > kappa1;
-            let (u_off1, emb_k1, emb_1_1, bigu1_eff) = if q1.rho == 0 {
-                (0u8, 0u8, 0u8, kappa1)
-            } else if q1_has_u {
-                // bigu > kappa: emit residual u = bigu - kappa, choose
-                // single-significance EMB to match v's MSB.
-                (1u8, q1.rho, q1.rho, q1.bigu)
-            } else {
-                // bigu <= kappa: u_off=0 path. Effective bigu = kappa,
-                // emit kappa bits per significant sample (without
-                // implicit MSB ⇒ emb_k=emb_1=0).
-                (0u8, 0u8, 0u8, kappa1)
-            };
+            let plan1 = pick_quad_plan(cq1, q1.rho, q1.v, kappa1, is_first)?;
 
             if !(cq1 == 0 && q1.rho == 0) {
-                let ok = encode_cxt_vlc(&mut vlc, cq1, q1.rho, u_off1, emb_k1, emb_1_1, is_first);
+                let ok = encode_cxt_vlc(
+                    &mut vlc,
+                    cq1,
+                    q1.rho,
+                    plan1.u_off,
+                    plan1.emb_k,
+                    plan1.emb_1,
+                    is_first,
+                );
                 if !ok {
                     return Err(Error::unsupported(format!(
-                        "HTJ2K encode: missing CxtVLC entry for cq={cq1} rho={:#X} u_off={u_off1} emb_k={emb_k1:#X} emb_1={emb_1_1:#X}",
-                        q1.rho
+                        "HTJ2K encode: missing CxtVLC entry for cq={cq1} rho={:#X} u_off={} emb_k={:#X} emb_1={:#X}",
+                        q1.rho, plan1.u_off, plan1.emb_k, plan1.emb_1,
                     )));
                 }
             }
@@ -208,73 +192,141 @@ pub fn encode_cleanup(width: u32, height: u32, samples: &[SampleHt]) -> Result<V
                 } else {
                     exponent_predictor_non_first_linepair(&quads, qw, q2_idx)
                 };
-                let q2_has_u_local = q2.rho != 0 && q2.bigu > kappa2;
-                let (u_off2, emb_k2, emb_1_2, bigu2_eff) = if q2.rho == 0 {
-                    (0u8, 0u8, 0u8, kappa2)
-                } else if q2_has_u_local {
-                    (1u8, q2.rho, q2.rho, q2.bigu)
-                } else {
-                    (0u8, 0u8, 0u8, kappa2)
-                };
+                let plan2 = pick_quad_plan(cq2, q2.rho, q2.v, kappa2, is_first)?;
                 if !(cq2 == 0 && q2.rho == 0) {
-                    let ok =
-                        encode_cxt_vlc(&mut vlc, cq2, q2.rho, u_off2, emb_k2, emb_1_2, is_first);
+                    let ok = encode_cxt_vlc(
+                        &mut vlc,
+                        cq2,
+                        q2.rho,
+                        plan2.u_off,
+                        plan2.emb_k,
+                        plan2.emb_1,
+                        is_first,
+                    );
                     if !ok {
                         return Err(Error::unsupported(format!(
-                            "HTJ2K encode: missing CxtVLC entry for cq={cq2} rho={:#X} u_off={u_off2} emb_k={emb_k2:#X} emb_1={emb_1_2:#X}",
-                            q2.rho
+                            "HTJ2K encode: missing CxtVLC entry for cq={cq2} rho={:#X} u_off={} emb_k={:#X} emb_1={:#X}",
+                            q2.rho, plan2.u_off, plan2.emb_k, plan2.emb_1,
                         )));
                     }
                 }
                 sigemb_rho[q2_idx] = q2.rho;
-                Some((q2_idx, q2, cq2, kappa2, q2_has_u_local, bigu2_eff, u_off2))
+                Some((q2_idx, q2, kappa2, plan2))
             } else {
                 None
             };
 
             // §7.3.6 Eq 4 special case: first line-pair, both quads
-            // u_off = 1 — round 1 refuses this.
-            let q2_has_u = q2_opt.is_some_and(|t| t.6 == 1);
-            if is_first && u_off1 == 1 && q2_has_u {
-                return Err(Error::unsupported(
-                    "HTJ2K encode: first-line-pair quad-pair both u_off=1 (round 2+)",
-                ));
-            }
+            // u_off = 1. The decoder reads a MEL symbol; on `s = 1`
+            // each `u_q = 2 + u_pfx + u_sfx + 4 * u_ext` (Eq 4 — the
+            // smallest representable value is 2 + 1 = 3). On `s = 0`
+            // the encoding falls back to a hybrid layout: when
+            // `u_q1 ≤ 2` (u_pfx ∈ {1, 2}) both quads use normal U-VLC
+            // and there is NO q2 prefix collapse; when `u_q1 > 2`
+            // (u_pfx ≥ 3) q2 collapses to a single 1-bit prefix
+            // (u_q2 ∈ {1, 2}) with no suffix or extension.
+            //
+            // Encoder dispatch:
+            //   * Both u >= 3 → emit MEL=1, encode (u-2) for each via
+            //     normal U-VLC (Eq 4).
+            //   * u1 in {1, 2} → emit MEL=0, both quads use normal
+            //     U-VLC.
+            //   * u1 >= 3 AND u2 in {1, 2} → emit MEL=0, q1 normal
+            //     U-VLC, q2 collapsed to a single bit = u2 - 1.
+            //   * u1 >= 3 AND u2 >= 3 → take the MEL=1 path
+            //     (preferred above).
+            let q2_uoff = q2_opt.map(|t| t.3.u_off).unwrap_or(0);
+            let eq4_pair = is_first && plan1.u_off == 1 && q2_uoff == 1;
 
             // U-VLC residuals u_q1, u_q2 in interleaved order
             // (Figure 4): prefix(q1) → prefix(q2) → suffix(q1) →
             // suffix(q2) → ext(q1) → ext(q2). Quads with u_off=0 emit
             // nothing.
-            let u1 = if u_off1 == 1 { q1.bigu - kappa1 } else { 0 };
-            let u2 = match q2_opt {
-                Some((_, q2, _, kappa2, _, _, 1)) => q2.bigu - kappa2,
+            let u1_raw = if plan1.u_off == 1 {
+                q1.bigu - kappa1
+            } else {
+                0
+            };
+            let u2_raw = match &q2_opt {
+                Some((_, q2, kappa2, plan2)) if plan2.u_off == 1 => q2.bigu - *kappa2,
                 _ => 0,
             };
-            let (pfx1, sfx1, ext1) = if u_off1 == 1 { split_u(u1) } else { (0, 0, 0) };
-            let (pfx2, sfx2, ext2) = if q2_has_u { split_u(u2) } else { (0, 0, 0) };
-            if u_off1 == 1 {
-                encode_u_prefix(&mut vlc, pfx1);
-            }
-            if q2_has_u {
-                encode_u_prefix(&mut vlc, pfx2);
-            }
-            if u_off1 == 1 {
-                encode_u_suffix(&mut vlc, pfx1, sfx1);
-            }
-            if q2_has_u {
-                encode_u_suffix(&mut vlc, pfx2, sfx2);
-            }
-            if u_off1 == 1 {
-                encode_u_extension(&mut vlc, sfx1, ext1);
-            }
-            if q2_has_u {
-                encode_u_extension(&mut vlc, sfx2, ext2);
+            let q2_has_u = q2_uoff == 1;
+
+            if eq4_pair {
+                // Pick s=1 (Eq 4) when both u >= 3; else s=0 with
+                // optional q2 collapse.
+                if u1_raw >= 3 && u2_raw >= 3 {
+                    mel_syms.push(1);
+                    let u1 = u1_raw - 2;
+                    let u2 = u2_raw - 2;
+                    let (pfx1, sfx1, ext1) = split_u(u1);
+                    let (pfx2, sfx2, ext2) = split_u(u2);
+                    encode_u_prefix(&mut vlc, pfx1);
+                    encode_u_prefix(&mut vlc, pfx2);
+                    encode_u_suffix(&mut vlc, pfx1, sfx1);
+                    encode_u_suffix(&mut vlc, pfx2, sfx2);
+                    encode_u_extension(&mut vlc, sfx1, ext1);
+                    encode_u_extension(&mut vlc, sfx2, ext2);
+                } else {
+                    mel_syms.push(0);
+                    let (pfx1, sfx1, ext1) = split_u(u1_raw);
+                    if pfx1 > 2 {
+                        // q2 collapses to single bit. Outer guard
+                        // ensures u2_raw in {1, 2} in this branch (we
+                        // got here because (u1>=3, u2<3); collapse
+                        // input domain matches the decoder's
+                        // pfx2 = bit + 1 ∈ {1, 2}).
+                        debug_assert!(u2_raw == 1 || u2_raw == 2);
+                        encode_u_prefix(&mut vlc, pfx1);
+                        let bit = (u2_raw - 1) as u8;
+                        vlc.write_bit(bit);
+                        encode_u_suffix(&mut vlc, pfx1, sfx1);
+                        encode_u_extension(&mut vlc, sfx1, ext1);
+                    } else {
+                        // u1 in {1, 2}: normal interleaved U-VLC for
+                        // both quads. u2 may be >= 1 (any value).
+                        let (pfx2, sfx2, ext2) = split_u(u2_raw);
+                        encode_u_prefix(&mut vlc, pfx1);
+                        encode_u_prefix(&mut vlc, pfx2);
+                        encode_u_suffix(&mut vlc, pfx1, sfx1);
+                        encode_u_suffix(&mut vlc, pfx2, sfx2);
+                        encode_u_extension(&mut vlc, sfx1, ext1);
+                        encode_u_extension(&mut vlc, sfx2, ext2);
+                    }
+                }
+            } else {
+                // Standard interleaved U-VLC (no Eq 4).
+                let (pfx1, sfx1, ext1) = if plan1.u_off == 1 {
+                    split_u(u1_raw)
+                } else {
+                    (0, 0, 0)
+                };
+                let (pfx2, sfx2, ext2) = if q2_has_u { split_u(u2_raw) } else { (0, 0, 0) };
+                if plan1.u_off == 1 {
+                    encode_u_prefix(&mut vlc, pfx1);
+                }
+                if q2_has_u {
+                    encode_u_prefix(&mut vlc, pfx2);
+                }
+                if plan1.u_off == 1 {
+                    encode_u_suffix(&mut vlc, pfx1, sfx1);
+                }
+                if q2_has_u {
+                    encode_u_suffix(&mut vlc, pfx2, sfx2);
+                }
+                if plan1.u_off == 1 {
+                    encode_u_extension(&mut vlc, sfx1, ext1);
+                }
+                if q2_has_u {
+                    encode_u_extension(&mut vlc, sfx2, ext2);
+                }
             }
 
             // MagSgn bits per significant sample.
-            emit_quad_magsgn(&mut magsgn, &q1, bigu1_eff, u_off1)?;
-            if let Some((_, q2, _, _, _, bigu2_eff, u_off2)) = q2_opt {
-                emit_quad_magsgn(&mut magsgn, &q2, bigu2_eff, u_off2)?;
+            emit_quad_magsgn(&mut magsgn, &q1, plan1.bigu, plan1.emb_k)?;
+            if let Some((_, q2, _, plan2)) = q2_opt {
+                emit_quad_magsgn(&mut magsgn, &q2, plan2.bigu, plan2.emb_k)?;
             }
 
             qx += 2;
@@ -466,18 +518,19 @@ pub fn encode_cleanup(width: u32, height: u32, samples: &[SampleHt]) -> Result<V
     Ok(dcup)
 }
 
-fn emit_quad_magsgn(magsgn: &mut MagSgnWriter, q: &QuadEnc, bigu: u32, u_off: u8) -> Result<()> {
+fn emit_quad_magsgn(magsgn: &mut MagSgnWriter, q: &QuadEnc, bigu: u32, emb_k: u8) -> Result<()> {
     if q.rho == 0 {
         return Ok(());
     }
-    // Per the (emb_k, emb_1) pattern selected upstream:
-    //   * u_off == 0 ⇒ emb_k = emb_1 = 0 ⇒ kbit_j = 0 for every
-    //     significant sample ⇒ m = bigu, decoder reads `bigu` LSB bits
-    //     of v with no implicit MSB. Encoder emits `bigu` LSB bits.
-    //   * u_off == 1 (round-1 single-significance) ⇒ emb_k = emb_1 = ρ
-    //     ⇒ kbit_j = 1 for the lone significant sample, decoder reads
-    //     `bigu - 1` bits and ORs in `1 << (bigu - 1)`. Encoder emits
-    //     the lower `bigu - 1` bits of v; bit-(bigu-1) of v MUST be 1.
+    // Per T.814 §7.3.8: for each significant sample j, decoder reads
+    // `m = bigu - kbit_j` LSB bits of v, then ORs `ibit_j << m`. The
+    // implicit MSB at position m is determined by `ibit_j` (= the
+    // table's emb_1 bit), already constrained upstream to match
+    // `bit(m, v_j)`.
+    //
+    // Encoder side: emit `m` LSB bits of v. The bit at position `m`
+    // (implicit) is whatever the table row's emb_1 bit said it would
+    // be — we verified it matches v's bit pattern when picking the row.
     for j in 0..4u8 {
         if (q.rho >> j) & 1 == 0 {
             continue;
@@ -489,20 +542,88 @@ fn emit_quad_magsgn(magsgn: &mut MagSgnWriter, q: &QuadEnc, bigu: u32, u_off: u8
                 "HTJ2K encode: sample magnitude exceeds bigu",
             ));
         }
-        let m: u8 = if u_off == 1 {
-            // bit-(bigu-1) of v must be 1 (we picked bigu = bit_len(v)).
-            if bit_len != bigu {
-                return Err(Error::invalid(
-                    "HTJ2K encode: u_off=1 sample with bit_len != bigu",
-                ));
-            }
-            (bigu - 1) as u8
-        } else {
-            bigu as u8
-        };
+        let kbit = (emb_k >> j) & 1;
+        let m: u8 = (bigu - kbit as u32) as u8;
         magsgn.write_bits_lsb(v, m);
     }
     Ok(())
+}
+
+/// Per-quad encoding plan: chosen `(u_off, emb_k, emb_1)` plus the
+/// effective `bigu` to write in MagSgn.
+#[derive(Clone, Copy, Debug)]
+struct QuadPlan {
+    u_off: u8,
+    emb_k: u8,
+    emb_1: u8,
+    bigu: u32,
+}
+
+/// Pick a row of Annex C for one quad given its actual `(rho, v[4])`
+/// data, the `cq` context value and the κ_q exponent predictor. Round
+/// 2 prefers the cheap `(u_off=0, emb_k=0, emb_1=0)` row whenever
+/// `kappa >= max(bit_len(v_j))`; otherwise falls back to a u_off=1
+/// row picked by [`pick_emb_for_uoff1`]. For the §7.3.6 Eq-4 path the
+/// caller (which has both quads in scope) may further bump u_off=1
+/// values up to satisfy `u >= 2`.
+fn pick_quad_plan(cq: u8, rho: u8, v: [u32; 4], kappa: u32, is_first: bool) -> Result<QuadPlan> {
+    if rho == 0 {
+        return Ok(QuadPlan {
+            u_off: 0,
+            emb_k: 0,
+            emb_1: 0,
+            bigu: kappa,
+        });
+    }
+    let mut bigu_min: u32 = 0;
+    for j in 0..4u8 {
+        if (rho >> j) & 1 == 0 {
+            continue;
+        }
+        let bl = if v[j as usize] == 0 {
+            0
+        } else {
+            32 - v[j as usize].leading_zeros()
+        };
+        bigu_min = bigu_min.max(bl);
+    }
+    if bigu_min <= kappa {
+        // `(u_off=0, emb_k=0, emb_1=0)` row: present in Annex C for
+        // every (cq, rho) combination (verified empirically).
+        return Ok(QuadPlan {
+            u_off: 0,
+            emb_k: 0,
+            emb_1: 0,
+            bigu: kappa,
+        });
+    }
+    // u_off=1 path: bigu = bigu_min, search the table.
+    let bigu = bigu_min;
+    if let Some((emb_k, emb_1, _len)) = pick_emb_for_uoff1(cq, rho, v, bigu, is_first) {
+        return Ok(QuadPlan {
+            u_off: 1,
+            emb_k,
+            emb_1,
+            bigu,
+        });
+    }
+    // Fallback: bump bigu up by 1 and retry. This can change which
+    // bit-pattern matches the row — useful when the per-sample MSBs
+    // happen to clash with every available row at bigu_min.
+    for bump in 1..=4u32 {
+        let try_bigu = bigu_min + bump;
+        if let Some((emb_k, emb_1, _len)) = pick_emb_for_uoff1(cq, rho, v, try_bigu, is_first) {
+            return Ok(QuadPlan {
+                u_off: 1,
+                emb_k,
+                emb_1,
+                bigu: try_bigu,
+            });
+        }
+    }
+    Err(Error::unsupported(format!(
+        "HTJ2K encode: no Annex C row for (cq={cq}, rho={rho:#X}, u_off=1, bigu={bigu_min})",
+    )))
 }
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -549,26 +670,38 @@ fn pack_vlc_bits_into_segment(bits: &[u8]) -> Result<(u8, Vec<u8>)> {
         return Ok((reservoir, Vec::new()));
     }
     // Pack remaining bits res_width.. into bytes, 8 bits per byte
-    // LSB-first. Reverse-VLC stuffing rule (T.814 §7.1.4): when the
-    // PREVIOUSLY-emitted byte exceeds `0x8F` AND the new byte's low 7
-    // bits are all 1, the next byte's bit-7 is forced to 0 — the
-    // decoder reads only 7 payload bits from it. We mirror by
-    // limiting the new byte to 7 bits when the predicate fires; the
-    // remaining input bit gets pushed onto the next byte.
+    // LSB-first. Reverse-VLC stuffing rule (T.814 §7.1.4): the
+    // decoder skips the top bit of a new byte ONLY when the previously
+    // emitted byte was > 0x8F AND the new byte's low 7 bits are all 1
+    // (i.e. the byte would naturally be 0xFF). In every other case it
+    // reads all 8 bits.
+    //
+    // Encoder: peek at the next 7 input bits before packing. When the
+    // stuffing predicate is about to fire (prev_byte > 0x8F AND the
+    // next 7 bits are all 1), emit a byte whose low 7 bits are
+    // 0x7F + bit 7 forced to 0. The decoder will skip bit 7 anyway
+    // (bits=7) and consume the 7 input bits as payload.
+    //
+    // Otherwise emit all 8 input bits normally.
     let mut bytes_first_to_last: Vec<u8> = Vec::new();
     let rest = &bits[res_width..];
     let mut idx = 0;
     let mut prev_byte: u8 = 0;
     let mut have_prev = false;
     while idx < rest.len() {
-        let cap: usize = if have_prev && prev_byte > 0x8F { 7 } else { 8 };
+        let next7_all_one = rest.len() - idx >= 7 && rest[idx..idx + 7].iter().all(|&b| b == 1);
+        let cap: usize = if have_prev && prev_byte > 0x8F && next7_all_one {
+            7
+        } else {
+            8
+        };
         let chunk_end = (idx + cap).min(rest.len());
         let mut byte = 0u8;
         for (i, &b) in rest[idx..chunk_end].iter().enumerate() {
             byte |= (b & 1) << i;
         }
-        // The stuffing rule guarantees bit-7 stays 0 when cap=7
-        // (because we only filled bits 0..6).
+        // When cap = 7, byte's bit 7 is naturally 0 since we only
+        // filled bits 0..6 — and the low 7 bits are 0x7F by predicate.
         bytes_first_to_last.push(byte);
         prev_byte = byte;
         have_prev = true;
@@ -803,5 +936,198 @@ mod tests {
         samples[2 * 8 + 4] = SampleHt { mag: 1, sign: 1 };
         samples[4 * 8] = SampleHt { mag: 5, sign: 0 };
         check_roundtrip(8, 8, &samples);
+    }
+
+    /// Round-2 multi-significance per quad: 2x2 block with all four
+    /// samples significant (ρ = 0xF). Exercises the table search in
+    /// [`super::cxt_vlc_enc::pick_emb_for_uoff1`] for bigu = 1
+    /// (every v_j = 1) which lands in the (u_off=0, emb_k=0,
+    /// emb_1=0) row.
+    #[test]
+    fn roundtrip_2x2_all_significant_mag1() {
+        let samples = vec![
+            SampleHt { mag: 1, sign: 0 },
+            SampleHt { mag: 1, sign: 1 },
+            SampleHt { mag: 1, sign: 0 },
+            SampleHt { mag: 1, sign: 1 },
+        ];
+        check_roundtrip(2, 2, &samples);
+    }
+
+    /// 4x4 with two adjacent samples in the SAME quad (rho = 0x3:
+    /// j=0 + j=1 = TL + BL of one quad) — first-line-pair multi-sig.
+    #[test]
+    fn roundtrip_4x4_one_dual_sig_quad() {
+        let mut samples = vec![SampleHt::default(); 16];
+        // (0, 0) = TL of quad 0; (0, 1) = BL of quad 0.
+        samples[0] = SampleHt { mag: 1, sign: 0 };
+        samples[4] = SampleHt { mag: 2, sign: 1 };
+        check_roundtrip(4, 4, &samples);
+    }
+
+    /// 4x4 with three samples in one quad (rho = 0x7).
+    #[test]
+    fn roundtrip_4x4_three_sig_in_one_quad() {
+        let mut samples = vec![SampleHt::default(); 16];
+        samples[0] = SampleHt { mag: 1, sign: 0 }; // j=0 (TL)
+        samples[4] = SampleHt { mag: 1, sign: 1 }; // j=1 (BL)
+        samples[1] = SampleHt { mag: 1, sign: 0 }; // j=2 (TR)
+        check_roundtrip(4, 4, &samples);
+    }
+
+    /// 4x4 with all four samples of the first quad significant
+    /// (rho = 0xF) — first-line-pair, full-quad significance, mixed
+    /// magnitudes.
+    #[test]
+    fn roundtrip_4x4_full_quad_sig() {
+        let mut samples = vec![SampleHt::default(); 16];
+        samples[0] = SampleHt { mag: 2, sign: 0 };
+        samples[4] = SampleHt { mag: 3, sign: 1 };
+        samples[1] = SampleHt { mag: 1, sign: 1 };
+        samples[5] = SampleHt { mag: 2, sign: 0 };
+        check_roundtrip(4, 4, &samples);
+    }
+
+    /// 8x8 with multi-significance scattered across non-first
+    /// line-pair quads — exercises the κ_q predictor + table-1 path
+    /// combined with multi-sig.
+    #[test]
+    fn roundtrip_8x8_multi_sig_non_first_linepair() {
+        let mut samples = vec![SampleHt::default(); 64];
+        // Quad at (qx=2, qy=2) → samples (4,4), (4,5), (5,4), (5,5).
+        samples[4 * 8 + 4] = SampleHt { mag: 2, sign: 0 };
+        samples[5 * 8 + 4] = SampleHt { mag: 1, sign: 1 };
+        samples[4 * 8 + 5] = SampleHt { mag: 1, sign: 0 };
+        samples[5 * 8 + 5] = SampleHt { mag: 2, sign: 1 };
+        check_roundtrip(8, 8, &samples);
+    }
+
+    /// Densely-significant 8x8 block — every sample non-zero.
+    /// Stress-tests the encoder's table search across all (cq, ρ)
+    /// combinations.
+    #[test]
+    fn roundtrip_8x8_dense() {
+        let mut samples = Vec::with_capacity(64);
+        for i in 0..64 {
+            let mag = ((i % 5) + 1) as u32;
+            let sign = (i & 1) as u8;
+            samples.push(SampleHt { mag, sign });
+        }
+        check_roundtrip(8, 8, &samples);
+    }
+
+    /// 4x4 dense — every sample magnitude 1.
+    #[test]
+    fn roundtrip_4x4_all_mag1() {
+        let mut samples = Vec::with_capacity(16);
+        for i in 0..16 {
+            samples.push(SampleHt {
+                mag: 1,
+                sign: (i & 1) as u8,
+            });
+        }
+        check_roundtrip(4, 4, &samples);
+    }
+
+    /// 4x4 dense — alternating magnitudes 1, 2 to span multiple
+    /// (cq, ρ, bigu) combinations.
+    #[test]
+    fn roundtrip_4x4_alt_mag12() {
+        let mut samples = Vec::with_capacity(16);
+        for i in 0..16 {
+            samples.push(SampleHt {
+                mag: if (i & 1) == 0 { 1 } else { 2 },
+                sign: 0,
+            });
+        }
+        check_roundtrip(4, 4, &samples);
+    }
+
+    /// Smaller variant: 2x4 (one row of two quads), to study how the
+    /// non-first-linepair κ_q predictor + multi-sig interaction
+    /// behaves at second-row entry.
+    #[test]
+    fn roundtrip_4x4_first_row_only() {
+        let mut samples = vec![SampleHt::default(); 16];
+        for (i, slot) in samples.iter_mut().enumerate().take(4) {
+            *slot = SampleHt {
+                mag: if (i & 1) == 0 { 1 } else { 2 },
+                sign: 0,
+            };
+        }
+        check_roundtrip(4, 4, &samples);
+    }
+
+    /// 4x4 where the SECOND quad-row holds a multi-sig quad. Tests
+    /// the non-first-linepair κ_q predictor + multi-sig combination.
+    #[test]
+    fn roundtrip_4x4_second_row_multi_sig() {
+        let mut samples = vec![SampleHt::default(); 16];
+        // Quad at (qx=0, qy=1): samples (0,2), (0,3), (1,2), (1,3).
+        samples[2 * 4] = SampleHt { mag: 1, sign: 0 };
+        samples[3 * 4] = SampleHt { mag: 1, sign: 1 };
+        samples[2 * 4 + 1] = SampleHt { mag: 1, sign: 0 };
+        samples[3 * 4 + 1] = SampleHt { mag: 1, sign: 1 };
+        check_roundtrip(4, 4, &samples);
+    }
+
+    /// First row + second row both with multi-sig pairs. Triggers
+    /// the multi-sig κ_q predictor with non-default `max_e`.
+    #[test]
+    fn roundtrip_4x4_both_rows_multi_sig() {
+        let mut samples = vec![SampleHt::default(); 16];
+        for i in 0..4 {
+            samples[i] = SampleHt { mag: 1, sign: 0 };
+            samples[i + 4] = SampleHt { mag: 2, sign: 0 };
+            samples[i + 8] = SampleHt { mag: 1, sign: 1 };
+            samples[i + 12] = SampleHt { mag: 2, sign: 1 };
+        }
+        check_roundtrip(4, 4, &samples);
+    }
+
+    /// 4x4 with alternating mag=1, mag=2 by column position.
+    #[test]
+    fn roundtrip_4x4_alt_by_col() {
+        let mut samples = Vec::with_capacity(16);
+        for y in 0..4 {
+            for x in 0..4 {
+                let _ = y;
+                samples.push(SampleHt {
+                    mag: if (x & 1) == 0 { 1 } else { 2 },
+                    sign: 0,
+                });
+            }
+        }
+        check_roundtrip(4, 4, &samples);
+    }
+
+    /// 4x4 alternating by row.
+    #[test]
+    fn roundtrip_4x4_alt_by_row() {
+        let mut samples = Vec::with_capacity(16);
+        for y in 0..4 {
+            for _x in 0..4 {
+                samples.push(SampleHt {
+                    mag: if (y & 1) == 0 { 1 } else { 2 },
+                    sign: 0,
+                });
+            }
+        }
+        check_roundtrip(4, 4, &samples);
+    }
+
+    /// Round-2 first-line-pair Eq-4 special case: a quad-pair where
+    /// BOTH quads need u_off=1. We force this by placing
+    /// large-magnitude samples in adjacent quads of the first row.
+    /// kappa = 1 in the first line-pair, so any sample with magnitude
+    /// >= 2 (v >= 2 ⇒ bit_len(v) >= 2 > kappa = 1) needs u_off=1.
+    #[test]
+    fn roundtrip_2x4_first_linepair_eq4() {
+        // 4x2 codeblock: 2 quads, both in first line-pair, samples
+        // forced into u_off=1 path.
+        let mut samples = vec![SampleHt::default(); 8];
+        samples[0] = SampleHt { mag: 4, sign: 0 }; // quad 0, j=0
+        samples[2] = SampleHt { mag: 4, sign: 1 }; // quad 1, j=0
+        check_roundtrip(4, 2, &samples);
     }
 }

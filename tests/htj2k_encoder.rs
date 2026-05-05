@@ -169,3 +169,269 @@ fn strip_pgm_header(buf: &[u8]) -> &[u8] {
     }
     &buf[i..]
 }
+
+// ----- Round 2 fixtures -----
+
+/// 32×32 sparse pattern at NL=1: forward 5/3 DWT on a Gray8 image,
+/// self-roundtrip through the same crate's decoder.
+#[test]
+fn round2_nl1_sparse_self_roundtrip() {
+    let mut data = vec![0x80u8; 32 * 32];
+    data[0] = 0x81;
+    data[5 * 32 + 5] = 0x7F;
+    data[10 * 32 + 10] = 0x82;
+    let img = img32(data.clone());
+    let opts = EncodeOptionsHt {
+        cblk_log2: 5,
+        num_decomp: 1,
+    };
+    let cs = encode_image_htj2k(&img, &opts).expect("encode");
+    let p = probe(&cs).expect("probe");
+    assert_eq!(p.flavour, J2kFlavour::HighThroughput);
+    let decoded = decode_jpeg2000(&cs).expect("decode");
+    assert_eq!(decoded.planes[0].data, data);
+}
+
+/// 64×64 noise + bright square at NL=2: deeper pyramid with
+/// multi-significance per quad in HL/LH/HH bands.
+#[test]
+fn round2_nl2_noise_self_roundtrip() {
+    let mut data = vec![0x40u8; 64 * 64];
+    for y in 24..40 {
+        for x in 24..40 {
+            data[y * 64 + x] = 0xC0;
+        }
+    }
+    let img = Jpeg2000Image {
+        width: 64,
+        height: 64,
+        pixel_format: PixelFormat::Gray8,
+        planes: vec![Jpeg2000Plane {
+            stride: 64,
+            data: data.clone(),
+        }],
+        pts: None,
+    };
+    let opts = EncodeOptionsHt {
+        cblk_log2: 5,
+        num_decomp: 2,
+    };
+    let cs = encode_image_htj2k(&img, &opts).expect("encode");
+    let decoded = decode_jpeg2000(&cs).expect("decode");
+    assert_eq!(decoded.planes[0].data, data);
+}
+
+/// ojph_expand cross-decode for the round-2 NL=1 sparse fixture.
+#[test]
+fn round2_nl1_ojph_expand_cross_decode() {
+    if std::process::Command::new("ojph_expand")
+        .arg("-h")
+        .output()
+        .is_err()
+    {
+        eprintln!("ojph_expand not on PATH; skipping");
+        return;
+    }
+    let mut data = vec![0x80u8; 32 * 32];
+    data[0] = 0x81;
+    data[5 * 32 + 5] = 0x7F;
+    data[10 * 32 + 10] = 0x82;
+    let img = img32(data.clone());
+    let opts = EncodeOptionsHt {
+        cblk_log2: 5,
+        num_decomp: 1,
+    };
+    let cs = encode_image_htj2k(&img, &opts).expect("encode");
+
+    let tmp_dir = std::env::temp_dir();
+    let in_path = tmp_dir.join("oxideav_htj2k_round2_nl1_sparse.j2c");
+    let out_path = tmp_dir.join("oxideav_htj2k_round2_nl1_sparse.pgm");
+    std::fs::write(&in_path, &cs).expect("write codestream");
+    let _ = std::fs::remove_file(&out_path);
+
+    let status = std::process::Command::new("ojph_expand")
+        .args(["-i", in_path.to_str().unwrap()])
+        .args(["-o", out_path.to_str().unwrap()])
+        .status()
+        .expect("spawn ojph_expand");
+    assert!(status.success(), "ojph_expand failed on NL=1 codestream");
+
+    let pgm = std::fs::read(&out_path).expect("read pgm");
+    let payload = strip_pgm_header(&pgm);
+    assert_eq!(payload.len(), 32 * 32);
+    let n_diff = data
+        .iter()
+        .zip(payload.iter())
+        .filter(|(a, b)| a != b)
+        .count();
+    assert_eq!(n_diff, 0, "ojph_expand disagrees on {n_diff} pixels");
+
+    let _ = std::fs::remove_file(&in_path);
+    let _ = std::fs::remove_file(&out_path);
+}
+
+/// Print encoded byte sizes across NL values for several fixture
+/// shapes. Soft assertion: the output is informational only.
+#[test]
+fn round2_size_report() {
+    fn img(w: u32, h: u32, data: Vec<u8>) -> Jpeg2000Image {
+        Jpeg2000Image {
+            width: w,
+            height: h,
+            pixel_format: PixelFormat::Gray8,
+            planes: vec![Jpeg2000Plane {
+                stride: w as usize,
+                data,
+            }],
+            pts: None,
+        }
+    }
+    let solid = img(32, 32, vec![0x80u8; 32 * 32]);
+    let cs0 = encode_image_htj2k(
+        &solid,
+        &EncodeOptionsHt {
+            cblk_log2: 5,
+            num_decomp: 0,
+        },
+    )
+    .unwrap();
+    let cs1 = encode_image_htj2k(
+        &solid,
+        &EncodeOptionsHt {
+            cblk_log2: 5,
+            num_decomp: 1,
+        },
+    )
+    .unwrap();
+    eprintln!(
+        "solid 32x32 (raw 1024): NL=0 {} bytes, NL=1 {} bytes",
+        cs0.len(),
+        cs1.len()
+    );
+
+    let mut d = Vec::with_capacity(64 * 64);
+    for y in 0..64u32 {
+        for x in 0..64u32 {
+            let v = ((x + y) * 4).min(255) as u8;
+            d.push(v);
+        }
+    }
+    let grad = img(64, 64, d);
+    let cs0 = encode_image_htj2k(
+        &grad,
+        &EncodeOptionsHt {
+            cblk_log2: 5,
+            num_decomp: 0,
+        },
+    )
+    .unwrap();
+    let cs2 = encode_image_htj2k(
+        &grad,
+        &EncodeOptionsHt {
+            cblk_log2: 5,
+            num_decomp: 2,
+        },
+    )
+    .unwrap();
+    let cs3 = encode_image_htj2k(
+        &grad,
+        &EncodeOptionsHt {
+            cblk_log2: 5,
+            num_decomp: 3,
+        },
+    )
+    .unwrap();
+    eprintln!(
+        "64x64 gradient (raw 4096): NL=0 {} bytes, NL=2 {} bytes, NL=3 {} bytes",
+        cs0.len(),
+        cs2.len(),
+        cs3.len()
+    );
+
+    let mut d = Vec::with_capacity(64 * 64);
+    for i in 0..(64 * 64) {
+        d.push(((i * 17) % 251) as u8);
+    }
+    let noise = img(64, 64, d);
+    let cs0 = encode_image_htj2k(
+        &noise,
+        &EncodeOptionsHt {
+            cblk_log2: 5,
+            num_decomp: 0,
+        },
+    )
+    .unwrap();
+    let cs1 = encode_image_htj2k(
+        &noise,
+        &EncodeOptionsHt {
+            cblk_log2: 5,
+            num_decomp: 1,
+        },
+    )
+    .unwrap();
+    eprintln!(
+        "64x64 noise (raw 4096): NL=0 {} bytes, NL=1 {} bytes",
+        cs0.len(),
+        cs1.len()
+    );
+}
+
+/// ojph_expand cross-decode for the NL=2 64x64 fixture.
+#[test]
+fn round2_nl2_ojph_expand_cross_decode() {
+    if std::process::Command::new("ojph_expand")
+        .arg("-h")
+        .output()
+        .is_err()
+    {
+        eprintln!("ojph_expand not on PATH; skipping");
+        return;
+    }
+    let mut data = vec![0x40u8; 64 * 64];
+    for y in 24..40 {
+        for x in 24..40 {
+            data[y * 64 + x] = 0xC0;
+        }
+    }
+    let img = Jpeg2000Image {
+        width: 64,
+        height: 64,
+        pixel_format: PixelFormat::Gray8,
+        planes: vec![Jpeg2000Plane {
+            stride: 64,
+            data: data.clone(),
+        }],
+        pts: None,
+    };
+    let opts = EncodeOptionsHt {
+        cblk_log2: 5,
+        num_decomp: 2,
+    };
+    let cs = encode_image_htj2k(&img, &opts).expect("encode");
+
+    let tmp_dir = std::env::temp_dir();
+    let in_path = tmp_dir.join("oxideav_htj2k_round2_nl2_square.j2c");
+    let out_path = tmp_dir.join("oxideav_htj2k_round2_nl2_square.pgm");
+    std::fs::write(&in_path, &cs).expect("write codestream");
+    let _ = std::fs::remove_file(&out_path);
+
+    let status = std::process::Command::new("ojph_expand")
+        .args(["-i", in_path.to_str().unwrap()])
+        .args(["-o", out_path.to_str().unwrap()])
+        .status()
+        .expect("spawn ojph_expand");
+    assert!(status.success(), "ojph_expand failed on NL=2 codestream");
+
+    let pgm = std::fs::read(&out_path).expect("read pgm");
+    let payload = strip_pgm_header(&pgm);
+    assert_eq!(payload.len(), 64 * 64);
+    let n_diff = data
+        .iter()
+        .zip(payload.iter())
+        .filter(|(a, b)| a != b)
+        .count();
+    assert_eq!(n_diff, 0, "ojph_expand disagrees on {n_diff} pixels");
+
+    let _ = std::fs::remove_file(&in_path);
+    let _ = std::fs::remove_file(&out_path);
+}

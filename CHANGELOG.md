@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- encoder (HTJ2K, round 2 — task #477): multi-significance per quad,
+  forward 5/3 DWT plumbing for `NL ∈ [0, 5]`, and the §7.3.6 Eq-4
+  first-line-pair both-`u_off=1` special case.
+  - `cxt_vlc_enc::pick_emb_for_uoff1` searches Annex C for a row whose
+    `(emb_k, emb_1)` mask is compatible with the per-sample
+    `bit(bigu - kbit_j, v_j) == ibit_j` constraint; the cleanup encoder
+    falls back to `(u_off=0, emb_k=0, emb_1=0)` (universally available
+    across `(cq, ρ)`) when `kappa >= max bit_len(v_j)`.
+  - `cleanup_enc::pick_quad_plan` picks the per-quad plan; multi-sig
+    ρ ∈ {3, 5, 6, 7, 9..15} now round-trips through the same crate's
+    decoder.
+  - First-line-pair Eq-4 path: when both quads of a pair need
+    `u_off=1`, the encoder picks between `s=1` (Eq 4, both `u >= 3`)
+    and `s=0` (with optional q2 prefix collapse when `u_q1 > 2` and
+    `u_q2 ∈ {1, 2}`).
+  - `tile_enc` now wires `crate::encode::dwt::fdwt_53` level-by-level,
+    builds per-resolution / per-band / per-codeblock layouts via the
+    decoder's `build_subbands` helper, and emits one tier-2 packet per
+    resolution covering all bands of that resolution. QCD signals
+    `1 + 3 * NL` bands with the canonical reversible eps_b values
+    (LL = precision, HL/LH = precision + 1, HH = precision + 2).
+  - Reverse-VLC stuffing rule fixed: the encoder now mirrors the
+    decoder's predicate exactly (only force bit-7 = 0 in the next
+    byte when `prev > 0x8F` AND the next 7 input bits are all 1),
+    eliminating spurious bit insertions.
+  - 11 new self-roundtrip + 2 new `ojph_expand` cross-decode
+    integration tests cover NL=0..3 with sparse/dense/gradient
+    fixtures.
+
 - encoder (HTJ2K, round 1): minimum-viable HT cleanup-pass encoder.
   New `encode::htj2k::encode_image_htj2k` plus the
   `encode::EncodeOptionsHt` knob set produce a Part-15 codestream
