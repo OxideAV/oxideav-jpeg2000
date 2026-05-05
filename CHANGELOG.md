@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-jpeg2000/compare/v0.0.7...v0.0.8) - 2026-05-05
+
+### Other
+
+- HTJ2K encoder: refresh module doc to reflect round 2 scope
+- HTJ2K encoder round 2 — multi-significance + 5/3 DWT plumbing (task #477)
+- place HTJ2K encoder round 1 entry under [Unreleased]
+- HTJ2K encoder bootstrap (round 1) — task #456
+
 ### Added
 
 - encoder (HTJ2K, round 2 — task #477): multi-significance per quad,
