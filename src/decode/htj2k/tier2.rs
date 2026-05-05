@@ -44,6 +44,36 @@ use crate::image::{
     Jpeg2000Image, Jpeg2000PixelFormat as PixelFormat, Jpeg2000Plane as VideoPlane,
 };
 
+/// Compute `(num_tiles_x, num_tiles_y)` from SIZ. `XTsiz` / `YTsiz` are
+/// the nominal tile dimensions on the reference grid; the picture spans
+/// `[XOsiz, Xsiz)` × `[YOsiz, Ysiz)`.
+fn tile_grid_dims_ht(siz: &Siz) -> Result<(u32, u32)> {
+    if siz.xtsiz == 0 || siz.ytsiz == 0 {
+        return Err(Error::invalid("HTJ2K: SIZ XTsiz or YTsiz is zero"));
+    }
+    let nx = (siz.xsiz - siz.xtosiz).div_ceil(siz.xtsiz);
+    let ny = (siz.ysiz - siz.ytosiz).div_ceil(siz.ytsiz);
+    Ok((nx, ny))
+}
+
+/// Reference-grid rectangle for tile `(p, q)` per T.800 §B.3.
+fn tile_ref_rect_ht(siz: &Siz, p: u32, q: u32) -> (u32, u32, u32, u32) {
+    let tx0 = (siz.xtosiz + p * siz.xtsiz).max(siz.xosiz);
+    let ty0 = (siz.ytosiz + q * siz.ytsiz).max(siz.yosiz);
+    let tx1 = (siz.xtosiz + (p + 1) * siz.xtsiz).min(siz.xsiz);
+    let ty1 = (siz.ytosiz + (q + 1) * siz.ytsiz).min(siz.ysiz);
+    (tx0, ty0, tx1, ty1)
+}
+
+#[inline]
+fn div_ceil(a: u32, b: u32) -> u32 {
+    if b == 0 {
+        0
+    } else {
+        a.div_ceil(b)
+    }
+}
+
 /// Decode an HTJ2K codestream end-to-end into a [`Jpeg2000Image`].
 ///
 /// Mirrors the public [`crate::decode::frame::decode_frame`] entry
@@ -62,38 +92,23 @@ pub fn decode_frame_htj2k(cs: &Codestream, buf: &[u8]) -> Result<Jpeg2000Image> 
     let qcd = parse_qcd(qcd_bytes, cod.num_decomp)?;
 
     // §A.4: HTJ2K SPcod must signal "all blocks HT" (bit 6 = 1, bit 7 = 0).
-    // We accept any cblk_style for round 3 — the bytes in the body are
+    // We accept any cblk_style for round 4 — the bytes in the body are
     // what they are; we trust the CAP-marker dispatch in `lib.rs` to gate
     // calls into this driver.
     if cs.tile_parts.is_empty() {
         return Err(Error::invalid("jpeg2000: no tile-parts in codestream"));
     }
-    if cs.tile_parts.len() > 1 {
-        return Err(Error::unsupported(
-            "HTJ2K: multi-tile-part codestreams (round 4+)",
-        ));
-    }
-    if !cs.ppm.is_empty() {
-        return Err(Error::unsupported(
-            "HTJ2K: PPM-packed packet headers (round 4+)",
-        ));
-    }
-    if !cs.tile_parts[0].ppt.is_empty() {
-        return Err(Error::unsupported(
-            "HTJ2K: PPT-packed packet headers (round 4+)",
-        ));
-    }
-    if cs.poc.is_some() || cs.tile_parts[0].poc.is_some() {
-        return Err(Error::unsupported("HTJ2K: POC progressions (round 4+)"));
+    if cs.poc.is_some() || cs.tile_parts.iter().any(|tp| tp.poc.is_some()) {
+        return Err(Error::unsupported("HTJ2K: POC progressions (round 5+)"));
     }
     if cod.num_layers != 1 {
         return Err(Error::unsupported(
-            "HTJ2K: multi-layer codestreams (round 4+)",
+            "HTJ2K: multi-layer codestreams (round 5+)",
         ));
     }
     if cod.progression_order != 0 {
         return Err(Error::unsupported(
-            "HTJ2K: only LRCP progression supported in round 3",
+            "HTJ2K: only LRCP progression supported through round 4",
         ));
     }
 
@@ -105,100 +120,214 @@ pub fn decode_frame_htj2k(cs: &Codestream, buf: &[u8]) -> Result<Jpeg2000Image> 
     }
     if num_comps != 1 && num_comps != 3 {
         return Err(Error::unsupported(format!(
-            "HTJ2K: {num_comps} components — only 1 or 3 supported in round 3"
+            "HTJ2K: {num_comps} components — only 1 or 3 supported through round 4"
         )));
     }
 
-    // Single-tile precondition: the only tile-part covers the full image.
-    let tp = &cs.tile_parts[0];
-    if tp.tile_index != 0 {
-        return Err(Error::unsupported(
-            "HTJ2K: only the single-tile case is supported in round 3",
-        ));
+    // Tile grid (§B.3). Round-4 supports multi-tile codestreams.
+    let (num_tiles_x, num_tiles_y) = tile_grid_dims_ht(&cs.siz)?;
+    let total_tiles = (num_tiles_x as u64) * (num_tiles_y as u64);
+    if total_tiles == 0 {
+        return Err(Error::invalid("HTJ2K: empty tile grid"));
     }
-    let body_start = tp.sod_offset;
-    let body_end = body_start + tp.sod_length;
-    if body_end > buf.len() {
-        return Err(Error::invalid(
-            "jpeg2000: tile-part body extends past codestream",
-        ));
-    }
-    let body = &buf[body_start..body_end];
-
-    // Build per-component subband + cblk layout. Single-tile means the
-    // tile-component rectangle equals the image extent divided by the
-    // component sub-sampling.
-    let mut all_planes_i32: Vec<Vec<i32>> = Vec::with_capacity(num_comps);
-    let mut comp_sizes: Vec<(u32, u32, u32, u32)> = Vec::with_capacity(num_comps);
-    for c in &cs.siz.components {
-        let xr = c.xrsiz as u32;
-        let yr = c.yrsiz as u32;
-        let cx1 = img_w.div_ceil(xr);
-        let cy1 = img_h.div_ceil(yr);
-        comp_sizes.push((0, 0, cx1, cy1));
+    if total_tiles > u16::MAX as u64 + 1 {
+        return Err(Error::invalid("HTJ2K: tile count exceeds codestream limit"));
     }
 
-    let mut layouts: Vec<Vec<ResolutionLayout>> = Vec::with_capacity(num_comps);
-    for &(x0, y0, x1, y1) in &comp_sizes {
-        let subbands = build_subbands(x0, y0, x1, y1, cod.num_decomp);
-        layouts.push(build_resolutions(
-            subbands,
-            cod.num_decomp,
-            cod.cblk_w_log2,
-            cod.cblk_h_log2,
-            &cod.precincts,
-            (x0, y0, x1, y1),
-            1,
-            1,
-        ));
+    // Group tile-parts by tile index, preserving on-the-wire order.
+    let mut by_tile: Vec<Vec<usize>> = vec![Vec::new(); total_tiles as usize];
+    for (i, tp) in cs.tile_parts.iter().enumerate() {
+        if (tp.tile_index as u64) >= total_tiles {
+            return Err(Error::invalid(format!(
+                "HTJ2K: SOT Isot={} exceeds tile grid ({} tiles)",
+                tp.tile_index, total_tiles
+            )));
+        }
+        by_tile[tp.tile_index as usize].push(i);
     }
 
-    let num_res = (cod.num_decomp as usize) + 1;
-    walk_packets_htj2k(body, &cod, &mut layouts, num_res, num_comps)?;
+    // PPM packed packet headers (T.800 §A.7.4): the main-header carries
+    // a sequence of `(Nppm, Ippm)` records, one per tile-part of the
+    // codestream in order. Pre-split into per-tile-part header byte runs.
+    let ppm_per_tile_part: Option<Vec<Vec<u8>>> = if !cs.ppm.is_empty() {
+        Some(parse_ppm_per_tile_part(&cs.ppm, cs.tile_parts.len())?)
+    } else {
+        None
+    };
 
-    // Reconstruct each component: HT-decode every included code-block,
-    // place magnitudes into per-sub-band raster buffers, dequantise,
-    // IDWT, level-shift, pack to u8.
     let comp_precisions: Vec<u32> = cs.siz.components.iter().map(|c| c.bit_depth()).collect();
-    for (ci, &(_, _, cw, ch)) in comp_sizes.iter().enumerate() {
-        let prec = comp_precisions[ci];
-        let plane = synth_component_htj2k(
-            &layouts[ci],
-            num_res,
-            cw as usize,
-            ch as usize,
-            &cod,
-            &qcd,
-            prec,
-        )?;
-        all_planes_i32.push(plane);
-    }
 
-    // Inverse RCT/ICT for 3-component streams when MCT is set.
-    if num_comps == 3 && cod.mct == 1 {
-        // Require matching dims (single-tile → enforced by SIZ sub-sampling).
-        let n = all_planes_i32[0].len();
-        if all_planes_i32[1].len() != n || all_planes_i32[2].len() != n {
-            return Err(Error::invalid(
-                "HTJ2K: MCT=1 requires matching component dimensions",
+    // Pre-allocate each component's full-image plane.
+    let comp_full_dims: Vec<(usize, usize)> = cs
+        .siz
+        .components
+        .iter()
+        .map(|c| {
+            let xr = c.xrsiz as u32;
+            let yr = c.yrsiz as u32;
+            (img_w.div_ceil(xr) as usize, img_h.div_ceil(yr) as usize)
+        })
+        .collect();
+    let mut image_planes: Vec<Vec<u8>> = comp_full_dims
+        .iter()
+        .map(|&(w, h)| vec![0u8; w * h])
+        .collect();
+
+    #[allow(clippy::needless_range_loop)]
+    for tile_idx in 0..total_tiles as usize {
+        if by_tile[tile_idx].is_empty() {
+            // Tile missing from the codestream — leave zeros.
+            continue;
+        }
+        let p = (tile_idx as u32) % num_tiles_x;
+        let q = (tile_idx as u32) / num_tiles_x;
+        let (tx0, ty0, tx1, ty1) = tile_ref_rect_ht(&cs.siz, p, q);
+
+        // Per-component tile rectangle (component-grid).
+        let mut comp_sizes_abs: Vec<(u32, u32, u32, u32)> = Vec::with_capacity(num_comps);
+        let mut comp_sizes_rel: Vec<(u32, u32, u32, u32)> = Vec::with_capacity(num_comps);
+        for c in &cs.siz.components {
+            let xr = c.xrsiz as u32;
+            let yr = c.yrsiz as u32;
+            let cx0 = div_ceil(tx0, xr);
+            let cy0 = div_ceil(ty0, yr);
+            let cx1 = div_ceil(tx1, xr);
+            let cy1 = div_ceil(ty1, yr);
+            comp_sizes_abs.push((cx0, cy0, cx1, cy1));
+            comp_sizes_rel.push((0, 0, cx1 - cx0, cy1 - cy0));
+        }
+
+        // Concatenate all tile-parts of this tile.
+        let mut tile_body = Vec::new();
+        for &tp_ix in &by_tile[tile_idx] {
+            let tp = &cs.tile_parts[tp_ix];
+            let start = tp.sod_offset;
+            let end = start + tp.sod_length;
+            if end > buf.len() {
+                return Err(Error::invalid(
+                    "HTJ2K: tile-part body extends past codestream",
+                ));
+            }
+            tile_body.extend_from_slice(&buf[start..end]);
+        }
+
+        // Build the per-tile packet-header byte run when PPM or PPT is in
+        // use. The body cursor still walks `tile_body` (which contains
+        // packet bodies only, since the encoder routed headers into PPM/PPT).
+        let tile_packet_headers: Option<Vec<u8>> = if let Some(per_tp) = &ppm_per_tile_part {
+            let mut out = Vec::new();
+            for &tp_ix in &by_tile[tile_idx] {
+                if let Some(b) = per_tp.get(tp_ix) {
+                    out.extend_from_slice(b);
+                }
+            }
+            Some(out)
+        } else {
+            // PPT: aggregate all PPT segments (sorted by Zppt) of this
+            // tile's tile-parts.
+            let mut all_ppt: Vec<(u8, &[u8])> = Vec::new();
+            for &tp_ix in &by_tile[tile_idx] {
+                for ppt_seg in &cs.tile_parts[tp_ix].ppt {
+                    if ppt_seg.is_empty() {
+                        continue;
+                    }
+                    all_ppt.push((ppt_seg[0], &ppt_seg[1..]));
+                }
+            }
+            if all_ppt.is_empty() {
+                None
+            } else {
+                all_ppt.sort_by_key(|&(z, _)| z);
+                let mut out = Vec::new();
+                for (_, payload) in all_ppt {
+                    out.extend_from_slice(payload);
+                }
+                Some(out)
+            }
+        };
+
+        // Build per-component subband + cblk layout.
+        let mut layouts: Vec<Vec<ResolutionLayout>> = Vec::with_capacity(num_comps);
+        for &(x0, y0, x1, y1) in &comp_sizes_rel {
+            let subbands = build_subbands(x0, y0, x1, y1, cod.num_decomp);
+            layouts.push(build_resolutions(
+                subbands,
+                cod.num_decomp,
+                cod.cblk_w_log2,
+                cod.cblk_h_log2,
+                &cod.precincts,
+                (x0, y0, x1, y1),
+                1,
+                1,
             ));
         }
-        if cod.transform == 1 {
-            apply_rct_inverse(&mut all_planes_i32, n);
-        } else {
-            let depth = cs.siz.components[0].bit_depth();
-            apply_ict_inverse(&mut all_planes_i32, n, depth);
+
+        let num_res = (cod.num_decomp as usize) + 1;
+        walk_packets_htj2k(
+            &tile_body,
+            tile_packet_headers.as_deref(),
+            &cod,
+            &mut layouts,
+            num_res,
+            num_comps,
+        )?;
+
+        // Reconstruct each component for this tile.
+        let mut tile_planes: Vec<Vec<i32>> = Vec::with_capacity(num_comps);
+        for (ci, &(_, _, cw, ch)) in comp_sizes_rel.iter().enumerate() {
+            let prec = comp_precisions[ci];
+            let plane = synth_component_htj2k(
+                &layouts[ci],
+                num_res,
+                cw as usize,
+                ch as usize,
+                &cod,
+                &qcd,
+                prec,
+            )?;
+            tile_planes.push(plane);
+        }
+
+        // Inverse MCT (RCT/ICT) for 3-component streams when MCT is set.
+        if num_comps == 3 && cod.mct == 1 {
+            let n = tile_planes[0].len();
+            if tile_planes[1].len() != n || tile_planes[2].len() != n {
+                return Err(Error::invalid(
+                    "HTJ2K: MCT=1 requires matching component dimensions",
+                ));
+            }
+            if cod.transform == 1 {
+                apply_rct_inverse(&mut tile_planes, n);
+            } else {
+                let depth = cs.siz.components[0].bit_depth();
+                apply_ict_inverse(&mut tile_planes, n, depth);
+            }
+        }
+
+        let shifted = dc_shift_and_pack(&tile_planes, &comp_sizes_rel, &cs.siz)?;
+
+        // Stitch the tile's planes into the full image planes.
+        for ci in 0..num_comps {
+            let (cx0, cy0, cx1, cy1) = comp_sizes_abs[ci];
+            let w = (cx1 - cx0) as usize;
+            let h = (cy1 - cy0) as usize;
+            let (full_w, _) = comp_full_dims[ci];
+            let src = &shifted[ci];
+            let dst = &mut image_planes[ci];
+            for ly in 0..h {
+                let dst_row = (cy0 as usize + ly) * full_w + cx0 as usize;
+                let src_row = ly * w;
+                dst[dst_row..dst_row + w].copy_from_slice(&src[src_row..src_row + w]);
+            }
         }
     }
-
-    let shifted = dc_shift_and_pack(&all_planes_i32, &comp_sizes, &cs.siz)?;
 
     let (pixel_format, planes) = match num_comps {
         1 => (
             PixelFormat::Gray8,
             vec![VideoPlane {
-                stride: comp_sizes[0].2 as usize,
-                data: shifted.into_iter().next().unwrap(),
+                stride: comp_full_dims[0].0,
+                data: image_planes.remove(0),
             }],
         ),
         3 => {
@@ -215,11 +344,11 @@ pub fn decode_frame_htj2k(cs: &Codestream, buf: &[u8]) -> Result<Jpeg2000Image> 
             } else {
                 PixelFormat::Yuv444P
             };
-            let planes = shifted
+            let planes = image_planes
                 .into_iter()
                 .enumerate()
                 .map(|(i, p)| VideoPlane {
-                    stride: comp_sizes[i].2 as usize,
+                    stride: comp_full_dims[i].0,
                     data: p,
                 })
                 .collect();
@@ -228,12 +357,73 @@ pub fn decode_frame_htj2k(cs: &Codestream, buf: &[u8]) -> Result<Jpeg2000Image> 
         _ => unreachable!(),
     };
     Ok(Jpeg2000Image {
-        width: cs.siz.image_width(),
-        height: cs.siz.image_height(),
+        width: img_w,
+        height: img_h,
         pixel_format,
         planes,
         pts: None,
     })
+}
+
+/// Split a PPM main-header payload run into per-tile-part header byte
+/// runs. The PPM payload format per T.800 §A.7.4 is a sequence of `Zppm`
+/// (1 byte) + concatenated `(Nppm: u32_BE, Ippm: Nppm bytes)` records,
+/// one record per tile-part of the codestream in order.
+///
+/// `ppm_segments` are the raw per-segment payloads as surfaced by the
+/// codestream parser (each still carrying its leading `Zppm` byte). We
+/// sort by `Zppm`, strip it, concatenate the trailing bytes, then walk
+/// `(Nppm, Ippm)` records. Mirrors `crate::decode::frame::unpack_ppm`.
+fn parse_ppm_per_tile_part(
+    ppm_segments: &[Vec<u8>],
+    num_tile_parts: usize,
+) -> Result<Vec<Vec<u8>>> {
+    let mut sorted: Vec<&[u8]> = Vec::with_capacity(ppm_segments.len());
+    {
+        let mut tmp: Vec<(u8, &[u8])> = ppm_segments
+            .iter()
+            .map(|s| {
+                if s.is_empty() {
+                    (0u8, s.as_slice())
+                } else {
+                    (s[0], &s[1..])
+                }
+            })
+            .collect();
+        tmp.sort_by_key(|&(z, _)| z);
+        for (_, body) in tmp {
+            sorted.push(body);
+        }
+    }
+    let mut payload: Vec<u8> = Vec::new();
+    for body in sorted {
+        payload.extend_from_slice(body);
+    }
+    let mut out: Vec<Vec<u8>> = Vec::with_capacity(num_tile_parts);
+    let mut cur = 0usize;
+    while cur < payload.len() && out.len() < num_tile_parts {
+        if cur + 4 > payload.len() {
+            return Err(Error::invalid("HTJ2K: PPM truncated Nppm"));
+        }
+        let n = u32::from_be_bytes([
+            payload[cur],
+            payload[cur + 1],
+            payload[cur + 2],
+            payload[cur + 3],
+        ]) as usize;
+        cur += 4;
+        if cur + n > payload.len() {
+            return Err(Error::invalid("HTJ2K: PPM truncated Ippm"));
+        }
+        out.push(payload[cur..cur + n].to_vec());
+        cur += n;
+    }
+    // Pad with empty entries if the codestream listed fewer headers than
+    // tile-parts (legal — those tile-parts contribute no packets).
+    while out.len() < num_tile_parts {
+        out.push(Vec::new());
+    }
+    Ok(out)
 }
 
 /// Walk the LRCP single-layer tier-2 stream, capturing each
@@ -241,15 +431,22 @@ pub fn decode_frame_htj2k(cs: &Codestream, buf: &[u8]) -> Result<Jpeg2000Image> 
 /// classic decoder uses. This is byte-for-byte the same syntax as
 /// classic Part-1; only the downstream interpretation of those bytes
 /// changes.
+///
+/// When `packet_headers` is `Some`, the bytes contain every packet
+/// header for this tile in progression order; the body cursor `body`
+/// then carries packet bodies only (PPM/PPT setup, T.800 §A.7.4 /
+/// §A.7.5).
 #[allow(clippy::needless_range_loop)]
 fn walk_packets_htj2k(
     body: &[u8],
+    packet_headers: Option<&[u8]>,
     cod: &CodParams,
     layouts: &mut [Vec<ResolutionLayout>],
     num_res: usize,
     num_comps: usize,
 ) -> Result<()> {
     let mut cur = Cursor::new(body);
+    let mut header_cursor: Option<Cursor<'_>> = packet_headers.map(Cursor::new);
     // LRCP: outer layer (always 0 for single-layer), then resolution,
     // component, precinct. The loop reads / mutates `layouts[comp][resno]`
     // in spec order and isn't easily expressible as a chained iterator.
@@ -257,7 +454,14 @@ fn walk_packets_htj2k(
         for comp in 0..num_comps {
             let nprec = layouts[comp][resno].precincts.len();
             for prec_idx in 0..nprec {
-                parse_packet(&mut cur, 0, &mut layouts[comp][resno], prec_idx, cod)?;
+                parse_packet(
+                    &mut cur,
+                    header_cursor.as_mut(),
+                    0,
+                    &mut layouts[comp][resno],
+                    prec_idx,
+                    cod,
+                )?;
             }
         }
     }
@@ -266,18 +470,29 @@ fn walk_packets_htj2k(
 
 fn parse_packet(
     cur: &mut Cursor<'_>,
+    header_cursor: Option<&mut Cursor<'_>>,
     layer: u32,
     res: &mut ResolutionLayout,
     prec_idx: usize,
     cod: &CodParams,
 ) -> Result<()> {
+    // SOP marker is part of the body stream (NOT the packed-headers
+    // stream), so consume it from `cur` regardless of where headers live.
     if cod.sop_marker && cur.remaining().starts_with(&[0xFF, 0x91]) {
         if cur.remaining().len() < 6 {
             return Err(Error::invalid("HTJ2K: truncated SOP"));
         }
         cur.consume(6)?;
     }
-    let header_slice = cur.remaining();
+    // Pick the bit-stream source for the packet header. When PPM/PPT is
+    // in use the header bytes live in a separate stream (hdr_cur);
+    // otherwise the body cursor itself supplies the header bits.
+    let use_separate_hdr = header_cursor.is_some();
+    let header_slice: &[u8] = if let Some(ref hc) = header_cursor {
+        hc.remaining()
+    } else {
+        cur.remaining()
+    };
     let mut bio = Bio::new(header_slice);
     // Per HTJ2K §B.3 a packet contribution to one code-block consists of
     // either 1 codeword segment (Z_blk = 1: cleanup only) or 2 codeword
@@ -367,10 +582,18 @@ fn parse_packet(
         bio.inalign();
     }
     let header_bytes_used = bio.numbytes_read();
-    cur.consume(header_bytes_used)?;
-    if cod.eph_marker && cur.remaining().starts_with(&[0xFF, 0x92]) {
-        cur.consume(2)?;
+    if let Some(hc) = header_cursor {
+        hc.consume(header_bytes_used)?;
+        if cod.eph_marker && hc.remaining().starts_with(&[0xFF, 0x92]) {
+            hc.consume(2)?;
+        }
+    } else {
+        cur.consume(header_bytes_used)?;
+        if cod.eph_marker && cur.remaining().starts_with(&[0xFF, 0x92]) {
+            cur.consume(2)?;
+        }
     }
+    let _ = use_separate_hdr;
     for (sb_idx, g_idx, lcup, lref) in pending {
         let cleanup_bytes = cur.consume(lcup as usize)?.to_vec();
         res.cblk_states[sb_idx][g_idx]

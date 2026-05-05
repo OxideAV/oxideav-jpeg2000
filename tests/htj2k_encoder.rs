@@ -185,6 +185,7 @@ fn round2_nl1_sparse_self_roundtrip() {
         cblk_log2: 5,
         num_decomp: 1,
         use_color_transform: true,
+        ..Default::default()
     };
     let cs = encode_image_htj2k(&img, &opts).expect("encode");
     let p = probe(&cs).expect("probe");
@@ -217,6 +218,7 @@ fn round2_nl2_noise_self_roundtrip() {
         cblk_log2: 5,
         num_decomp: 2,
         use_color_transform: true,
+        ..Default::default()
     };
     let cs = encode_image_htj2k(&img, &opts).expect("encode");
     let decoded = decode_jpeg2000(&cs).expect("decode");
@@ -243,6 +245,7 @@ fn round2_nl1_ojph_expand_cross_decode() {
         cblk_log2: 5,
         num_decomp: 1,
         use_color_transform: true,
+        ..Default::default()
     };
     let cs = encode_image_htj2k(&img, &opts).expect("encode");
 
@@ -296,6 +299,7 @@ fn round2_size_report() {
             cblk_log2: 5,
             num_decomp: 0,
             use_color_transform: true,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -305,6 +309,7 @@ fn round2_size_report() {
             cblk_log2: 5,
             num_decomp: 1,
             use_color_transform: true,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -328,6 +333,7 @@ fn round2_size_report() {
             cblk_log2: 5,
             num_decomp: 0,
             use_color_transform: true,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -337,6 +343,7 @@ fn round2_size_report() {
             cblk_log2: 5,
             num_decomp: 2,
             use_color_transform: true,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -346,6 +353,7 @@ fn round2_size_report() {
             cblk_log2: 5,
             num_decomp: 3,
             use_color_transform: true,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -367,6 +375,7 @@ fn round2_size_report() {
             cblk_log2: 5,
             num_decomp: 0,
             use_color_transform: true,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -376,6 +385,7 @@ fn round2_size_report() {
             cblk_log2: 5,
             num_decomp: 1,
             use_color_transform: true,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -417,6 +427,7 @@ fn round2_nl2_ojph_expand_cross_decode() {
         cblk_log2: 5,
         num_decomp: 2,
         use_color_transform: true,
+        ..Default::default()
     };
     let cs = encode_image_htj2k(&img, &opts).expect("encode");
 
@@ -490,6 +501,7 @@ fn round3_rgb_mct_self_roundtrip() {
         cblk_log2: 5,
         num_decomp: 1,
         use_color_transform: true,
+        ..Default::default()
     };
     let cs = encode_image_htj2k(&img, &opts).expect("encode");
     let p = probe(&cs).expect("probe");
@@ -541,6 +553,7 @@ fn round3_yuv444_planar_self_roundtrip() {
         cblk_log2: 5,
         num_decomp: 1,
         use_color_transform: true, // ignored for YUV input
+        ..Default::default()
     };
     let cs = encode_image_htj2k(&img, &opts).expect("encode");
     let decoded = decode_jpeg2000(&cs).expect("decode");
@@ -584,6 +597,7 @@ fn round3_rgb_mct_ojph_expand_cross_decode() {
         cblk_log2: 5,
         num_decomp: 1,
         use_color_transform: true,
+        ..Default::default()
     };
     let cs = encode_image_htj2k(&img, &opts).expect("encode");
 
@@ -648,6 +662,7 @@ fn round3_rgb_mct_nl2_64_ojph_expand_cross_decode() {
         cblk_log2: 5,
         num_decomp: 2,
         use_color_transform: true,
+        ..Default::default()
     };
     let cs = encode_image_htj2k(&img, &opts).expect("encode");
 
@@ -709,6 +724,7 @@ fn round3_rgb_size_report() {
             cblk_log2: 5,
             num_decomp: 3,
             use_color_transform: true,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -718,6 +734,7 @@ fn round3_rgb_size_report() {
             cblk_log2: 5,
             num_decomp: 3,
             use_color_transform: false,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -727,4 +744,60 @@ fn round3_rgb_size_report() {
         cs_mct.len(),
         cs_no_mct.len()
     );
+}
+
+// ----- Round 4 fixtures -----
+
+use oxideav_jpeg2000::encode::HtTransform;
+
+fn ojph_present() -> bool {
+    std::process::Command::new("ojph_expand")
+        .arg("-h")
+        .output()
+        .is_ok()
+}
+
+/// Round-4: 9/7 irreversible 32×32 solid DC — `ojph_expand` cross-decodes
+/// within ±2 LSB of the original (the DC coefficient lives in LL with a
+/// stepsize of 1, so the only loss is float→int rounding). This is the
+/// cleanest single-tile round-4 fixture for cross-decode validation.
+#[test]
+fn round4_9_7_solid_dc_32x32_ojph_cross_decode() {
+    if !ojph_present() {
+        eprintln!("ojph_expand not on PATH; skipping");
+        return;
+    }
+    let img = img32(vec![0x80u8; 32 * 32]);
+    let opts = EncodeOptionsHt {
+        cblk_log2: 5,
+        num_decomp: 1,
+        transform: HtTransform::Irreversible97,
+        use_color_transform: false,
+        ..Default::default()
+    };
+    let cs = encode_image_htj2k(&img, &opts).expect("encode");
+    let tmp = std::env::temp_dir();
+    let in_p = tmp.join("oxideav_round4_lossy97.j2c");
+    let out_p = tmp.join("oxideav_round4_lossy97.pgm");
+    std::fs::write(&in_p, &cs).expect("write");
+    let _ = std::fs::remove_file(&out_p);
+    let st = std::process::Command::new("ojph_expand")
+        .args(["-i", in_p.to_str().unwrap()])
+        .args(["-o", out_p.to_str().unwrap()])
+        .status()
+        .expect("ojph spawn");
+    assert!(st.success(), "ojph_expand failed on 9/7 codestream");
+    let pgm = std::fs::read(&out_p).expect("read");
+    let payload = strip_pgm_header(&pgm);
+    assert_eq!(payload.len(), 32 * 32);
+    let mut max_dev = 0i32;
+    for &b in payload {
+        max_dev = max_dev.max((b as i32 - 0x80).abs());
+    }
+    assert!(
+        max_dev <= 2,
+        "ojph_expand 9/7 cross-decode drift {max_dev} LSB > 2",
+    );
+    let _ = std::fs::remove_file(&in_p);
+    let _ = std::fs::remove_file(&out_p);
 }

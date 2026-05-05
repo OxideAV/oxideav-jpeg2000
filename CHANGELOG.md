@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- encoder (HTJ2K, round 4 — task #477): four new sub-features land
+  cleanly in one drop.
+  - **9/7 irreversible transform** path. New `HtTransform` enum
+    selector on `EncodeOptionsHt`; the encoder applies forward 9/7
+    lifting (`encode::dwt::fdwt_97`), per-band scalar quantisation
+    with `eps_b = precision`, `mu = 0` (so `stepsize_b = 1`), and
+    emits the QCD in expounded form (qntsty = 2). The transform byte
+    in COD is set to 0 for irreversible. Self-roundtrip MAD ≤ 2 LSB
+    on a 64×64 gray gradient at NL=2; `ojph_expand` cross-decodes the
+    32×32 solid-DC fixture within ±2 LSB.
+  - **Multi-tile codestream output** via the new `tile_size:
+    Option<(u32, u32)>` knob. Per-tile forward DWT + tier-1 + tier-2
+    are completely independent; the SOT/SOD pair is repeated per tile
+    in raster order with the right `Isot` / `Psot` values. Self-
+    roundtrip is bit-exact on a 64×64 image with `XTsiz=YTsiz=32`
+    (4-tile grid) and on a non-aligned 48×48 image with the same
+    tile size.
+  - **Sub-sampled chroma input** for `Yuv420P` (chroma at half H+V)
+    and `Yuv422P` (chroma at half H). SIZ writes per-component
+    `(XRsiz, YRsiz)`; per-component DWT runs at the sub-sampled
+    extent. Forward MCT is rejected (and surfaced as
+    `Error::Unsupported`) for sub-sampled input, since the RCT
+    requires same-sized R/G/B and is meaningless for chroma at half
+    resolution.
+  - **PPM / PPT packed packet headers** via the new
+    `HtPacketHeaderPlacement` knob (`Inline` (default) /
+    `PackedMainHeader` / `PackedPerTilePart`). The encoder builds
+    the inline-headers tile body first, then re-routes per-tile
+    headers through the existing classic-encoder
+    `decode::tile::split_packet_headers` helper into either a single
+    PPM segment in the main header or one PPT segment per tile-part.
+  - The HT decoder's tier-2 driver (`decode::htj2k::decode_frame_htj2k`)
+    is extended in-place to support multi-tile codestreams (Isot
+    grouping per T.800 §B.3) and PPM/PPT packed packet headers
+    (separate `header_cursor` consumed by `parse_packet`).
+  - 4 new self-roundtrip tile_enc tests (multi-tile 2×2 / non-aligned,
+    multi-tile RGB+MCT, PPM, PPT) plus 9/7 single-tile + 9/7 gradient
+    self-roundtrip, plus 1 new `ojph_expand` cross-decode for 9/7
+    solid-DC.
+  - `EncodeOptionsHt` gains `transform: HtTransform`, `tile_size:
+    Option<(u32, u32)>`, `packet_header_placement:
+    HtPacketHeaderPlacement` fields. All field defaults preserve
+    round-3 behaviour (`Reversible53`, `None`, `Inline`).
+  - Encoder gaps remaining: SigProp/MagRef refinement passes (Z_blk
+    ∈ {2, 3}), multi-layer, multi-set HT (T.814 Annex B), constrained
+    sets (T.814 §8), POC progression schedule.
+
 ## [0.0.9](https://github.com/OxideAV/oxideav-jpeg2000/compare/v0.0.8...v0.0.9) - 2026-05-05
 
 ### Other

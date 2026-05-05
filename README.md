@@ -104,25 +104,40 @@ irreversible path produces a lossy bitstream with round-trip PSNR
   multi-band fixture (every HF band populated) decodes at MAD ≈ 0.47
   with max-deviation 2 against the OpenJPH-binary reference. The
   pblk > 0 / pblk < 0 / `z = 1` algebraic cases on the 9/7 float
-  path are unit-tested against the closed-form Eq E-1. **Encoder side
-  (round 3):** `encode::htj2k::encode_image_htj2k` produces a Part-15
-  codestream for `Gray8`, `Rgb24`, and `Yuv444P` 8-bit input with
-  lossless 5/3 and `NL ∈ [0, 5]` decomposition levels. Multi-component
-  tier-2 packets (LRCP, one packet per `(resolution, component)`),
-  optional forward 5/3 reversible component transform (RCT, T.800
-  §G.1) for `Rgb24` input — signalled in COD by `MCT = 1` and inverted
-  by the decoder — are now in. Multi-significance per quad
-  (ρ ∈ {3, 5, 6, 7, 9..15}) and the §7.3.6 Eq-4 first-line-pair
-  both-`u_off=1` special case carry over from round 2. Self-roundtrip
-  is bit-exact and `ojph_expand` (binary, black-box) cross-decodes our
-  output bit-exactly on the round-1 32×32 NL=0 fixtures, the round-2
-  NL=1 32×32 sparse and NL=2 64×64 bright-square fixtures, and the
-  round-3 RGB+MCT 32×32 NL=1 + 64×64 NL=2 RGB-gradient fixtures.
+  path are unit-tested against the closed-form Eq E-1. **Decoder
+  multi-tile + PPM/PPT (round 4):** the HT decoder now dispatches
+  multi-tile-part codestreams (Isot grouping per T.800 §B.3) and
+  splits PPM (main-header packed) / PPT (per-tile-part packed)
+  packet headers from the body cursor.
+  **Encoder side (round 4):** `encode::htj2k::encode_image_htj2k`
+  produces a Part-15 codestream for `Gray8`, `Rgb24`, `Yuv444P`,
+  `Yuv422P`, and `Yuv420P` 8-bit input with both 5/3 lossless
+  (`HtTransform::Reversible53`) and 9/7 irreversible
+  (`HtTransform::Irreversible97`) wavelets, `NL ∈ [0, 5]`
+  decomposition levels. Multi-tile output via the new
+  `EncodeOptionsHt::tile_size` knob; per-tile DWT + tier-1 + tier-2
+  are independent. PPM (main-header) and PPT (per-tile-part) packed
+  packet header layouts are wired via the existing classic encoder
+  splitter, selectable through `EncodeOptionsHt::packet_header_placement`.
+  Multi-component tier-2 packets (LRCP, one per `(resolution,
+  component)`), optional forward 5/3 reversible component transform
+  (RCT, T.800 §G.1) for `Rgb24` input — signalled in COD by `MCT = 1`
+  — and multi-significance per quad (ρ ∈ {3, 5, 6, 7, 9..15}) plus
+  the §7.3.6 Eq-4 first-line-pair both-`u_off=1` special case carry
+  over from rounds 2-3. The 9/7 path uses the existing
+  `encode::dwt::fdwt_97` lifting plus a per-band scalar quantiser
+  with `eps_b = precision`, `mu = 0` so `stepsize_b = 1` on every
+  sub-band (QCD emitted in expounded form, qntsty = 2).
+  Self-roundtrip is bit-exact for 5/3 across all fixtures (single-
+  tile, multi-tile, sub-sampled chroma, PPM/PPT) and within ±2 LSB
+  for 9/7 on the 64×64 gradient; `ojph_expand` (binary, black-box)
+  cross-decodes our 9/7 32×32 single-tile fixture within ±2 LSB,
+  matching all round-1..round-3 single-tile cross-decode results.
   Compression vs raw: 64×64 8-bit Gray gradient → 4516 bytes at NL=0,
   **596 bytes at NL=2, 444 bytes at NL=3** (~90% reduction). Encoder
-  gaps: SigProp/MagRef refinement passes, multi-tile, multi-layer,
-  sub-sampled chroma (4:2:2 / 4:2:0), PPM/PPT, multi-set HT
-  (T.814 §B), constrained sets (T.814 §8), 9/7 irreversible HTJ2K.
+  gaps: SigProp/MagRef refinement passes (Z_blk ∈ {2, 3}), multi-
+  layer, multi-set HT (T.814 §B), constrained sets (T.814 §8),
+  POC progression schedule.
 - **RGB input beyond 8-bit unsigned chroma** — the decoder's RCT
   inverse currently clamps chroma to unsigned 8-bit before the
   inverse transform, so encoder inputs with chroma excursions outside

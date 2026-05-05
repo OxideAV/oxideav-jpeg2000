@@ -37,7 +37,7 @@ pub use codestream::{
 };
 
 #[cfg(feature = "htj2k")]
-pub use htj2k::{encode_image_htj2k, EncodeOptionsHt};
+pub use htj2k::{encode_image_htj2k, EncodeOptionsHt, HtPacketHeaderPlacement, HtTransform};
 
 #[cfg(feature = "registry")]
 pub use codestream::encode_frame;
