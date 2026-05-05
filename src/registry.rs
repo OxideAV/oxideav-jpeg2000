@@ -10,8 +10,8 @@
 
 use oxideav_core::{
     frame::VideoPlane, CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecRegistry,
-    ContainerRegistry, Decoder, Encoder, Error, Frame, Packet, PixelFormat, Result, TimeBase,
-    VideoFrame,
+    ContainerRegistry, Decoder, Encoder, Error, Frame, Packet, PixelFormat, Result, RuntimeContext,
+    TimeBase, VideoFrame,
 };
 
 use crate::error::Jpeg2000Error;
@@ -60,7 +60,7 @@ impl From<Jpeg2000Image> for Frame {
 }
 
 /// Register the JPEG 2000 decoder + encoder factories.
-pub fn register(reg: &mut CodecRegistry) {
+pub fn register_codecs(reg: &mut CodecRegistry) {
     let caps = CodecCapabilities::video("jpeg2000")
         .with_lossy(true)
         .with_intra_only(true);
@@ -70,6 +70,19 @@ pub fn register(reg: &mut CodecRegistry) {
             .decoder(make_decoder)
             .encoder(make_encoder),
     );
+}
+
+/// Unified registration entry point: install both the JPEG 2000 codec
+/// factories and every `.j2k` / `.jp2` / etc. extension hint into a
+/// [`RuntimeContext`].
+///
+/// This is the preferred entry point for new code — it matches the
+/// convention every sibling crate now follows. Direct callers that
+/// only need one of the two sub-registries can keep using
+/// [`register_codecs`] / [`register_containers`].
+pub fn register(ctx: &mut RuntimeContext) {
+    register_codecs(&mut ctx.codecs);
+    register_containers(&mut ctx.containers);
 }
 
 /// Register the JPEG 2000 file-extension hints. All standard codestream
@@ -297,7 +310,7 @@ mod tests {
     #[test]
     fn encoder_factory_builds_live_encoder() {
         let mut reg = CodecRegistry::new();
-        register(&mut reg);
+        register_codecs(&mut reg);
         let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
         let enc = reg.make_encoder(&params).expect("factory returns encoder");
         assert_eq!(enc.codec_id().as_str(), CODEC_ID_STR);
@@ -344,6 +357,28 @@ mod tests {
                 "extension .{ext} must not be claimed by jpeg2000",
             );
         }
+    }
+
+    #[test]
+    fn register_via_runtime_context_installs_codec_factory() {
+        let mut ctx = RuntimeContext::new();
+        register(&mut ctx);
+        let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        let dec = ctx
+            .codecs
+            .make_decoder(&params)
+            .expect("jpeg2000 decoder factory");
+        assert_eq!(dec.codec_id().as_str(), CODEC_ID_STR);
+        // The unified entry point also wires the .j2k / .jp2 / etc.
+        // extension hints through the same call.
+        assert_eq!(
+            ctx.containers.container_for_extension("j2k"),
+            Some("jpeg2000"),
+        );
+        assert_eq!(
+            ctx.containers.container_for_extension("jp2"),
+            Some("jpeg2000"),
+        );
     }
 
     fn build_tiny_j2k() -> Vec<u8> {

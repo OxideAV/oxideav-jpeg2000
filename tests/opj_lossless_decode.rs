@@ -70,7 +70,7 @@ fn parse_pgm(bytes: &[u8]) -> (u32, u32, Vec<u8>) {
 
 fn decode_j2k(bytes: &[u8]) -> oxideav_core::VideoFrame {
     let mut reg = CodecRegistry::new();
-    oxideav_jpeg2000::register(&mut reg);
+    oxideav_jpeg2000::register_codecs(&mut reg);
     let params = CodecParameters::video(CodecId::new(oxideav_jpeg2000::CODEC_ID_STR));
     let mut dec = reg.make_decoder(&params).expect("factory");
     let pkt = Packet::new(0, TimeBase::new(1, 1), bytes.to_vec());

@@ -70,7 +70,7 @@ fn build_rgb_pattern(w: u32, h: u32) -> VideoFrame {
 
 fn decode_with_us(bytes: &[u8]) -> VideoFrame {
     let mut reg = CodecRegistry::new();
-    oxideav_jpeg2000::register(&mut reg);
+    oxideav_jpeg2000::register_codecs(&mut reg);
     let params = CodecParameters::video(CodecId::new(oxideav_jpeg2000::CODEC_ID_STR));
     let mut dec = reg.make_decoder(&params).expect("decoder factory");
     let pkt = Packet::new(0, TimeBase::new(1, 1), bytes.to_vec());

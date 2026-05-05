@@ -14,7 +14,7 @@ const BASELINE_J2K: &[u8] = include_bytes!("fixtures/baseline.j2k");
 #[test]
 fn baseline_decodes_to_sensible_pixels() {
     let mut reg = CodecRegistry::new();
-    oxideav_jpeg2000::register(&mut reg);
+    oxideav_jpeg2000::register_codecs(&mut reg);
     let params = CodecParameters::video(CodecId::new(oxideav_jpeg2000::CODEC_ID_STR));
     let mut dec = reg.make_decoder(&params).expect("factory");
     let pkt = Packet::new(0, TimeBase::new(1, 1), BASELINE_J2K.to_vec());
