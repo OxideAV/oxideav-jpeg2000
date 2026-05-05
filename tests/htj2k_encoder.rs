@@ -184,6 +184,7 @@ fn round2_nl1_sparse_self_roundtrip() {
     let opts = EncodeOptionsHt {
         cblk_log2: 5,
         num_decomp: 1,
+        use_color_transform: true,
     };
     let cs = encode_image_htj2k(&img, &opts).expect("encode");
     let p = probe(&cs).expect("probe");
@@ -215,6 +216,7 @@ fn round2_nl2_noise_self_roundtrip() {
     let opts = EncodeOptionsHt {
         cblk_log2: 5,
         num_decomp: 2,
+        use_color_transform: true,
     };
     let cs = encode_image_htj2k(&img, &opts).expect("encode");
     let decoded = decode_jpeg2000(&cs).expect("decode");
@@ -240,6 +242,7 @@ fn round2_nl1_ojph_expand_cross_decode() {
     let opts = EncodeOptionsHt {
         cblk_log2: 5,
         num_decomp: 1,
+        use_color_transform: true,
     };
     let cs = encode_image_htj2k(&img, &opts).expect("encode");
 
@@ -292,6 +295,7 @@ fn round2_size_report() {
         &EncodeOptionsHt {
             cblk_log2: 5,
             num_decomp: 0,
+            use_color_transform: true,
         },
     )
     .unwrap();
@@ -300,6 +304,7 @@ fn round2_size_report() {
         &EncodeOptionsHt {
             cblk_log2: 5,
             num_decomp: 1,
+            use_color_transform: true,
         },
     )
     .unwrap();
@@ -322,6 +327,7 @@ fn round2_size_report() {
         &EncodeOptionsHt {
             cblk_log2: 5,
             num_decomp: 0,
+            use_color_transform: true,
         },
     )
     .unwrap();
@@ -330,6 +336,7 @@ fn round2_size_report() {
         &EncodeOptionsHt {
             cblk_log2: 5,
             num_decomp: 2,
+            use_color_transform: true,
         },
     )
     .unwrap();
@@ -338,6 +345,7 @@ fn round2_size_report() {
         &EncodeOptionsHt {
             cblk_log2: 5,
             num_decomp: 3,
+            use_color_transform: true,
         },
     )
     .unwrap();
@@ -358,6 +366,7 @@ fn round2_size_report() {
         &EncodeOptionsHt {
             cblk_log2: 5,
             num_decomp: 0,
+            use_color_transform: true,
         },
     )
     .unwrap();
@@ -366,6 +375,7 @@ fn round2_size_report() {
         &EncodeOptionsHt {
             cblk_log2: 5,
             num_decomp: 1,
+            use_color_transform: true,
         },
     )
     .unwrap();
@@ -406,6 +416,7 @@ fn round2_nl2_ojph_expand_cross_decode() {
     let opts = EncodeOptionsHt {
         cblk_log2: 5,
         num_decomp: 2,
+        use_color_transform: true,
     };
     let cs = encode_image_htj2k(&img, &opts).expect("encode");
 
@@ -434,4 +445,286 @@ fn round2_nl2_ojph_expand_cross_decode() {
 
     let _ = std::fs::remove_file(&in_path);
     let _ = std::fs::remove_file(&out_path);
+}
+
+// ----- Round 3 fixtures -----
+
+/// Strip the P6 PPM header off a buffer and return the raw RGB payload
+/// (3 bytes per pixel, packed).
+fn strip_ppm_header(buf: &[u8]) -> &[u8] {
+    let mut i = 0usize;
+    let mut newlines = 0;
+    while i < buf.len() && newlines < 3 {
+        if buf[i] == b'\n' {
+            newlines += 1;
+        }
+        i += 1;
+    }
+    &buf[i..]
+}
+
+/// 32x32 RGB gradient with MCT — self-roundtrip through this crate's
+/// own decoder. Verifies forward RCT + multi-component packet emit +
+/// inverse RCT recovers the original RGB.
+#[test]
+fn round3_rgb_mct_self_roundtrip() {
+    let mut data = Vec::with_capacity(32 * 32 * 3);
+    for y in 0..32u32 {
+        for x in 0..32u32 {
+            data.push(((x * 8) & 0xFF) as u8);
+            data.push(((y * 8) & 0xFF) as u8);
+            data.push((((x + y) * 4) & 0xFF) as u8);
+        }
+    }
+    let img = Jpeg2000Image {
+        width: 32,
+        height: 32,
+        pixel_format: PixelFormat::Rgb24,
+        planes: vec![Jpeg2000Plane {
+            stride: 96,
+            data: data.clone(),
+        }],
+        pts: None,
+    };
+    let opts = EncodeOptionsHt {
+        cblk_log2: 5,
+        num_decomp: 1,
+        use_color_transform: true,
+    };
+    let cs = encode_image_htj2k(&img, &opts).expect("encode");
+    let p = probe(&cs).expect("probe");
+    assert_eq!(p.flavour, J2kFlavour::HighThroughput);
+    assert_eq!(p.num_components, 3);
+    let decoded = decode_jpeg2000(&cs).expect("decode");
+    for y in 0..32usize {
+        for x in 0..32usize {
+            let off = y * 96 + 3 * x;
+            assert_eq!(decoded.planes[0].data[y * 32 + x], data[off]);
+            assert_eq!(decoded.planes[1].data[y * 32 + x], data[off + 1]);
+            assert_eq!(decoded.planes[2].data[y * 32 + x], data[off + 2]);
+        }
+    }
+}
+
+/// 32x32 Yuv444P planar — three independent 8-bit planes, no MCT.
+#[test]
+fn round3_yuv444_planar_self_roundtrip() {
+    let mut y = Vec::with_capacity(32 * 32);
+    let mut cb = Vec::with_capacity(32 * 32);
+    let mut cr = Vec::with_capacity(32 * 32);
+    for i in 0..(32 * 32u32) {
+        y.push(((i * 17) % 251) as u8);
+        cb.push((128u32 + (i % 64)) as u8);
+        cr.push((128u32 + ((i * 3) % 32)) as u8);
+    }
+    let img = Jpeg2000Image {
+        width: 32,
+        height: 32,
+        pixel_format: PixelFormat::Yuv444P,
+        planes: vec![
+            Jpeg2000Plane {
+                stride: 32,
+                data: y.clone(),
+            },
+            Jpeg2000Plane {
+                stride: 32,
+                data: cb.clone(),
+            },
+            Jpeg2000Plane {
+                stride: 32,
+                data: cr.clone(),
+            },
+        ],
+        pts: None,
+    };
+    let opts = EncodeOptionsHt {
+        cblk_log2: 5,
+        num_decomp: 1,
+        use_color_transform: true, // ignored for YUV input
+    };
+    let cs = encode_image_htj2k(&img, &opts).expect("encode");
+    let decoded = decode_jpeg2000(&cs).expect("decode");
+    assert_eq!(decoded.pixel_format, PixelFormat::Yuv444P);
+    assert_eq!(decoded.planes[0].data, y);
+    assert_eq!(decoded.planes[1].data, cb);
+    assert_eq!(decoded.planes[2].data, cr);
+}
+
+/// 32x32 RGB sparse with MCT, cross-decoded through `ojph_expand`. The
+/// resulting PPM must match the input RGB byte-exact.
+#[test]
+fn round3_rgb_mct_ojph_expand_cross_decode() {
+    if std::process::Command::new("ojph_expand")
+        .arg("-h")
+        .output()
+        .is_err()
+    {
+        eprintln!("ojph_expand not on PATH; skipping");
+        return;
+    }
+    let mut data = Vec::with_capacity(32 * 32 * 3);
+    for y in 0..32u32 {
+        for x in 0..32u32 {
+            data.push(((x * 8) & 0xFF) as u8);
+            data.push(((y * 8) & 0xFF) as u8);
+            data.push((((x + y) * 4) & 0xFF) as u8);
+        }
+    }
+    let img = Jpeg2000Image {
+        width: 32,
+        height: 32,
+        pixel_format: PixelFormat::Rgb24,
+        planes: vec![Jpeg2000Plane {
+            stride: 96,
+            data: data.clone(),
+        }],
+        pts: None,
+    };
+    let opts = EncodeOptionsHt {
+        cblk_log2: 5,
+        num_decomp: 1,
+        use_color_transform: true,
+    };
+    let cs = encode_image_htj2k(&img, &opts).expect("encode");
+
+    let tmp_dir = std::env::temp_dir();
+    let in_path = tmp_dir.join("oxideav_htj2k_round3_rgb_mct.j2c");
+    let out_path = tmp_dir.join("oxideav_htj2k_round3_rgb_mct.ppm");
+    std::fs::write(&in_path, &cs).expect("write codestream");
+    let _ = std::fs::remove_file(&out_path);
+
+    let status = std::process::Command::new("ojph_expand")
+        .args(["-i", in_path.to_str().unwrap()])
+        .args(["-o", out_path.to_str().unwrap()])
+        .status()
+        .expect("spawn ojph_expand");
+    assert!(status.success(), "ojph_expand failed on RGB+MCT codestream");
+
+    let ppm = std::fs::read(&out_path).expect("read ppm");
+    let payload = strip_ppm_header(&ppm);
+    assert_eq!(payload.len(), 32 * 32 * 3);
+    let n_diff = data
+        .iter()
+        .zip(payload.iter())
+        .filter(|(a, b)| a != b)
+        .count();
+    assert_eq!(n_diff, 0, "ojph_expand disagrees on {n_diff} bytes");
+
+    let _ = std::fs::remove_file(&in_path);
+    let _ = std::fs::remove_file(&out_path);
+}
+
+/// 64x64 RGB gradient at NL=2 with MCT — bigger spec exercise + ojph_expand
+/// cross-decode.
+#[test]
+fn round3_rgb_mct_nl2_64_ojph_expand_cross_decode() {
+    if std::process::Command::new("ojph_expand")
+        .arg("-h")
+        .output()
+        .is_err()
+    {
+        eprintln!("ojph_expand not on PATH; skipping");
+        return;
+    }
+    let mut data = Vec::with_capacity(64 * 64 * 3);
+    for y in 0..64u32 {
+        for x in 0..64u32 {
+            data.push(((x * 4) & 0xFF) as u8);
+            data.push(((y * 4) & 0xFF) as u8);
+            data.push((((x + y) * 2) & 0xFF) as u8);
+        }
+    }
+    let img = Jpeg2000Image {
+        width: 64,
+        height: 64,
+        pixel_format: PixelFormat::Rgb24,
+        planes: vec![Jpeg2000Plane {
+            stride: 192,
+            data: data.clone(),
+        }],
+        pts: None,
+    };
+    let opts = EncodeOptionsHt {
+        cblk_log2: 5,
+        num_decomp: 2,
+        use_color_transform: true,
+    };
+    let cs = encode_image_htj2k(&img, &opts).expect("encode");
+
+    let tmp_dir = std::env::temp_dir();
+    let in_path = tmp_dir.join("oxideav_htj2k_round3_rgb_mct_64.j2c");
+    let out_path = tmp_dir.join("oxideav_htj2k_round3_rgb_mct_64.ppm");
+    std::fs::write(&in_path, &cs).expect("write codestream");
+    let _ = std::fs::remove_file(&out_path);
+
+    let status = std::process::Command::new("ojph_expand")
+        .args(["-i", in_path.to_str().unwrap()])
+        .args(["-o", out_path.to_str().unwrap()])
+        .status()
+        .expect("spawn ojph_expand");
+    assert!(
+        status.success(),
+        "ojph_expand failed on 64x64 RGB+MCT NL=2 codestream"
+    );
+
+    let ppm = std::fs::read(&out_path).expect("read ppm");
+    let payload = strip_ppm_header(&ppm);
+    assert_eq!(payload.len(), 64 * 64 * 3);
+    let n_diff = data
+        .iter()
+        .zip(payload.iter())
+        .filter(|(a, b)| a != b)
+        .count();
+    assert_eq!(n_diff, 0, "ojph_expand disagrees on {n_diff} bytes");
+
+    let _ = std::fs::remove_file(&in_path);
+    let _ = std::fs::remove_file(&out_path);
+}
+
+/// Encoder size report for round 3 — RGB gradients with vs without MCT
+/// at the same NL. Informational only; printed to stderr.
+#[test]
+fn round3_rgb_size_report() {
+    let mut data = Vec::with_capacity(64 * 64 * 3);
+    for y in 0..64u32 {
+        for x in 0..64u32 {
+            data.push(((x * 4) & 0xFF) as u8);
+            data.push(((y * 4) & 0xFF) as u8);
+            data.push((((x + y) * 2) & 0xFF) as u8);
+        }
+    }
+    let img = Jpeg2000Image {
+        width: 64,
+        height: 64,
+        pixel_format: PixelFormat::Rgb24,
+        planes: vec![Jpeg2000Plane {
+            stride: 192,
+            data: data.clone(),
+        }],
+        pts: None,
+    };
+    let cs_mct = encode_image_htj2k(
+        &img,
+        &EncodeOptionsHt {
+            cblk_log2: 5,
+            num_decomp: 3,
+            use_color_transform: true,
+        },
+    )
+    .unwrap();
+    let cs_no_mct = encode_image_htj2k(
+        &img,
+        &EncodeOptionsHt {
+            cblk_log2: 5,
+            num_decomp: 3,
+            use_color_transform: false,
+        },
+    )
+    .unwrap();
+    eprintln!(
+        "64x64 RGB gradient (raw {} bytes): NL=3 MCT {} bytes, NL=3 no-MCT {} bytes",
+        data.len(),
+        cs_mct.len(),
+        cs_no_mct.len()
+    );
 }

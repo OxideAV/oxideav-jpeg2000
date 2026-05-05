@@ -105,19 +105,24 @@ irreversible path produces a lossy bitstream with round-trip PSNR
   with max-deviation 2 against the OpenJPH-binary reference. The
   pblk > 0 / pblk < 0 / `z = 1` algebraic cases on the 9/7 float
   path are unit-tested against the closed-form Eq E-1. **Encoder side
-  (round 2):** `encode::htj2k::encode_image_htj2k` produces a Part-15
-  codestream for single-Gray8-component, lossless 5/3 with
-  `NL ∈ [0, 5]` decomposition levels. Multi-significance per quad
-  (ρ ∈ {3, 5, 6, 7, 9..15}), the §7.3.6 Eq-4 first-line-pair
-  both-`u_off=1` special case, and per-resolution tier-2 packets are
-  all wired. Self-roundtrip is bit-exact and `ojph_expand` (binary,
-  black-box) cross-decodes our output bit-exactly on the round-1
-  32×32 NL=0 sparse + solid fixtures plus the round-2 NL=1 32×32
-  sparse and NL=2 64×64 bright-square fixtures. Compression vs raw:
-  64×64 8-bit gradient → 4516 bytes at NL=0, **596 bytes at NL=2,
-  444 bytes at NL=3** (~90% reduction). Encoder gaps: SigProp/MagRef
-  refinement passes, multi-tile, multi-layer, PPM/PPT, RGB/MCT,
-  multi-set HT (T.814 §B), constrained sets (T.814 §8).
+  (round 3):** `encode::htj2k::encode_image_htj2k` produces a Part-15
+  codestream for `Gray8`, `Rgb24`, and `Yuv444P` 8-bit input with
+  lossless 5/3 and `NL ∈ [0, 5]` decomposition levels. Multi-component
+  tier-2 packets (LRCP, one packet per `(resolution, component)`),
+  optional forward 5/3 reversible component transform (RCT, T.800
+  §G.1) for `Rgb24` input — signalled in COD by `MCT = 1` and inverted
+  by the decoder — are now in. Multi-significance per quad
+  (ρ ∈ {3, 5, 6, 7, 9..15}) and the §7.3.6 Eq-4 first-line-pair
+  both-`u_off=1` special case carry over from round 2. Self-roundtrip
+  is bit-exact and `ojph_expand` (binary, black-box) cross-decodes our
+  output bit-exactly on the round-1 32×32 NL=0 fixtures, the round-2
+  NL=1 32×32 sparse and NL=2 64×64 bright-square fixtures, and the
+  round-3 RGB+MCT 32×32 NL=1 + 64×64 NL=2 RGB-gradient fixtures.
+  Compression vs raw: 64×64 8-bit Gray gradient → 4516 bytes at NL=0,
+  **596 bytes at NL=2, 444 bytes at NL=3** (~90% reduction). Encoder
+  gaps: SigProp/MagRef refinement passes, multi-tile, multi-layer,
+  sub-sampled chroma (4:2:2 / 4:2:0), PPM/PPT, multi-set HT
+  (T.814 §B), constrained sets (T.814 §8), 9/7 irreversible HTJ2K.
 - **RGB input beyond 8-bit unsigned chroma** — the decoder's RCT
   inverse currently clamps chroma to unsigned 8-bit before the
   inverse transform, so encoder inputs with chroma excursions outside

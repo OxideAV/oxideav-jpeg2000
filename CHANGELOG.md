@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- encoder (HTJ2K, round 3 — task #477): multi-component encode for
+  `Gray8`, `Rgb24`, and `Yuv444P` input pixel formats with optional
+  forward 5/3 reversible component transform (RCT, T.800 §G.1) for RGB.
+  - SIZ now writes `Csiz = N` (1 or 3) with the matching per-component
+    sub-sampling `(XRsiz, YRsiz)` fields. The tier-2 packet emit loop
+    walks `(resolution, component)` in LRCP order, one packet per tuple.
+  - COD signals `MCT = 1` when the encoder applies forward RCT to
+    `Rgb24` input (Y = (R + 2G + B) >> 2, Cb = B - G, Cr = R - G); the
+    crate's HTJ2K decoder already inverts the RCT for 5/3 + MCT = 1
+    streams.
+  - QCD epsilons are bumped by one bit when MCT is active to give the
+    chroma's extra dynamic range room (Cb / Cr can hit ±255 from 8-bit
+    RGB input). For luma this is over-allocation but the cleanup pass
+    still round-trips bit-exactly.
+  - 5 new self-roundtrip + 2 new `ojph_expand` cross-decode integration
+    tests cover RGB+MCT (32×32 NL=1, 64×64 NL=2), RGB no-MCT, and
+    `Yuv444P` planar input.
+  - `EncodeOptionsHt` gains a `use_color_transform: bool` field
+    (defaults to `true`).
+
 ## [0.0.8](https://github.com/OxideAV/oxideav-jpeg2000/compare/v0.0.7...v0.0.8) - 2026-05-05
 
 ### Other
