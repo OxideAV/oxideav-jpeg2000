@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/OxideAV/oxideav-jpeg2000/compare/v0.0.8...v0.0.9) - 2026-05-05
+
+### Other
+
+- HTJ2K encoder round 3 — multi-component RGB + MCT (RCT) (task #477)
+
 ### Added
 
 - encoder (HTJ2K, round 3 — task #477): multi-component encode for
