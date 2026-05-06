@@ -15,12 +15,6 @@ categories = ["multimedia::encoding", "multimedia::images"]
 
 [dependencies]
 oxideav-core = { version = "0.1", optional = true }
-# Distributed-slice auto-registration into `oxideav_core::REGISTRARS`
-# via the `oxideav_core::register!` macro. Tiny crate, no transitive
-# deps; works on every target including wasm. Optional + gated behind
-# the `registry` feature so standalone image-library callers don't pull
-# it in.
-linkme = { version = "0.3", optional = true }
 
 [features]
 default = ["registry"]
@@ -29,7 +23,7 @@ default = ["registry"]
 # `oxideav-core`-free build; the standalone `decode_jpeg2000` /
 # `encode_jpeg2000` API plus the underlying `codestream` / `decode` /
 # `encode` modules are still exposed.
-registry = ["dep:oxideav-core", "dep:linkme"]
+registry = ["dep:oxideav-core"]
 # High-Throughput JPEG 2000 (ISO/IEC 15444-15) decoder. Enables the
 # FBCOT block-coding entropy decoder and the tier-2 packet walker that
 # routes per-codeblock segments through it. When the feature is off the
