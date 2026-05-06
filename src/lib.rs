@@ -112,7 +112,9 @@ pub mod image;
 pub mod registry;
 
 #[cfg(feature = "registry")]
-pub use registry::{__oxideav_entry, register, register_codecs, register_containers, J2kDecoder, J2kEncoder};
+pub use registry::{
+    __oxideav_entry, register, register_codecs, register_containers, J2kDecoder, J2kEncoder,
+};
 
 pub use codestream::{Cap, Codestream, ComponentInfo, Cpf, Marker, Siz, TilePart};
 pub use error::{Jpeg2000Error, Result};
