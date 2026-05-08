@@ -134,10 +134,18 @@ irreversible path produces a lossy bitstream with round-trip PSNR
   cross-decodes our 9/7 32×32 single-tile fixture within ±2 LSB,
   matching all round-1..round-3 single-tile cross-decode results.
   Compression vs raw: 64×64 8-bit Gray gradient → 4516 bytes at NL=0,
-  **596 bytes at NL=2, 444 bytes at NL=3** (~90% reduction). Encoder
-  gaps: SigProp/MagRef refinement passes (Z_blk ∈ {2, 3}), multi-
-  layer, multi-set HT (T.814 §B), constrained sets (T.814 §8),
-  POC progression schedule.
+  **596 bytes at NL=2, 444 bytes at NL=3** (~90% reduction).
+  **Encoder side (round 6):** SigProp + MagRef refinement passes
+  (`Z_blk ∈ {2, 3}`) wired into the codestream via the new
+  `EncodeOptionsHt::pass_count: HtPassCount` selector. Per-codeblock
+  the encoder runs cleanup → `encode_sigprop` → `encode_magref` to
+  produce `Dcup` + `Dref`; the packet header writes `num_passes` plus
+  two length fields per ISO/IEC 15444-15 §B.3. `ojph_expand` cross-
+  decodes our `Z_blk = 2` and `Z_blk = 3` codestreams bit-exactly on
+  the 32×32 sparse fixture. Encoder gaps: rate-distortion truncation
+  of refinement bits (currently emitted as zeros), multi-layer, multi-
+  set HT (T.814 §B), constrained sets (T.814 §8), POC progression
+  schedule.
 - **RGB input beyond 8-bit unsigned chroma** — the decoder's RCT
   inverse currently clamps chroma to unsigned 8-bit before the
   inverse transform, so encoder inputs with chroma excursions outside

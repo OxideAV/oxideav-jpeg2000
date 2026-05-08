@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- HTJ2K encoder round 6: SigProp + MagRef refinement passes wired into
+  the codestream. New `EncodeOptionsHt::pass_count: HtPassCount` selector
+  (`Cleanup` / `CleanupSigprop` / `CleanupSigpropMagref`) drives the
+  per-codeblock pipeline through `encode_sigprop` + `encode_magref` (the
+  primitives have existed since rounds 4-5 but were not exercised by the
+  packet emitter). Per-codeblock the encoder runs the cleanup pass to
+  produce `Dcup`, then constructs an in-memory `CleanupOutput`
+  equivalent from the sample magnitudes and runs the SigProp + MagRef
+  encoders with all-zero refinement bits to obtain `Dref`. The packet
+  body emits two codeword segments — `Dcup` (cleanup) followed by
+  `Dref` (refinement) — and the packet header writes
+  `num_passes ∈ {1, 2, 3}` plus two length fields when `num_passes ≥ 2`
+  (widths `lblock + ⌊log2(passes_added)⌋` per ISO/IEC 15444-15 §B.3 +
+  T.800 §B.10.7.2). lblock growth now picks the smallest value that
+  fits both length fields. New `tile_enc::tests` self-roundtrip tests
+  cover Z_blk = 2 and Z_blk = 3 across solid, sparse, RGB-with-MCT, and
+  multi-tile inputs; `htj2k_encoder.rs` integration tests add
+  `ojph_expand` cross-decode validation that the new `Z_blk = 2` /
+  `Z_blk = 3` codestreams are accepted bit-exactly by OpenJPH.
 - encoder (classic Part-1, round 5): three encoder improvements.
   - **Explicit per-resolution precinct sizes** (`EncodeOptions::precincts`).
     New `precincts: Option<Vec<(u8, u8)>>` field on `EncodeOptions`

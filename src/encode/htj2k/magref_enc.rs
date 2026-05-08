@@ -189,9 +189,9 @@ mod tests {
         let dref_tail = encode_magref(&cleanup, &ref_bit).expect("magref enc");
 
         let out = decode_codeblock(2, 2, ZBlk::Three, &dcup, &dref_tail).expect("dec Z3");
-        for i in 0..n {
+        for (i, &want) in ref_bit.iter().take(n).enumerate() {
             assert_eq!(out.z[i], 1, "z[{i}] must be 1");
-            assert_eq!(out.refinement[i], ref_bit[i], "r[{i}] mismatch");
+            assert_eq!(out.refinement[i], want, "r[{i}] mismatch");
         }
     }
 }

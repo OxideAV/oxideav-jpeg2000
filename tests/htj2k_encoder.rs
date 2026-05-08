@@ -801,3 +801,157 @@ fn round4_9_7_solid_dc_32x32_ojph_cross_decode() {
     let _ = std::fs::remove_file(&in_p);
     let _ = std::fs::remove_file(&out_p);
 }
+
+// ----- Round 6 fixtures: SigProp + MagRef encoder passes -----
+
+use oxideav_jpeg2000::encode::HtPassCount;
+
+/// Round-6: 32×32 sparse Gray8 fixture with `Z_blk = 2` (cleanup +
+/// SigProp). Self round-trip through our own decoder must be bit-exact:
+/// the cleanup pass already communicates the full sample magnitude in
+/// FBCOT round 1, so the additional SigProp pass cannot alter `mag[n]`.
+#[test]
+fn round6_zblk_2_sparse_self_roundtrip() {
+    let mut data = vec![0x80u8; 32 * 32];
+    data[0] = 0x90;
+    data[5 * 32 + 5] = 0x70;
+    data[10 * 32 + 10] = 0xA0;
+    let img = img32(data.clone());
+    let opts = EncodeOptionsHt {
+        cblk_log2: 5,
+        num_decomp: 1,
+        pass_count: HtPassCount::CleanupSigprop,
+        ..Default::default()
+    };
+    let cs = encode_image_htj2k(&img, &opts).expect("encode");
+    let p = probe(&cs).expect("probe");
+    assert_eq!(p.flavour, J2kFlavour::HighThroughput);
+    let decoded = decode_jpeg2000(&cs).expect("decode");
+    let n_diff = data
+        .iter()
+        .zip(decoded.planes[0].data.iter())
+        .filter(|(a, b)| a != b)
+        .count();
+    assert_eq!(n_diff, 0, "{n_diff} pixels differ after Z_blk=2 roundtrip");
+}
+
+/// Round-6: same fixture with `Z_blk = 3` (cleanup + SigProp + MagRef).
+#[test]
+fn round6_zblk_3_sparse_self_roundtrip() {
+    let mut data = vec![0x80u8; 32 * 32];
+    data[0] = 0x90;
+    data[5 * 32 + 5] = 0x70;
+    data[10 * 32 + 10] = 0xA0;
+    let img = img32(data.clone());
+    let opts = EncodeOptionsHt {
+        cblk_log2: 5,
+        num_decomp: 1,
+        pass_count: HtPassCount::CleanupSigpropMagref,
+        ..Default::default()
+    };
+    let cs = encode_image_htj2k(&img, &opts).expect("encode");
+    let decoded = decode_jpeg2000(&cs).expect("decode");
+    let n_diff = data
+        .iter()
+        .zip(decoded.planes[0].data.iter())
+        .filter(|(a, b)| a != b)
+        .count();
+    assert_eq!(n_diff, 0, "{n_diff} pixels differ after Z_blk=3 roundtrip");
+}
+
+/// Round-6: cross-decode our `Z_blk = 2` codestream through
+/// `ojph_expand` and check the decoded pixels match the input. Skipped
+/// silently when the binary is not on PATH (workspace policy bars
+/// OpenJPH source — only the binary is in scope as a black-box
+/// validator).
+#[test]
+fn round6_zblk_2_sparse_ojph_cross_decode() {
+    if !ojph_present() {
+        eprintln!("ojph_expand not on PATH; skipping");
+        return;
+    }
+    let mut data = vec![0x80u8; 32 * 32];
+    data[0] = 0x90;
+    data[5 * 32 + 5] = 0x70;
+    data[10 * 32 + 10] = 0xA0;
+    let img = img32(data.clone());
+    let opts = EncodeOptionsHt {
+        cblk_log2: 5,
+        num_decomp: 1,
+        pass_count: HtPassCount::CleanupSigprop,
+        ..Default::default()
+    };
+    let cs = encode_image_htj2k(&img, &opts).expect("encode");
+    let tmp = std::env::temp_dir();
+    let in_p = tmp.join("oxideav_round6_zblk2.j2c");
+    let out_p = tmp.join("oxideav_round6_zblk2.pgm");
+    std::fs::write(&in_p, &cs).expect("write");
+    let _ = std::fs::remove_file(&out_p);
+    let st = std::process::Command::new("ojph_expand")
+        .args(["-i", in_p.to_str().unwrap()])
+        .args(["-o", out_p.to_str().unwrap()])
+        .status()
+        .expect("ojph spawn");
+    assert!(st.success(), "ojph_expand failed on Z_blk=2 codestream");
+    let pgm = std::fs::read(&out_p).expect("read");
+    let payload = strip_pgm_header(&pgm);
+    assert_eq!(payload.len(), 32 * 32);
+    let n_diff = data
+        .iter()
+        .zip(payload.iter())
+        .filter(|(a, b)| a != b)
+        .count();
+    assert_eq!(
+        n_diff, 0,
+        "ojph_expand cross-decode disagrees on {n_diff} pixels (Z_blk=2)"
+    );
+    let _ = std::fs::remove_file(&in_p);
+    let _ = std::fs::remove_file(&out_p);
+}
+
+/// Round-6: cross-decode our `Z_blk = 3` codestream through
+/// `ojph_expand` and check the decoded pixels match the input.
+#[test]
+fn round6_zblk_3_sparse_ojph_cross_decode() {
+    if !ojph_present() {
+        eprintln!("ojph_expand not on PATH; skipping");
+        return;
+    }
+    let mut data = vec![0x80u8; 32 * 32];
+    data[0] = 0x90;
+    data[5 * 32 + 5] = 0x70;
+    data[10 * 32 + 10] = 0xA0;
+    let img = img32(data.clone());
+    let opts = EncodeOptionsHt {
+        cblk_log2: 5,
+        num_decomp: 1,
+        pass_count: HtPassCount::CleanupSigpropMagref,
+        ..Default::default()
+    };
+    let cs = encode_image_htj2k(&img, &opts).expect("encode");
+    let tmp = std::env::temp_dir();
+    let in_p = tmp.join("oxideav_round6_zblk3.j2c");
+    let out_p = tmp.join("oxideav_round6_zblk3.pgm");
+    std::fs::write(&in_p, &cs).expect("write");
+    let _ = std::fs::remove_file(&out_p);
+    let st = std::process::Command::new("ojph_expand")
+        .args(["-i", in_p.to_str().unwrap()])
+        .args(["-o", out_p.to_str().unwrap()])
+        .status()
+        .expect("ojph spawn");
+    assert!(st.success(), "ojph_expand failed on Z_blk=3 codestream");
+    let pgm = std::fs::read(&out_p).expect("read");
+    let payload = strip_pgm_header(&pgm);
+    assert_eq!(payload.len(), 32 * 32);
+    let n_diff = data
+        .iter()
+        .zip(payload.iter())
+        .filter(|(a, b)| a != b)
+        .count();
+    assert_eq!(
+        n_diff, 0,
+        "ojph_expand cross-decode disagrees on {n_diff} pixels (Z_blk=3)"
+    );
+    let _ = std::fs::remove_file(&in_p);
+    let _ = std::fs::remove_file(&out_p);
+}

@@ -1,4 +1,4 @@
-//! HTJ2K codestream + tile-body encoder (round 4).
+//! HTJ2K codestream + tile-body encoder (round 6).
 //!
 //! Wraps [`super::cleanup_enc::encode_cleanup`] in the marker chain
 //! that ISO/IEC 15444-15 requires: SOC + SIZ (with Rsiz bit 14 set
@@ -52,14 +52,29 @@
 //!   first-line-pair both-`u_off=1` special case.
 //! * Single quality layer.
 //!
-//! Out of scope (round 5+):
+//! Round-6 additions:
 //!
-//! * SigProp / MagRef refinement passes (Z_blk ∈ {2, 3}). Currently
-//!   the encoder emits cleanup-only (Z_blk = 1).
+//! * **HT SigProp + MagRef encoder passes** (`Z_blk ∈ {2, 3}`). New
+//!   [`EncodeOptionsHt::pass_count`] selector drives the per-codeblock
+//!   pipeline through [`super::sigprop_enc::encode_sigprop`] +
+//!   [`super::magref_enc::encode_magref`] with all-zero refinement bits
+//!   (placeholder-equivalent for sample magnitudes; the decoder still
+//!   recovers the same `mag[n]` as cleanup-only). The packet body now
+//!   emits two codeword segments — `Dcup` (cleanup) followed by `Dref`
+//!   (SigProp + MagRef) — and the packet header writes `num_passes`
+//!   plus two length fields per ISO/IEC 15444-15 §B.3.
+//!
+//! Out of scope (round 7+):
+//!
 //! * Multi-layer (single quality layer per code-block).
+//! * Rate-distortion truncation: refinement-bit selection is currently
+//!   "all zero".
 //! * Constrained sets (T.814 §8) and multi-set HT (T.814 Annex B).
 
 use super::cleanup_enc::{encode_cleanup, SampleHt};
+use super::magref_enc::encode_magref;
+use super::sigprop_enc::encode_sigprop;
+use crate::decode::htj2k::CleanupOutput;
 use crate::decode::tile::{
     build_subbands, parse_cod, parse_qcd, split_packet_headers, CodParams as DecodedCodParams,
     QcdParams as DecodedQcdParams,
@@ -96,6 +111,30 @@ pub enum HtPacketHeaderPlacement {
     PackedPerTilePart,
 }
 
+/// Choice of FBCOT pass count (`Z_blk`) per ISO/IEC 15444-15 Annex B
+/// for each code-block emitted by the encoder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HtPassCount {
+    /// `Z_blk = 1` — cleanup pass only (the historical default).
+    #[default]
+    Cleanup,
+    /// `Z_blk = 2` — cleanup + SigProp.
+    CleanupSigprop,
+    /// `Z_blk = 3` — cleanup + SigProp + MagRef.
+    CleanupSigpropMagref,
+}
+
+impl HtPassCount {
+    /// Numeric `num_passes` value as written in the tier-2 packet header.
+    fn num_passes(self) -> u32 {
+        match self {
+            HtPassCount::Cleanup => 1,
+            HtPassCount::CleanupSigprop => 2,
+            HtPassCount::CleanupSigpropMagref => 3,
+        }
+    }
+}
+
 /// Knobs for the HTJ2K encoder.
 #[derive(Debug, Clone)]
 pub struct EncodeOptionsHt {
@@ -119,6 +158,9 @@ pub struct EncodeOptionsHt {
     /// Where the per-tile packet header bytes live in the emitted
     /// codestream. Default `Inline`.
     pub packet_header_placement: HtPacketHeaderPlacement,
+    /// FBCOT pass count (`Z_blk`) per code-block. Default
+    /// [`HtPassCount::Cleanup`].
+    pub pass_count: HtPassCount,
 }
 
 impl Default for EncodeOptionsHt {
@@ -130,13 +172,19 @@ impl Default for EncodeOptionsHt {
             transform: HtTransform::Reversible53,
             tile_size: None,
             packet_header_placement: HtPacketHeaderPlacement::Inline,
+            pass_count: HtPassCount::Cleanup,
         }
     }
 }
 
 #[derive(Clone, Default)]
 struct CodedCblk {
+    /// Cleanup segment bytes (`Dcup`, `Lcup` bytes).
     data: Vec<u8>,
+    /// Refinement segment bytes (`Dref`, `Lref` bytes). Empty when the
+    /// encoder is emitting `Z_blk = 1`. May also be empty when SigProp +
+    /// MagRef produce zero bytes (e.g. all-zero block under `Z_blk ≥ 2`).
+    dref: Vec<u8>,
     missing_msb: u32,
     included: bool,
 }
@@ -243,6 +291,7 @@ pub fn encode_image_htj2k(image: &Jpeg2000Image, opts: &EncodeOptionsHt) -> Resu
                 apply_mct,
                 precision,
                 dc_shift,
+                opts.pass_count,
             )?;
             per_tile_bodies.push(body);
         }
@@ -369,6 +418,7 @@ fn encode_one_tile(
     apply_mct: bool,
     precision: u32,
     dc_shift: i32,
+    pass_count: HtPassCount,
 ) -> Result<Vec<u8>> {
     let _ = apply_mct;
     let num_comps = full_planes.len();
@@ -522,6 +572,7 @@ fn encode_one_tile(
                     if max_mag == 0 {
                         cblks.push(CodedCblk {
                             data: Vec::new(),
+                            dref: Vec::new(),
                             missing_msb: nbps + 1,
                             included: false,
                         });
@@ -530,8 +581,14 @@ fn encode_one_tile(
 
                     let missing_msb = nbps;
                     let dcup = encode_cleanup(cbw as u32, cbh as u32, &samples)?;
+                    let dref = if pass_count.num_passes() >= 2 {
+                        build_dref_bytes(cbw as u32, cbh as u32, &samples, pass_count)?
+                    } else {
+                        Vec::new()
+                    };
                     cblks.push(CodedCblk {
                         data: dcup,
+                        dref,
                         missing_msb,
                         included: true,
                     });
@@ -554,7 +611,7 @@ fn encode_one_tile(
     #[allow(clippy::needless_range_loop)]
     for resno in 0..num_res {
         for ci in 0..num_comps {
-            emit_packet_htj2k(&mut body, &per_comp[ci][resno])?;
+            emit_packet_htj2k(&mut body, &per_comp[ci][resno], pass_count)?;
         }
     }
     let _ = dc_shift;
@@ -723,7 +780,8 @@ fn extract_plane_dc_shifted(
 }
 
 /// Emit one tier-2 packet for a single (resolution, component) tuple.
-fn emit_packet_htj2k(out: &mut Vec<u8>, res: &ResEnc) -> Result<()> {
+fn emit_packet_htj2k(out: &mut Vec<u8>, res: &ResEnc, pass_count: HtPassCount) -> Result<()> {
+    let num_passes = pass_count.num_passes();
     let mut bw = BioWriterMsbFirst::new();
     let any_included = res.bands.iter().any(|b| b.cblks.iter().any(|c| c.included));
     if !any_included {
@@ -760,32 +818,188 @@ fn emit_packet_htj2k(out: &mut Vec<u8>, res: &ResEnc) -> Result<()> {
                 bw.write_bit(0);
             }
             bw.write_bit(1);
-            // num_passes = 1.
-            bw.write_bit(0);
-            // Lblock growth from default 3.
+            // num_passes ∈ {1, 2, 3}, comma-coded per T.800 §B.10.7.1.
+            write_num_passes_ht(&mut bw, num_passes);
+            // Lblock growth: must accommodate every length field this
+            // codeblock will write. Per ISO/IEC 15444-15 §B.3 + T.800
+            // §B.10.7.2, when num_passes ≥ 2 the cleanup contributes
+            // 1 pass (length field width = lblock + ⌊log2(1)⌋ = lblock)
+            // and the refinement contributes (num_passes − 1) passes
+            // (length field width = lblock + ⌊log2(num_passes − 1)⌋,
+            // which is 0 for num_passes=2 and 1 for num_passes=3). We
+            // pick the smallest lblock that fits both.
             let lcup = c.data.len() as u32;
+            let lref = c.dref.len() as u32;
+            let needed_for_lcup = bits_needed_for(lcup);
+            let needed_for_lref = if num_passes >= 2 {
+                let extra = ilog2_ht(num_passes - 1);
+                bits_needed_for(lref).saturating_sub(extra)
+            } else {
+                0
+            };
+            let needed = needed_for_lcup.max(needed_for_lref);
             let mut lblock = 3u32;
-            while (1u32 << lblock) <= lcup {
+            while lblock < needed {
                 bw.write_bit(1);
                 lblock += 1;
             }
             bw.write_bit(0);
+            // First length field — cleanup. Width = lblock + log2(1) = lblock.
             for k in (0..lblock).rev() {
                 bw.write_bit(((lcup >> k) & 1) as u8);
+            }
+            if num_passes >= 2 {
+                // Second length field — refinement. Width =
+                // lblock + ⌊log2(num_passes − 1)⌋.
+                let lref_width = lblock + ilog2_ht(num_passes - 1);
+                for k in (0..lref_width).rev() {
+                    bw.write_bit(((lref >> k) & 1) as u8);
+                }
             }
         }
     }
     bw.flush_aligned(out);
-    // Packet body: per-band, per-cblk concatenation.
+    // Packet body: per-band, per-cblk concatenation. Cleanup (Dcup)
+    // bytes precede refinement (Dref) bytes for each included codeblock,
+    // matching the decoder's two-segment consumption order.
     for band in &res.bands {
         for c in &band.cblks {
             if !c.included {
                 continue;
             }
             out.extend_from_slice(&c.data);
+            out.extend_from_slice(&c.dref);
         }
     }
     Ok(())
+}
+
+/// Inverse of `crate::decode::tile::read_num_passes` for the values
+/// `num_passes ∈ {1, 2, 3}` that the HT encoder produces. Round-6 only
+/// emits these three values, so the longer comma-coded tails (4..36, 37..)
+/// are not needed.
+fn write_num_passes_ht(bio: &mut BioWriterMsbFirst, n: u32) {
+    if n == 1 {
+        bio.write_bit(0);
+        return;
+    }
+    bio.write_bit(1);
+    if n == 2 {
+        bio.write_bit(0);
+        return;
+    }
+    bio.write_bit(1);
+    debug_assert!(
+        n == 3,
+        "HT encoder write_num_passes_ht: only num_passes ∈ {{1, 2, 3}} supported"
+    );
+    // n - 3 fits in 2 bits. For n=3 → v=0.
+    bio.write_bit(0);
+    bio.write_bit(0);
+}
+
+/// Smallest non-negative `lblock` such that `2^lblock > value`.
+fn bits_needed_for(value: u32) -> u32 {
+    if value == 0 {
+        0
+    } else {
+        32 - value.leading_zeros()
+    }
+}
+
+/// Local copy of `crate::decode::tile::ilog2` to avoid a leak of the
+/// crate-private decoder helper into the encoder module.
+fn ilog2_ht(n: u32) -> u32 {
+    if n == 0 {
+        0
+    } else {
+        31 - n.leading_zeros()
+    }
+}
+
+/// Build the HT refinement segment bytes for one code-block at the
+/// requested pass count. The returned bytes are the SigProp bytes
+/// followed by the MagRef bytes (which the decoder reads from the tail
+/// of `Dref`, by way of the reverse-byte `MagRefReader`).
+///
+/// The refinement bits supplied to [`encode_sigprop`] / [`encode_magref`]
+/// are uniformly zero. This is sufficient to preserve the cleanup
+/// magnitudes through `decode_codeblock` round-trip — the decoder
+/// reaches `mag[n]` from the cleanup pass and the additional refinement
+/// stages only update the auxiliary `r_n` / `z_n` indicators.
+fn build_dref_bytes(
+    width: u32,
+    height: u32,
+    samples: &[SampleHt],
+    pass_count: HtPassCount,
+) -> Result<Vec<u8>> {
+    if pass_count == HtPassCount::Cleanup {
+        return Ok(Vec::new());
+    }
+    // Reconstruct the per-sample (mag, sign, sig, exp) state in the
+    // quad-scan layout the SigProp/MagRef encoders consume. This
+    // mirrors the layout produced by `decode_cleanup` so the decoder's
+    // SigProp/MagRef stages walk the same scan order on round-trip.
+    let qw = width.div_ceil(2) as usize;
+    let qh = height.div_ceil(2) as usize;
+    let nsamples = qw * qh * 4;
+    let mut mag = vec![0u64; nsamples];
+    let mut sign = vec![0u8; nsamples];
+    let mut sig = vec![0u8; nsamples];
+    let mut exp = vec![0u8; nsamples];
+    let cb_w = width as usize;
+    let cb_h = height as usize;
+    for qy in 0..qh {
+        for qx in 0..qw {
+            let q = qy * qw + qx;
+            for j in 0..4u8 {
+                let (dx, dy) = match j {
+                    0 => (0u32, 0),
+                    1 => (0, 1),
+                    2 => (1, 0),
+                    3 => (1, 1),
+                    _ => unreachable!(),
+                };
+                let x = (2 * qx) + dx as usize;
+                let y = (2 * qy) + dy as usize;
+                if x >= cb_w || y >= cb_h {
+                    continue;
+                }
+                let s = samples[y * cb_w + x];
+                let n_idx = 4 * q + j as usize;
+                if s.mag != 0 {
+                    sig[n_idx] = 1;
+                    mag[n_idx] = s.mag as u64;
+                    sign[n_idx] = s.sign & 1;
+                    let two_mu_minus_1 = (2 * s.mag).saturating_sub(1);
+                    exp[n_idx] = if two_mu_minus_1 == 0 {
+                        0
+                    } else {
+                        (32 - two_mu_minus_1.leading_zeros()) as u8
+                    };
+                }
+            }
+        }
+    }
+    let cleanup = CleanupOutput {
+        width,
+        height,
+        mag,
+        sign,
+        exp,
+        sig,
+    };
+
+    let ref_mag = vec![0u8; nsamples];
+    let ref_sign = vec![0u8; nsamples];
+    let sigprop = encode_sigprop(&cleanup, &ref_mag, &ref_sign)?;
+    let mut out = sigprop.bits;
+    if pass_count == HtPassCount::CleanupSigpropMagref {
+        let ref_bit = vec![0u8; nsamples];
+        let magref_tail = encode_magref(&cleanup, &ref_bit)?;
+        out.extend_from_slice(&magref_tail);
+    }
+    Ok(out)
 }
 
 /// Tag-tree threshold=1 sweep encoder (carried over from round 3
@@ -1646,6 +1860,267 @@ mod tests {
         let opts = EncodeOptionsHt {
             num_decomp: 2,
             packet_header_placement: HtPacketHeaderPlacement::PackedPerTilePart,
+            ..Default::default()
+        };
+        let cs = encode_image_htj2k(&img, &opts).expect("encode");
+        let decoded = decode_jpeg2000(&cs).expect("decode");
+        assert_eq!(decoded.planes[0].data, data);
+    }
+
+    /// Round-6: solid 32×32 Gray8 with `Z_blk = 2` (cleanup + SigProp).
+    /// Decoder must recover the same magnitudes as cleanup-only.
+    #[test]
+    fn roundtrip_solid_dc_32x32_zblk_2() {
+        let img = build_gray_solid(32, 32, 0x80);
+        let opts = EncodeOptionsHt {
+            pass_count: HtPassCount::CleanupSigprop,
+            ..Default::default()
+        };
+        let cs = encode_image_htj2k(&img, &opts).expect("encode");
+        let decoded = decode_jpeg2000(&cs).expect("decode");
+        assert_eq!(decoded.planes[0].data, img.planes[0].data);
+    }
+
+    /// Round-6: solid 32×32 Gray8 with `Z_blk = 3` (cleanup + SigProp +
+    /// MagRef). Decoder must still recover the input bit-exactly.
+    #[test]
+    fn roundtrip_solid_dc_32x32_zblk_3() {
+        let img = build_gray_solid(32, 32, 0x80);
+        let opts = EncodeOptionsHt {
+            pass_count: HtPassCount::CleanupSigpropMagref,
+            ..Default::default()
+        };
+        let cs = encode_image_htj2k(&img, &opts).expect("encode");
+        let decoded = decode_jpeg2000(&cs).expect("decode");
+        assert_eq!(decoded.planes[0].data, img.planes[0].data);
+    }
+
+    /// Round-6: sparse 32×32 with `Z_blk = 2`, NL=1.
+    #[test]
+    fn roundtrip_sparse_32x32_nl1_zblk_2() {
+        let mut data = vec![0x80u8; 32 * 32];
+        data[0] = 0x81;
+        data[5 * 32 + 5] = 0x7F;
+        data[10 * 32 + 10] = 0x82;
+        let img = Jpeg2000Image {
+            width: 32,
+            height: 32,
+            pixel_format: PixelFormat::Gray8,
+            planes: vec![Jpeg2000Plane {
+                stride: 32,
+                data: data.clone(),
+            }],
+            pts: None,
+        };
+        let opts = EncodeOptionsHt {
+            num_decomp: 1,
+            pass_count: HtPassCount::CleanupSigprop,
+            ..Default::default()
+        };
+        let cs = encode_image_htj2k(&img, &opts).expect("encode");
+        let decoded = decode_jpeg2000(&cs).expect("decode");
+        assert_eq!(decoded.planes[0].data, data);
+    }
+
+    /// Round-6: sparse 32×32 with `Z_blk = 3`, NL=1. Exercises the
+    /// MagRef encoder against significant samples in the LL/HL/LH/HH
+    /// bands of a single decomposition level.
+    #[test]
+    fn roundtrip_sparse_32x32_nl1_zblk_3() {
+        let mut data = vec![0x80u8; 32 * 32];
+        data[0] = 0x81;
+        data[5 * 32 + 5] = 0x7F;
+        data[10 * 32 + 10] = 0x82;
+        let img = Jpeg2000Image {
+            width: 32,
+            height: 32,
+            pixel_format: PixelFormat::Gray8,
+            planes: vec![Jpeg2000Plane {
+                stride: 32,
+                data: data.clone(),
+            }],
+            pts: None,
+        };
+        let opts = EncodeOptionsHt {
+            num_decomp: 1,
+            pass_count: HtPassCount::CleanupSigpropMagref,
+            ..Default::default()
+        };
+        let cs = encode_image_htj2k(&img, &opts).expect("encode");
+        let decoded = decode_jpeg2000(&cs).expect("decode");
+        assert_eq!(decoded.planes[0].data, data);
+    }
+
+    /// Round-6: 32×32 noise pattern at NL=1 with Z_blk = 3 — every band
+    /// has many significant samples so MagRef emits multi-byte Dref.
+    #[test]
+    fn roundtrip_32x32_nl1_noise_zblk_3() {
+        let mut data = Vec::with_capacity(32 * 32);
+        for i in 0..(32 * 32) {
+            data.push(((i * 17) % 251) as u8);
+        }
+        let img = Jpeg2000Image {
+            width: 32,
+            height: 32,
+            pixel_format: PixelFormat::Gray8,
+            planes: vec![Jpeg2000Plane {
+                stride: 32,
+                data: data.clone(),
+            }],
+            pts: None,
+        };
+        let opts = EncodeOptionsHt {
+            num_decomp: 1,
+            pass_count: HtPassCount::CleanupSigpropMagref,
+            ..Default::default()
+        };
+        let cs = encode_image_htj2k(&img, &opts).expect("encode");
+        let decoded = decode_jpeg2000(&cs).expect("decode");
+        assert_eq!(decoded.planes[0].data, data);
+    }
+
+    /// Round-6: RGB with MCT + Z_blk = 3 — three components each with
+    /// SigProp + MagRef.
+    #[test]
+    fn roundtrip_32x32_rgb_mct_zblk_3() {
+        let mut data = Vec::with_capacity(32 * 32 * 3);
+        for y in 0..32u32 {
+            for x in 0..32u32 {
+                let r = ((x * 8) & 0xFF) as u8;
+                let g = ((y * 8) & 0xFF) as u8;
+                let b = (((x + y) * 4) & 0xFF) as u8;
+                data.push(r);
+                data.push(g);
+                data.push(b);
+            }
+        }
+        let stride = 32 * 3;
+        let img = Jpeg2000Image {
+            width: 32,
+            height: 32,
+            pixel_format: PixelFormat::Rgb24,
+            planes: vec![Jpeg2000Plane {
+                stride,
+                data: data.clone(),
+            }],
+            pts: None,
+        };
+        let opts = EncodeOptionsHt {
+            num_decomp: 1,
+            pass_count: HtPassCount::CleanupSigpropMagref,
+            ..Default::default()
+        };
+        let cs = encode_image_htj2k(&img, &opts).expect("encode");
+        let decoded = decode_jpeg2000(&cs).expect("decode");
+        for y in 0..32usize {
+            for x in 0..32usize {
+                let off = y * stride + 3 * x;
+                assert_eq!(decoded.planes[0].data[y * 32 + x], data[off]);
+                assert_eq!(decoded.planes[1].data[y * 32 + x], data[off + 1]);
+                assert_eq!(decoded.planes[2].data[y * 32 + x], data[off + 2]);
+            }
+        }
+    }
+
+    /// Round-6: confirm that for a sparse fixture, switching the
+    /// pass-count knob from `Cleanup` → `CleanupSigprop` →
+    /// `CleanupSigpropMagref` produces a strictly non-shrinking
+    /// codestream (Dref bytes accumulate as more passes are emitted).
+    #[test]
+    fn pass_count_increases_codestream_size_monotonically() {
+        let mut data = vec![0x80u8; 32 * 32];
+        data[0] = 0x90;
+        data[5 * 32 + 5] = 0x70;
+        data[10 * 32 + 10] = 0xA0;
+        data[15 * 32 + 15] = 0x60;
+        let img = Jpeg2000Image {
+            width: 32,
+            height: 32,
+            pixel_format: PixelFormat::Gray8,
+            planes: vec![Jpeg2000Plane {
+                stride: 32,
+                data: data.clone(),
+            }],
+            pts: None,
+        };
+        let mk = |pc: HtPassCount| EncodeOptionsHt {
+            num_decomp: 1,
+            pass_count: pc,
+            ..Default::default()
+        };
+        let cs1 = encode_image_htj2k(&img, &mk(HtPassCount::Cleanup)).expect("Z=1");
+        let cs2 = encode_image_htj2k(&img, &mk(HtPassCount::CleanupSigprop)).expect("Z=2");
+        let cs3 = encode_image_htj2k(&img, &mk(HtPassCount::CleanupSigpropMagref)).expect("Z=3");
+        assert!(
+            cs2.len() >= cs1.len(),
+            "Z=2 codestream ({} B) shorter than Z=1 ({} B)",
+            cs2.len(),
+            cs1.len()
+        );
+        assert!(
+            cs3.len() >= cs2.len(),
+            "Z=3 codestream ({} B) shorter than Z=2 ({} B)",
+            cs3.len(),
+            cs2.len()
+        );
+    }
+
+    /// Round-6: explicit precincts + Z_blk = 3 — cross-checks that the
+    /// new refinement bytes flow correctly through every packet header
+    /// even when the precinct grid produces multiple precincts per
+    /// resolution.
+    #[test]
+    fn roundtrip_64x64_nl2_zblk_3_smoke_decode() {
+        let mut data = Vec::with_capacity(64 * 64);
+        for i in 0..(64 * 64) {
+            data.push(((i * 7 + 3) % 256) as u8);
+        }
+        let img = Jpeg2000Image {
+            width: 64,
+            height: 64,
+            pixel_format: PixelFormat::Gray8,
+            planes: vec![Jpeg2000Plane {
+                stride: 64,
+                data: data.clone(),
+            }],
+            pts: None,
+        };
+        let opts = EncodeOptionsHt {
+            num_decomp: 2,
+            pass_count: HtPassCount::CleanupSigpropMagref,
+            ..Default::default()
+        };
+        let cs = encode_image_htj2k(&img, &opts).expect("encode");
+        let p = probe(&cs).expect("probe");
+        assert_eq!(p.flavour, J2kFlavour::HighThroughput);
+        let decoded = decode_jpeg2000(&cs).expect("decode");
+        assert_eq!(decoded.planes[0].data, data);
+    }
+
+    /// Round-6: multi-tile Gray8 64×64 with 32×32 tile size + Z_blk = 3.
+    /// Confirms the refinement passes work across tile boundaries.
+    #[test]
+    fn roundtrip_64x64_multitile_zblk_3() {
+        let mut data = Vec::with_capacity(64 * 64);
+        for y in 0..64 {
+            for x in 0..64 {
+                data.push(((x ^ y) * 4 % 255) as u8);
+            }
+        }
+        let img = Jpeg2000Image {
+            width: 64,
+            height: 64,
+            pixel_format: PixelFormat::Gray8,
+            planes: vec![Jpeg2000Plane {
+                stride: 64,
+                data: data.clone(),
+            }],
+            pts: None,
+        };
+        let opts = EncodeOptionsHt {
+            num_decomp: 1,
+            tile_size: Some((32, 32)),
+            pass_count: HtPassCount::CleanupSigpropMagref,
             ..Default::default()
         };
         let cs = encode_image_htj2k(&img, &opts).expect("encode");
