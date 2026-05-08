@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/OxideAV/oxideav-jpeg2000/compare/v0.0.9...v0.0.10) - 2026-05-08
+
+### Other
+
+- HTJ2K encoder round 6: SigProp + MagRef passes wired into codestream
+- rustfmt the `__oxideav_entry` re-export line
+- drop dead `linkme` dep
+- re-export __oxideav_entry from registry sub-module
+- jpeg2000 encoder round 5: explicit precincts + HTJ2K SigProp/MagRef + 9/7 QCD clarity
+- registry calls: rename make_decoder/make_encoder → first_decoder/first_encoder
+- auto-register via oxideav_core::register! macro (linkme distributed slice)
+- HTJ2K encoder round 4 — 9/7 + multi-tile + sub-sampled chroma + PPM/PPT (task #477)
+- unify entry point on register(&mut RuntimeContext) ([#502](https://github.com/OxideAV/oxideav-jpeg2000/pull/502))
+- add register_containers for .j2k/.jp2/.jpf/.jpx/.jpm/.j2c/.jpc
+
 ### Added
 
 - HTJ2K encoder round 6: SigProp + MagRef refinement passes wired into
