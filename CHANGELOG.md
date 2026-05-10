@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- 5/3 lossless encoder produced unrecoverable streams for any input
+  whose tile-component band needed more than one code-block per
+  precinct (e.g. `1x129` / `129x1` / `2x129` RGB at the default 64x64
+  cblk). Two underlying bugs in `encode/tile.rs`:
+  1. The tier-2 emitter wrote ALL inclusion bits, then ALL
+     zero-bitplane bits, then ALL num-passes / Lblock / length bits —
+     while the matching decoder reads those four streams INTERLEAVED
+     per code-block (T.800 §B.10.4 / §B.10.7 / §B.10.8 / §B.10.9). With
+     >= 2 cblks per precinct the streams diverged and every packet
+     decoded as empty.
+  2. The zero-bitplane tag tree was emitted as one independent
+     `OneLeafTree` per code-block, while the decoder uses a SHARED
+     per-precinct multi-leaf `TagTree` (T.800 §B.10.7) — the shortcut
+     happened to match decoder output only when the precinct held a
+     single cblk.
+  Fixed by interleaving the four per-cblk bit streams and replacing
+  `OneLeafTree` with the shared `TagTreeEnc`. New regression tests in
+  `tests/roundtrip_53.rs` pin `1x129`, `129x1`, and a 16x16-cblk small
+  variant. Caught by `jp2_lossless_self_roundtrip` libFuzzer harness.
+- 5/3 (and 9/7) encoder skipped the forward DWT entirely whenever
+  **either** axis was < 2 (e.g. `2x1`, `1xN`) while still signalling
+  `num_decomp = 1` in COD — the decoder then ran a full inverse DWT on
+  raw level-shifted samples and produced garbage. Per T.800 §F.4.2 the
+  1-D analysis on a length-1 axis is a no-op, so the fix is to keep
+  applying the level as long as **either** axis has length >= 2 (the
+  `[LL, HL]` / `[LL; LH]` band layout matches what `build_subbands`
+  already produces). Caught by both fuzz harnesses.
+
 ## [0.0.10](https://github.com/OxideAV/oxideav-jpeg2000/compare/v0.0.9...v0.0.10) - 2026-05-08
 
 ### Other

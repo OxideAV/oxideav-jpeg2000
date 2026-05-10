@@ -101,10 +101,22 @@ pub fn encode_tile(
         // Apply `num_decomp` levels of forward DWT. At each level, the
         // low-pass quadrant of the previous canvas becomes the input
         // to the next level. Strides don't change — we work in place.
+        //
+        // T.800 §F.4.2: the 1-D lifting on a length-1 row/column is a
+        // no-op (the high-pass band is empty), so we may still apply
+        // the level as long as **either** axis has length ≥ 2. Skipping
+        // when only one axis is degenerate (the previous `||` guard)
+        // left the canvas un-transformed while the COD still claimed
+        // `num_decomp` levels — the decoder then ran a full inverse DWT
+        // on raw level-shifted samples and produced garbage. The
+        // canonical layout produced by `fdwt_53` for a 2×1 image is
+        // `[LL, HL]` (and symmetrically `[LL; LH]` for 1×N), which is
+        // exactly what `build_subbands` expects (LH / HH have height 0
+        // / width 0 respectively in the degenerate axis).
         let mut cur_w = comp_w;
         let mut cur_h = comp_h;
         for _level in 0..num_decomp as usize {
-            if cur_w < 2 || cur_h < 2 {
+            if cur_w < 2 && cur_h < 2 {
                 break;
             }
             fdwt_53(&mut canvas, cur_w, cur_h, comp_w);
@@ -349,10 +361,15 @@ pub fn encode_tile_97(
         // 5/3 path: at each level, transform the current active
         // rectangle, then compact the low-pass quadrant so the next
         // level operates on a smaller top-left region.
+        //
+        // Skip-when-both-axes-degenerate (T.800 §F.4.2): see the
+        // matching comment above `fdwt_53` for why we keep applying the
+        // 1-D pass on a length-1 axis even when the other axis is
+        // degenerate.
         let mut cur_w = comp_w;
         let mut cur_h = comp_h;
         for _level in 0..num_decomp as usize {
-            if cur_w < 2 || cur_h < 2 {
+            if cur_w < 2 && cur_h < 2 {
                 break;
             }
             fdwt_97(&mut canvas, cur_w, cur_h, comp_w);
@@ -630,71 +647,78 @@ fn emit_packet(out: &mut Vec<u8>, res: &mut EncResolution) -> Result<()> {
 
     bio.write_bit(1);
 
-    // Per sub-band: inclusion + zero-bitplane tag trees + num-passes +
-    // Lblock growth + length.
-    for (sb_idx, sb) in res.subbands.iter().enumerate() {
+    // Per sub-band: per-cblk INTERLEAVED inclusion → zero-bitplane →
+    // num-passes → Lblock growth → length. The decoder reads these
+    // four bit-streams together for every cblk before moving on
+    // (T.800 §B.10.4 / §B.10.7 / §B.10.8 / §B.10.9), so the encoder
+    // must emit them in the same per-cblk order. A previous version
+    // wrote ALL inclusion bits first, ALL zero-bitplane bits second,
+    // and so on — that happened to match the decoder when each band
+    // had at most one code-block (the historical default for
+    // <= 64×64 LL_NL grids), but as soon as a band straddles a code-
+    // block boundary the streams diverge and the decoder mis-parses
+    // every packet that follows. Caught by round-1 fuzz at 1×129
+    // RGB / 129×1 RGB / 2×129 RGB inputs.
+    //
+    // The zero-bitplane tag tree is also a SHARED per-precinct tree
+    // (one leaf per cblk) — the previous OneLeafTree-per-cblk shortcut
+    // was correct only when the precinct held a single cblk because
+    // the internal-node bits collapsed away. With > 1 cblk the
+    // decoder walks shared internal nodes that the encoder never
+    // emitted bits for. Fixed by replacing OneLeafTree with the same
+    // multi-leaf TagTreeEnc used for inclusion.
+    for sb_idx in 0..res.subbands.len() {
         let p = &res.precincts[sb_idx];
         if p.cblks.is_empty() {
             continue;
         }
-        // Build inclusion tag tree leaves: 0 = included here, big value
-        // otherwise. Since this is layer 0 we always pass threshold 1,
-        // so the leaf must be 0 for included blocks.
         let w = p.cblks_w;
         let h = p.cblks_h;
         let mut incl_leaves = vec![u32::MAX; w * h];
         let mut zb_leaves = vec![0u32; w * h];
         for i in 0..w * h {
             if p.included[i] {
+                // Layer 0 inclusion threshold is 1, so leaf value 0
+                // signals "include here".
                 incl_leaves[i] = 0;
                 zb_leaves[i] = p.cblks[i].missing_msb;
             }
         }
-        encode_tagtree(&mut bio, w, h, &incl_leaves, 1);
-        // zero-bitplane tag trees: encoded per block if included. For
-        // each included block, we iterate thresholds from 1 upward
-        // until the leaf value < threshold. OpenJPEG instead writes
-        // thresholds: we pass incl-ordered threshold `missing_msb + 1`.
+        let mut incl_tree = TagTreeEnc::new(w, h, &incl_leaves);
+        let mut zb_tree = TagTreeEnc::new(w, h, &zb_leaves);
         for cy in 0..h {
             for cx in 0..w {
                 let idx = cy * w + cx;
+                // Inclusion query (single threshold = layer + 1 = 1).
+                incl_tree.emit(&mut bio, cx, cy, 1);
                 if !p.included[idx] {
                     continue;
                 }
-                // zero-bitplane value = missing_msb. Encode threshold
-                // sweep from 1 upward — this emits `missing_msb` zero
-                // bits and then a single one bit at threshold
-                // `missing_msb + 1`.
+                // Zero-bitplane query — sweep thresholds 1..=mm + 1
+                // mirroring the decoder's `loop { decode(.., i); i+=1 }`
+                // (i = 0 is a no-op since `low < 0` is unreachable for
+                // u32, so we start at 1).
                 let mm = zb_leaves[idx];
-                let mut tree = OneLeafTree::new(mm);
                 for th in 1..=mm + 1 {
-                    tree.decode_or_encode(&mut bio, th);
+                    zb_tree.emit(&mut bio, cx, cy, th);
                 }
-                let _ = sb;
-            }
-        }
-        // For each included block: num_passes + lblock growth + length.
-        for (idx, cblk) in p.cblks.iter().enumerate() {
-            if !p.included[idx] {
-                continue;
-            }
-            write_num_passes(&mut bio, cblk.total_passes);
-            // Adaptive Lblock. We start Lblock at 3 (matches the
-            // decoder's `CblkState::default`). For a single-layer
-            // stream we don't need to grow it past what's required.
-            let mut lblock = 3u32;
-            loop {
-                let (needs_growth, _) =
-                    bits_needed(cblk.data.len() as u32, cblk.total_passes, lblock);
-                if !needs_growth {
-                    break;
+                // num-passes + Lblock growth + length.
+                let cblk = &p.cblks[idx];
+                write_num_passes(&mut bio, cblk.total_passes);
+                let mut lblock = 3u32;
+                loop {
+                    let (needs_growth, _) =
+                        bits_needed(cblk.data.len() as u32, cblk.total_passes, lblock);
+                    if !needs_growth {
+                        break;
+                    }
+                    bio.write_bit(1);
+                    lblock += 1;
                 }
-                bio.write_bit(1);
-                lblock += 1;
+                bio.write_bit(0);
+                let total_len_bits = lblock + ilog2(cblk.total_passes);
+                bio.write(total_len_bits, cblk.data.len() as u32);
             }
-            bio.write_bit(0);
-            let total_len_bits = lblock + ilog2(cblk.total_passes);
-            bio.write(total_len_bits, cblk.data.len() as u32);
         }
     }
     bio.inalign();
@@ -761,27 +785,15 @@ fn write_num_passes(bio: &mut BioWriter, n: u32) {
     bio.write(7, n - 37);
 }
 
-/// Encode a tag tree so the decoder — given the sequence of per-leaf
-/// threshold queries — recovers `values[]`.
+/// Tag-tree encoder — see [`TagTree::decode`] in `decode/tagtree.rs`
+/// for the matching read-side state machine.
 ///
-/// We emit *value + 1* zero bits followed by one `1` bit at each
-/// internal level to signal that the decoded lower bound has reached
-/// the true value. This is the standard build per T.800 §B.10.2.
-fn encode_tagtree(bio: &mut BioWriter, w: usize, h: usize, values: &[u32], threshold: u32) {
-    // Reuse the simple-decoder structure. To stay consistent with the
-    // decoder we emit threshold queries one by one: for each leaf, we
-    // iterate the threshold 1..=threshold and emit the bit that the
-    // decoder would expect.
-    let mut tree = TagTreeEnc::new(w, h, values);
-    for y in 0..h {
-        for x in 0..w {
-            for th in 1..=threshold {
-                tree.emit(bio, x, y, th);
-            }
-        }
-    }
-}
-
+/// Each call to [`TagTreeEnc::emit`] processes one threshold query for
+/// one leaf, walking root → leaf and emitting the bits the decoder will
+/// consume. Internal-node "1" terminators are emitted exactly once per
+/// node (tracked by `resolved`), which is what makes the shared per-
+/// precinct tag tree correct across multiple cblks: only the *first*
+/// cblk visit pays for internal-node bits.
 struct TagTreeEnc {
     w: usize,
     h: usize,
@@ -904,34 +916,6 @@ impl TagTreeEnc {
                 lh = lh.div_ceil(2);
             }
             (lw, lh)
-        }
-    }
-}
-
-/// Minimal single-leaf tag tree wrapper, used for zero-bitplane tag
-/// trees where each cblk has its own tree of size 1×1.
-struct OneLeafTree {
-    value: u32,
-    low: u32,
-    resolved: bool,
-}
-
-impl OneLeafTree {
-    fn new(value: u32) -> Self {
-        OneLeafTree {
-            value,
-            low: 0,
-            resolved: false,
-        }
-    }
-    fn decode_or_encode(&mut self, bio: &mut BioWriter, threshold: u32) {
-        while self.low < threshold && self.low < self.value {
-            bio.write_bit(0);
-            self.low += 1;
-        }
-        if self.low < threshold && !self.resolved {
-            bio.write_bit(1);
-            self.resolved = true;
         }
     }
 }

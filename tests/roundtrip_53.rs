@@ -95,6 +95,194 @@ fn roundtrip_16x16_one_decomp_level_is_bit_exact() {
     );
 }
 
+/// Round-1 fuzz regressions — degenerate single-row / single-column
+/// inputs at `num_decomp = 1`. Before the fix, the encoder skipped the
+/// forward DWT entirely whenever **either** axis was < 2 while still
+/// signalling `num_decomp = 1` in COD; the decoder then ran a full
+/// inverse DWT on raw level-shifted samples and produced garbage —
+/// caught by both `oxideav_encode_openjpeg_decode` and
+/// `jp2_lossless_self_roundtrip` fuzz harnesses.
+///
+/// Per T.800 §F.4.2 the 1-D analysis on a length-1 axis is a no-op (the
+/// HP band is empty), so the fix is to keep applying the level as long
+/// as **either** axis has length >= 2 — the canonical band layout
+/// (`[LL, HL]` for 2x1, `[LL; LH]` for 1xN) is what the matching
+/// `build_subbands` produces.
+#[test]
+fn roundtrip_2x1_rgb_one_decomp_is_bit_exact() {
+    // Reproducer bytes from
+    // fuzz/artifacts/oxideav_encode_openjpeg_decode/crash-29ee71...
+    let rgb: &[u8] = &[0x04, 0x2c, 0xc4, 0x71, 0x04, 0x2c];
+    let src = VideoFrame {
+        pts: None,
+        planes: vec![VideoPlane {
+            stride: 6,
+            data: rgb.to_vec(),
+        }],
+    };
+    let opts = EncodeOptions {
+        num_decomp: 1,
+        ..EncodeOptions::default()
+    };
+    let bytes = encode_frame(&Frame::Video(src), 2, 1, PixelFormat::Rgb24, &opts).expect("encode");
+    let dec = decode(&bytes);
+    assert_eq!(dec.planes.len(), 3);
+    let mut got = Vec::with_capacity(rgb.len());
+    for i in 0..2 {
+        got.push(dec.planes[0].data[i]);
+        got.push(dec.planes[1].data[i]);
+        got.push(dec.planes[2].data[i]);
+    }
+    assert_eq!(got.as_slice(), rgb, "2x1 RGB at NL=1 must round-trip");
+}
+
+#[test]
+fn roundtrip_1x2_rgb_one_decomp_is_bit_exact() {
+    let rgb: &[u8] = &[0x12, 0x34, 0x56, 0xab, 0xcd, 0xef];
+    let src = VideoFrame {
+        pts: None,
+        planes: vec![VideoPlane {
+            stride: 3,
+            data: rgb.to_vec(),
+        }],
+    };
+    let opts = EncodeOptions {
+        num_decomp: 1,
+        ..EncodeOptions::default()
+    };
+    let bytes = encode_frame(&Frame::Video(src), 1, 2, PixelFormat::Rgb24, &opts).expect("encode");
+    let dec = decode(&bytes);
+    let mut got = Vec::with_capacity(rgb.len());
+    for i in 0..2 {
+        got.push(dec.planes[0].data[i]);
+        got.push(dec.planes[1].data[i]);
+        got.push(dec.planes[2].data[i]);
+    }
+    assert_eq!(got.as_slice(), rgb, "1x2 RGB at NL=1 must round-trip");
+}
+
+/// Round-1 fuzz regression — `1×129` RGB at `num_decomp = 1` produces
+/// a band where the LL_1 sub-band is `1×65`, which spans **two**
+/// `64×64` code-blocks vertically. The previous tier-2 emitter wrote
+/// (i) ALL inclusion bits → ALL zero-bitplane bits → ALL num-passes
+/// bits, while the decoder reads them INTERLEAVED per cblk; and (ii) a
+/// per-cblk `OneLeafTree` for the zero-bitplane tag tree, while the
+/// decoder uses a SHARED per-precinct tag tree (T.800 §B.10.4 +
+/// §B.10.7). With ≥ 2 cblks per precinct, both shortcuts produced a
+/// stream that decoded to all-`0x80` (the level-shift constant —
+/// every packet read as empty) — caught by `jp2_lossless_self_roundtrip`
+/// fuzz at minimised 388-byte input. Fixed by interleaving the four
+/// per-cblk bit streams and replacing `OneLeafTree` with the shared
+/// `TagTreeEnc`.
+#[test]
+fn roundtrip_1x129_rgb_one_decomp_two_cblks_per_band() {
+    let rgb: Vec<u8> = (0..(129u32 * 3)).map(|i| (i % 256) as u8).collect();
+    let src = VideoFrame {
+        pts: None,
+        planes: vec![VideoPlane {
+            stride: 3,
+            data: rgb.clone(),
+        }],
+    };
+    let opts = EncodeOptions {
+        num_decomp: 1,
+        ..EncodeOptions::default()
+    };
+    let bytes =
+        encode_frame(&Frame::Video(src), 1, 129, PixelFormat::Rgb24, &opts).expect("encode");
+    let dec = decode(&bytes);
+    let mut got = Vec::with_capacity(rgb.len());
+    for i in 0..129 {
+        got.push(dec.planes[0].data[i]);
+        got.push(dec.planes[1].data[i]);
+        got.push(dec.planes[2].data[i]);
+    }
+    assert_eq!(
+        got.as_slice(),
+        rgb.as_slice(),
+        "1x129 RGB at NL=1 (LL_1=1x65 -> 2 cblks vertically) must round-trip"
+    );
+}
+
+#[test]
+fn roundtrip_129x1_rgb_one_decomp_two_cblks_per_band() {
+    let rgb: Vec<u8> = (0..(129u32 * 3)).map(|i| (i % 256) as u8).collect();
+    let src = VideoFrame {
+        pts: None,
+        planes: vec![VideoPlane {
+            stride: 129 * 3,
+            data: rgb.clone(),
+        }],
+    };
+    let opts = EncodeOptions {
+        num_decomp: 1,
+        ..EncodeOptions::default()
+    };
+    let bytes =
+        encode_frame(&Frame::Video(src), 129, 1, PixelFormat::Rgb24, &opts).expect("encode");
+    let dec = decode(&bytes);
+    let mut got = Vec::with_capacity(rgb.len());
+    for i in 0..129 {
+        got.push(dec.planes[0].data[i]);
+        got.push(dec.planes[1].data[i]);
+        got.push(dec.planes[2].data[i]);
+    }
+    assert_eq!(
+        got.as_slice(),
+        rgb.as_slice(),
+        "129x1 RGB at NL=1 must round-trip"
+    );
+}
+
+/// Force ≥ 2 cblks per band via a small explicit `cblk_*_log2` (16x16
+/// blocks) so the multi-cblk path runs at modest image sizes and the
+/// regression coverage doesn't depend on the default 64x64 cblk size.
+#[test]
+fn roundtrip_small_cblk_multi_cblks_per_band() {
+    let rgb: Vec<u8> = (0..(40u32 * 3)).map(|i| (i % 256) as u8).collect();
+    let src = VideoFrame {
+        pts: None,
+        planes: vec![VideoPlane {
+            stride: 3,
+            data: rgb.clone(),
+        }],
+    };
+    let opts = EncodeOptions {
+        num_decomp: 1,
+        cblk_w_log2: 4,
+        cblk_h_log2: 4,
+        ..EncodeOptions::default()
+    };
+    let bytes = encode_frame(&Frame::Video(src), 1, 40, PixelFormat::Rgb24, &opts).expect("encode");
+    let dec = decode(&bytes);
+    let mut got = Vec::with_capacity(rgb.len());
+    for i in 0..40 {
+        got.push(dec.planes[0].data[i]);
+        got.push(dec.planes[1].data[i]);
+        got.push(dec.planes[2].data[i]);
+    }
+    assert_eq!(got.as_slice(), rgb.as_slice());
+}
+
+#[test]
+fn roundtrip_2x1_gray_one_decomp_is_bit_exact() {
+    let src = VideoFrame {
+        pts: None,
+        planes: vec![VideoPlane {
+            stride: 2,
+            data: vec![0x42, 0xa7],
+        }],
+    };
+    let opts = EncodeOptions {
+        num_decomp: 1,
+        ..EncodeOptions::default()
+    };
+    let bytes =
+        encode_frame(&Frame::Video(src.clone()), 2, 1, PixelFormat::Gray8, &opts).expect("encode");
+    let dec = decode(&bytes);
+    assert_eq!(dec.planes[0].data, src.planes[0].data);
+}
+
 #[test]
 fn roundtrip_gradient_is_bit_exact() {
     let src = build_gradient(64, 64);
