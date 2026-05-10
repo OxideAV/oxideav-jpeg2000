@@ -88,7 +88,7 @@ fn image_from_fuzz_input(data: &[u8]) -> Option<(u32, u32, &[u8])> {
     Some((width as u32, height as u32, rgb))
 }
 
-fn build_rgb_frame(width: u32, height: u32, rgb: &[u8]) -> Frame {
+fn build_rgb_frame(width: u32, _height: u32, rgb: &[u8]) -> Frame {
     Frame::Video(VideoFrame {
         pts: None,
         planes: vec![VideoPlane {
@@ -100,7 +100,7 @@ fn build_rgb_frame(width: u32, height: u32, rgb: &[u8]) -> Frame {
 
 fn decode_with_oxideav(bytes: &[u8]) -> Option<VideoFrame> {
     let mut reg = CodecRegistry::new();
-    oxideav_jpeg2000::register(&mut reg);
+    oxideav_jpeg2000::register_codecs(&mut reg);
     let params = CodecParameters::video(CodecId::new(oxideav_jpeg2000::CODEC_ID_STR));
     let mut dec = reg.first_decoder(&params).ok()?;
     let pkt = Packet::new(0u32, TimeBase::new(1, 1), bytes.to_vec());

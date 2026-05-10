@@ -72,7 +72,7 @@ fn image_from_fuzz_input(data: &[u8]) -> Option<(u32, u32, &[u8])> {
     Some((width as u32, height as u32, rgb))
 }
 
-fn build_rgb_frame(width: u32, height: u32, rgb: &[u8]) -> Frame {
+fn build_rgb_frame(width: u32, _height: u32, rgb: &[u8]) -> Frame {
     Frame::Video(VideoFrame {
         pts: None,
         planes: vec![VideoPlane {
