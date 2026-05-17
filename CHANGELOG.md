@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.11](https://github.com/OxideAV/oxideav-jpeg2000/compare/v0.0.10...v0.0.11) - 2026-05-17
+
+### Other
+
+- decoder round 73: Region of Interest (RGN) Maxshift decode (T.800 §A.6.3 + Annex H)
+- fix lossless 5/3 streams for degenerate-axis & multi-cblk inputs
+
 ### Added
 
 - decoder: Region of Interest (RGN) Maxshift method (T.800 §A.6.3 +
