@@ -251,10 +251,31 @@ pub fn decode_frame(cs: &Codestream, buf: &[u8]) -> Result<Jpeg2000Image> {
             }
         };
 
+        // Per-component RGN Maxshift `s` (T.800 §A.6.3 + §H.1).
+        // Precedence: a tile-part RGN for component `c` overrides the
+        // main-header RGN for that same component (and same tile). The
+        // first per-tile-part RGN encountered wins (per the spec,
+        // multiple tile-part RGNs for the same component must be
+        // consistent — we don't validate that here, just take the first).
+        let mut roi_shifts: Vec<u8> = vec![0u8; num_comps];
+        for rgn in &cs.rgn {
+            if (rgn.crgn as usize) < num_comps {
+                roi_shifts[rgn.crgn as usize] = rgn.sprgn;
+            }
+        }
+        for &tp_ix in &by_tile[tile_idx] {
+            for rgn in &cs.tile_parts[tp_ix].rgn {
+                if (rgn.crgn as usize) < num_comps {
+                    roi_shifts[rgn.crgn as usize] = rgn.sprgn;
+                }
+            }
+        }
+
         let params = DecodeParams {
             comp_precisions: &comp_precisions,
             poc: tile_poc.as_ref(),
             packet_headers: tile_packet_headers.as_deref(),
+            roi_shifts: &roi_shifts,
         };
         let mut planes = decode_tile_with_params(&tile_body, &comp_sizes_rel, &cod, &qcd, &params)?;
 

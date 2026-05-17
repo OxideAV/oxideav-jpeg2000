@@ -127,10 +127,12 @@ fn diag_opj16_sub_band_values() {
     }
     let comp_sizes: Vec<(u32, u32, u32, u32)> = vec![(0, 0, w, h)];
     let precisions = vec![8u32];
+    let roi_shifts = vec![0u8];
     let params = DecodeParams {
         comp_precisions: &precisions,
         poc: None,
         packet_headers: None,
+        roi_shifts: &roi_shifts,
     };
     let planes = decode_tile_with_params(&body, &comp_sizes, &cod, &qcd, &params).expect("tile");
 

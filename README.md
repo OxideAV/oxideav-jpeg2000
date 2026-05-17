@@ -12,7 +12,8 @@ framework but usable standalone.
 marker chain (SOC, SIZ, COD, QCD, COC, QCC, RGN, POC, PPM, PPT, PLM,
 PLT, TLM, CRG, COM, SOT, SOD, EOC) and returns image geometry,
 per-component bit depth / signedness / sub-sampling, raw COD and QCD
-segments, and each tile-part's byte range.
+segments, parsed RGN (Region of Interest) segments at both main-header
+and tile-part-header scope, and each tile-part's byte range.
 
 **Sample decoder** — the `decode` module reconstructs pixels for
 baseline `.j2k` codestreams. The pipeline covers:
@@ -37,6 +38,16 @@ baseline `.j2k` codestreams. The pipeline covers:
 - **Reversible component transform (RCT)** for 3-channel 5/3 streams
   and **irreversible colour transform (ICT)** for 3-channel 9/7
   streams with `MCT = 1` in the COD.
+- **Region of Interest (RGN) Maxshift method** (T.800 §A.6.3 +
+  Annex H). The parsed RGN segments thread a per-component shift `s`
+  into `DecodeParams::roi_shifts`; the tier-1 / synthesis path
+  bumps `band_numbps` by `s` on every codeblock whose
+  `missing_msb < s` (i.e. those that exercise the extra ROI bit-
+  planes) and divides the reconstructed magnitude by `2^s` to undo
+  the encode-side upshift. Bit-exact lossless against
+  `opj_compress -ROI c=<i>,U=<s>` fixtures: 8-bit Gray (U=4, U=8),
+  RGB+RCT with U=4 on luma, and within ≤ 4 LSB against the
+  `opj_decompress` reference for the 9/7 irreversible RGN path.
 
 **Sample encoder** — the `encode` module emits `.j2k` codestreams
 (or `.jp2` containers) for both the **5/3 integer reversible
@@ -89,8 +100,10 @@ irreversible path produces a lossy bitstream with round-trip PSNR
 - **Multi-tile codestreams** — single-tile only for now.
 - **Multi-layer (progressive quality) streams** — single layer only.
 - **User-defined precinct grids**, **CPRL / PCRL / RPCL progression
-  orders**, **PPT / PPM packed headers**, **region-of-interest
-  (RGN)**.
+  orders**, **PPT / PPM packed headers**.
+- **Region of Interest (RGN) on the encoder side** — the decoder
+  honours `RGN` segments produced by other encoders, but our own
+  encoder does not yet emit `RGN` markers.
 - The **HT block coder** (Part 15, ISO/IEC 15444-15 / ITU-T T.814) is
   decoder-side functional behind the `htj2k` Cargo feature for
   single-tile single-layer LRCP codestreams. CAP marker parsing, the

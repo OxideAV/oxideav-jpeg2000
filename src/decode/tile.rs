@@ -668,6 +668,15 @@ pub struct DecodeParams<'a> {
     /// bytes from this slice and packet bodies from `body`. When
     /// `None`, both come from `body` (the historical layout).
     pub packet_headers: Option<&'a [u8]>,
+    /// Per-component Maxshift ROI scaling value `s` from any in-scope
+    /// `RGN` marker (T.800 §A.6.3 + §H.1). `0` means "no ROI for this
+    /// component" — the synthesis runs unchanged. A non-zero entry
+    /// causes (a) `band_numbps` to be bumped by `s` so tier-1 decodes
+    /// the extra ROI bit-planes, and (b) a post-T1 threshold-shift:
+    /// any reconstructed magnitude `>= 2^Mb` is identified as an ROI
+    /// coefficient and divided by `2^s`. Slice length should equal
+    /// `comp_precisions.len()`; missing entries default to 0.
+    pub roi_shifts: &'a [u8],
 }
 
 #[allow(clippy::needless_range_loop)]
@@ -679,10 +688,12 @@ pub fn decode_tile(
 ) -> Result<Vec<Vec<i32>>> {
     // Legacy signature used by tests: assume 8-bit components.
     let precisions: Vec<u32> = vec![8u32; comp_sizes.len()];
+    let roi_shifts: Vec<u8> = vec![0u8; comp_sizes.len()];
     let params = DecodeParams {
         comp_precisions: &precisions,
         poc: None,
         packet_headers: None,
+        roi_shifts: &roi_shifts,
     };
     decode_tile_with_params(body, comp_sizes, cod, qcd, &params)
 }
@@ -751,6 +762,7 @@ pub fn decode_tile_with_params(
             out.push(Vec::new());
             continue;
         }
+        let roi_shift = params.roi_shifts.get(comp_idx).copied().unwrap_or(0);
         if cod.transform == 1 {
             out.push(synth_component_53(
                 &layouts[comp_idx],
@@ -759,6 +771,7 @@ pub fn decode_tile_with_params(
                 comp_h,
                 cod,
                 qcd,
+                roi_shift,
             )?);
         } else {
             // 9/7 irreversible float path.
@@ -771,6 +784,7 @@ pub fn decode_tile_with_params(
                 cod,
                 qcd,
                 prec,
+                roi_shift,
             )?);
         }
     }
@@ -788,6 +802,7 @@ fn synth_component_53(
     comp_h: usize,
     cod: &CodParams,
     qcd: &QcdParams,
+    roi_shift: u8,
 ) -> Result<Vec<i32>> {
     // Decode every sub-band's code-blocks into its own buffer.
     let mut band_bufs: Vec<Vec<i32>> = Vec::with_capacity(num_res * 3 + 1);
@@ -811,7 +826,24 @@ fn synth_component_53(
                     let w = (bx1 - bx0) as usize;
                     let h = (by1 - by0) as usize;
                     let (eps, _mant) = qcd.bands[sb.band_idx];
-                    let band_numbps = qcd.guard_bits as i32 + eps as i32 - 1;
+                    // Per T.800 §A.6.3 + §H.1 the RGN Maxshift `s`
+                    // extends the bit-plane budget by `s` so the
+                    // encoder can place upshifted coefficients above
+                    // the natural background range. The encoder
+                    // signals the per-codeblock effective shift via
+                    // `missing_msb`: codeblocks that exercise the
+                    // extra `s` planes have `missing_msb < s` and
+                    // need a `>> s` correction; codeblocks confined
+                    // to the bottom Mb planes (`missing_msb >= s`)
+                    // were never upshifted and decode normally.
+                    let bg_mb = qcd.guard_bits as i32 + eps as i32 - 1;
+                    let (extra_planes, post_shift) =
+                        if roi_shift > 0 && st.missing_msb < roi_shift as u32 {
+                            (roi_shift as i32, roi_shift as u32)
+                        } else {
+                            (0, 0)
+                        };
+                    let band_numbps = bg_mb + extra_planes;
                     let bpno = band_numbps + 1 - st.missing_msb as i32;
                     if bpno < 1 {
                         continue;
@@ -829,7 +861,13 @@ fn synth_component_53(
                     let rel_y = (by0 - sb.y0) as usize;
                     for ly in 0..h {
                         for lx in 0..w {
-                            let v = decoded.data[ly * w + lx];
+                            let v0 = decoded.data[ly * w + lx];
+                            let v = if post_shift > 0 {
+                                let sign = v0.signum();
+                                sign * (v0.abs() >> post_shift)
+                            } else {
+                                v0
+                            };
                             buf[(rel_y + ly) * bw + (rel_x + lx)] = v / 2;
                         }
                     }
@@ -921,6 +959,7 @@ fn synth_component_97(
     cod: &CodParams,
     qcd: &QcdParams,
     precision: u32,
+    roi_shift: u8,
 ) -> Result<Vec<i32>> {
     // Decode every sub-band's code-blocks into a float buffer with
     // dequantised samples.
@@ -956,7 +995,19 @@ fn synth_component_97(
                     let (bx0, by0, bx1, by1) = layout.cblk_rects[sb_idx][idx];
                     let w = (bx1 - bx0) as usize;
                     let h = (by1 - by0) as usize;
-                    let band_numbps = qcd.guard_bits as i32 + eps as i32 - 1;
+                    // RGN per-codeblock: if `missing_msb < s` the
+                    // encoder reached the extra `s` bit-planes for
+                    // this block and we must (a) extend the budget
+                    // by `s` and (b) divide the decoded magnitude
+                    // by `2^s` post-T1 (T.800 §A.6.3 + §H.1).
+                    let bg_mb = qcd.guard_bits as i32 + eps as i32 - 1;
+                    let (extra_planes, post_shift) =
+                        if roi_shift > 0 && st.missing_msb < roi_shift as u32 {
+                            (roi_shift as i32, roi_shift as u32)
+                        } else {
+                            (0, 0)
+                        };
+                    let band_numbps = bg_mb + extra_planes;
                     let bpno = band_numbps + 1 - st.missing_msb as i32;
                     if bpno < 1 {
                         continue;
@@ -974,7 +1025,13 @@ fn synth_component_97(
                     let rel_y = (by0 - sb.y0) as usize;
                     for ly in 0..h {
                         for lx in 0..w {
-                            let v = decoded.data[ly * w + lx];
+                            let v0 = decoded.data[ly * w + lx];
+                            let v = if post_shift > 0 {
+                                let sign = v0.signum();
+                                sign * (v0.abs() >> post_shift)
+                            } else {
+                                v0
+                            };
                             buf[(rel_y + ly) * bw + (rel_x + lx)] = (v as f64 * scale) as f32;
                         }
                     }

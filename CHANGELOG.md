@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- decoder: Region of Interest (RGN) Maxshift method (T.800 §A.6.3 +
+  Annex H). The codestream parser now exposes parsed `Rgn` segments
+  (`Crgn`, `Srgn`, `SPrgn`) via `Codestream::rgn` for main-header
+  segments and `TilePart::rgn` for per-tile-part segments; tile-part
+  RGNs override the main-header RGN for the same component on a
+  per-tile basis. The decoder threads the resulting per-component
+  shift `s` through `DecodeParams::roi_shifts` and applies a per-
+  codeblock Maxshift correction in both `synth_component_53` and
+  `synth_component_97`: a codeblock whose `missing_msb < s` has
+  exercised the extra `s` bit-planes (i.e. the encoder either
+  upshifted ROI samples or applied OpenJPEG's component-wide
+  "Component of Interest" mode), so its `band_numbps` is bumped by
+  `s` and the post-T1 magnitude is right-shifted by `s`. Codeblocks
+  with `missing_msb >= s` decode unchanged. New `tests/rgn_decode.rs`
+  pins eight integration cases against `opj_compress -ROI`-generated
+  fixtures: constant Gray8 (U=4, U=8), gradient Gray8 (U=4, U=8 —
+  both bit-exact lossless), RGB+MCT with ROI on luma (bit-exact
+  lossless), and a 9/7 irreversible RGN-on-Gray fixture (max
+  deviation ≤ 4 LSB against the `opj_decompress` reference). The
+  parser tests confirm `Rgn { crgn, srgn=0, sprgn }` is populated
+  correctly for main-header RGN markers.
+
 ### Fixed
 
 - 5/3 lossless encoder produced unrecoverable streams for any input

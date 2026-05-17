@@ -204,6 +204,57 @@ pub struct Cpf {
     pub cpfnum: u128,
 }
 
+/// Parsed `RGN` (Region of Interest) marker segment (T.800 §A.6.3).
+///
+/// `RGN` signals an ROI scaled-by-shift over one component using the
+/// Maxshift method (the only `Srgn` value defined by Part 1, value `0`).
+/// The decoder applies the `SPrgn` upshift after tier-1 to identify
+/// ROI coefficients by magnitude threshold and divide them back down
+/// per T.800 §H.1.
+///
+/// Field layout:
+///
+/// | Field  | Bits | Meaning                                    |
+/// |--------|------|--------------------------------------------|
+/// | `Crgn` | 8/16 | Component index (8 bits if Csiz < 257)     |
+/// | `Srgn` | 8    | ROI style — always `0` (Implicit / Maxshift) |
+/// | `SPrgn`| 8    | Upshift amount applied to ROI coefficients |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rgn {
+    /// `Crgn` — index of the component this RGN applies to.
+    pub crgn: u16,
+    /// `Srgn` — ROI style. Always `0` (Implicit Maxshift) in Part 1.
+    pub srgn: u8,
+    /// `SPrgn` — Maxshift value `s`. Background coefficients are at
+    /// magnitudes `< 2^Mb`; ROI coefficients are at magnitudes
+    /// `>= 2^Mb` and are divided by `2^s` on decode (T.800 §H.1).
+    pub sprgn: u8,
+}
+
+/// Parse one `RGN` marker segment payload.
+///
+/// `bytes` is the payload after Lrgn (variable length depending on
+/// whether `Csiz < 257`, in which case `Crgn` is 8 bits; otherwise 16).
+pub fn parse_rgn(bytes: &[u8], num_components: u16) -> Result<Rgn> {
+    let crgn_bytes = if num_components < 257 { 1 } else { 2 };
+    if bytes.len() < crgn_bytes + 2 {
+        return Err(Error::invalid("jpeg2000: RGN segment truncated"));
+    }
+    let (crgn, rest) = if crgn_bytes == 1 {
+        (bytes[0] as u16, &bytes[1..])
+    } else {
+        (u16::from_be_bytes([bytes[0], bytes[1]]), &bytes[2..])
+    };
+    let srgn = rest[0];
+    let sprgn = rest[1];
+    if srgn != 0 {
+        return Err(Error::unsupported(format!(
+            "jpeg2000: RGN Srgn={srgn} not supported (only Maxshift = 0 in Part 1)"
+        )));
+    }
+    Ok(Rgn { crgn, srgn, sprgn })
+}
+
 /// Records a single tile-part's position + length inside the codestream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TilePart {
@@ -235,6 +286,11 @@ pub struct TilePart {
     /// (across its tile-parts) and reads packet headers from the
     /// resulting buffer.
     pub ppt: Vec<Vec<u8>>,
+    /// Parsed `RGN` marker segments from this tile-part header
+    /// (T.800 §A.6.3), one per component for which RGN applies in this
+    /// tile. Tile-part RGN overrides any main-header RGN for the same
+    /// component (and same tile).
+    pub rgn: Vec<Rgn>,
 }
 
 /// Full parse result for one J2K codestream.
@@ -262,6 +318,11 @@ pub struct Codestream {
     /// When non-empty, every tile's packet headers are stored here
     /// instead of inside the tile-part bodies.
     pub ppm: Vec<Vec<u8>>,
+    /// Parsed `RGN` segments from the main header (T.800 §A.6.3), one
+    /// per component the encoder applied an ROI shift to. A main-header
+    /// RGN applies to every tile unless that tile's first tile-part
+    /// header carries a per-tile RGN for the same component.
+    pub rgn: Vec<Rgn>,
     pub tile_parts: Vec<TilePart>,
     /// Byte offset of the EOC marker, or `None` if the stream was truncated.
     pub eoc_offset: Option<usize>,
@@ -311,8 +372,10 @@ pub fn parse(buf: &[u8]) -> Result<Codestream> {
     // raw payloads here in the order encountered; downstream tier-2
     // setup re-sorts by Zppm and concatenates per §A.7.4.
     let mut ppm: Vec<Vec<u8>> = Vec::new();
+    let mut rgn: Vec<Rgn> = Vec::new();
     let mut tile_parts: Vec<TilePart> = Vec::new();
     let mut eoc_offset: Option<usize> = None;
+    let num_components = siz.num_components() as u16;
 
     loop {
         if cur.remaining() == 0 {
@@ -350,9 +413,12 @@ pub fn parse(buf: &[u8]) -> Result<Codestream> {
                 let seg = cur.read_len_segment()?;
                 ppm.push(seg.to_vec());
             }
+            Marker::RGN => {
+                let seg = cur.read_len_segment()?;
+                rgn.push(parse_rgn(seg, num_components)?);
+            }
             Marker::COC
             | Marker::QCC
-            | Marker::RGN
             | Marker::PPT
             | Marker::TLM
             | Marker::PRF
@@ -383,6 +449,7 @@ pub fn parse(buf: &[u8]) -> Result<Codestream> {
                 // this tile, which is not yet supported).
                 let mut tp_poc: Option<Vec<u8>> = None;
                 let mut tp_ppt: Vec<Vec<u8>> = Vec::new();
+                let mut tp_rgn: Vec<Rgn> = Vec::new();
                 loop {
                     let next = cur.read_marker()?;
                     match next {
@@ -406,11 +473,14 @@ pub fn parse(buf: &[u8]) -> Result<Codestream> {
                             let s = cur.read_len_segment()?;
                             tp_ppt.push(s.to_vec());
                         }
+                        Marker::RGN => {
+                            let s = cur.read_len_segment()?;
+                            tp_rgn.push(parse_rgn(s, num_components)?);
+                        }
                         Marker::COD
                         | Marker::COC
                         | Marker::QCD
                         | Marker::QCC
-                        | Marker::RGN
                         | Marker::PLT
                         | Marker::COM => {
                             let _ = cur.read_len_segment()?;
@@ -448,6 +518,7 @@ pub fn parse(buf: &[u8]) -> Result<Codestream> {
                     sod_length,
                     poc: tp_poc,
                     ppt: tp_ppt,
+                    rgn: tp_rgn,
                 });
                 cur.skip(sod_length)?;
             }
@@ -477,6 +548,7 @@ pub fn parse(buf: &[u8]) -> Result<Codestream> {
         qcd,
         poc,
         ppm,
+        rgn,
         tile_parts,
         eoc_offset,
     })
