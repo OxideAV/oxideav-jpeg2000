@@ -4,6 +4,16 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ## [Unreleased]
 
+## [0.0.11](https://github.com/OxideAV/oxideav-jpeg2000/compare/v0.0.10...v0.0.11) - 2026-05-21
+
+### Other
+
+- round 4: JP2 ISO BMFF box wrapper parser (T.800 Annex I)
+- round 3: typed COC/QCC/POC/RGN/PLT/PPT tile-part markers
+- round 2: SOT/SOD tile-part walker
+- round 1: clean-room main-header parser (SOC/SIZ/COD/QCD)
+- orphan rebuild: clean-room scaffold post 2026-05-20 audit
+
 ### Added
 
 * **Clean-room round 4 (2026-05-21).** JP2 ISO BMFF box wrapper
