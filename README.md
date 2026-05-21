@@ -3,18 +3,20 @@
 Pure-Rust JPEG 2000 (J2K + JP2) and High-Throughput JPEG 2000 (HTJ2K)
 codec.
 
-## Status — 2026-05-21 (clean-room round 3)
+## Status — 2026-05-21 (clean-room round 4)
 
-**Codestream-structural parser only.** The crate parses the
-JPEG 2000 Part-1 **main header** (`SOC`, `SIZ`, `COD`, `QCD`) and
-walks the **tile-part chain** (`SOT` / `SOD` / `EOC`), returning a
-`J2kCodestream` with the main header plus an ordered
-`Vec<TilePart>`. Each `TilePart` carries its parsed `Sot` (tile
-index, `Psot`, `TPsot`, `TNsot`), byte offsets of the `SOT` marker,
-`SOD` marker, and bit-stream body inside the input buffer, plus a
-`Vec<TilePartMarker>` of the **typed marker segments** parsed out
-of the tile-part header between `SOT` and `SOD`. Recognised
-tile-part-header markers parse into typed structs:
+**Codestream-structural + JP2-wrapper parsers.** The crate parses
+the JPEG 2000 Part-1 **main header** (`SOC`, `SIZ`, `COD`, `QCD`),
+walks the **tile-part chain** (`SOT` / `SOD` / `EOC`), and decodes
+the **JP2 ISO BMFF box wrapper** (Annex I).
+
+`parse_codestream` returns a `J2kCodestream` with the main header
+plus an ordered `Vec<TilePart>`. Each `TilePart` carries its parsed
+`Sot` (tile index, `Psot`, `TPsot`, `TNsot`), byte offsets of the
+`SOT` marker, `SOD` marker, and bit-stream body inside the input
+buffer, plus a `Vec<TilePartMarker>` of the **typed marker
+segments** parsed out of the tile-part header between `SOT` and
+`SOD`. Recognised tile-part-header markers parse into typed structs:
 
 * `COD` → `Cod` (T.800 §A.6.1, override of main header)
 * `COC` → `Coc` (T.800 §A.6.2, per-component coding-style override)
@@ -32,6 +34,18 @@ the codestream's `Csiz`. Markers forbidden in tile-part headers
 hard-rejected. Both fixed-`Psot` and `Psot = 0` ("body until EOC")
 tile-part framings are supported per T.800 §A.4.2.
 
+`jp2::parse_jp2` walks an ISO BMFF box chain — `jP  ` signature,
+`ftyp` (brand / minor version / compatibility list), `jp2h`
+superbox (`ihdr` + optional `bpcc` + one or more `colr`), and
+`jp2c` Contiguous Codestream — into a typed `Jp2Container` with
+`codestream_offset` / `codestream_len` pointing at the slice that
+callers may hand to `parse_codestream`. All three box length
+encodings (standard `LBox`, extended `LBox = 1` + `XLBox`, and
+"until end of file" `LBox = 0`) are supported per T.800 §I.4. `colr`
+recognises enumerated (`METH = 1`, sRGB / greyscale / sYCC) and
+ICC-profile (`METH = 2`, raw bytes preserved) methods; other
+methods are accepted-and-skipped per T.800 §I.5.3.3.
+
 What is **not** implemented yet:
 
 * Tier-1 (EBCOT MQ-coder block coding).
@@ -40,7 +54,8 @@ What is **not** implemented yet:
 * Dequantisation (E.1 / E.2 reconstruction formulas).
 * Multiple-component-transform (MCT, Annex G).
 * Tile-part body decode (the walker delimits but does not decode).
-* JP2 box-structured file format (ISO BMFF wrapper around the J2K codestream).
+* `pclr` / `cmap` / `cdef` / `res` JP2 boxes (skipped silently;
+  `jp2h` enforces `ihdr` first + at least one `colr` only).
 * HTJ2K Part-15 block coder.
 * Any encoder path.
 
@@ -67,6 +82,13 @@ consulted:
 * T.800 §A.7.5 + Table A.39 (PPT).
 * T.800 §A.2 / Tables A.2 / A.3 (per-header marker allow-lists used
   to validate the tile-part walker).
+* T.800 Annex I (JP2 file format) — §I.4 + Figure I.4 / Table I.1
+  (binary box layout), §I.5.1 (Signature box), §I.5.2 + Tables I.3
+  / I.4 (File Type box), §I.5.3 + Figure I.7 (JP2 Header superbox),
+  §I.5.3.1 + Figure I.8 / Tables I.5 / I.6 (Image Header box),
+  §I.5.3.2 + Tables I.7 / I.8 (Bits Per Component box), §I.5.3.3 +
+  Figure I.10 / Tables I.9 / I.10 / I.11 (Colour Specification
+  box), §I.5.4 (Contiguous Codestream box).
 
 No external library source — OpenJPEG, OpenJPH, Kakadu, FFmpeg, etc.
 — was consulted, quoted, paraphrased, or used as a cross-check

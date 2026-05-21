@@ -2,20 +2,27 @@
 //!
 //! Pure-Rust JPEG 2000 (J2K) codestream parser and (eventually) codec.
 //!
-//! ## Status — 2026-05-21 (round 3)
+//! ## Status — 2026-05-21 (round 4)
 //!
 //! Main-header parser ([`parse_j2k_header`], round 1) plus tile-part
 //! walker ([`walk_tile_parts`] / [`parse_codestream`], round 2) plus
-//! typed per-tile-part marker parsers (round 3). The walker returns
-//! an ordered [`Vec<TilePart>`] giving each tile-part's parsed
-//! [`Sot`] (tile index, `Psot`, `TPsot`, `TNsot`), byte offsets of
-//! its `SOT` marker, `SOD` marker, and bit-stream body, plus a
-//! [`Vec<TilePartMarker>`] of the typed marker segments parsed out
-//! of the tile-part header between `SOT` and `SOD`. Recognised
-//! tile-part-header markers: [`Cod`], [`Coc`], [`Qcd`], [`Qcc`],
-//! [`Rgn`], [`Poc`], [`Plt`], [`Ppt`], and `COM`. Both fixed-`Psot`
-//! and `Psot == 0` ("body until EOC") framings are supported per
-//! T.800 §A.4.2.
+//! typed per-tile-part marker parsers (round 3) plus a JP2 ISO BMFF
+//! box-wrapper parser ([`jp2::parse_jp2`], round 4). The walker
+//! returns an ordered [`Vec<TilePart>`] giving each tile-part's
+//! parsed [`Sot`] (tile index, `Psot`, `TPsot`, `TNsot`), byte
+//! offsets of its `SOT` marker, `SOD` marker, and bit-stream body,
+//! plus a [`Vec<TilePartMarker>`] of the typed marker segments
+//! parsed out of the tile-part header between `SOT` and `SOD`.
+//! Recognised tile-part-header markers: [`Cod`], [`Coc`], [`Qcd`],
+//! [`Qcc`], [`Rgn`], [`Poc`], [`Plt`], [`Ppt`], and `COM`. Both
+//! fixed-`Psot` and `Psot == 0` ("body until EOC") framings are
+//! supported per T.800 §A.4.2. Round 4 adds [`jp2::parse_jp2`] which
+//! decodes the JP2 box wrapper — `jP  ` signature, `ftyp` (brand /
+//! minor / compat list), `jp2h` (`ihdr` / optional `bpcc` /
+//! `colr`), and the `jp2c` Contiguous Codestream box's payload
+//! span — and returns a [`jp2::Jp2Container`] with
+//! `codestream_offset` / `codestream_len` pointing at the slice
+//! that callers may then hand to [`parse_codestream`].
 //!
 //! Codestream-body decoding (tier-1 EBCOT, tier-2 packet parsing,
 //! wavelet inverse transform, dequantisation, MCT) and any encoder
@@ -40,6 +47,8 @@
 //! a cross-check oracle.
 
 #![warn(missing_debug_implementations)]
+
+pub mod jp2;
 
 #[cfg(feature = "registry")]
 use oxideav_core::RuntimeContext;

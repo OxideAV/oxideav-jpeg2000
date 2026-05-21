@@ -6,6 +6,46 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 4 (2026-05-21).** JP2 ISO BMFF box wrapper
+  parser (`jp2` submodule, T.800 / ISO/IEC 15444-1 Annex I). New
+  `jp2::parse_jp2(&[u8]) -> Result<Jp2Container, Error>` walks the
+  top-level box chain — `jP  ` signature (§I.5.1), `ftyp` (§I.5.2 /
+  Tables I.3 / I.4), `jp2h` superbox (§I.5.3 / Figure I.7) carrying
+  `ihdr` (§I.5.3.1 / Tables I.5 / I.6) + optional `bpcc` (§I.5.3.2 /
+  Tables I.7 / I.8) + one or more `colr` (§I.5.3.3 / Tables I.9 /
+  I.10 / I.11), and the first `jp2c` Contiguous Codestream box
+  (§I.5.4) — into a typed `Jp2Container { ftyp: Ftyp, header:
+  Jp2Header, codestream_offset, codestream_len }`. `Ftyp` preserves
+  brand + minor version + the compatibility-list `CLi` entries and
+  exposes `is_jp2_compatible()` (true iff one CLi is `'jp2 '`).
+  `Ihdr` preserves the raw `BPC` byte plus convenience accessors
+  `bit_depth()` / `is_signed()` / `varies_in_bit_depth()`. `Colr`
+  decodes both enumerated (`METH = 1`, EnumCS 16 = sRGB, 17 =
+  greyscale, 18 = sYCC, other = `Reserved(u32)`) and ICC-profile
+  (`METH = 2`, raw bytes preserved) methods; reserved methods are
+  accepted-and-skipped per T.800 §I.5.3.3. All three box-length
+  encodings handled per T.800 §I.4: standard `LBox`, extended
+  `LBox = 1` + 8-byte `XLBox`, and `LBox = 0` ("until end of file").
+  Spec invariants enforced: `jp2h` first-child-is-`ihdr`, at most
+  one `bpcc`, at least one `colr`, `bpcc` required when `BPC =
+  0xFF`. Optional `xml ` / `jp2i` / `uuid` etc. boxes appearing
+  between `ftyp` and `jp2c` are tolerated and skipped by length.
+  Fourteen new unit tests against synthetic JP2 byte buffers
+  covering happy path, ICC-profile colr, 3-component `bpcc`,
+  extended-length `jp2c`, `LBox = 0` last-box framing, intermediate
+  unknown box skip, plus rejection cases (missing signature, bad
+  signature magic, missing ftyp, `BPC = 0xFF` without `bpcc`,
+  `jp2h` with no `colr`, truncated box, reserved `LBox` value, and
+  brand-compatibility recognition). Forty tests total pass; cargo
+  fmt-check + clippy `-D warnings` clean. The codestream parser
+  (rounds 1-3) is untouched.
+
+  Built solely against `docs/image/jpeg2000/T-REC-T.800-201906-S.pdf`
+  (T.800 Annex I §I.4, §I.5.1, §I.5.2 + Tables I.3 / I.4, §I.5.3 +
+  Figure I.7, §I.5.3.1 + Tables I.5 / I.6, §I.5.3.2 + Tables I.7 /
+  I.8, §I.5.3.3 + Tables I.9 / I.10 / I.11, §I.5.4). No external
+  library source consulted.
+
 * **Clean-room round 3 (2026-05-21).** Typed tile-part marker parsers.
   Six new typed marker structs — `Coc` (T.800 §A.6.2), `Qcc`
   (§A.6.5), `Rgn` (§A.6.3), `Poc` + `PocProgression` (§A.6.6),
