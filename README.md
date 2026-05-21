@@ -3,12 +3,13 @@
 Pure-Rust JPEG 2000 (J2K + JP2) and High-Throughput JPEG 2000 (HTJ2K)
 codec.
 
-## Status — 2026-05-21 (clean-room round 4)
+## Status — 2026-05-22 (clean-room round 5)
 
-**Codestream-structural + JP2-wrapper parsers.** The crate parses
-the JPEG 2000 Part-1 **main header** (`SOC`, `SIZ`, `COD`, `QCD`),
-walks the **tile-part chain** (`SOT` / `SOD` / `EOC`), and decodes
-the **JP2 ISO BMFF box wrapper** (Annex I).
+**Codestream-structural + JP2-wrapper + tier-2 packet-header reader.**
+The crate parses the JPEG 2000 Part-1 **main header** (`SOC`, `SIZ`,
+`COD`, `QCD`), walks the **tile-part chain** (`SOT` / `SOD` / `EOC`),
+decodes the **JP2 ISO BMFF box wrapper** (Annex I), and reads the
+**tier-2 packet-header bit stream** (T.800 §B.10).
 
 `parse_codestream` returns a `J2kCodestream` with the main header
 plus an ordered `Vec<TilePart>`. Each `TilePart` carries its parsed
@@ -46,14 +47,49 @@ recognises enumerated (`METH = 1`, sRGB / greyscale / sYCC) and
 ICC-profile (`METH = 2`, raw bytes preserved) methods; other
 methods are accepted-and-skipped per T.800 §I.5.3.3.
 
+`packet::decode_packet_header` (and the multi-packet
+`packet::walk_packet_headers`) reads the bit-stuffed packet-header
+bit stream described in T.800 §B.10 from a tile-part body, given a
+caller-supplied `PacketGeometry` slice describing each packet's
+sub-band → code-block layout. The reader composes the primitives
+defined in the same submodule:
+
+* `PacketBitReader` — MSB-first reader honouring §B.10.1's stuffed-
+  zero-after-`0xFF` rule.
+* `TagTree` — stateful 2-D hierarchical-minimum tag tree per §B.10.2;
+  `decode_below_threshold` and `decode_value` cover the §B.10.4 /
+  §B.10.5 query forms.
+* `decode_coding_passes` — §B.10.6 / Table B.4 Huffman for 1..164
+  passes.
+* `LblockState` + `decode_segment_length` — §B.10.7.1 length read
+  with the `Lblock`-increment prefix.
+* `PrecinctState` + `SubBandState` — per-precinct carry across
+  layers (inclusion + zero-bitplane trees + `already_included` flags
+  + per-block `Lblock`).
+* Optional `SopEphMode` for SOP / EPH framing around each packet.
+
+`PacketHeader` carries `non_zero_length`, the per-code-block
+`Vec<CodeBlockContribution>` (`included` / `zero_bit_planes` /
+`coding_passes` / `segment_lengths`), `bytes_consumed`, and
+`num_codeblocks`. Computing the §B.12 progression-order packet
+sequence + per-precinct geometry from COD / SIZ lands in round 6;
+round 5 takes the geometry as caller input so the bit-reader surface
+can be exercised in isolation.
+
 What is **not** implemented yet:
 
-* Tier-1 (EBCOT MQ-coder block coding).
-* Tier-2 (packet-header walking, layer assembly).
+* Tier-1 (EBCOT MQ-coder block coding) — the packet-header reader
+  reports byte ranges per code-block, but the codeword bytes are not
+  yet decoded.
+* §B.6 / §B.7 / §B.12 progression-order geometry computation (round
+  5's packet reader takes the geometry as caller input; round 6 will
+  derive it from `Cod` + `Siz`).
+* §B.10.7.2 multi-codeword-segment splitting (round 5 emits one
+  segment length per included code-block; termination boundaries are
+  a tier-1 input we don't have yet).
 * Inverse 5-3 and 9-7 wavelet transforms.
 * Dequantisation (E.1 / E.2 reconstruction formulas).
 * Multiple-component-transform (MCT, Annex G).
-* Tile-part body decode (the walker delimits but does not decode).
 * `pclr` / `cmap` / `cdef` / `res` JP2 boxes (skipped silently;
   `jp2h` enforces `ihdr` first + at least one `colr` only).
 * HTJ2K Part-15 block coder.
@@ -89,6 +125,15 @@ consulted:
   §I.5.3.2 + Tables I.7 / I.8 (Bits Per Component box), §I.5.3.3 +
   Figure I.10 / Tables I.9 / I.10 / I.11 (Colour Specification
   box), §I.5.4 (Contiguous Codestream box).
+* T.800 §B.10 (Packet header information coding) — §B.10.1 (bit-
+  stuffing routine), §B.10.2 + Figure B.12 (tag trees), §B.10.3
+  (zero-length packet bit), §B.10.4 (code-block inclusion — partial
+  tag tree on first inclusion, 1-bit signal thereafter), §B.10.5
+  (zero bit-plane information tag tree), §B.10.6 + Table B.4
+  (codewords for number of coding passes), §B.10.7.1 (`Lblock`-
+  based single codeword-segment length), §B.10.8 (master order of
+  information within a packet header), §A.8.1 / §A.8.2 (SOP / EPH
+  framing markers).
 
 No external library source — OpenJPEG, OpenJPH, Kakadu, FFmpeg, etc.
 — was consulted, quoted, paraphrased, or used as a cross-check

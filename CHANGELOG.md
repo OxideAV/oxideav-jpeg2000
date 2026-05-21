@@ -6,6 +6,83 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 5 (2026-05-22).** Tier-2 packet-header reading
+  primitives (`packet` submodule, T.800 §B.10). New
+  `packet::PacketBitReader` implements the §B.10.1 bit-stuffing rule
+  (MSB-first; after every `0xFF` byte the next byte's MSB is a
+  stuffed zero, stripped on read). `packet::TagTree` is a stateful
+  2-D hierarchical-minimum tag-tree decoder per §B.10.2: levels are
+  built root-first by halving the leaf grid, each node carries a
+  `(current_value, fully_decoded)` pair, and the
+  `decode_below_threshold(x, y, T, reader)` / `decode_value(x, y,
+  reader)` query forms commit only as many bits as needed and preserve
+  causality across calls so adjacent code-blocks / layers do not
+  re-read bits the spec already committed. `packet::decode_coding_passes`
+  decodes the §B.10.6 / Table B.4 Huffman for 1..164 coding passes
+  (`0` → 1; `10` → 2; `1100`/`1101`/`1110` → 3/4/5; prefix `1111`
+  + 5 bits → 6..36; prefix `1111 11111` + 7 bits → 37..164).
+  `packet::LblockState` + `packet::decode_segment_length` implement
+  the §B.10.7.1 codeword-segment length read: leading `k` ones plus
+  terminating zero increment `Lblock` by `k` (initial 3, monotone
+  non-decreasing), then `(Lblock + floor(log2 passes))` bits encode
+  the length. `packet::PrecinctState` + `packet::SubBandState`
+  carry the per-(precinct, sub-band) inclusion + zero-bitplane tag
+  trees, the per-block `already_included` flag, and the per-block
+  `Lblock` state across the layers of one precinct's packet
+  sequence; layout is initialised from the first packet's
+  `PacketGeometry` and a mismatch on subsequent packets is
+  rejected. `packet::decode_packet_header(bytes, geometry, state,
+  sop_eph)` reads one full packet header per the §B.10.8 master
+  order — zero-length bit; for each sub-band, for each code-block in
+  raster order: inclusion-tag-tree query (or 1-bit signal if
+  already included), zero-bitplane tag-tree value (on first
+  inclusion only), coding-passes Huffman, Lblock increment + segment
+  length — and returns a typed `PacketHeader { non_zero_length,
+  contributions: Vec<CodeBlockContribution>, bytes_consumed,
+  num_code_blocks }`. Optional SOP / EPH framing per `SopEphMode`
+  (T.800 §A.8.1 / §A.8.2, COD `Scod` bits `0x02` / `0x04`).
+  `packet::walk_packet_headers(body, packets, sop_eph)` composes the
+  per-packet reader across a tile-part body (typically
+  `TilePart::body_offset .. body_offset + body_len`): given a slice
+  of `(precinct_index, PacketGeometry)` tuples in codestream order it
+  decodes each header, advances `bytes_consumed + total_body_bytes`
+  bytes for the packet's body, and returns `Vec<PacketHeader>`.
+  Twenty-four new unit tests cover the bit reader (MSB-first ordering
+  + `0xFF`-stuffing + pack/unpack round-trip), tag tree (1×1
+  decode_value, 1×1 threshold partial + threshold true, state
+  retention, 2×2 with shared root), the coding-passes Huffman
+  across all three ranges (1..5, 6..36, 37..164), Lblock-incremented
+  segment lengths (initial, +2 increment, multi-pass extra bits),
+  packet-header happy paths (empty, single-block first inclusion,
+  already-included one-bit, not-yet-included partial tag tree,
+  three-sub-band packet at resolution > 0), two-packet walker
+  retaining inclusion across layers, overrun rejection against a
+  short body, SOP+EPH consumption, and precinct-state layout
+  mismatch rejection. Sixty-four tests total pass; cargo fmt-check +
+  clippy `-D warnings` clean (both default + `--no-default-features`
+  builds). Two new error variants `Error::InvalidPacketHeader`
+  (malformed bit sequence or geometry mismatch) and
+  `Error::PacketHeaderOverrun` (walker exhausted body before
+  geometry's packet count was satisfied). The codestream parser
+  (rounds 1-3) and JP2 wrapper (round 4) are untouched.
+
+  Built solely against `docs/image/jpeg2000/T-REC-T.800-201906-S.pdf`
+  (T.800 §B.10.1 — bit-stuffing, §B.10.2 + Figure B.12 — tag trees,
+  §B.10.3 — zero-length packet bit, §B.10.4 — code-block inclusion,
+  §B.10.5 — zero bit-plane information, §B.10.6 + Table B.4 —
+  coding-passes Huffman, §B.10.7.1 — single codeword-segment
+  length, §B.10.8 — master order, §A.8.1 — SOP marker, §A.8.2 —
+  EPH marker). No external library source — OpenJPEG, OpenJPH,
+  Kakadu, FFmpeg, libavcodec, jpeg2000-rs, etc. — was consulted,
+  quoted, paraphrased, or used as a cross-check oracle when writing
+  this module.
+
+  Geometry computation (T.800 §B.6 precinct partitioning, §B.7
+  sub-band → code-block partitioning, §B.12 progression-order
+  iteration) lands in round 6; round 5 takes the geometry as caller
+  input. §B.10.7.2 multi-codeword-segment splitting is also deferred
+  — round 5 emits one segment length per included code-block.
+
 * **Clean-room round 4 (2026-05-21).** JP2 ISO BMFF box wrapper
   parser (`jp2` submodule, T.800 / ISO/IEC 15444-1 Annex I). New
   `jp2::parse_jp2(&[u8]) -> Result<Jp2Container, Error>` walks the
