@@ -2,12 +2,15 @@
 //!
 //! Pure-Rust JPEG 2000 (J2K) codestream parser and (eventually) codec.
 //!
-//! ## Status — 2026-05-20 (round 1)
+//! ## Status — 2026-05-21 (round 2)
 //!
-//! First-pass codestream-header parser landed. This crate now reads
-//! the main-header marker segments **SOC**, **SIZ**, **COD**, and
-//! **QCD** from a JPEG 2000 Part-1 codestream and reports the parsed
-//! values via [`J2kHeader`].
+//! Main-header parser ([`parse_j2k_header`], round 1) plus tile-part
+//! walker ([`walk_tile_parts`] / [`parse_codestream`], round 2). The
+//! walker returns an ordered [`Vec<TilePart>`] giving each tile-part's
+//! parsed [`Sot`] (tile index, `Psot`, `TPsot`, `TNsot`) plus byte
+//! offsets of its `SOT` marker, `SOD` marker, and bit-stream body
+//! inside the input buffer. Both fixed-`Psot` and `Psot == 0` ("body
+//! until EOC") framings are supported per T.800 §A.4.2.
 //!
 //! Codestream-body decoding (tier-1 EBCOT, tier-2 packet parsing,
 //! wavelet inverse transform, dequantisation, MCT) and any encoder
@@ -20,9 +23,11 @@
 //! came from:
 //!
 //! * ITU-T Rec. T.800 (06/2019) | ISO/IEC 15444-1, §A "Codestream
-//!   syntax". Tables A.4 (SOC), A.9 / A.10 / A.11 (SIZ), A.12 / A.13
-//!   / A.14 / A.15 / A.16 / A.17 / A.18 / A.19 / A.20 / A.21 (COD),
-//!   A.27 / A.28 / A.29 / A.30 (QCD).
+//!   syntax". Tables A.2 / A.3 (per-header marker allow-list),
+//!   A.4 (SOC), A.5 / A.6 (SOT / tile-part counts), A.7 (SOD),
+//!   A.8 (EOC), A.9 / A.10 / A.11 (SIZ), A.12 / A.13 / A.14 / A.15
+//!   / A.16 / A.17 / A.18 / A.19 / A.20 / A.21 (COD), A.27 / A.28
+//!   / A.29 / A.30 (QCD).
 //!
 //! No external library source (OpenJPEG, OpenJPH, Kakadu, FFmpeg,
 //! libavcodec, etc.) was consulted, quoted, paraphrased, or used as
@@ -101,6 +106,17 @@ pub enum Error {
     InvalidDecompositionLevels,
     /// An expected main-header marker code was not recognised.
     UnknownMarker(u16),
+    /// Round-2 tile-part walker hit a marker that's forbidden in a
+    /// tile-part header (e.g. `SOC`, `SIZ`, `CAP`, `PRF`, `TLM`, …)
+    /// per T.800 Table A.2 column "Tile-part header".
+    UnexpectedMainHeaderMarker(u16),
+    /// Tile-part walker reached EOF without seeing the `EOC` marker.
+    MissingEoc,
+    /// `Psot` field referenced a tile-part length that overran the
+    /// codestream buffer (T.800 §A.4.2).
+    PsotOverflow,
+    /// A tile-part walker found `TPsot` > 254 (T.800 Table A.5).
+    InvalidTilePartIndex,
 }
 
 impl core::fmt::Display for Error {
@@ -129,6 +145,22 @@ impl core::fmt::Display for Error {
                 )
             }
             Error::UnknownMarker(m) => write!(f, "JPEG 2000: unknown marker 0x{:04X}", m),
+            Error::UnexpectedMainHeaderMarker(m) => write!(
+                f,
+                "JPEG 2000: marker 0x{:04X} is not allowed inside a tile-part header",
+                m
+            ),
+            Error::MissingEoc => write!(f, "JPEG 2000: codestream ended without EOC marker"),
+            Error::PsotOverflow => write!(
+                f,
+                "JPEG 2000: Psot tile-part length overruns codestream buffer"
+            ),
+            Error::InvalidTilePartIndex => {
+                write!(
+                    f,
+                    "JPEG 2000: invalid TPsot tile-part index (must be 0..=254)"
+                )
+            }
         }
     }
 }
@@ -338,6 +370,73 @@ impl J2kHeader {
     pub fn image_height(&self) -> u32 {
         self.siz.y_size.saturating_sub(self.siz.y_offset)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Tile-part header (T.800 §A.4.2 / Table A.5).
+// ---------------------------------------------------------------------------
+
+/// Parsed `SOT` marker segment — T.800 §A.4.2 / Table A.5.
+///
+/// The five `Isot` / `Psot` / `TPsot` / `TNsot` values are returned
+/// verbatim as in the codestream so callers can perform their own
+/// cross-checks (the spec allows the encoder to encode `Psot = 0` to
+/// mean "until EOC" and `TNsot = 0` to mean "tile-part count not yet
+/// known"; see T.800 Table A.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sot {
+    /// `Isot` — tile index (0..=65_534), T.800 §A.4.2.
+    pub tile_index: u16,
+    /// `Psot` — length in bytes, from the start of the SOT marker to
+    /// the end of the tile-part data. `0` means "until EOC", allowed
+    /// only for the last tile-part (T.800 §A.4.2).
+    pub psot: u32,
+    /// `TPsot` — tile-part index within this tile (0..=254).
+    pub tile_part_index: u8,
+    /// `TNsot` — total tile-parts in this tile, `0` if unknown
+    /// (T.800 Table A.6).
+    pub num_tile_parts: u8,
+}
+
+/// One walked tile-part — the parsed `SOT` header, byte offsets of
+/// the tile-part header / `SOD` / bit-stream body inside the
+/// codestream buffer passed to [`walk_tile_parts`], and the body
+/// length in bytes.
+///
+/// All offsets are measured from the start of the input slice — i.e.
+/// `sot_offset` points at the `0xFF90` `SOT` marker, `sod_offset`
+/// points at the `0xFF93` `SOD` marker, and `body_offset` points at
+/// the first byte of the tier-2 bit stream (one byte past the `SOD`
+/// marker).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TilePart {
+    /// The parsed SOT marker segment for this tile-part.
+    pub sot: Sot,
+    /// Byte offset of the `SOT` marker (`0xFF90`) inside the
+    /// codestream buffer.
+    pub sot_offset: usize,
+    /// Byte offset of the `SOD` marker (`0xFF93`) inside the buffer.
+    pub sod_offset: usize,
+    /// Byte offset of the first bit-stream body byte (`sod_offset +
+    /// 2`).
+    pub body_offset: usize,
+    /// Length of the tile-part bit-stream body in bytes — the bytes
+    /// between `body_offset` and the next `SOT` / `EOC` marker.
+    pub body_len: usize,
+}
+
+/// Parsed JPEG 2000 Part-1 codestream — main header plus the
+/// ordered list of tile-parts produced by [`walk_tile_parts`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct J2kCodestream {
+    /// Main-header marker segments (round 1).
+    pub header: J2kHeader,
+    /// Tile-parts in codestream order.
+    pub tile_parts: Vec<TilePart>,
+    /// `true` if the codestream ended with an explicit `EOC` marker.
+    /// `false` is only legal for truncated streams (T.800 §A.4.4
+    /// NOTE 2) but we accept it and surface the fact for callers.
+    pub saw_eoc: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -654,6 +753,199 @@ pub fn parse_j2k_header(bytes: &[u8]) -> Result<J2kHeader, Error> {
 }
 
 // ---------------------------------------------------------------------------
+// Tile-part walker (T.800 §A.4.2 / §A.4.3 — SOT + SOD).
+// ---------------------------------------------------------------------------
+
+/// Parses a `SOT` marker segment **whose 2-byte marker code has
+/// already been consumed**. T.800 §A.4.2 / Table A.5.
+fn parse_sot(reader: &mut Reader<'_>) -> Result<Sot, Error> {
+    // Lsot is fixed at 10 per Table A.5.
+    let lsot = reader.read_u16_be()?;
+    if lsot != 10 {
+        return Err(Error::InvalidMarkerLength);
+    }
+    let tile_index = reader.read_u16_be()?;
+    let psot = reader.read_u32_be()?;
+    // Psot = 0 OR 14..=u32::MAX per Table A.5. A non-zero Psot smaller
+    // than 14 (the minimum SOT + SOD overhead) is illegal.
+    if psot != 0 && psot < 14 {
+        return Err(Error::InvalidMarkerLength);
+    }
+    let tile_part_index = reader.read_u8()?;
+    if tile_part_index > 254 {
+        // Unreachable for u8, but kept for spec alignment.
+        return Err(Error::InvalidTilePartIndex);
+    }
+    let num_tile_parts = reader.read_u8()?;
+    Ok(Sot {
+        tile_index,
+        psot,
+        tile_part_index,
+        num_tile_parts,
+    })
+}
+
+/// Set of marker codes whose appearance inside a tile-part header is
+/// **forbidden** per T.800 Table A.2 (main-header-only markers).
+///
+/// Hitting any of these mid-tile-part is a hard error rather than a
+/// length-skip, because the spec rules them out: a real encoder would
+/// never emit them and a corrupted-stream heuristic could misalign
+/// the walker.
+const MAIN_HEADER_ONLY_MARKERS: &[u16] = &[
+    MARKER_SOC, MARKER_SIZ, MARKER_CAP, MARKER_PRF, 0xFF63, // CRG
+    0xFF55, // TLM
+    0xFF57, // PLM
+    0xFF60, // PPM
+];
+
+/// Walks the per-tile-part marker chain starting at the byte
+/// immediately after the main header consumed by [`parse_j2k_header`]
+/// and stopping at the `EOC` marker (or EOF, with `saw_eoc = false`).
+///
+/// For each tile-part the walker returns a [`TilePart`] containing
+/// the parsed `SOT`, the byte offsets of the SOT / SOD / body inside
+/// the input slice, and the body length in bytes. The actual tier-1 /
+/// tier-2 decode is intentionally **not** performed in this round:
+/// the body is treated as an opaque span of bytes and the walker only
+/// uses the `Psot` length field (or, when `Psot == 0`, "until the
+/// next SOT or EOC") to delimit each tile-part.
+///
+/// References: T.800 §A.4.2 (SOT), §A.4.3 (SOD), §A.4.4 (EOC),
+/// Table A.5, Table A.6.
+pub fn walk_tile_parts(bytes: &[u8], header: &J2kHeader) -> Result<Vec<TilePart>, Error> {
+    let mut tile_parts = Vec::new();
+    let mut pos = header.bytes_consumed;
+    loop {
+        if pos + 2 > bytes.len() {
+            return Err(Error::MissingEoc);
+        }
+        let marker = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]);
+        if marker == MARKER_EOC {
+            return Ok(tile_parts);
+        }
+        if marker != MARKER_SOT {
+            return Err(Error::UnknownMarker(marker));
+        }
+        let tp = walk_one_tile_part(bytes, pos)?;
+        // Advance: if Psot is non-zero, the next tile-part begins at
+        // sot_offset + Psot (T.800 §A.4.2: Psot measures from the start
+        // of the SOT marker). If Psot is zero, the body extends to the
+        // next SOT or EOC — the walker already located that boundary.
+        pos = tp.body_offset + tp.body_len;
+        tile_parts.push(tp);
+    }
+}
+
+/// Like [`walk_tile_parts`] but also reports whether the trailing
+/// `EOC` marker was present.
+pub fn parse_codestream(bytes: &[u8]) -> Result<J2kCodestream, Error> {
+    let header = parse_j2k_header(bytes)?;
+    let tile_parts = walk_tile_parts(bytes, &header)?;
+    // walk_tile_parts returns Ok only on EOC (the MissingEoc branch
+    // returns Err); reaching here implies the walker terminated on
+    // EOC.
+    Ok(J2kCodestream {
+        header,
+        tile_parts,
+        saw_eoc: true,
+    })
+}
+
+/// Walks a single tile-part starting at the byte offset of its SOT
+/// marker. Returns the parsed [`TilePart`].
+fn walk_one_tile_part(bytes: &[u8], sot_offset: usize) -> Result<TilePart, Error> {
+    let mut reader = Reader {
+        buf: bytes,
+        pos: sot_offset,
+    };
+    let marker = reader.read_u16_be()?;
+    if marker != MARKER_SOT {
+        return Err(Error::UnknownMarker(marker));
+    }
+    let sot = parse_sot(&mut reader)?;
+    // Walk the tile-part header markers until SOD.
+    let sod_offset = loop {
+        if reader.remaining() < 2 {
+            return Err(Error::UnexpectedEof);
+        }
+        let m = reader.read_u16_be()?;
+        if m == MARKER_SOD {
+            // SOD is delimiter — its 2 bytes are already consumed.
+            // Record its offset (where the 0xFF93 marker started).
+            break reader.pos - 2;
+        }
+        if MAIN_HEADER_ONLY_MARKERS.contains(&m) {
+            return Err(Error::UnexpectedMainHeaderMarker(m));
+        }
+        match m {
+            // Markers permitted in tile-part headers per T.800 Table
+            // A.2: COD, COC, RGN, QCD, QCC, POC, PLT, PPT, COM. All
+            // carry a 16-bit length so we skip by length.
+            MARKER_COD | MARKER_COC | MARKER_QCD | MARKER_QCC | MARKER_COM | 0xFF5E | 0xFF5F
+            | 0xFF58 | 0xFF61 => {
+                let len = reader.read_u16_be()?;
+                if len < 2 {
+                    return Err(Error::InvalidMarkerLength);
+                }
+                reader.skip(len as usize - 2)?;
+            }
+            other => return Err(Error::UnknownMarker(other)),
+        }
+    };
+    let body_offset = sod_offset + 2;
+    // Compute body length per Psot rules (T.800 §A.4.2).
+    let body_len = if sot.psot != 0 {
+        // Psot measures from the start of the SOT marker to end of
+        // tile-part data.
+        let psot = sot.psot as usize;
+        let tile_part_end = sot_offset.checked_add(psot).ok_or(Error::PsotOverflow)?;
+        if tile_part_end > bytes.len() {
+            return Err(Error::PsotOverflow);
+        }
+        if tile_part_end < body_offset {
+            return Err(Error::InvalidMarkerLength);
+        }
+        tile_part_end - body_offset
+    } else {
+        // Psot == 0: body extends to the next SOT or EOC marker.
+        scan_until_sot_or_eoc(bytes, body_offset)?
+    };
+    Ok(TilePart {
+        sot,
+        sot_offset,
+        sod_offset,
+        body_offset,
+        body_len,
+    })
+}
+
+/// Scan forward from `start` for the next `0xFF90` (SOT) or `0xFFD9`
+/// (EOC) marker and return the byte distance from `start` to that
+/// marker. Used only when `Psot == 0` (T.800 §A.4.2 — last tile-part
+/// of a streamed encode).
+///
+/// The scanner respects JPEG 2000's bitstream framing: a `0xFF` byte
+/// followed by anything in `0x00..=0x8F` is **not** a marker (T.800
+/// §B.10.1 marker-stuffing — packet-body payloads never produce a
+/// false `0xFF9x` / `0xFFDx` sequence). We only need to recognise
+/// the SOT (`0xFF90`) / EOC (`0xFFD9`) codes here.
+fn scan_until_sot_or_eoc(bytes: &[u8], start: usize) -> Result<usize, Error> {
+    let mut i = start;
+    while i + 1 < bytes.len() {
+        if bytes[i] == 0xFF {
+            let next = bytes[i + 1];
+            if next == 0x90 || next == 0xD9 {
+                return Ok(i - start);
+            }
+        }
+        i += 1;
+    }
+    // Reached EOF without seeing SOT or EOC.
+    Err(Error::MissingEoc)
+}
+
+// ---------------------------------------------------------------------------
 // Decoder / encoder stubs.
 // ---------------------------------------------------------------------------
 
@@ -949,5 +1241,255 @@ mod tests {
     fn decode_and_encode_are_still_unimplemented() {
         assert_eq!(decode_jpeg2000(&[0xFF, 0x4F]), Err(Error::NotImplemented));
         assert_eq!(encode_jpeg2000(&[0u8; 4], 2, 2), Err(Error::NotImplemented));
+    }
+
+    // -----------------------------------------------------------------------
+    // Round-2 SOT / SOD walker tests (T.800 §A.4.2 / §A.4.3).
+    // -----------------------------------------------------------------------
+
+    /// Build a `SOT` marker segment (12 bytes total: marker + Lsot=10 +
+    /// payload). T.800 §A.4.2 / Table A.5.
+    fn synth_sot(isot: u16, psot: u32, tpsot: u8, tnsot: u8) -> Vec<u8> {
+        let mut v = Vec::with_capacity(12);
+        v.extend_from_slice(&MARKER_SOT.to_be_bytes());
+        v.extend_from_slice(&10u16.to_be_bytes());
+        v.extend_from_slice(&isot.to_be_bytes());
+        v.extend_from_slice(&psot.to_be_bytes());
+        v.push(tpsot);
+        v.push(tnsot);
+        v
+    }
+
+    /// Append `SOD` + `n` opaque body bytes.
+    fn append_sod_body(buf: &mut Vec<u8>, body: &[u8]) {
+        buf.extend_from_slice(&MARKER_SOD.to_be_bytes());
+        buf.extend_from_slice(body);
+    }
+
+    /// Build a full codestream: main header from `synth_minimal_header`
+    /// (trimmed to drop its trailing SOT) plus a sequence of
+    /// `(sot, body)` tile-parts plus a terminating `EOC`.
+    fn synth_codestream(tile_parts: &[(Sot, Vec<u8>)]) -> Vec<u8> {
+        // Drop the SOT terminator that synth_minimal_header appends so
+        // we can splice our own tile-parts in.
+        let mut hdr = synth_minimal_header();
+        assert_eq!(&hdr[hdr.len() - 2..], &MARKER_SOT.to_be_bytes());
+        hdr.truncate(hdr.len() - 2);
+        for (sot, body) in tile_parts {
+            // Total tile-part length = 12 (SOT) + 2 (SOD) + body.len().
+            // If sot.psot is 0 we leave it; otherwise the test asserts
+            // psot == 14 + body.len() so the walker can compute body_len
+            // from Psot.
+            let sot_bytes = synth_sot(
+                sot.tile_index,
+                sot.psot,
+                sot.tile_part_index,
+                sot.num_tile_parts,
+            );
+            hdr.extend_from_slice(&sot_bytes);
+            append_sod_body(&mut hdr, body);
+        }
+        hdr.extend_from_slice(&MARKER_EOC.to_be_bytes());
+        hdr
+    }
+
+    #[test]
+    fn walks_single_tile_part() {
+        let body = vec![0x12, 0x34, 0x56, 0x78];
+        let psot = (12 + 2 + body.len()) as u32; // 12 SOT + 2 SOD + body
+        let sot = Sot {
+            tile_index: 0,
+            psot,
+            tile_part_index: 0,
+            num_tile_parts: 1,
+        };
+        let bytes = synth_codestream(&[(sot, body.clone())]);
+        let cs = parse_codestream(&bytes).expect("parse codestream");
+        assert!(cs.saw_eoc);
+        assert_eq!(cs.tile_parts.len(), 1);
+        let tp = cs.tile_parts[0];
+        assert_eq!(tp.sot.tile_index, 0);
+        assert_eq!(tp.sot.psot, psot);
+        assert_eq!(tp.sot.tile_part_index, 0);
+        assert_eq!(tp.sot.num_tile_parts, 1);
+        assert_eq!(tp.body_len, body.len());
+        // The bytes between body_offset and body_offset + body_len
+        // should match the body we encoded.
+        assert_eq!(
+            &bytes[tp.body_offset..tp.body_offset + tp.body_len],
+            body.as_slice()
+        );
+    }
+
+    #[test]
+    fn walks_two_tile_parts() {
+        let body0 = vec![0xAA; 8];
+        let body1 = vec![0xBB; 16];
+        let psot0 = (12 + 2 + body0.len()) as u32;
+        let psot1 = (12 + 2 + body1.len()) as u32;
+        let tps = [
+            (
+                Sot {
+                    tile_index: 0,
+                    psot: psot0,
+                    tile_part_index: 0,
+                    num_tile_parts: 1,
+                },
+                body0.clone(),
+            ),
+            (
+                Sot {
+                    tile_index: 1,
+                    psot: psot1,
+                    tile_part_index: 0,
+                    num_tile_parts: 1,
+                },
+                body1.clone(),
+            ),
+        ];
+        let bytes = synth_codestream(&tps);
+        let cs = parse_codestream(&bytes).expect("parse codestream");
+        assert_eq!(cs.tile_parts.len(), 2);
+        assert_eq!(cs.tile_parts[0].sot.tile_index, 0);
+        assert_eq!(cs.tile_parts[1].sot.tile_index, 1);
+        assert_eq!(cs.tile_parts[0].body_len, body0.len());
+        assert_eq!(cs.tile_parts[1].body_len, body1.len());
+        // Tile-part order in offsets is strictly monotonic.
+        assert!(cs.tile_parts[0].sot_offset < cs.tile_parts[1].sot_offset);
+    }
+
+    #[test]
+    fn walks_psot_zero_last_tile_part() {
+        // Psot == 0 — body extends until EOC. T.800 §A.4.2.
+        // We use a body that does NOT contain any 0xFF90 / 0xFFD9 byte
+        // pair so the scanner only stops at the appended EOC.
+        let body = vec![0x01, 0x02, 0x03, 0x04, 0xFF, 0x00, 0xFF, 0x7F];
+        let sot = Sot {
+            tile_index: 0,
+            psot: 0,
+            tile_part_index: 0,
+            num_tile_parts: 1,
+        };
+        let bytes = synth_codestream(&[(sot, body.clone())]);
+        let cs = parse_codestream(&bytes).expect("parse codestream");
+        assert_eq!(cs.tile_parts.len(), 1);
+        let tp = cs.tile_parts[0];
+        assert_eq!(tp.sot.psot, 0);
+        assert_eq!(tp.body_len, body.len());
+    }
+
+    #[test]
+    fn rejects_psot_overrun() {
+        // Build a single-tile-part stream and lie about Psot — claim
+        // 4096 bytes when only ~30 are present.
+        let body = vec![0u8; 4];
+        let sot = Sot {
+            tile_index: 0,
+            psot: 4096,
+            tile_part_index: 0,
+            num_tile_parts: 1,
+        };
+        let bytes = synth_codestream(&[(sot, body)]);
+        let err = parse_codestream(&bytes).unwrap_err();
+        assert_eq!(err, Error::PsotOverflow);
+    }
+
+    #[test]
+    fn rejects_missing_eoc() {
+        // Synthesize a codestream then chop the trailing EOC marker.
+        let body = vec![0xAA; 8];
+        let sot = Sot {
+            tile_index: 0,
+            psot: (12 + 2 + body.len()) as u32,
+            tile_part_index: 0,
+            num_tile_parts: 1,
+        };
+        let mut bytes = synth_codestream(&[(sot, body)]);
+        // Trim the last 2 bytes (the EOC marker).
+        bytes.truncate(bytes.len() - 2);
+        let err = parse_codestream(&bytes).unwrap_err();
+        assert_eq!(err, Error::MissingEoc);
+    }
+
+    #[test]
+    fn rejects_main_header_marker_in_tile_part() {
+        // Build a tile-part whose tile-part header (between SOT and
+        // SOD) contains a SIZ marker — illegal per T.800 Table A.2.
+        let mut tp = synth_sot(0, 0, 0, 1);
+        // Inject a SIZ marker after SOT.
+        tp.extend_from_slice(&MARKER_SIZ.to_be_bytes());
+        tp.extend_from_slice(&41u16.to_be_bytes()); // Lsiz
+        tp.extend_from_slice(&[0u8; 39]); // dummy payload
+        tp.extend_from_slice(&MARKER_SOD.to_be_bytes());
+        tp.extend_from_slice(&[0u8; 4]); // body
+                                         // Splice into a full codestream after the main header.
+        let mut hdr = synth_minimal_header();
+        hdr.truncate(hdr.len() - 2); // drop trailing SOT
+        hdr.extend_from_slice(&tp);
+        hdr.extend_from_slice(&MARKER_EOC.to_be_bytes());
+        let err = parse_codestream(&hdr).unwrap_err();
+        assert_eq!(err, Error::UnexpectedMainHeaderMarker(MARKER_SIZ));
+    }
+
+    #[test]
+    fn accepts_tile_part_with_inline_com_marker() {
+        // A COM marker is legal inside the tile-part header (T.800
+        // Table A.2 — Comment is optional in both main and tile-part
+        // headers). The walker should skip it by length.
+        let mut tp = synth_sot(0, 0, 0, 1);
+        // COM marker, Lcom = 6, registration = 0x0000, 2 payload bytes.
+        tp.extend_from_slice(&MARKER_COM.to_be_bytes());
+        tp.extend_from_slice(&6u16.to_be_bytes());
+        tp.extend_from_slice(&[0x00, 0x00, 0xDE, 0xAD]);
+        // Then SOD + body.
+        tp.extend_from_slice(&MARKER_SOD.to_be_bytes());
+        tp.extend_from_slice(&[0xCAu8, 0xFE, 0xBA, 0xBE]);
+        let mut hdr = synth_minimal_header();
+        hdr.truncate(hdr.len() - 2);
+        hdr.extend_from_slice(&tp);
+        hdr.extend_from_slice(&MARKER_EOC.to_be_bytes());
+        let cs = parse_codestream(&hdr).expect("parse with inline COM");
+        assert_eq!(cs.tile_parts.len(), 1);
+        assert_eq!(cs.tile_parts[0].body_len, 4);
+    }
+
+    #[test]
+    fn rejects_sot_with_wrong_lsot() {
+        // Build a codestream where the SOT marker claims Lsot = 12
+        // instead of the spec-mandated 10. T.800 Table A.5.
+        let mut hdr = synth_minimal_header();
+        hdr.truncate(hdr.len() - 2);
+        hdr.extend_from_slice(&MARKER_SOT.to_be_bytes());
+        hdr.extend_from_slice(&12u16.to_be_bytes()); // wrong Lsot
+        hdr.extend_from_slice(&0u16.to_be_bytes()); // Isot
+        hdr.extend_from_slice(&0u32.to_be_bytes()); // Psot
+        hdr.push(0); // TPsot
+        hdr.push(1); // TNsot
+        hdr.extend_from_slice(&[0u8; 2]); // 2 stray bytes from the wrong Lsot
+        hdr.extend_from_slice(&MARKER_SOD.to_be_bytes());
+        hdr.extend_from_slice(&[0u8; 4]);
+        hdr.extend_from_slice(&MARKER_EOC.to_be_bytes());
+        let err = parse_codestream(&hdr).unwrap_err();
+        assert_eq!(err, Error::InvalidMarkerLength);
+    }
+
+    #[test]
+    fn walk_tile_parts_reports_offsets_into_buffer() {
+        // Verify TilePart.sot_offset and TilePart.sod_offset point
+        // exactly at the 0xFF90 / 0xFF93 markers in the buffer.
+        let body = vec![0u8; 4];
+        let psot = (12 + 2 + body.len()) as u32;
+        let sot = Sot {
+            tile_index: 0,
+            psot,
+            tile_part_index: 0,
+            num_tile_parts: 1,
+        };
+        let bytes = synth_codestream(&[(sot, body)]);
+        let cs = parse_codestream(&bytes).expect("parse");
+        let tp = cs.tile_parts[0];
+        assert_eq!(&bytes[tp.sot_offset..tp.sot_offset + 2], &[0xFF, 0x90]);
+        assert_eq!(&bytes[tp.sod_offset..tp.sod_offset + 2], &[0xFF, 0x93]);
+        assert_eq!(tp.body_offset, tp.sod_offset + 2);
     }
 }

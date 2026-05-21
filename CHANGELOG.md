@@ -6,6 +6,29 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 2 (2026-05-21).** SOT / SOD tile-part walker.
+  New `Sot` / `TilePart` / `J2kCodestream` types and
+  `walk_tile_parts(bytes, header)` / `parse_codestream(bytes)` entry
+  points return an ordered list of tile-parts with the parsed
+  `(Isot, Psot, TPsot, TNsot)` quartet plus byte offsets of the SOT
+  marker, SOD marker, and bit-stream body inside the input slice.
+  Both fixed-`Psot` and `Psot == 0` ("body until EOC") framings are
+  supported per T.800 §A.4.2. Tile-part-header markers are
+  validated against T.800 Table A.2's per-header allow-list — main-
+  header-only markers (`SOC`, `SIZ`, `CAP`, `PRF`, `CRG`, `TLM`,
+  `PLM`, `PPM`) trigger `Error::UnexpectedMainHeaderMarker`; legal
+  in-tile-part markers (`COD`, `COC`, `RGN`, `QCD`, `QCC`, `POC`,
+  `PLT`, `PPT`, `COM`) are skipped by length. Nine new unit tests
+  covering single/multi-tile-part happy paths, Psot-zero streaming,
+  overrun rejection, missing-EOC, illegal-marker-in-tile-part, COM
+  injection, wrong-Lsot, and offset reporting against synthetic
+  buffers. Sixteen tests total pass.
+
+  Built solely against `docs/image/jpeg2000/T-REC-T.800-201906-S.pdf`
+  (T.800 §A.2 / Table A.2 / §A.4.2 / Table A.5 / Table A.6 /
+  §A.4.3 / Table A.7 / §A.4.4 / Table A.8). No external library
+  source consulted.
+
 * **Clean-room round 1 (2026-05-20).** Initial JPEG 2000 Part-1
   main-header parser: `SOC`, `SIZ`, `COD`, `QCD` marker segments are
   recognised, length-checked, and decoded into a typed `J2kHeader`

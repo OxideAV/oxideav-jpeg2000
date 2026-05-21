@@ -3,16 +3,21 @@
 Pure-Rust JPEG 2000 (J2K + JP2) and High-Throughput JPEG 2000 (HTJ2K)
 codec.
 
-## Status — 2026-05-20 (clean-room round 1)
+## Status — 2026-05-21 (clean-room round 2)
 
-**Codestream-header parser only.** The crate now parses the
-JPEG 2000 Part-1 main-header marker chain — `SOC`, `SIZ`, `COD`, and
-`QCD` — and returns a fully-typed [`J2kHeader`] describing image
-extent, tile layout, component count, sample precision/sign, wavelet
-kernel, progression order, decomposition levels, and quantisation
-style. Optional `CAP`, `PRF`, `COM`, `COC`, `QCC`, `RGN`, `POC`,
-`PLM`, `PPM`, and `TLM` markers are recognised and skipped via their
-length field.
+**Codestream-structural parser only.** The crate parses the
+JPEG 2000 Part-1 **main header** (`SOC`, `SIZ`, `COD`, `QCD`) and now
+also walks the **tile-part chain** (`SOT` / `SOD` / `EOC`), returning
+a `J2kCodestream` with the main header plus an ordered `Vec<TilePart>`
+containing each tile-part's parsed `Sot` (tile index, `Psot`,
+`TPsot`, `TNsot`) plus byte offsets of the `SOT` marker, `SOD`
+marker, and bit-stream body inside the input buffer. Inline
+tile-part-header markers (`COD`, `COC`, `RGN`, `QCD`, `QCC`, `POC`,
+`PLT`, `PPT`, `COM`) are recognised and skipped by length; markers
+forbidden in tile-part headers (`SOC`, `SIZ`, `CAP`, `PRF`, `CRG`,
+`TLM`, `PLM`, `PPM`) are hard-rejected. Both fixed-`Psot` and
+`Psot = 0` ("body until EOC") tile-part framings are supported per
+T.800 §A.4.2.
 
 What is **not** implemented yet:
 
@@ -21,7 +26,7 @@ What is **not** implemented yet:
 * Inverse 5-3 and 9-7 wavelet transforms.
 * Dequantisation (E.1 / E.2 reconstruction formulas).
 * Multiple-component-transform (MCT, Annex G).
-* Tile-part body reassembly.
+* Tile-part body decode (the walker delimits but does not decode).
 * JP2 box-structured file format (ISO BMFF wrapper around the J2K codestream).
 * HTJ2K Part-15 block coder.
 * Any encoder path.
@@ -35,11 +40,14 @@ This module was written from scratch against the JPEG 2000 standards
 documents under `docs/image/jpeg2000/` only. The specific sections
 consulted:
 
-* T.800 §A.4 (delimiting markers — SOC, SOT, SOD, EOC).
+* T.800 §A.4 (delimiting markers — SOC, SOT, SOD, EOC) +
+  Tables A.4 / A.5 / A.6 / A.7 / A.8.
 * T.800 §A.5.1 + Tables A.9 / A.10 / A.11 (SIZ).
 * T.800 §A.6.1 + Tables A.12 / A.13 / A.14 / A.15 / A.16 / A.17 /
   A.18 / A.19 / A.20 / A.21 (COD).
 * T.800 §A.6.4 + Tables A.27 / A.28 / A.29 / A.30 (QCD).
+* T.800 §A.2 / Tables A.2 / A.3 (per-header marker allow-lists used
+  to validate the tile-part walker).
 
 No external library source — OpenJPEG, OpenJPH, Kakadu, FFmpeg, etc.
 — was consulted, quoted, paraphrased, or used as a cross-check
