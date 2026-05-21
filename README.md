@@ -3,21 +3,34 @@
 Pure-Rust JPEG 2000 (J2K + JP2) and High-Throughput JPEG 2000 (HTJ2K)
 codec.
 
-## Status — 2026-05-21 (clean-room round 2)
+## Status — 2026-05-21 (clean-room round 3)
 
 **Codestream-structural parser only.** The crate parses the
-JPEG 2000 Part-1 **main header** (`SOC`, `SIZ`, `COD`, `QCD`) and now
-also walks the **tile-part chain** (`SOT` / `SOD` / `EOC`), returning
-a `J2kCodestream` with the main header plus an ordered `Vec<TilePart>`
-containing each tile-part's parsed `Sot` (tile index, `Psot`,
-`TPsot`, `TNsot`) plus byte offsets of the `SOT` marker, `SOD`
-marker, and bit-stream body inside the input buffer. Inline
-tile-part-header markers (`COD`, `COC`, `RGN`, `QCD`, `QCC`, `POC`,
-`PLT`, `PPT`, `COM`) are recognised and skipped by length; markers
-forbidden in tile-part headers (`SOC`, `SIZ`, `CAP`, `PRF`, `CRG`,
-`TLM`, `PLM`, `PPM`) are hard-rejected. Both fixed-`Psot` and
-`Psot = 0` ("body until EOC") tile-part framings are supported per
-T.800 §A.4.2.
+JPEG 2000 Part-1 **main header** (`SOC`, `SIZ`, `COD`, `QCD`) and
+walks the **tile-part chain** (`SOT` / `SOD` / `EOC`), returning a
+`J2kCodestream` with the main header plus an ordered
+`Vec<TilePart>`. Each `TilePart` carries its parsed `Sot` (tile
+index, `Psot`, `TPsot`, `TNsot`), byte offsets of the `SOT` marker,
+`SOD` marker, and bit-stream body inside the input buffer, plus a
+`Vec<TilePartMarker>` of the **typed marker segments** parsed out
+of the tile-part header between `SOT` and `SOD`. Recognised
+tile-part-header markers parse into typed structs:
+
+* `COD` → `Cod` (T.800 §A.6.1, override of main header)
+* `COC` → `Coc` (T.800 §A.6.2, per-component coding-style override)
+* `QCD` → `Qcd` (T.800 §A.6.4, quantisation override)
+* `QCC` → `Qcc` (T.800 §A.6.5, per-component quantisation override)
+* `RGN` → `Rgn` (T.800 §A.6.3, region-of-interest declaration)
+* `POC` → `Poc` (T.800 §A.6.6, progression-order change list)
+* `PLT` → `Plt` (T.800 §A.7.3, packet-length list, 7-bit VLQ decoded)
+* `PPT` → `Ppt` (T.800 §A.7.5, opaque packet-header payload)
+* `COM` → `Com(Vec<u8>)` (T.800 §A.9.2, comment payload verbatim)
+
+8-bit vs 16-bit component-index width is selected automatically from
+the codestream's `Csiz`. Markers forbidden in tile-part headers
+(`SOC`, `SIZ`, `CAP`, `PRF`, `CRG`, `TLM`, `PLM`, `PPM`) are
+hard-rejected. Both fixed-`Psot` and `Psot = 0` ("body until EOC")
+tile-part framings are supported per T.800 §A.4.2.
 
 What is **not** implemented yet:
 
@@ -45,7 +58,13 @@ consulted:
 * T.800 §A.5.1 + Tables A.9 / A.10 / A.11 (SIZ).
 * T.800 §A.6.1 + Tables A.12 / A.13 / A.14 / A.15 / A.16 / A.17 /
   A.18 / A.19 / A.20 / A.21 (COD).
+* T.800 §A.6.2 + Tables A.22 / A.23 (COC).
+* T.800 §A.6.3 + Tables A.24 / A.25 / A.26 (RGN).
 * T.800 §A.6.4 + Tables A.27 / A.28 / A.29 / A.30 (QCD).
+* T.800 §A.6.5 + Table A.31 (QCC).
+* T.800 §A.6.6 + Table A.32 (POC).
+* T.800 §A.7.3 + Tables A.37 / A.36 (PLT — Iplt 7-bit VLQ decoding).
+* T.800 §A.7.5 + Table A.39 (PPT).
 * T.800 §A.2 / Tables A.2 / A.3 (per-header marker allow-lists used
   to validate the tile-part walker).
 

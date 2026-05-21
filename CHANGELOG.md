@@ -6,6 +6,36 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 3 (2026-05-21).** Typed tile-part marker parsers.
+  Six new typed marker structs — `Coc` (T.800 §A.6.2), `Qcc`
+  (§A.6.5), `Rgn` (§A.6.3), `Poc` + `PocProgression` (§A.6.6),
+  `Plt` (§A.7.3), `Ppt` (§A.7.5) — plus a new `TilePartMarker` enum
+  exposing them along with the existing `Cod` / `Qcd` and a `Com`
+  catch-all (§A.9.2). `TilePart` now surfaces a
+  `markers: Vec<TilePartMarker>` field carrying the marker chain
+  parsed out of each tile-part header in codestream order; the
+  walker no longer length-skips these segments. 8-bit vs 16-bit
+  component-index width is selected from the codestream's `Csiz`
+  per T.800 (`Csiz < 257` → 8 bits, `Csiz >= 257` → 16 bits) for
+  COC, QCC, RGN, and POC. PLT decodes its `Iplt` 7-bit
+  variable-length packet-length stream (T.800 Table A.36) into a
+  `Vec<u32>`, validates that every PLT segment ends with a
+  completed packet length (`A.7.3`), and rejects 32-bit overflow.
+  `TilePart` is now `Clone` (no longer `Copy`) because it owns a
+  `Vec` of marker payloads. Ten new unit tests covering COC, QCC,
+  RGN, POC (with `CEpoc = 0` → 256 interpretation), PLT (single
+  and multi-segment with distinct `Zplt`), PLT VLQ overrun
+  rejection, PPT, full-marker-chain ordering across all 9 typed
+  variants, and an out-of-range COC `NL` rejection. Twenty-six
+  tests total pass.
+
+  Built solely against `docs/image/jpeg2000/T-REC-T.800-201906-S.pdf`
+  (T.800 §A.6.2 / Table A.22 / A.23 / A.15 (COC), §A.6.3 / Table
+  A.24 / A.25 / A.26 (RGN), §A.6.5 / Table A.31 (QCC), §A.6.6 /
+  Table A.32 (POC), §A.7.3 / Table A.37 / Table A.36 (PLT), §A.7.5 /
+  Table A.39 (PPT), §A.9.2 (COM)). No external library source
+  consulted.
+
 * **Clean-room round 2 (2026-05-21).** SOT / SOD tile-part walker.
   New `Sot` / `TilePart` / `J2kCodestream` types and
   `walk_tile_parts(bytes, header)` / `parse_codestream(bytes)` entry

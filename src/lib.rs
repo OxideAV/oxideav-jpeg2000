@@ -2,15 +2,20 @@
 //!
 //! Pure-Rust JPEG 2000 (J2K) codestream parser and (eventually) codec.
 //!
-//! ## Status — 2026-05-21 (round 2)
+//! ## Status — 2026-05-21 (round 3)
 //!
 //! Main-header parser ([`parse_j2k_header`], round 1) plus tile-part
-//! walker ([`walk_tile_parts`] / [`parse_codestream`], round 2). The
-//! walker returns an ordered [`Vec<TilePart>`] giving each tile-part's
-//! parsed [`Sot`] (tile index, `Psot`, `TPsot`, `TNsot`) plus byte
-//! offsets of its `SOT` marker, `SOD` marker, and bit-stream body
-//! inside the input buffer. Both fixed-`Psot` and `Psot == 0` ("body
-//! until EOC") framings are supported per T.800 §A.4.2.
+//! walker ([`walk_tile_parts`] / [`parse_codestream`], round 2) plus
+//! typed per-tile-part marker parsers (round 3). The walker returns
+//! an ordered [`Vec<TilePart>`] giving each tile-part's parsed
+//! [`Sot`] (tile index, `Psot`, `TPsot`, `TNsot`), byte offsets of
+//! its `SOT` marker, `SOD` marker, and bit-stream body, plus a
+//! [`Vec<TilePartMarker>`] of the typed marker segments parsed out
+//! of the tile-part header between `SOT` and `SOD`. Recognised
+//! tile-part-header markers: [`Cod`], [`Coc`], [`Qcd`], [`Qcc`],
+//! [`Rgn`], [`Poc`], [`Plt`], [`Ppt`], and `COM`. Both fixed-`Psot`
+//! and `Psot == 0` ("body until EOC") framings are supported per
+//! T.800 §A.4.2.
 //!
 //! Codestream-body decoding (tier-1 EBCOT, tier-2 packet parsing,
 //! wavelet inverse transform, dequantisation, MCT) and any encoder
@@ -26,8 +31,9 @@
 //!   syntax". Tables A.2 / A.3 (per-header marker allow-list),
 //!   A.4 (SOC), A.5 / A.6 (SOT / tile-part counts), A.7 (SOD),
 //!   A.8 (EOC), A.9 / A.10 / A.11 (SIZ), A.12 / A.13 / A.14 / A.15
-//!   / A.16 / A.17 / A.18 / A.19 / A.20 / A.21 (COD), A.27 / A.28
-//!   / A.29 / A.30 (QCD).
+//!   / A.16 / A.17 / A.18 / A.19 / A.20 / A.21 (COD), A.22 / A.23
+//!   (COC), A.24 / A.25 / A.26 (RGN), A.27 / A.28 / A.29 / A.30
+//!   (QCD), A.31 (QCC), A.32 (POC), A.36 / A.37 (PLT), A.39 (PPT).
 //!
 //! No external library source (OpenJPEG, OpenJPH, Kakadu, FFmpeg,
 //! libavcodec, etc.) was consulted, quoted, paraphrased, or used as
@@ -61,6 +67,14 @@ pub const MARKER_COC: u16 = 0xFF53;
 pub const MARKER_QCD: u16 = 0xFF5C;
 /// `QCC` — Quantization component (T.800 Table A.31).
 pub const MARKER_QCC: u16 = 0xFF5D;
+/// `RGN` — Region of interest (T.800 Table A.24).
+pub const MARKER_RGN: u16 = 0xFF5E;
+/// `POC` — Progression order change (T.800 Table A.32).
+pub const MARKER_POC: u16 = 0xFF5F;
+/// `PLT` — Packet length, tile-part header (T.800 Table A.37).
+pub const MARKER_PLT: u16 = 0xFF58;
+/// `PPT` — Packed packet headers, tile-part header (T.800 Table A.39).
+pub const MARKER_PPT: u16 = 0xFF61;
 /// `CAP` — Extended capabilities (T.800 Table A.11bis).
 pub const MARKER_CAP: u16 = 0xFF50;
 /// `PRF` — Profile (T.800 Table A.11quater).
@@ -372,6 +386,154 @@ impl J2kHeader {
     }
 }
 
+/// Parsed COC marker segment (T.800 §A.6.2, Tables A.22 / A.23 / A.15).
+///
+/// Per-component override of [`Cod`]. The component index is parsed
+/// according to T.800 §A.6.2: 8-bit when the codestream's `Csiz` is
+/// strictly less than 257, 16-bit otherwise.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Coc {
+    /// `Ccoc` — component index this segment applies to (0..=16_383).
+    pub component_index: u16,
+    /// `Scoc` — coding style (T.800 Table A.23).
+    pub scoc: u8,
+    /// Whether user-defined precincts are present (low bit of `Scoc`).
+    pub user_defined_precincts: bool,
+    /// `SPcoc` decomposition levels, NL (0..=32).
+    pub decomposition_levels: u8,
+    /// Code-block width exponent offset, xcb (T.800 Table A.15).
+    pub code_block_width_exp: u8,
+    /// Code-block height exponent offset, ycb (T.800 Table A.15).
+    pub code_block_height_exp: u8,
+    /// Code-block style flags (T.800 Table A.19).
+    pub code_block_style: u8,
+    /// Wavelet transform kernel (T.800 Table A.20).
+    pub transform: WaveletTransform,
+    /// User-defined precinct sizes when `user_defined_precincts` is true,
+    /// `NL+1` bytes per T.800 Table A.21. Empty when maximum-precincts.
+    pub precincts: Vec<u8>,
+}
+
+/// Parsed QCC marker segment (T.800 §A.6.5, Tables A.31 / A.28).
+///
+/// Per-component override of [`Qcd`]. The component index is parsed
+/// according to T.800 §A.6.5: 8-bit when `Csiz` is strictly less than
+/// 257, 16-bit otherwise.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Qcc {
+    /// `Cqcc` — component index this segment applies to (0..=16_383).
+    pub component_index: u16,
+    /// `Sqcc` — full byte (style in low 5 bits, guard bits in high 3).
+    pub sqcc: u8,
+    /// Decoded quantisation style.
+    pub style: QuantizationStyle,
+    /// Number of guard bits (high 3 bits of Sqcc, T.800 Table A.28).
+    pub guard_bits: u8,
+    /// Raw `SPqcc` payload bytes — same format as [`Qcd::spqcd`].
+    pub spqcc: Vec<u8>,
+}
+
+/// One progression-order-change entry from a [`Poc`] marker segment.
+///
+/// Mirrors the 7-byte (`Csiz` < 257) / 9-byte (`Csiz` >= 257) per-entry
+/// tuple from T.800 §A.6.6 / Table A.32.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PocProgression {
+    /// `RSpoci` — resolution level index (inclusive) at start of progression.
+    pub resolution_start: u8,
+    /// `CSpoci` — component index (inclusive) at start of progression.
+    pub component_start: u16,
+    /// `LYEpoci` — layer index (exclusive) at end of progression.
+    pub layer_end: u16,
+    /// `REpoci` — resolution level index (exclusive) at end of progression.
+    pub resolution_end: u8,
+    /// `CEpoci` — component index (exclusive) at end of progression
+    /// (T.800 Table A.32: 0 is interpreted as 256 for `Csiz` < 257, or
+    /// 16 384 for `Csiz` >= 257).
+    pub component_end: u16,
+    /// `Ppoci` — progression order for this entry (T.800 Table A.16).
+    pub progression: ProgressionOrder,
+}
+
+/// Parsed POC marker segment (T.800 §A.6.6, Table A.32).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Poc {
+    /// One progression entry per `(RSpoci, CSpoci, LYEpoci, REpoci,
+    /// CEpoci, Ppoci)` tuple in the marker segment.
+    pub progressions: Vec<PocProgression>,
+}
+
+/// Parsed RGN marker segment (T.800 §A.6.3, Tables A.24 / A.25 / A.26).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rgn {
+    /// `Crgn` — component index this segment applies to (0..=16_383).
+    pub component_index: u16,
+    /// `Srgn` — ROI style (0 = implicit / maximum shift; T.800 Table A.25).
+    pub srgn: u8,
+    /// `SPrgn` — parameter for the ROI style (T.800 Table A.26).
+    ///
+    /// For `Srgn = 0` this is the implicit-ROI binary shift (0..=255).
+    pub sprgn: u8,
+}
+
+/// Parsed PLT marker segment (T.800 §A.7.3, Tables A.37 / A.36).
+///
+/// PLT enumerates packet lengths inside a tile-part. Each `Iplt`
+/// entry is a 7-bit big-endian variable-length integer with a
+/// continuation bit (T.800 Table A.36); we decode them eagerly into
+/// `packet_lengths`. The raw `Zplt` index is preserved so callers
+/// can reassemble multiple PLT segments per tile-part by sorting on
+/// `Zplt` ascending (T.800 §A.7.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plt {
+    /// `Zplt` — index of this PLT segment among the tile-part's PLTs.
+    pub z_index: u8,
+    /// Decoded `Iplt` packet lengths in declaration order.
+    pub packet_lengths: Vec<u32>,
+}
+
+/// Parsed PPT marker segment (T.800 §A.7.5, Table A.39).
+///
+/// PPT carries opaque packet-header bytes for the tile-part it appears
+/// in. The bytes are kept verbatim; the tier-2 packet-header decoder
+/// (queued for a later round) re-streams them when packets without
+/// in-stream headers are decoded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ppt {
+    /// `Zppt` — index of this PPT segment among the tile-part's PPTs.
+    pub z_index: u8,
+    /// Raw `Ippt` packet-header payload.
+    pub packet_headers: Vec<u8>,
+}
+
+/// One typed marker segment parsed out of a tile-part header.
+///
+/// The walker emits these in codestream order between the `SOT`
+/// marker and the `SOD` marker of each tile-part. T.800 Table A.2
+/// enumerates the permitted markers — exactly those listed here, plus
+/// the optional [`Com`](Self::Com) catch-all (Comment, T.800 §A.9.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TilePartMarker {
+    /// `COD` override for this tile-part (T.800 §A.6.1).
+    Cod(Cod),
+    /// `COC` per-component coding-style override (T.800 §A.6.2).
+    Coc(Coc),
+    /// `QCD` quantisation override for this tile-part (T.800 §A.6.4).
+    Qcd(Qcd),
+    /// `QCC` per-component quantisation override (T.800 §A.6.5).
+    Qcc(Qcc),
+    /// `RGN` region-of-interest declaration (T.800 §A.6.3).
+    Rgn(Rgn),
+    /// `POC` progression-order change (T.800 §A.6.6).
+    Poc(Poc),
+    /// `PLT` packet-length list (T.800 §A.7.3).
+    Plt(Plt),
+    /// `PPT` packed packet-header payload (T.800 §A.7.5).
+    Ppt(Ppt),
+    /// `COM` comment payload (T.800 §A.9.2) — preserved verbatim.
+    Com(Vec<u8>),
+}
+
 // ---------------------------------------------------------------------------
 // Tile-part header (T.800 §A.4.2 / Table A.5).
 // ---------------------------------------------------------------------------
@@ -408,7 +570,12 @@ pub struct Sot {
 /// points at the `0xFF93` `SOD` marker, and `body_offset` points at
 /// the first byte of the tier-2 bit stream (one byte past the `SOD`
 /// marker).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `markers` carries the typed marker segments that appeared inside
+/// the tile-part header (between `SOT` and `SOD`), in codestream
+/// order. T.800 Table A.2 enumerates which markers are permitted;
+/// see [`TilePartMarker`] for the variants.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TilePart {
     /// The parsed SOT marker segment for this tile-part.
     pub sot: Sot,
@@ -423,6 +590,11 @@ pub struct TilePart {
     /// Length of the tile-part bit-stream body in bytes — the bytes
     /// between `body_offset` and the next `SOT` / `EOC` marker.
     pub body_len: usize,
+    /// Typed marker segments parsed out of the tile-part header
+    /// between `SOT` and `SOD`, in codestream order. Empty for a
+    /// tile-part whose header carried only the `SOT` and `SOD`
+    /// delimiters.
+    pub markers: Vec<TilePartMarker>,
 }
 
 /// Parsed JPEG 2000 Part-1 codestream — main header plus the
@@ -675,6 +847,279 @@ fn parse_qcd(reader: &mut Reader<'_>) -> Result<Qcd, Error> {
     })
 }
 
+/// Parses a COC marker segment whose marker code has already been
+/// consumed. T.800 §A.6.2 / Tables A.22 / A.23 / A.15.
+///
+/// `csiz` is the number of components from the codestream's SIZ
+/// segment; T.800 §A.6.2 specifies that `Ccoc` is 8 bits when
+/// `Csiz < 257` and 16 bits otherwise.
+fn parse_coc(reader: &mut Reader<'_>, csiz: u16) -> Result<Coc, Error> {
+    let lcoc = reader.read_u16_be()?;
+    if !(9..=43).contains(&lcoc) {
+        return Err(Error::InvalidMarkerLength);
+    }
+    let body_len = (lcoc as usize)
+        .checked_sub(2)
+        .ok_or(Error::InvalidMarkerLength)?;
+    let start = reader.pos;
+    let component_index: u16 = if csiz < 257 {
+        reader.read_u8()? as u16
+    } else {
+        reader.read_u16_be()?
+    };
+    let scoc = reader.read_u8()?;
+    // SPcoc parameters per Table A.15: NL, xcb, ycb, code-block style,
+    // transform, then NL+1 precinct bytes if user-defined precincts.
+    let decomposition_levels = reader.read_u8()?;
+    if decomposition_levels > 32 {
+        return Err(Error::InvalidDecompositionLevels);
+    }
+    let cb_w = reader.read_u8()?;
+    let cb_h = reader.read_u8()?;
+    let code_block_style = reader.read_u8()?;
+    let transform = WaveletTransform::from_byte(reader.read_u8()?);
+    let user_defined_precincts = (scoc & 0x01) != 0;
+    let precincts = if user_defined_precincts {
+        let n = decomposition_levels as usize + 1;
+        reader.read_bytes(n)?.to_vec()
+    } else {
+        Vec::new()
+    };
+    let consumed = reader.pos - start;
+    if consumed != body_len {
+        return Err(Error::InvalidMarkerLength);
+    }
+    Ok(Coc {
+        component_index,
+        scoc,
+        user_defined_precincts,
+        decomposition_levels,
+        code_block_width_exp: cb_w,
+        code_block_height_exp: cb_h,
+        code_block_style,
+        transform,
+        precincts,
+    })
+}
+
+/// Parses a QCC marker segment whose marker code has already been
+/// consumed. T.800 §A.6.5 / Tables A.31 / A.28.
+fn parse_qcc(reader: &mut Reader<'_>, csiz: u16) -> Result<Qcc, Error> {
+    let lqcc = reader.read_u16_be()?;
+    if !(5..=199).contains(&lqcc) {
+        return Err(Error::InvalidMarkerLength);
+    }
+    let body_len = (lqcc as usize)
+        .checked_sub(2)
+        .ok_or(Error::InvalidMarkerLength)?;
+    let start = reader.pos;
+    let component_index: u16 = if csiz < 257 {
+        reader.read_u8()? as u16
+    } else {
+        reader.read_u16_be()?
+    };
+    let sqcc = reader.read_u8()?;
+    let style = QuantizationStyle::from_byte(sqcc);
+    let guard_bits = (sqcc >> 5) & 0x07;
+    let consumed_so_far = reader.pos - start;
+    if consumed_so_far > body_len {
+        return Err(Error::InvalidMarkerLength);
+    }
+    let payload_len = body_len - consumed_so_far;
+    let bytes = reader.read_bytes(payload_len)?;
+    // Mirror the QCD style-vs-payload sanity check (T.800 Table A.28).
+    let style_check_ok = match style {
+        QuantizationStyle::None => true, // 1 byte each, any non-negative count
+        QuantizationStyle::ScalarDerived => payload_len == 2,
+        QuantizationStyle::ScalarExpounded => payload_len % 2 == 0,
+        QuantizationStyle::Reserved(_) => true,
+    };
+    if !style_check_ok {
+        return Err(Error::InvalidMarkerLength);
+    }
+    Ok(Qcc {
+        component_index,
+        sqcc,
+        style,
+        guard_bits,
+        spqcc: bytes.to_vec(),
+    })
+}
+
+/// Parses a POC marker segment whose marker code has already been
+/// consumed. T.800 §A.6.6 / Table A.32.
+fn parse_poc(reader: &mut Reader<'_>, csiz: u16) -> Result<Poc, Error> {
+    let lpoc = reader.read_u16_be()?;
+    if lpoc < 9 {
+        return Err(Error::InvalidMarkerLength);
+    }
+    let body_len = (lpoc as usize)
+        .checked_sub(2)
+        .ok_or(Error::InvalidMarkerLength)?;
+    // Per-entry size: 7 bytes when Csiz < 257 (CSpoc/CEpoc are 8 bit),
+    // 9 bytes otherwise (CSpoc/CEpoc are 16 bit).
+    let entry_size = if csiz < 257 { 7 } else { 9 };
+    if body_len % entry_size != 0 {
+        return Err(Error::InvalidMarkerLength);
+    }
+    let count = body_len / entry_size;
+    let mut progressions = Vec::with_capacity(count);
+    for _ in 0..count {
+        let resolution_start = reader.read_u8()?;
+        let component_start: u16 = if csiz < 257 {
+            reader.read_u8()? as u16
+        } else {
+            reader.read_u16_be()?
+        };
+        let layer_end = reader.read_u16_be()?;
+        let resolution_end = reader.read_u8()?;
+        let component_end_raw: u16 = if csiz < 257 {
+            reader.read_u8()? as u16
+        } else {
+            reader.read_u16_be()?
+        };
+        // T.800 Table A.32 footnote: CEpoc = 0 is interpreted as 256
+        // for Csiz < 257 (or 16 384 for Csiz >= 257). We surface the
+        // interpreted value to spare callers the repeated check.
+        let component_end = if component_end_raw == 0 {
+            if csiz < 257 {
+                256
+            } else {
+                16_384
+            }
+        } else {
+            component_end_raw
+        };
+        let progression = ProgressionOrder::from_byte(reader.read_u8()?);
+        progressions.push(PocProgression {
+            resolution_start,
+            component_start,
+            layer_end,
+            resolution_end,
+            component_end,
+            progression,
+        });
+    }
+    Ok(Poc { progressions })
+}
+
+/// Parses an RGN marker segment whose marker code has already been
+/// consumed. T.800 §A.6.3 / Tables A.24 / A.25 / A.26.
+fn parse_rgn(reader: &mut Reader<'_>, csiz: u16) -> Result<Rgn, Error> {
+    let lrgn = reader.read_u16_be()?;
+    if !(5..=6).contains(&lrgn) {
+        return Err(Error::InvalidMarkerLength);
+    }
+    let body_len = (lrgn as usize)
+        .checked_sub(2)
+        .ok_or(Error::InvalidMarkerLength)?;
+    let start = reader.pos;
+    let component_index: u16 = if csiz < 257 {
+        reader.read_u8()? as u16
+    } else {
+        reader.read_u16_be()?
+    };
+    let srgn = reader.read_u8()?;
+    let sprgn = reader.read_u8()?;
+    let consumed = reader.pos - start;
+    if consumed != body_len {
+        return Err(Error::InvalidMarkerLength);
+    }
+    Ok(Rgn {
+        component_index,
+        srgn,
+        sprgn,
+    })
+}
+
+/// Parses a PLT marker segment whose marker code has already been
+/// consumed. T.800 §A.7.3 / Tables A.37 / A.36.
+fn parse_plt(reader: &mut Reader<'_>) -> Result<Plt, Error> {
+    let lplt = reader.read_u16_be()?;
+    if lplt < 4 {
+        return Err(Error::InvalidMarkerLength);
+    }
+    let body_len = (lplt as usize)
+        .checked_sub(2)
+        .ok_or(Error::InvalidMarkerLength)?;
+    if body_len < 1 {
+        return Err(Error::InvalidMarkerLength);
+    }
+    let z_index = reader.read_u8()?;
+    let iplt_len = body_len - 1;
+    let iplt_bytes = reader.read_bytes(iplt_len)?;
+    // Decode the 7-bit-VLQ packet-length stream per T.800 Table A.36.
+    // Each length consists of one or more continuation bytes (bit 7 = 1)
+    // followed by a terminating byte (bit 7 = 0). The bit-7-stripped
+    // 7-bit chunks are concatenated MSB-first into the integer.
+    let mut packet_lengths = Vec::new();
+    let mut cur: u32 = 0;
+    let mut bits_in_cur: u32 = 0;
+    for &b in iplt_bytes {
+        // Each 7-bit chunk extends `cur` from the LSB side, so we
+        // shift previously-accumulated bits left by 7.
+        cur = cur.checked_shl(7).ok_or(Error::InvalidMarkerLength)? | ((b & 0x7F) as u32);
+        bits_in_cur += 7;
+        if (b & 0x80) == 0 {
+            packet_lengths.push(cur);
+            cur = 0;
+            bits_in_cur = 0;
+        } else if bits_in_cur > 28 {
+            // 32-bit packet length safety: 5 continuation bytes would
+            // need 35 bits; the spec leaves an upper bound implicit
+            // but anything beyond 32 bits exceeds Iplt's representable
+            // range as a u32.
+            return Err(Error::InvalidMarkerLength);
+        }
+    }
+    // T.800 §A.7.3: "Every marker segment in this series shall end
+    // with a completed packet header length." A dangling continuation
+    // bit means a malformed PLT.
+    if bits_in_cur != 0 {
+        return Err(Error::InvalidMarkerLength);
+    }
+    Ok(Plt {
+        z_index,
+        packet_lengths,
+    })
+}
+
+/// Parses a PPT marker segment whose marker code has already been
+/// consumed. T.800 §A.7.5 / Table A.39.
+fn parse_ppt(reader: &mut Reader<'_>) -> Result<Ppt, Error> {
+    let lppt = reader.read_u16_be()?;
+    if lppt < 4 {
+        return Err(Error::InvalidMarkerLength);
+    }
+    let body_len = (lppt as usize)
+        .checked_sub(2)
+        .ok_or(Error::InvalidMarkerLength)?;
+    if body_len < 1 {
+        return Err(Error::InvalidMarkerLength);
+    }
+    let z_index = reader.read_u8()?;
+    let ippt_len = body_len - 1;
+    let packet_headers = reader.read_bytes(ippt_len)?.to_vec();
+    Ok(Ppt {
+        z_index,
+        packet_headers,
+    })
+}
+
+/// Parses a COM marker segment whose marker code has already been
+/// consumed, returning the raw payload bytes (including the 2-byte
+/// `Rcom` registration field). T.800 §A.9.2 / Table A.49.
+fn parse_com(reader: &mut Reader<'_>) -> Result<Vec<u8>, Error> {
+    let lcom = reader.read_u16_be()?;
+    if lcom < 4 {
+        return Err(Error::InvalidMarkerLength);
+    }
+    let body_len = (lcom as usize)
+        .checked_sub(2)
+        .ok_or(Error::InvalidMarkerLength)?;
+    Ok(reader.read_bytes(body_len)?.to_vec())
+}
+
 // ---------------------------------------------------------------------------
 // Top-level header walker.
 // ---------------------------------------------------------------------------
@@ -814,6 +1259,7 @@ const MAIN_HEADER_ONLY_MARKERS: &[u16] = &[
 /// References: T.800 §A.4.2 (SOT), §A.4.3 (SOD), §A.4.4 (EOC),
 /// Table A.5, Table A.6.
 pub fn walk_tile_parts(bytes: &[u8], header: &J2kHeader) -> Result<Vec<TilePart>, Error> {
+    let csiz = header.siz.components.len() as u16;
     let mut tile_parts = Vec::new();
     let mut pos = header.bytes_consumed;
     loop {
@@ -827,7 +1273,7 @@ pub fn walk_tile_parts(bytes: &[u8], header: &J2kHeader) -> Result<Vec<TilePart>
         if marker != MARKER_SOT {
             return Err(Error::UnknownMarker(marker));
         }
-        let tp = walk_one_tile_part(bytes, pos)?;
+        let tp = walk_one_tile_part(bytes, pos, csiz)?;
         // Advance: if Psot is non-zero, the next tile-part begins at
         // sot_offset + Psot (T.800 §A.4.2: Psot measures from the start
         // of the SOT marker). If Psot is zero, the body extends to the
@@ -854,7 +1300,7 @@ pub fn parse_codestream(bytes: &[u8]) -> Result<J2kCodestream, Error> {
 
 /// Walks a single tile-part starting at the byte offset of its SOT
 /// marker. Returns the parsed [`TilePart`].
-fn walk_one_tile_part(bytes: &[u8], sot_offset: usize) -> Result<TilePart, Error> {
+fn walk_one_tile_part(bytes: &[u8], sot_offset: usize, csiz: u16) -> Result<TilePart, Error> {
     let mut reader = Reader {
         buf: bytes,
         pos: sot_offset,
@@ -864,7 +1310,9 @@ fn walk_one_tile_part(bytes: &[u8], sot_offset: usize) -> Result<TilePart, Error
         return Err(Error::UnknownMarker(marker));
     }
     let sot = parse_sot(&mut reader)?;
-    // Walk the tile-part header markers until SOD.
+    // Walk the tile-part header markers until SOD, parsing each one
+    // into the typed [`TilePartMarker`] variant.
+    let mut markers: Vec<TilePartMarker> = Vec::new();
     let sod_offset = loop {
         if reader.remaining() < 2 {
             return Err(Error::UnexpectedEof);
@@ -878,18 +1326,19 @@ fn walk_one_tile_part(bytes: &[u8], sot_offset: usize) -> Result<TilePart, Error
         if MAIN_HEADER_ONLY_MARKERS.contains(&m) {
             return Err(Error::UnexpectedMainHeaderMarker(m));
         }
+        // Markers permitted in tile-part headers per T.800 Table A.2:
+        // COD, COC, RGN, QCD, QCC, POC, PLT, PPT, COM. Each parser
+        // expects the 2-byte marker code to have already been consumed.
         match m {
-            // Markers permitted in tile-part headers per T.800 Table
-            // A.2: COD, COC, RGN, QCD, QCC, POC, PLT, PPT, COM. All
-            // carry a 16-bit length so we skip by length.
-            MARKER_COD | MARKER_COC | MARKER_QCD | MARKER_QCC | MARKER_COM | 0xFF5E | 0xFF5F
-            | 0xFF58 | 0xFF61 => {
-                let len = reader.read_u16_be()?;
-                if len < 2 {
-                    return Err(Error::InvalidMarkerLength);
-                }
-                reader.skip(len as usize - 2)?;
-            }
+            MARKER_COD => markers.push(TilePartMarker::Cod(parse_cod(&mut reader)?)),
+            MARKER_COC => markers.push(TilePartMarker::Coc(parse_coc(&mut reader, csiz)?)),
+            MARKER_QCD => markers.push(TilePartMarker::Qcd(parse_qcd(&mut reader)?)),
+            MARKER_QCC => markers.push(TilePartMarker::Qcc(parse_qcc(&mut reader, csiz)?)),
+            MARKER_RGN => markers.push(TilePartMarker::Rgn(parse_rgn(&mut reader, csiz)?)),
+            MARKER_POC => markers.push(TilePartMarker::Poc(parse_poc(&mut reader, csiz)?)),
+            MARKER_PLT => markers.push(TilePartMarker::Plt(parse_plt(&mut reader)?)),
+            MARKER_PPT => markers.push(TilePartMarker::Ppt(parse_ppt(&mut reader)?)),
+            MARKER_COM => markers.push(TilePartMarker::Com(parse_com(&mut reader)?)),
             other => return Err(Error::UnknownMarker(other)),
         }
     };
@@ -917,6 +1366,7 @@ fn walk_one_tile_part(bytes: &[u8], sot_offset: usize) -> Result<TilePart, Error
         sod_offset,
         body_offset,
         body_len,
+        markers,
     })
 }
 
@@ -1307,7 +1757,7 @@ mod tests {
         let cs = parse_codestream(&bytes).expect("parse codestream");
         assert!(cs.saw_eoc);
         assert_eq!(cs.tile_parts.len(), 1);
-        let tp = cs.tile_parts[0];
+        let tp = &cs.tile_parts[0];
         assert_eq!(tp.sot.tile_index, 0);
         assert_eq!(tp.sot.psot, psot);
         assert_eq!(tp.sot.tile_part_index, 0);
@@ -1373,7 +1823,7 @@ mod tests {
         let bytes = synth_codestream(&[(sot, body.clone())]);
         let cs = parse_codestream(&bytes).expect("parse codestream");
         assert_eq!(cs.tile_parts.len(), 1);
-        let tp = cs.tile_parts[0];
+        let tp = &cs.tile_parts[0];
         assert_eq!(tp.sot.psot, 0);
         assert_eq!(tp.body_len, body.len());
     }
@@ -1487,9 +1937,354 @@ mod tests {
         };
         let bytes = synth_codestream(&[(sot, body)]);
         let cs = parse_codestream(&bytes).expect("parse");
-        let tp = cs.tile_parts[0];
+        let tp = &cs.tile_parts[0];
         assert_eq!(&bytes[tp.sot_offset..tp.sot_offset + 2], &[0xFF, 0x90]);
         assert_eq!(&bytes[tp.sod_offset..tp.sod_offset + 2], &[0xFF, 0x93]);
         assert_eq!(tp.body_offset, tp.sod_offset + 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Round-3 typed tile-part marker tests
+    // (T.800 §A.6.2 / §A.6.3 / §A.6.5 / §A.6.6 / §A.7.3 / §A.7.5).
+    // -----------------------------------------------------------------------
+
+    /// Build a tile-part header `SOT + <markers> + SOD + body`, splice
+    /// it into the minimal main header, and append the trailing `EOC`.
+    fn synth_tile_part_with_markers(markers: &[u8], body: &[u8]) -> Vec<u8> {
+        let mut tp = synth_sot(0, 0, 0, 1);
+        tp.extend_from_slice(markers);
+        tp.extend_from_slice(&MARKER_SOD.to_be_bytes());
+        tp.extend_from_slice(body);
+        let mut hdr = synth_minimal_header();
+        hdr.truncate(hdr.len() - 2); // drop trailing SOT terminator
+        hdr.extend_from_slice(&tp);
+        hdr.extend_from_slice(&MARKER_EOC.to_be_bytes());
+        hdr
+    }
+
+    #[test]
+    fn parses_coc_in_tile_part_csiz_lt_257() {
+        // Build a COC marker for component 0 with 0 decomp levels.
+        // Lcoc = 2 + 1 (Ccoc) + 1 (Scoc) + 6 (SPcoc: NL/xcb/ycb/style/
+        // transform) - wait Table A.15 says: NL(1) xcb(1) ycb(1) style(1)
+        // transform(1) + precincts(0 because Scoc=0). So body after Lcoc:
+        // Ccoc(1) Scoc(1) NL(1) xcb(1) ycb(1) style(1) transform(1) = 7.
+        // Lcoc = 2 (the field itself) + 7 = 9.
+        let mut coc = Vec::new();
+        coc.extend_from_slice(&MARKER_COC.to_be_bytes());
+        coc.extend_from_slice(&9u16.to_be_bytes()); // Lcoc
+        coc.push(0); // Ccoc (8-bit; csiz=1 < 257)
+        coc.push(0x00); // Scoc = max precincts
+        coc.push(0); // NL = 0
+        coc.push(4); // xcb
+        coc.push(4); // ycb
+        coc.push(0); // code-block style
+        coc.push(1); // transform = 5-3 reversible
+        let bytes = synth_tile_part_with_markers(&coc, &[0xAAu8; 4]);
+        let cs = parse_codestream(&bytes).expect("parse");
+        assert_eq!(cs.tile_parts.len(), 1);
+        let tp = &cs.tile_parts[0];
+        assert_eq!(tp.markers.len(), 1);
+        match &tp.markers[0] {
+            TilePartMarker::Coc(c) => {
+                assert_eq!(c.component_index, 0);
+                assert_eq!(c.scoc, 0x00);
+                assert_eq!(c.decomposition_levels, 0);
+                assert_eq!(c.transform, WaveletTransform::Reversible5x3);
+                assert!(!c.user_defined_precincts);
+                assert!(c.precincts.is_empty());
+            }
+            other => panic!("expected COC, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_qcc_in_tile_part_csiz_lt_257() {
+        // QCC for component 0 with style = scalar-expounded, 1 sub-band,
+        // 1 guard bit. Lqcc = 2 + 1 (Cqcc) + 1 (Sqcc) + 2 (SPqcc) = 6.
+        let mut qcc = Vec::new();
+        qcc.extend_from_slice(&MARKER_QCC.to_be_bytes());
+        qcc.extend_from_slice(&6u16.to_be_bytes()); // Lqcc
+        qcc.push(0); // Cqcc (8-bit)
+        qcc.push((1u8 << 5) | 0x02); // Sqcc: guard=1, style=expounded
+        qcc.push(0x10);
+        qcc.push(0x00);
+        let bytes = synth_tile_part_with_markers(&qcc, &[0u8; 4]);
+        let cs = parse_codestream(&bytes).expect("parse");
+        let tp = &cs.tile_parts[0];
+        match &tp.markers[0] {
+            TilePartMarker::Qcc(q) => {
+                assert_eq!(q.component_index, 0);
+                assert_eq!(q.style, QuantizationStyle::ScalarExpounded);
+                assert_eq!(q.guard_bits, 1);
+                assert_eq!(q.spqcc, vec![0x10, 0x00]);
+            }
+            other => panic!("expected QCC, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_rgn_in_tile_part_csiz_lt_257() {
+        // RGN for component 0, Srgn = 0 (implicit), SPrgn = 5.
+        // Lrgn = 2 + 1 (Crgn) + 1 (Srgn) + 1 (SPrgn) = 5.
+        let mut rgn = Vec::new();
+        rgn.extend_from_slice(&MARKER_RGN.to_be_bytes());
+        rgn.extend_from_slice(&5u16.to_be_bytes()); // Lrgn
+        rgn.push(0); // Crgn (8-bit)
+        rgn.push(0); // Srgn = implicit-ROI
+        rgn.push(5); // SPrgn = shift 5
+        let bytes = synth_tile_part_with_markers(&rgn, &[0u8; 4]);
+        let cs = parse_codestream(&bytes).expect("parse");
+        let tp = &cs.tile_parts[0];
+        match &tp.markers[0] {
+            TilePartMarker::Rgn(r) => {
+                assert_eq!(r.component_index, 0);
+                assert_eq!(r.srgn, 0);
+                assert_eq!(r.sprgn, 5);
+            }
+            other => panic!("expected RGN, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_poc_in_tile_part_csiz_lt_257() {
+        // POC with two progression entries, Csiz < 257 → 7 bytes each.
+        // Lpoc = 2 + 7 * 2 = 16.
+        let mut poc = Vec::new();
+        poc.extend_from_slice(&MARKER_POC.to_be_bytes());
+        poc.extend_from_slice(&16u16.to_be_bytes()); // Lpoc
+                                                     // Entry 1: RSpoc=0 CSpoc=0 LYEpoc=1 REpoc=5 CEpoc=3 Ppoc=Lrcp(0)
+        poc.push(0);
+        poc.push(0);
+        poc.extend_from_slice(&1u16.to_be_bytes());
+        poc.push(5);
+        poc.push(3);
+        poc.push(0x00);
+        // Entry 2: RSpoc=2 CSpoc=1 LYEpoc=2 REpoc=6 CEpoc=0 (→ 256)
+        //           Ppoc=Rpcl(2)
+        poc.push(2);
+        poc.push(1);
+        poc.extend_from_slice(&2u16.to_be_bytes());
+        poc.push(6);
+        poc.push(0);
+        poc.push(0x02);
+        let bytes = synth_tile_part_with_markers(&poc, &[0u8; 4]);
+        let cs = parse_codestream(&bytes).expect("parse");
+        let tp = &cs.tile_parts[0];
+        match &tp.markers[0] {
+            TilePartMarker::Poc(p) => {
+                assert_eq!(p.progressions.len(), 2);
+                let e0 = p.progressions[0];
+                assert_eq!(e0.resolution_start, 0);
+                assert_eq!(e0.component_start, 0);
+                assert_eq!(e0.layer_end, 1);
+                assert_eq!(e0.resolution_end, 5);
+                assert_eq!(e0.component_end, 3);
+                assert_eq!(e0.progression, ProgressionOrder::Lrcp);
+                let e1 = p.progressions[1];
+                assert_eq!(e1.resolution_start, 2);
+                assert_eq!(e1.component_start, 1);
+                // CEpoc = 0 → interpreted as 256 for Csiz < 257.
+                assert_eq!(e1.component_end, 256);
+                assert_eq!(e1.progression, ProgressionOrder::Rpcl);
+            }
+            other => panic!("expected POC, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_plt_packet_length_vlq() {
+        // PLT with three packet lengths: 5 (one byte 0x05),
+        // 128 (encoded as 0x81 0x00), and 16 384 (encoded as
+        // 0x81 0x80 0x00). Iplt bytes thus total 1 + 2 + 3 = 6.
+        // Lplt = 2 + 1 (Zplt) + 6 = 9.
+        let mut plt = Vec::new();
+        plt.extend_from_slice(&MARKER_PLT.to_be_bytes());
+        plt.extend_from_slice(&9u16.to_be_bytes()); // Lplt
+        plt.push(0); // Zplt
+        plt.push(0x05); // length 5 (terminator, 0x05)
+        plt.push(0x81); // length 128: cont=1, 7-bit val=1
+        plt.push(0x00); //   terminator, 7-bit val=0 → 1<<7|0 = 128
+        plt.push(0x81); // length 16384: cont=1, val=1
+        plt.push(0x80); //   cont=1, val=0
+        plt.push(0x00); //   terminator, val=0 → 1<<14 = 16384
+        let bytes = synth_tile_part_with_markers(&plt, &[0u8; 4]);
+        let cs = parse_codestream(&bytes).expect("parse");
+        let tp = &cs.tile_parts[0];
+        match &tp.markers[0] {
+            TilePartMarker::Plt(p) => {
+                assert_eq!(p.z_index, 0);
+                assert_eq!(p.packet_lengths, vec![5, 128, 16_384]);
+            }
+            other => panic!("expected PLT, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_plt_with_dangling_continuation_bit() {
+        // PLT whose final Iplt byte has the continuation bit set —
+        // T.800 §A.7.3 forbids this: every PLT must end with a
+        // completed packet length.
+        let mut plt = Vec::new();
+        plt.extend_from_slice(&MARKER_PLT.to_be_bytes());
+        plt.extend_from_slice(&5u16.to_be_bytes()); // Lplt
+        plt.push(0); // Zplt
+        plt.push(0x81); // continuation bit set, no terminator follows
+        plt.push(0x82); // continuation bit set, still no terminator
+        let bytes = synth_tile_part_with_markers(&plt, &[0u8; 4]);
+        let err = parse_codestream(&bytes).unwrap_err();
+        assert_eq!(err, Error::InvalidMarkerLength);
+    }
+
+    #[test]
+    fn parses_ppt_opaque_packet_headers() {
+        // PPT with 4 opaque header bytes. Lppt = 2 + 1 (Zppt) + 4 = 7.
+        let mut ppt = Vec::new();
+        ppt.extend_from_slice(&MARKER_PPT.to_be_bytes());
+        ppt.extend_from_slice(&7u16.to_be_bytes()); // Lppt
+        ppt.push(0); // Zppt
+        ppt.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        let bytes = synth_tile_part_with_markers(&ppt, &[0u8; 4]);
+        let cs = parse_codestream(&bytes).expect("parse");
+        let tp = &cs.tile_parts[0];
+        match &tp.markers[0] {
+            TilePartMarker::Ppt(p) => {
+                assert_eq!(p.z_index, 0);
+                assert_eq!(p.packet_headers, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+            }
+            other => panic!("expected PPT, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn preserves_marker_order_in_tile_part_header() {
+        // COD then COC then QCD then QCC then RGN then POC then PLT
+        // then PPT then COM — all in one tile-part header. Verify the
+        // walker emits the typed `markers` slice in codestream order.
+        let mut all = Vec::new();
+        // COD: same shape as synth_minimal_header's COD (12 bytes total).
+        all.extend_from_slice(&MARKER_COD.to_be_bytes());
+        all.extend_from_slice(&12u16.to_be_bytes());
+        all.push(0x00);
+        all.push(0x00);
+        all.extend_from_slice(&1u16.to_be_bytes());
+        all.push(0);
+        all.push(0);
+        all.push(4);
+        all.push(4);
+        all.push(0);
+        all.push(1);
+        // COC
+        all.extend_from_slice(&MARKER_COC.to_be_bytes());
+        all.extend_from_slice(&9u16.to_be_bytes());
+        all.push(0);
+        all.push(0x00);
+        all.push(0);
+        all.push(4);
+        all.push(4);
+        all.push(0);
+        all.push(1);
+        // QCD
+        all.extend_from_slice(&MARKER_QCD.to_be_bytes());
+        all.extend_from_slice(&4u16.to_be_bytes());
+        all.push(0x00);
+        all.push(0x00);
+        // QCC
+        all.extend_from_slice(&MARKER_QCC.to_be_bytes());
+        all.extend_from_slice(&5u16.to_be_bytes());
+        all.push(0);
+        all.push(0x00);
+        all.push(0x00);
+        // RGN
+        all.extend_from_slice(&MARKER_RGN.to_be_bytes());
+        all.extend_from_slice(&5u16.to_be_bytes());
+        all.push(0);
+        all.push(0);
+        all.push(0);
+        // POC (1 entry, 7 bytes when Csiz < 257)
+        all.extend_from_slice(&MARKER_POC.to_be_bytes());
+        all.extend_from_slice(&9u16.to_be_bytes());
+        all.push(0);
+        all.push(0);
+        all.extend_from_slice(&1u16.to_be_bytes());
+        all.push(1);
+        all.push(1);
+        all.push(0x00);
+        // PLT (1 length: 7)
+        all.extend_from_slice(&MARKER_PLT.to_be_bytes());
+        all.extend_from_slice(&4u16.to_be_bytes());
+        all.push(0);
+        all.push(0x07);
+        // PPT
+        all.extend_from_slice(&MARKER_PPT.to_be_bytes());
+        all.extend_from_slice(&5u16.to_be_bytes());
+        all.push(0);
+        all.push(0x01);
+        all.push(0x02);
+        // COM
+        all.extend_from_slice(&MARKER_COM.to_be_bytes());
+        all.extend_from_slice(&6u16.to_be_bytes());
+        all.extend_from_slice(&[0x00, 0x00, 0xAB, 0xCD]);
+
+        let bytes = synth_tile_part_with_markers(&all, &[0u8; 4]);
+        let cs = parse_codestream(&bytes).expect("parse");
+        let tp = &cs.tile_parts[0];
+        assert_eq!(tp.markers.len(), 9);
+        assert!(matches!(tp.markers[0], TilePartMarker::Cod(_)));
+        assert!(matches!(tp.markers[1], TilePartMarker::Coc(_)));
+        assert!(matches!(tp.markers[2], TilePartMarker::Qcd(_)));
+        assert!(matches!(tp.markers[3], TilePartMarker::Qcc(_)));
+        assert!(matches!(tp.markers[4], TilePartMarker::Rgn(_)));
+        assert!(matches!(tp.markers[5], TilePartMarker::Poc(_)));
+        assert!(matches!(tp.markers[6], TilePartMarker::Plt(_)));
+        assert!(matches!(tp.markers[7], TilePartMarker::Ppt(_)));
+        assert!(matches!(tp.markers[8], TilePartMarker::Com(_)));
+    }
+
+    #[test]
+    fn parses_two_plt_segments_with_distinct_z_indices() {
+        // Two PLT segments in the same tile-part header. T.800 §A.7.3
+        // says Zplt orders them; the walker returns them in codestream
+        // order so callers can reassemble by Zplt themselves.
+        let mut plts = Vec::new();
+        plts.extend_from_slice(&MARKER_PLT.to_be_bytes());
+        plts.extend_from_slice(&4u16.to_be_bytes());
+        plts.push(0); // Zplt = 0
+        plts.push(0x05);
+        plts.extend_from_slice(&MARKER_PLT.to_be_bytes());
+        plts.extend_from_slice(&4u16.to_be_bytes());
+        plts.push(1); // Zplt = 1
+        plts.push(0x07);
+        let bytes = synth_tile_part_with_markers(&plts, &[0u8; 4]);
+        let cs = parse_codestream(&bytes).expect("parse");
+        let tp = &cs.tile_parts[0];
+        assert_eq!(tp.markers.len(), 2);
+        match (&tp.markers[0], &tp.markers[1]) {
+            (TilePartMarker::Plt(p0), TilePartMarker::Plt(p1)) => {
+                assert_eq!(p0.z_index, 0);
+                assert_eq!(p0.packet_lengths, vec![5]);
+                assert_eq!(p1.z_index, 1);
+                assert_eq!(p1.packet_lengths, vec![7]);
+            }
+            other => panic!("expected two PLTs, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_coc_with_out_of_range_decomposition_levels() {
+        // COC declaring NL = 33 (Table A.15 caps at 32).
+        let mut coc = Vec::new();
+        coc.extend_from_slice(&MARKER_COC.to_be_bytes());
+        coc.extend_from_slice(&9u16.to_be_bytes());
+        coc.push(0); // Ccoc
+        coc.push(0x00); // Scoc
+        coc.push(33); // NL invalid
+        coc.push(4);
+        coc.push(4);
+        coc.push(0);
+        coc.push(1);
+        let bytes = synth_tile_part_with_markers(&coc, &[0u8; 4]);
+        let err = parse_codestream(&bytes).unwrap_err();
+        assert_eq!(err, Error::InvalidDecompositionLevels);
     }
 }
