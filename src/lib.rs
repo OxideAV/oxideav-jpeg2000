@@ -2,7 +2,7 @@
 //!
 //! Pure-Rust JPEG 2000 (J2K) codestream parser and (eventually) codec.
 //!
-//! ## Status — 2026-05-22 (round 5)
+//! ## Status — 2026-05-22 (round 6)
 //!
 //! Main-header parser ([`parse_j2k_header`], round 1) plus tile-part
 //! walker ([`walk_tile_parts`] / [`parse_codestream`], round 2) plus
@@ -10,36 +10,43 @@
 //! box-wrapper parser ([`jp2::parse_jp2`], round 4) plus a
 //! structural tier-2 packet-header reader
 //! ([`packet::decode_packet_header`] / [`packet::walk_packet_headers`],
-//! round 5). The walker returns an ordered [`Vec<TilePart>`] giving
-//! each tile-part's parsed [`Sot`] (tile index, `Psot`, `TPsot`,
-//! `TNsot`), byte offsets of its `SOT` marker, `SOD` marker, and
-//! bit-stream body, plus a [`Vec<TilePartMarker>`] of the typed
-//! marker segments parsed out of the tile-part header between `SOT`
-//! and `SOD`. Recognised tile-part-header markers: [`Cod`], [`Coc`],
-//! [`Qcd`], [`Qcc`], [`Rgn`], [`Poc`], [`Plt`], [`Ppt`], and `COM`.
-//! Both fixed-`Psot` and `Psot == 0` ("body until EOC") framings are
-//! supported per T.800 §A.4.2. Round 4 adds [`jp2::parse_jp2`] which
-//! decodes the JP2 box wrapper — `jP  ` signature, `ftyp` (brand /
-//! minor / compat list), `jp2h` (`ihdr` / optional `bpcc` /
-//! `colr`), and the `jp2c` Contiguous Codestream box's payload
-//! span — and returns a [`jp2::Jp2Container`] with
-//! `codestream_offset` / `codestream_len` pointing at the slice
-//! that callers may then hand to [`parse_codestream`]. Round 5 adds
-//! the [`packet`] submodule: a bit-stuffed [`packet::PacketBitReader`]
-//! (T.800 §B.10.1), a stateful [`packet::TagTree`] (§B.10.2), the
-//! coding-passes Huffman ([`packet::decode_coding_passes`], §B.10.6 /
-//! Table B.4), the `Lblock`-based segment-length reader
+//! round 5) plus SIZ-derived per-tile / per-component geometry
+//! ([`geometry::derive_tile_geometry`] / [`geometry::image_area`] /
+//! [`geometry::tile_grid_extent`], round 6). The walker returns an
+//! ordered [`Vec<TilePart>`] giving each tile-part's parsed [`Sot`]
+//! (tile index, `Psot`, `TPsot`, `TNsot`), byte offsets of its `SOT`
+//! marker, `SOD` marker, and bit-stream body, plus a
+//! [`Vec<TilePartMarker>`] of the typed marker segments parsed out of
+//! the tile-part header between `SOT` and `SOD`. Recognised
+//! tile-part-header markers: [`Cod`], [`Coc`], [`Qcd`], [`Qcc`],
+//! [`Rgn`], [`Poc`], [`Plt`], [`Ppt`], and `COM`. Both fixed-`Psot`
+//! and `Psot == 0` ("body until EOC") framings are supported per
+//! T.800 §A.4.2. Round 4 adds [`jp2::parse_jp2`] which decodes the
+//! JP2 box wrapper — `jP  ` signature, `ftyp` (brand / minor /
+//! compat list), `jp2h` (`ihdr` / optional `bpcc` / `colr`), and the
+//! `jp2c` Contiguous Codestream box's payload span — and returns a
+//! [`jp2::Jp2Container`] with `codestream_offset` / `codestream_len`
+//! pointing at the slice that callers may then hand to
+//! [`parse_codestream`]. Round 5 adds the [`packet`] submodule: a
+//! bit-stuffed [`packet::PacketBitReader`] (T.800 §B.10.1), a
+//! stateful [`packet::TagTree`] (§B.10.2), the coding-passes Huffman
+//! ([`packet::decode_coding_passes`], §B.10.6 / Table B.4), the
+//! `Lblock`-based segment-length reader
 //! ([`packet::decode_segment_length`], §B.10.7.1), and a
-//! [`packet::decode_packet_header`] that composes them all per
-//! §B.10.8 against a caller-supplied [`packet::PacketGeometry`].
+//! [`packet::decode_packet_header`] that composes them all per §B.10.8
+//! against a caller-supplied [`packet::PacketGeometry`]. Round 6
+//! adds the [`geometry`] submodule: image-area + tile-grid + per-tile
+//! per-component coordinate derivation directly from a parsed [`Siz`]
+//! per T.800 §B.2 / §B.3 / §B.5 (Equations B-1, B-2, B-3, B-4, B-5,
+//! B-6, B-7, B-8, B-9, B-10, B-11, B-12, B-13).
 //!
 //! Codestream-body decoding (tier-1 EBCOT MQ-coder, wavelet inverse
 //! transform, dequantisation, MCT) and any encoder path are **not**
 //! implemented yet — [`decode_jpeg2000`] and [`encode_jpeg2000`]
-//! both return [`Error::NotImplemented`]. Computing the
-//! progression-order packet sequence + per-precinct geometry from
-//! COD / SIZ (T.800 §B.6 / §B.7 / §B.12) lives in round 6; round 5
-//! takes the geometry as caller input.
+//! both return [`Error::NotImplemented`]. Round 6 lands per-tile +
+//! per-component geometry derivation (T.800 §B.2 / §B.3 / §B.5);
+//! resolution-level → sub-band → precinct partitioning (§B.5 / §B.6)
+//! and progression-order iteration (§B.12) are queued for round 7.
 //!
 //! ## Clean-room provenance
 //!
@@ -60,6 +67,7 @@
 
 #![warn(missing_debug_implementations)]
 
+pub mod geometry;
 pub mod jp2;
 pub mod packet;
 

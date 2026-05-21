@@ -3,13 +3,16 @@
 Pure-Rust JPEG 2000 (J2K + JP2) and High-Throughput JPEG 2000 (HTJ2K)
 codec.
 
-## Status — 2026-05-22 (clean-room round 5)
+## Status — 2026-05-22 (clean-room round 6)
 
-**Codestream-structural + JP2-wrapper + tier-2 packet-header reader.**
-The crate parses the JPEG 2000 Part-1 **main header** (`SOC`, `SIZ`,
-`COD`, `QCD`), walks the **tile-part chain** (`SOT` / `SOD` / `EOC`),
-decodes the **JP2 ISO BMFF box wrapper** (Annex I), and reads the
-**tier-2 packet-header bit stream** (T.800 §B.10).
+**Codestream-structural + JP2-wrapper + tier-2 packet-header reader +
+SIZ-derived tile geometry.** The crate parses the JPEG 2000 Part-1
+**main header** (`SOC`, `SIZ`, `COD`, `QCD`), walks the **tile-part
+chain** (`SOT` / `SOD` / `EOC`), decodes the **JP2 ISO BMFF box
+wrapper** (Annex I), reads the **tier-2 packet-header bit stream**
+(T.800 §B.10), and derives **per-tile + per-component coordinate
+geometry** from the SIZ marker (T.800 §B.2 / §B.3 / §B.5 — Equations
+B-1, B-2, B-3, B-4, B-5, B-6, B-7, B-8, B-9, B-10, B-11, B-12, B-13).
 
 `parse_codestream` returns a `J2kCodestream` with the main header
 plus an ordered `Vec<TilePart>`. Each `TilePart` carries its parsed
@@ -71,19 +74,39 @@ defined in the same submodule:
 `PacketHeader` carries `non_zero_length`, the per-code-block
 `Vec<CodeBlockContribution>` (`included` / `zero_bit_planes` /
 `coding_passes` / `segment_lengths`), `bytes_consumed`, and
-`num_codeblocks`. Computing the §B.12 progression-order packet
-sequence + per-precinct geometry from COD / SIZ lands in round 6;
-round 5 takes the geometry as caller input so the bit-reader surface
-can be exercised in isolation.
+`num_codeblocks`.
+
+`geometry::derive_tile_geometry(siz, t)` derives the geometry of tile
+`t` (the `Isot` value from a `SOT` marker) directly from a parsed
+[`Siz`] per T.800 §B.3 — Equations B-6 (`p = t mod numXtiles`, `q =
+t / numXtiles`), B-7 / B-8 / B-9 / B-10 (`tx0(p,q) = max(XTOsiz +
+p·XTsiz, XOsiz)`, `tx1(p,q) = min(XTOsiz + (p+1)·XTsiz, Xsiz)` and
+symmetrically for y), and per-component bounds per §B.5 Equation B-12
+(`tcx0 = ceil(tx0/XRsizi)`, etc.). Returned `TileGeometry` carries
+`(p, q)`, the reference-grid corners `(tx0, ty0, tx1, ty1)`, and one
+`TileComponentGeometry { tcx0, tcy0, tcx1, tcy1 }` per component in
+SIZ-declaration order. `geometry::image_area(siz)` exposes the
+whole-image per-component bounding box per Equation B-1, and
+`geometry::tile_grid_extent(siz)` returns the `(numXtiles, numYtiles)`
+pair from Equation B-5. `geometry::validate_siz(siz)` enforces the
+inter-field invariants from Equations B-3 / B-4 plus the §B.2
+non-empty image-area requirement. The §B.4 worked example (two
+components, 1432×954 reference grid, (1,1) and (2,2) sub-sampling,
+4×4 tile grid with the spec-quoted tx/ty quartet) drives the
+test suite.
 
 What is **not** implemented yet:
 
 * Tier-1 (EBCOT MQ-coder block coding) — the packet-header reader
   reports byte ranges per code-block, but the codeword bytes are not
   yet decoded.
-* §B.6 / §B.7 / §B.12 progression-order geometry computation (round
-  5's packet reader takes the geometry as caller input; round 6 will
-  derive it from `Cod` + `Siz`).
+* §B.6 (precinct partitioning) + §B.7 (sub-band → code-block
+  partitioning) + §B.12 progression-order packet iteration. Round 6
+  lands per-tile + per-component coordinate geometry; round 7 will
+  derive resolution-level / sub-band / precinct extents from a
+  combination of `geometry::TileComponentGeometry` plus `COD` /
+  `COC` precinct sizes and emit the packet-precinct sequence for
+  each progression order.
 * §B.10.7.2 multi-codeword-segment splitting (round 5 emits one
   segment length per included code-block; termination boundaries are
   a tier-1 input we don't have yet).
@@ -134,6 +157,17 @@ consulted:
   based single codeword-segment length), §B.10.8 (master order of
   information within a packet header), §A.8.1 / §A.8.2 (SOP / EPH
   framing markers).
+* T.800 §B.2 (Image area definition — Equation B-1 / B-2 per-component
+  bounding box on the component domain), §B.3 (Image area division
+  into tiles and tile-components — Equations B-3 / B-4 inter-field
+  invariants, Equation B-5 tile-grid extent, Equation B-6 tile-index
+  to `(p, q)`, Equations B-7 / B-8 / B-9 / B-10 per-tile
+  reference-grid bounds, Equation B-11 tile dimensions), §B.5
+  (Transformed tile-component division — Equation B-12 per-component
+  tile mapping, Equation B-13 tile-component dimensions), §B.4
+  worked example (1432×954 reference grid, 4×4 tile grid, two
+  components with (1,1) and (2,2) sub-sampling, asymmetric
+  ceiling-divide on the y-axis for the sub-sampled component).
 
 No external library source — OpenJPEG, OpenJPH, Kakadu, FFmpeg, etc.
 — was consulted, quoted, paraphrased, or used as a cross-check

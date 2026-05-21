@@ -6,6 +6,67 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 6 (2026-05-22).** Per-tile + per-component
+  coordinate-geometry derivation (`geometry` submodule, T.800 §B.2 /
+  §B.3 / §B.5). New `geometry::derive_tile_geometry(siz, t)` takes a
+  parsed `Siz` and a tile-grid index `t` (the `Isot` from a `SOT`
+  marker) and returns a typed `TileGeometry { tile_index, p, q, tx0,
+  ty0, tx1, ty1, components: Vec<TileComponentGeometry> }`. Reference-
+  grid corners follow T.800 Equations B-6 (`p = t mod numXtiles`,
+  `q = floor(t / numXtiles)`), B-7 (`tx0 = max(XTOsiz + p*XTsiz,
+  XOsiz)`), B-8 (`ty0` symmetric), B-9 (`tx1 = min(XTOsiz +
+  (p+1)*XTsiz, Xsiz)`), B-10 (`ty1` symmetric). Per-component bounds
+  follow Equation B-12 with ceiling division (`tcx0 =
+  ceil(tx0/XRsizi)`, etc.). `geometry::image_area(siz)` exposes the
+  per-component image-area bounding box per Equation B-1 (`x0 =
+  ceil(XOsiz/XRsizc)`, `x1 = ceil(Xsiz/XRsizc)`, …), and
+  `geometry::tile_grid_extent(siz)` returns `(numXtiles, numYtiles)`
+  per Equation B-5. `geometry::validate_siz(siz)` checks the
+  inter-field invariants from Equations B-3 (`XTOsiz <= XOsiz`,
+  `YTOsiz <= YOsiz`), B-4 (`XTsiz + XTOsiz > XOsiz`, `YTsiz + YTOsiz
+  > YOsiz`), and §B.2's non-empty image-area requirement (`Xsiz >
+  XOsiz`, `Ysiz > YOsiz`). Internal `ceil_div_u32` uses
+  `(a + b - 1) / b` with `checked_add` overflow guard. Tile-grid
+  arithmetic widens to `u64` for the `XTOsiz + (p+1)*XTsiz` term to
+  preserve correctness on extreme-corner `XTsiz` values near
+  `u32::MAX` before clipping back to `min(Xsiz)`. Sixteen new unit
+  tests, all driven by spec-quoted numeric examples: image-area
+  matches §B.4's two-component 1432×954 worked example (component 0
+  → 1280×720 at (152, 234)..(1432, 954); component 1 → 640×360 at
+  (76, 117)..(716, 477)); tile-grid extent matches §B.4's 4×4 = 16
+  tiles; per-tile derivation matches §B.4's quoted tx0 / tx1 / ty0 /
+  ty1 quartets across all sixteen tile indices; interior-tile
+  per-component dims match §B.4's "interior tiles are 396×297 on
+  component 0 but (198×148, 198×149) on component 1 depending on
+  q-parity" observation; first-tile clamping to image offset and
+  last-tile clamping to image extent both verified; out-of-range
+  tile index rejected as `InvalidTilePartIndex`; single-tile
+  single-component grid; three-to-one sub-sampling exercising the
+  per-component ceiling-divide corner; and three `validate_siz`
+  rejection cases (XTOsiz > XOsiz, XTsiz + XTOsiz <= XOsiz, empty
+  image area). Eighty tests total pass (64 prior + 16 new); cargo
+  fmt-check + clippy `-D warnings` clean (both default +
+  `--no-default-features` builds). No new error variants — geometry
+  failures are surfaced via the existing `Error::InvalidMarkerLength`
+  (invariant violation) and `Error::InvalidTilePartIndex` (out-of-
+  range `t`).
+
+  Built solely against `docs/image/jpeg2000/T-REC-T.800-201906-S.pdf`
+  (§B.2 — Equation B-1 / B-2 image-area + per-component bounds; §B.3
+  — Equations B-3 / B-4 invariants, B-5 tile-grid extent, B-6 tile
+  index to `(p, q)`, B-7 / B-8 / B-9 / B-10 per-tile reference-grid
+  bounds, B-11 dimensions; §B.4 worked example for test corpus; §B.5
+  — Equation B-12 / B-13 per-component tile mapping). No external
+  library source — OpenJPEG, OpenJPH, Kakadu, FFmpeg, libavcodec,
+  jpeg2000-rs, etc. — was consulted, quoted, paraphrased, or used
+  as a cross-check oracle.
+
+  Resolution-level + sub-band + precinct partitioning (T.800 §B.5
+  Equation B-14 / Table B.1 for sub-band corners, §B.6 Equation B-16
+  for precinct counts, §B.7 Equations B-17 / B-18 for code-block
+  dims) and the §B.12 progression-order packet iterator lands in
+  round 7.
+
 * **Clean-room round 5 (2026-05-22).** Tier-2 packet-header reading
   primitives (`packet` submodule, T.800 §B.10). New
   `packet::PacketBitReader` implements the §B.10.1 bit-stuffing rule
