@@ -6,6 +6,65 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 7 (2026-05-22).** Per-resolution-level +
+  per-sub-band geometry on top of the round-6 `TileComponentGeometry`
+  (`geometry` submodule, T.800 §B.5 — Equation B-14 / Equation B-15 /
+  Table B.1). New `geometry::derive_resolution_levels(tc, NL)` takes a
+  `TileComponentGeometry` plus the `NL` (number of decomposition
+  levels) signalled by the `COD` or `COC` marker for that component
+  and returns a typed `Vec<ResolutionLevel>` of length `NL + 1`,
+  indexed by resolution level `r = 0..=NL`. Each `ResolutionLevel
+  { r, n_l, trx0, try0, trx1, try1, sub_bands: Vec<SubBand> }` carries
+  its own bounding-sample rectangle on the tile-component domain per
+  Equation B-14 (`trx0 = ceil(tcx0 / 2^(NL - r))`, symmetrically for
+  the other three corners), implemented via a `ceil_div_pow2(tc, n)`
+  helper that uses the closed-form `(tc + (1 << n) - 1) >> n` for
+  `n < 32` and a saturating branch for `n = 32` to dodge `1u64 << 32`
+  overflow. Each `SubBand { orientation: SubBandOrientation, nb,
+  tbx0, tby0, tbx1, tby1 }` carries its corners per Equation B-15
+  (`tbx0 = ceil((tcx0 - 2^(nb-1)·xob) / 2^nb)`, symmetrically), with
+  the orientation displacements `(xob, yob)` looked up from Table B.1
+  (`LL = (0, 0)`, `HL = (1, 0)`, `LH = (0, 1)`, `HH = (1, 1)`).
+  Sub-band corners are computed in signed `i64` arithmetic to surface
+  the `tcx0 - 2^(nb-1)·xob < 0` corner, then clamped to zero per
+  §B.5's implicit non-negativity assumption for sub-band coordinates.
+  `SubBandOrientation::{xob, yob}` expose the Table B.1 entries as
+  `u32`. The `sub_bands` vector follows §B.5's lead-in ("The lowest
+  resolution level, r = 0, is represented by the NLLL band"): a
+  **single** `SubBand` with orientation `LL` and `nb = NL` at `r = 0`,
+  and **three** sub-bands `[HL, LH, HH]` at decomposition level
+  `nb = NL - r + 1` for every `r ≥ 1`. The `NL = 0` corner (no
+  wavelet decomposition) emits a single resolution level with one
+  `LL` sub-band identical to the tile-component. `NL = 32` (the
+  Table A.15 upper bound) is handled without overflow. Twelve new
+  unit tests against the geometry of an aligned `64×64` tile-component
+  (`NL = 1`, `NL = 3`) plus an offset `[1, 5)×[1, 5)` tile-component
+  exercising the signed-corner math (HL → `(0, 1)..(2, 3)`, LH →
+  `(1, 0)..(3, 2)`, HH → `(0, 0)..(2, 2)`), plus Table B.1 lookup,
+  `NL = 0` corner, `NL = 32` no-overflow corner, and resolution-level
+  counting + LL-only-at-r=0 + HL/LH/HH-at-r>=1 + dimension-halving
+  invariants. Ninety-two tests total pass (80 prior + 12 new); cargo
+  fmt-check + clippy `-D warnings` clean (both default +
+  `--no-default-features` builds). No new error variants — the
+  function never fails; `NL` is bounded by the `COD` parser at parse
+  time (Table A.15: `0..=32`) and the function's `debug_assert!`
+  guards on `NL ≤ 32` reflect that invariant.
+
+  Built solely against `docs/image/jpeg2000/T-REC-T.800-201906-S.pdf`
+  (§B.5 lead-in describing `r = 0` as the NLLL band; Equation B-14
+  resolution-level corners; Equation B-15 sub-band corners; Table B.1
+  sub-band orientation displacements `(xob, yob)`; §B.5 closing
+  paragraph on sub-band width = `tbx1 - tbx0` and height =
+  `tby1 - tby0`). No external library source — OpenJPEG, OpenJPH,
+  Kakadu, FFmpeg, libavcodec, jpeg2000-rs, etc. — was consulted,
+  quoted, paraphrased, or used as a cross-check oracle.
+
+  §B.6 precinct partitioning (Equation B-16 `numprecinctswide` /
+  `numprecinctshigh` from the `COD` / `COC` `PPx` / `PPy` bytes),
+  §B.7 sub-band → code-block partitioning (Equations B-17 / B-18
+  with `xcb` / `ycb` exponent offsets), and §B.12 progression-order
+  packet iteration land in round 8.
+
 * **Clean-room round 6 (2026-05-22).** Per-tile + per-component
   coordinate-geometry derivation (`geometry` submodule, T.800 §B.2 /
   §B.3 / §B.5). New `geometry::derive_tile_geometry(siz, t)` takes a

@@ -2,7 +2,7 @@
 //!
 //! Pure-Rust JPEG 2000 (J2K) codestream parser and (eventually) codec.
 //!
-//! ## Status — 2026-05-22 (round 6)
+//! ## Status — 2026-05-22 (round 7)
 //!
 //! Main-header parser ([`parse_j2k_header`], round 1) plus tile-part
 //! walker ([`walk_tile_parts`] / [`parse_codestream`], round 2) plus
@@ -12,10 +12,12 @@
 //! ([`packet::decode_packet_header`] / [`packet::walk_packet_headers`],
 //! round 5) plus SIZ-derived per-tile / per-component geometry
 //! ([`geometry::derive_tile_geometry`] / [`geometry::image_area`] /
-//! [`geometry::tile_grid_extent`], round 6). The walker returns an
-//! ordered [`Vec<TilePart>`] giving each tile-part's parsed [`Sot`]
-//! (tile index, `Psot`, `TPsot`, `TNsot`), byte offsets of its `SOT`
-//! marker, `SOD` marker, and bit-stream body, plus a
+//! [`geometry::tile_grid_extent`], round 6) plus resolution-level +
+//! sub-band geometry from COD's `NL`
+//! ([`geometry::derive_resolution_levels`], round 7). The walker
+//! returns an ordered [`Vec<TilePart>`] giving each tile-part's parsed
+//! [`Sot`] (tile index, `Psot`, `TPsot`, `TNsot`), byte offsets of its
+//! `SOT` marker, `SOD` marker, and bit-stream body, plus a
 //! [`Vec<TilePartMarker>`] of the typed marker segments parsed out of
 //! the tile-part header between `SOT` and `SOD`. Recognised
 //! tile-part-header markers: [`Cod`], [`Coc`], [`Qcd`], [`Qcc`],
@@ -38,15 +40,20 @@
 //! adds the [`geometry`] submodule: image-area + tile-grid + per-tile
 //! per-component coordinate derivation directly from a parsed [`Siz`]
 //! per T.800 §B.2 / §B.3 / §B.5 (Equations B-1, B-2, B-3, B-4, B-5,
-//! B-6, B-7, B-8, B-9, B-10, B-11, B-12, B-13).
+//! B-6, B-7, B-8, B-9, B-10, B-11, B-12, B-13). Round 7 lifts the
+//! typed [`geometry::TileComponentGeometry`] to per-resolution-level
+//! [`geometry::ResolutionLevel`] (T.800 §B.5 / Equation B-14) plus
+//! per-sub-band [`geometry::SubBand`] corners (T.800 §B.5 / Equation
+//! B-15 with the orientation displacements `(xob, yob)` from Table
+//! B.1).
 //!
 //! Codestream-body decoding (tier-1 EBCOT MQ-coder, wavelet inverse
 //! transform, dequantisation, MCT) and any encoder path are **not**
 //! implemented yet — [`decode_jpeg2000`] and [`encode_jpeg2000`]
-//! both return [`Error::NotImplemented`]. Round 6 lands per-tile +
-//! per-component geometry derivation (T.800 §B.2 / §B.3 / §B.5);
-//! resolution-level → sub-band → precinct partitioning (§B.5 / §B.6)
-//! and progression-order iteration (§B.12) are queued for round 7.
+//! both return [`Error::NotImplemented`]. Round 7 closes §B.5
+//! sub-band geometry; §B.6 precinct partitioning, §B.7 sub-band →
+//! code-block partitioning, and §B.12 progression-order iteration are
+//! queued for round 8.
 //!
 //! ## Clean-room provenance
 //!

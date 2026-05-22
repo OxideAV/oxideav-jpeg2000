@@ -3,16 +3,19 @@
 Pure-Rust JPEG 2000 (J2K + JP2) and High-Throughput JPEG 2000 (HTJ2K)
 codec.
 
-## Status — 2026-05-22 (clean-room round 6)
+## Status — 2026-05-22 (clean-room round 7)
 
 **Codestream-structural + JP2-wrapper + tier-2 packet-header reader +
-SIZ-derived tile geometry.** The crate parses the JPEG 2000 Part-1
-**main header** (`SOC`, `SIZ`, `COD`, `QCD`), walks the **tile-part
-chain** (`SOT` / `SOD` / `EOC`), decodes the **JP2 ISO BMFF box
-wrapper** (Annex I), reads the **tier-2 packet-header bit stream**
-(T.800 §B.10), and derives **per-tile + per-component coordinate
-geometry** from the SIZ marker (T.800 §B.2 / §B.3 / §B.5 — Equations
-B-1, B-2, B-3, B-4, B-5, B-6, B-7, B-8, B-9, B-10, B-11, B-12, B-13).
+SIZ-derived tile geometry + resolution-level / sub-band geometry.**
+The crate parses the JPEG 2000 Part-1 **main header** (`SOC`, `SIZ`,
+`COD`, `QCD`), walks the **tile-part chain** (`SOT` / `SOD` / `EOC`),
+decodes the **JP2 ISO BMFF box wrapper** (Annex I), reads the
+**tier-2 packet-header bit stream** (T.800 §B.10), derives **per-tile
++ per-component coordinate geometry** from the SIZ marker (T.800 §B.2
+/ §B.3 / §B.5 — Equations B-1..B-13), and now lifts each
+tile-component to **per-resolution-level + per-sub-band geometry**
+using COD/COC's `NL` (T.800 §B.5 — Equation B-14 for the resolution
+level corners, Equation B-15 + Table B.1 for the sub-band corners).
 
 `parse_codestream` returns a `J2kCodestream` with the main header
 plus an ordered `Vec<TilePart>`. Each `TilePart` carries its parsed
@@ -95,18 +98,38 @@ components, 1432×954 reference grid, (1,1) and (2,2) sub-sampling,
 4×4 tile grid with the spec-quoted tx/ty quartet) drives the
 test suite.
 
+`geometry::derive_resolution_levels(tc, NL)` lifts one
+`TileComponentGeometry` to a `Vec<ResolutionLevel>` of length `NL + 1`
+covering resolution levels `r = 0..=NL`. Each `ResolutionLevel`
+carries its own `(trx0, try0, trx1, try1)` per Equation B-14
+(`trx0 = ceil(tcx0 / 2^(NL - r))`, etc.) plus a `Vec<SubBand>` whose
+membership follows §B.5's lead-in: `r = 0` carries **one** sub-band
+with orientation `LL` (the "NLLL" band; `nb = NL`), while `r ≥ 1`
+carries **three** sub-bands with orientations `HL`, `LH`, `HH` at
+decomposition level `nb = NL - r + 1`. Each `SubBand` records
+`(tbx0, tby0, tbx1, tby1)` per Equation B-15
+(`tbx0 = ceil((tcx0 - 2^(nb-1)·xob) / 2^nb)`, symmetrically for the
+other corners), with the orientation displacements `(xob, yob)`
+looked up from Table B.1 (`LL = (0, 0)`, `HL = (1, 0)`, `LH = (0, 1)`,
+`HH = (1, 1)`). Sub-band corner math runs in signed `i64` to surface
+the `tcx0 - 2^(nb-1)·xob < 0` corner (clamped to zero per §B.5's
+implicit non-negativity assumption). `NL = 0` collapses to a single
+`r = 0` level with one full-tile-component LL band; `NL = 32` (the
+Table A.15 upper bound) is handled without overflow via 64-bit
+intermediates.
+
 What is **not** implemented yet:
 
 * Tier-1 (EBCOT MQ-coder block coding) — the packet-header reader
   reports byte ranges per code-block, but the codeword bytes are not
   yet decoded.
 * §B.6 (precinct partitioning) + §B.7 (sub-band → code-block
-  partitioning) + §B.12 progression-order packet iteration. Round 6
-  lands per-tile + per-component coordinate geometry; round 7 will
-  derive resolution-level / sub-band / precinct extents from a
-  combination of `geometry::TileComponentGeometry` plus `COD` /
-  `COC` precinct sizes and emit the packet-precinct sequence for
-  each progression order.
+  partitioning) + §B.12 progression-order packet iteration. Round 7
+  closes resolution-level + sub-band geometry (`§B.5` Equation B-14 /
+  B-15); round 8 will derive precinct extents from
+  `geometry::ResolutionLevel` plus `COD` / `COC` precinct-size bytes,
+  partition each sub-band into code-blocks per §B.7, and emit the
+  packet-precinct sequence for each progression order.
 * §B.10.7.2 multi-codeword-segment splitting (round 5 emits one
   segment length per included code-block; termination boundaries are
   a tier-1 input we don't have yet).
@@ -164,7 +187,9 @@ consulted:
   to `(p, q)`, Equations B-7 / B-8 / B-9 / B-10 per-tile
   reference-grid bounds, Equation B-11 tile dimensions), §B.5
   (Transformed tile-component division — Equation B-12 per-component
-  tile mapping, Equation B-13 tile-component dimensions), §B.4
+  tile mapping, Equation B-13 tile-component dimensions, Equation
+  B-14 resolution-level corners, Equation B-15 sub-band corners,
+  Table B.1 sub-band orientation displacements `(xob, yob)`), §B.4
   worked example (1432×954 reference grid, 4×4 tile grid, two
   components with (1,1) and (2,2) sub-sampling, asymmetric
   ceiling-divide on the y-axis for the sub-sampled component).
