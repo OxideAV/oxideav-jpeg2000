@@ -3,11 +3,11 @@
 Pure-Rust JPEG 2000 (J2K + JP2) and High-Throughput JPEG 2000 (HTJ2K)
 codec.
 
-## Status — 2026-05-24 (clean-room round 8)
+## Status — 2026-05-24 (clean-room round 9)
 
 **Codestream-structural + JP2-wrapper + tier-2 packet-header reader +
 SIZ-derived tile geometry + resolution-level / sub-band geometry +
-precinct / code-block partition.**
+precinct / code-block partition + precinct → code-block enumeration.**
 The crate parses the JPEG 2000 Part-1 **main header** (`SOC`, `SIZ`,
 `COD`, `QCD`), walks the **tile-part chain** (`SOT` / `SOD` / `EOC`),
 decodes the **JP2 ISO BMFF box wrapper** (Annex I), reads the
@@ -16,10 +16,13 @@ decodes the **JP2 ISO BMFF box wrapper** (Annex I), reads the
 / §B.3 / §B.5 — Equations B-1..B-13), lifts each tile-component to
 **per-resolution-level + per-sub-band geometry** using COD/COC's `NL`
 (T.800 §B.5 — Equation B-14 for the resolution level corners, Equation
-B-15 + Table B.1 for the sub-band corners), and now partitions each
-resolution level into **precincts** (T.800 §B.6 — Equation B-16) and
-its sub-bands into **code-blocks** (T.800 §B.7 — Equation B-17 / B-18)
-from the COD/COC `PPx` / `PPy` and `xcb` / `ycb` exponents.
+B-15 + Table B.1 for the sub-band corners), partitions each resolution
+level into **precincts** (T.800 §B.6 — Equation B-16) and its sub-bands
+into **code-blocks** (T.800 §B.7 — Equation B-17 / B-18) from the
+COD/COC `PPx` / `PPy` and `xcb` / `ycb` exponents, and now **enumerates
+the code-blocks of each sub-band confined to a given precinct** (T.800
+§B.7 / §B.9), the bridge that feeds the round-5 packet reader's
+`PacketGeometry`.
 
 `parse_codestream` returns a `J2kCodestream` with the main header
 plus an ordered `Vec<TilePart>`. Each `TilePart` carries its parsed
@@ -144,18 +147,45 @@ ycb }` with `width()` / `height()` = `2^xcb'` / `2^ycb'`. `xcb` /
 `PP - 1` shave at `r = 0` is a saturating subtraction so the
 Table-A.21-legal NLLL-band `PP = 0` clamps to a `1×1` partition.
 
+`geometry::derive_precinct_code_blocks(level, pp, xcb, ycb,
+precinct_index)` enumerates, for one precinct of a `ResolutionLevel`,
+the code-blocks of **every** sub-band confined to that precinct per
+T.800 §B.7 / §B.9. It returns a `PrecinctCodeBlocks { r, precinct_index,
+px, py, sub_bands: Vec<PrecinctSubBand> }`, one `PrecinctSubBand` per
+sub-band (just `LL` at `r = 0`; `HL` / `LH` / `HH` at `r ≥ 1`, in §B.9
+packet order). Each `PrecinctSubBand` carries `grid_wide` × `grid_high`
+— the exact `packet::SubBandGeometry { width, height }` the round-5
+packet reader consumes — plus a raster-order `Vec<PrecinctCodeBlock>`
+matching the §B.10.8 walk order. Each `PrecinctCodeBlock` records its
+in-precinct grid index `(cbx, cby)` and its sample corners `(x0, y0,
+x1, y1)` on the sub-band domain, **clipped to both** the precinct
+projection and the sub-band's own bounds (§B.7 NOTE: a partition cell
+may extend past the sub-band edge; only the inside coefficients are
+coded, so `width()` / `height()` give the real coefficient count). The
+precinct partition is anchored at `(0, 0)`; its footprint projects onto
+each sub-band with exponent `PPx` at `r = 0` (the LL band coincides
+with the resolution-level domain) and `PPx - 1` at `r ≥ 1` (the
+high-pass sub-bands sit one wavelet level finer — the Equation B-20
+`2^(PPx + NL - r)` reference-grid step divided by the sub-band's
+`2^(NL - r + 1)` scale). The code-block partition is anchored at `(0,
+0)` with step `2^xcb'`; in a conformant stream `xcb' ≤` the footprint
+exponent (default `PPx = 15` → footprint `2^14`, real blocks ≤ `2^6`),
+and the enumeration clamps the exponent to the footprint so the
+partition stays a tiling (no code-block claimed by two precincts) even
+at the degenerate literal-§B.7 `xcb' = PPx > PPx - 1` edge. An
+out-of-range `precinct_index` returns `Error::InvalidTilePartIndex`.
+
 What is **not** implemented yet:
 
 * Tier-1 (EBCOT MQ-coder block coding) — the packet-header reader
   reports byte ranges per code-block, but the codeword bytes are not
   yet decoded.
-* Precinct → code-block **enumeration** (which code-blocks of a
-  sub-band fall in a given precinct, clipped to both bounds) + §B.12
-  progression-order packet iteration (Equation B-20 / B-21). Round 8
-  closes the precinct / code-block **counts** (§B.6 / §B.7); round 9
-  will bridge those counts to the round-5 `packet` reader's
-  `PacketGeometry` input and emit the packet-precinct sequence for
-  each progression order, plus §B.8 layer / §B.9 packet assembly.
+* §B.12 progression-order packet iteration (Equation B-20 / B-21) +
+  §B.8 layer / §B.9 packet assembly. Round 9 closes the precinct →
+  code-block **enumeration** (the bridge from the §B.6 / §B.7 counts to
+  the round-5 `packet` reader's `PacketGeometry`); a later round will
+  drive the packet-precinct sequence for each of the five progression
+  orders across the enumerated precincts.
 * §B.10.7.2 multi-codeword-segment splitting (round 5 emits one
   segment length per included code-block; termination boundaries are
   a tier-1 input we don't have yet).
@@ -227,7 +257,15 @@ consulted:
   B-17 / B-18 effective code-block exponents `xcb'` / `ycb'` clamped to
   the precinct, code-block partition anchored at `(0, 0)`, §B.7 NOTE on
   code-blocks extending past the sub-band edge; Table A.18 code-block
-  exponent `xcb = value + 2`).
+  exponent `xcb = value + 2`), §B.9 (precinct → code-block confinement
+  — "the code-block contributions appear in raster order, confined to
+  the bounds established by the relevant precinct"; only code-blocks
+  that contain samples from the relevant sub-band, confined to the
+  precinct, have any representation in the packet), §B.12.1.3 /
+  Equation B-20 (the `2^(PP + NL - r)` reference-grid precinct step
+  that, divided by the sub-band's `2^(NL - r + 1)` scale, yields the
+  projected precinct exponent on each high-pass sub-band — `PP - 1`
+  at `r ≥ 1`, `PP` at `r = 0`).
 
 No external library source — OpenJPEG, OpenJPH, Kakadu, FFmpeg, etc.
 — was consulted, quoted, paraphrased, or used as a cross-check

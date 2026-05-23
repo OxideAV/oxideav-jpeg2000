@@ -1,8 +1,9 @@
 //! Image-area + tile-grid + tile-component coordinate derivation from
 //! the SIZ marker segment, plus per-resolution-level + per-sub-band
 //! geometry from the COD marker's `NL` (number of decomposition levels),
-//! plus the precinct partition (§B.6) and code-block partition (§B.7)
-//! of each resolution level.
+//! plus the precinct partition (§B.6), code-block partition (§B.7), and
+//! the precinct → code-block enumeration (§B.7 / §B.9) of each resolution
+//! level.
 //!
 //! All derivations follow T.800 (ITU-T Rec. T.800 (06/2019) | ISO/IEC
 //! 15444-1) §B.2 / §B.3 / §B.5 / §B.6 / §B.7 — Equations B-1, B-2, B-3,
@@ -50,8 +51,14 @@
 //! count from the `PPx` / `PPy` exponents, with Table A.21 nibble
 //! layout and the Table A.13 maximum-precinct default `PPx = PPy = 15`);
 //! §B.7 (Equation B-17 / Equation B-18 effective code-block exponents
-//! clamped to the precinct, with Table A.18 `xcb = value + 2`). No
-//! external library source was consulted.
+//! clamped to the precinct, with Table A.18 `xcb = value + 2`; the §B.7
+//! NOTE on code-blocks extending past the sub-band edge; the §B.9
+//! "code-block contributions appear in raster order, confined to the
+//! bounds established by the relevant precinct" ordering; and the
+//! Equation B-20 `2^(PP + NL - r)` reference-grid precinct step that
+//! projects to `2^PP` on the `r = 0` LL band and `2^(PP - 1)` on the
+//! `r ≥ 1` high-pass sub-bands). No external library source was
+//! consulted.
 
 use crate::{Error, Siz};
 
@@ -892,6 +899,298 @@ pub fn derive_code_block_dimensions(
         xcb: xcb.min(px_bound),
         ycb: ycb.min(py_bound),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Precinct → code-block enumeration (T.800 §B.7 / §B.9) — the bridge
+// between the §B.6 precinct count, the §B.7 code-block partition, and the
+// `packet` module's `PacketGeometry` input.
+// ---------------------------------------------------------------------------
+
+/// One code-block of a sub-band, confined to a precinct, on the sub-band
+/// coordinate domain, per T.800 §B.7 / §B.9.
+///
+/// `cbx` / `cby` are the code-block's **partition indices** within the
+/// per-(precinct, sub-band) raster grid — `cbx` runs `0..grid_wide` and
+/// `cby` runs `0..grid_high`, matching the order T.800 §B.10.8 walks the
+/// code-blocks ("for all code-blocks in this sub-band confined to the
+/// relevant precinct, in raster order"). These are exactly the `(x, y)`
+/// fields the `packet` module reports on each
+/// `CodeBlockContribution`.
+///
+/// `(x0, y0)` / `(x1, y1)` are the code-block's sample corners on the
+/// **sub-band** coordinate domain, already clipped to **both** the
+/// precinct's projection onto the sub-band **and** the sub-band's own
+/// `(tbx0, tby0)..(tbx1, tby1)` bounds. The §B.7 NOTE says a code-block
+/// in the partition may extend past the sub-band edge and only the
+/// coefficients inside the sub-band are coded — `(x1, y1)` is therefore
+/// the clipped extent (the part that actually carries coefficients), so
+/// `x1 - x0` / `y1 - y0` is the number of columns / rows of real
+/// coefficients in this code-block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrecinctCodeBlock {
+    /// 0-based column of this code-block within the precinct's per-
+    /// sub-band code-block grid (raster order, §B.10.8).
+    pub cbx: u32,
+    /// 0-based row of this code-block within the precinct's per-sub-band
+    /// code-block grid.
+    pub cby: u32,
+    /// Upper-left sample x on the sub-band domain (clipped).
+    pub x0: u32,
+    /// Upper-left sample y on the sub-band domain (clipped).
+    pub y0: u32,
+    /// Lower-right-exclusive sample x on the sub-band domain (clipped to
+    /// `tbx1`).
+    pub x1: u32,
+    /// Lower-right-exclusive sample y on the sub-band domain (clipped to
+    /// `tby1`).
+    pub y1: u32,
+}
+
+impl PrecinctCodeBlock {
+    /// Number of real coefficient columns in this code-block (the clipped
+    /// width `x1 - x0`).
+    pub fn width(&self) -> u32 {
+        self.x1.saturating_sub(self.x0)
+    }
+
+    /// Number of real coefficient rows in this code-block (the clipped
+    /// height `y1 - y0`).
+    pub fn height(&self) -> u32 {
+        self.y1.saturating_sub(self.y0)
+    }
+}
+
+/// The code-blocks of one sub-band that fall in one precinct, per T.800
+/// §B.7 / §B.9.
+///
+/// `grid_wide` × `grid_high` is the number of code-blocks across × down
+/// in this precinct for this sub-band — exactly the
+/// `SubBandGeometry { width, height }` the `packet` module's per-precinct
+/// packet header reader consumes. `code_blocks` lists them in raster
+/// order (row-major), so the *i*-th entry corresponds to packet-header
+/// code-block index *i* (`cbx = i % grid_wide`, `cby = i / grid_wide`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrecinctSubBand {
+    /// Sub-band orientation (`LL` at `r = 0`; `HL` / `LH` / `HH` at
+    /// `r ≥ 1`), echoing the owning [`SubBand`].
+    pub orientation: SubBandOrientation,
+    /// Number of code-blocks across this precinct for this sub-band.
+    pub grid_wide: u32,
+    /// Number of code-blocks down this precinct for this sub-band.
+    pub grid_high: u32,
+    /// The code-blocks in raster order.
+    pub code_blocks: Vec<PrecinctCodeBlock>,
+}
+
+/// All code-blocks of every sub-band that fall in one precinct of one
+/// resolution level, per T.800 §B.7 / §B.9.
+///
+/// The `sub_bands` vector follows the §B.9 packet order: one `LL` entry
+/// at `r = 0`, three `[HL, LH, HH]` entries at `r ≥ 1`. A precinct may be
+/// **empty** (every sub-band's grid is `0 × 0`); §B.6 / §B.9 still require
+/// an empty packet for it, which is why the entry is retained rather than
+/// dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrecinctCodeBlocks {
+    /// Resolution level this precinct belongs to.
+    pub r: u8,
+    /// Raster precinct index `0..numprecincts` (the value §B.12 orders
+    /// packets by).
+    pub precinct_index: u32,
+    /// Precinct column index `0..numprecinctswide`.
+    pub px: u32,
+    /// Precinct row index `0..numprecinctshigh`.
+    pub py: u32,
+    /// One entry per sub-band present at this resolution level, in §B.9
+    /// packet order.
+    pub sub_bands: Vec<PrecinctSubBand>,
+}
+
+/// Project a precinct's 1-D extent (one axis) onto a sub-band domain and
+/// enumerate the intersecting code-blocks along that axis.
+///
+/// Returns `(grid, cells)` where `grid` is the number of code-blocks
+/// across this axis of the precinct for this sub-band and `cells` lists
+/// each code-block's clipped `[lo, hi)` sample range on the sub-band
+/// domain. All inputs are exponents / coordinates already specialised to
+/// one axis.
+///
+/// The geometry per T.800 §B.6 / §B.7 / §B.12 (Equation B-20):
+///
+/// * The precinct partition is anchored at `(0, 0)` (§B.6). On the
+///   sub-band domain its step is `2^pcb_exp` where `pcb_exp` is the
+///   **projected** precinct exponent — `PP` at `r = 0` (the `LL` band
+///   coincides with the resolution-level domain) and `PP - 1` at
+///   `r ≥ 1` (the high-pass sub-bands sit one wavelet level finer than
+///   the resolution level, so the precinct footprint halves). This is
+///   the `2^(PP + NL - r)` reference-grid step of Equation B-20 divided
+///   by the sub-band's `2^(NL - r + 1)` reference-grid scale.
+/// * Precinct cell `p` (`0..grid_precincts`) covers sub-band samples
+///   `[(anchor + p) · 2^pcb_exp, (anchor + p + 1) · 2^pcb_exp)` where
+///   `anchor = floor(tb_lo / 2^pcb_exp)`, then clipped to
+///   `[tb_lo, tb_hi)`.
+/// * The code-block partition is anchored at `(0, 0)` with step
+///   `2^cb_exp` (§B.7). The code-blocks intersecting the precinct cell
+///   run `floor(cell_lo / 2^cb_exp) ..= ceil(cell_hi / 2^cb_exp) - 1`,
+///   each clipped to both the precinct cell and the sub-band bounds.
+fn enumerate_axis(
+    tb_lo: u32,
+    tb_hi: u32,
+    pcb_exp: u8,
+    cb_exp: u8,
+    precinct: u32,
+) -> (u32, Vec<(u32, u32)>) {
+    // Empty sub-band on this axis → no precinct cells, no code-blocks.
+    if tb_hi <= tb_lo {
+        return (0, Vec::new());
+    }
+
+    // Precinct cell extent on the sub-band domain, anchored at (0, 0).
+    let anchor = floor_div_pow2(tb_lo, pcb_exp);
+    let pstart = pow2_mul(anchor + precinct, pcb_exp);
+    let pend = pow2_mul(anchor + precinct + 1, pcb_exp);
+    // Clip the precinct cell to the sub-band bounds.
+    let cell_lo = pstart.max(tb_lo);
+    let cell_hi = pend.min(tb_hi);
+    if cell_hi <= cell_lo {
+        // This precinct cell does not overlap the sub-band on this axis.
+        return (0, Vec::new());
+    }
+
+    // Code-blocks (partition step 2^cb_exp, anchored at (0, 0)) that
+    // intersect [cell_lo, cell_hi). First/last partition indices:
+    let first = floor_div_pow2(cell_lo, cb_exp);
+    let last = floor_div_pow2(cell_hi - 1, cb_exp);
+    let grid = last - first + 1;
+
+    let mut cells = Vec::with_capacity(grid as usize);
+    for cb in first..=last {
+        let cb_start = pow2_mul(cb, cb_exp);
+        let cb_end = pow2_mul(cb + 1, cb_exp);
+        // Clip the code-block to both the precinct cell and (via the
+        // cell) the sub-band — cell_lo/cell_hi are already inside the
+        // sub-band, so a single clamp to the cell suffices.
+        let lo = cb_start.max(cell_lo);
+        let hi = cb_end.min(cell_hi);
+        cells.push((lo, hi));
+    }
+    (grid, cells)
+}
+
+/// `value * 2^exp` saturating to `u32::MAX` (a code-block / precinct
+/// edge can in principle exceed `u32` for hostile exponents; the sub-band
+/// bounds always clip it back into range so the saturation is harmless).
+#[inline]
+fn pow2_mul(value: u32, exp: u8) -> u32 {
+    if exp >= 32 {
+        if value == 0 {
+            0
+        } else {
+            u32::MAX
+        }
+    } else {
+        value.checked_shl(exp as u32).unwrap_or(u32::MAX)
+    }
+}
+
+/// Enumerate the code-blocks of every sub-band that fall in precinct
+/// `precinct_index` of one resolution level, per T.800 §B.7 / §B.9.
+///
+/// `level` is the [`ResolutionLevel`] (its sub-bands and corners), `pp`
+/// is the precinct exponents `(PPx, PPy)` in force at this level (see
+/// [`precinct_exponents_at`]), `xcb` / `ycb` are the **real** code-block
+/// exponents (Table A.18: `COD` / `COC` stored byte `+ 2`), and
+/// `precinct_index` is the raster precinct index `0..numprecincts` (§B.6 /
+/// Figure B.8).
+///
+/// The §B.7 code-block clamp ([`derive_code_block_dimensions`]) is applied
+/// internally, so `xcb` / `ycb` are the unclamped nominal exponents. The
+/// result's per-sub-band `grid_wide` × `grid_high` is exactly the
+/// `SubBandGeometry { width, height }` the `packet` module consumes, and
+/// `code_blocks` lists them in the raster order §B.10.8 walks.
+///
+/// Returns [`Error::InvalidTilePartIndex`] if `precinct_index` is outside
+/// `0..numprecincts` for this resolution level — the caller is expected to
+/// have obtained the count from [`derive_precinct_partition`].
+pub fn derive_precinct_code_blocks(
+    level: &ResolutionLevel,
+    pp: PrecinctExponents,
+    xcb: u8,
+    ycb: u8,
+    precinct_index: u32,
+) -> Result<PrecinctCodeBlocks, Error> {
+    let partition = derive_precinct_partition(level, pp);
+    let num = partition.num_precincts();
+    if num == 0 || (precinct_index as u64) >= num {
+        return Err(Error::InvalidTilePartIndex);
+    }
+    // Raster decode of the precinct index per §B.6 / Figure B.8.
+    let px = precinct_index % partition.num_wide;
+    let py = precinct_index / partition.num_wide;
+
+    // Projected precinct exponents on the sub-band domain: PP at r = 0
+    // (LL coincides with the resolution-level domain), PP - 1 at r ≥ 1
+    // (high-pass sub-bands sit one wavelet level finer). See Eq B-20.
+    let (pcbx, pcby) = if level.r == 0 {
+        (pp.ppx, pp.ppy)
+    } else {
+        (pp.ppx.saturating_sub(1), pp.ppy.saturating_sub(1))
+    };
+
+    // Effective code-block exponents per §B.7 (Eq B-17 / B-18).
+    let cb = derive_code_block_dimensions(level.r, xcb, ycb, pp);
+
+    // §B.9 requires each code-block be "confined to the relevant
+    // precinct", so a code-block can never exceed a precinct cell. On the
+    // sub-band domain the precinct cell is `2^pcbx × 2^pcby`. In a
+    // conformant stream the §B.7 clamp already keeps `xcb' ≤ pcbx`
+    // (default `PPx = 15` → footprint `2^14`, real code-blocks ≤ `2^6`),
+    // but at `r ≥ 1` the literal §B.7 `min(xcb, PPx)` can equal `PPx`
+    // while the projected footprint exponent is `PPx - 1`. We clamp the
+    // enumeration exponent to the footprint so the precinct partition
+    // stays a tiling (no code-block claimed by two precincts), which is
+    // the only reading of §B.9 under which "confined to the precinct" is
+    // well-defined.
+    let cbx_eff = cb.xcb.min(pcbx);
+    let cby_eff = cb.ycb.min(pcby);
+
+    let mut sub_bands = Vec::with_capacity(level.sub_bands.len());
+    for band in &level.sub_bands {
+        let (grid_wide, cells_x) = enumerate_axis(band.tbx0, band.tbx1, pcbx, cbx_eff, px);
+        let (grid_high, cells_y) = enumerate_axis(band.tby0, band.tby1, pcby, cby_eff, py);
+
+        // If either axis is empty the precinct holds no code-blocks from
+        // this sub-band (an empty precinct, §B.6) — emit a 0×0 grid.
+        let mut code_blocks = Vec::with_capacity((grid_wide as usize) * (grid_high as usize));
+        for (cby, &(y0, y1)) in cells_y.iter().enumerate() {
+            for (cbx, &(x0, x1)) in cells_x.iter().enumerate() {
+                code_blocks.push(PrecinctCodeBlock {
+                    cbx: cbx as u32,
+                    cby: cby as u32,
+                    x0,
+                    y0,
+                    x1,
+                    y1,
+                });
+            }
+        }
+
+        sub_bands.push(PrecinctSubBand {
+            orientation: band.orientation,
+            grid_wide,
+            grid_high,
+            code_blocks,
+        });
+    }
+
+    Ok(PrecinctCodeBlocks {
+        r: level.r,
+        precinct_index,
+        px,
+        py,
+        sub_bands,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1757,5 +2056,340 @@ mod tests {
         assert_eq!(cb.ycb, 4);
         assert_eq!(cb.width(), 32);
         assert_eq!(cb.height(), 16);
+    }
+
+    // -- §B.7 / §B.9 precinct → code-block enumeration ----------------
+
+    /// Aligned 64×64 tile-component, NL = 1.
+    fn tc_aligned_64() -> TileComponentGeometry {
+        TileComponentGeometry {
+            tcx0: 0,
+            tcy0: 0,
+            tcx1: 64,
+            tcy1: 64,
+        }
+    }
+
+    #[test]
+    fn enumerate_r0_ll_band_splits_into_codeblocks() {
+        // NL = 1, r = 0: the LL band spans [0, 32)×[0, 32). PPx = PPy = 4
+        // → precinct step 2^4 = 16 on the resolution-level domain → 2×2 =
+        // 4 precincts. r = 0 projects PP directly (footprint 16). xcb =
+        // ycb = 6, xcb' = min(6, PPx - 1) = min(6, 3) = 3 → 8×8 code-
+        // blocks. Each 16×16 precinct holds a 2×2 grid of 8×8 blocks.
+        let levels = derive_resolution_levels(tc_aligned_64(), 1);
+        let pp = PrecinctExponents { ppx: 4, ppy: 4 };
+        let part = derive_precinct_partition(&levels[0], pp);
+        assert_eq!((part.num_wide, part.num_high), (2, 2));
+
+        let p = derive_precinct_code_blocks(&levels[0], pp, 6, 6, 0).unwrap();
+        assert_eq!((p.px, p.py), (0, 0));
+        assert_eq!(p.sub_bands.len(), 1);
+        let ll = &p.sub_bands[0];
+        assert_eq!(ll.orientation, SubBandOrientation::LL);
+        assert_eq!((ll.grid_wide, ll.grid_high), (2, 2));
+        assert_eq!(ll.code_blocks.len(), 4);
+        // Raster order: (0,0)=[0,8)×[0,8), (1,0)=[8,16)×[0,8),
+        //               (0,1)=[0,8)×[8,16), (1,1)=[8,16)×[8,16).
+        assert_eq!(
+            ll.code_blocks[0],
+            PrecinctCodeBlock {
+                cbx: 0,
+                cby: 0,
+                x0: 0,
+                y0: 0,
+                x1: 8,
+                y1: 8
+            }
+        );
+        assert_eq!(
+            ll.code_blocks[1],
+            PrecinctCodeBlock {
+                cbx: 1,
+                cby: 0,
+                x0: 8,
+                y0: 0,
+                x1: 16,
+                y1: 8
+            }
+        );
+        assert_eq!(
+            ll.code_blocks[3],
+            PrecinctCodeBlock {
+                cbx: 1,
+                cby: 1,
+                x0: 8,
+                y0: 8,
+                x1: 16,
+                y1: 16
+            }
+        );
+    }
+
+    #[test]
+    fn enumerate_r0_last_precinct_anchored() {
+        // Same setup, precinct index 3 → (px, py) = (1, 1): cell
+        // [16, 32)×[16, 32), 2×2 blocks of 8×8 anchored at (0, 0).
+        let levels = derive_resolution_levels(tc_aligned_64(), 1);
+        let pp = PrecinctExponents { ppx: 4, ppy: 4 };
+        let p = derive_precinct_code_blocks(&levels[0], pp, 6, 6, 3).unwrap();
+        assert_eq!((p.px, p.py), (1, 1));
+        let ll = &p.sub_bands[0];
+        assert_eq!((ll.grid_wide, ll.grid_high), (2, 2));
+        assert_eq!(
+            ll.code_blocks[0],
+            PrecinctCodeBlock {
+                cbx: 0,
+                cby: 0,
+                x0: 16,
+                y0: 16,
+                x1: 24,
+                y1: 24
+            }
+        );
+        assert_eq!(
+            ll.code_blocks[3],
+            PrecinctCodeBlock {
+                cbx: 1,
+                cby: 1,
+                x0: 24,
+                y0: 24,
+                x1: 32,
+                y1: 32
+            }
+        );
+    }
+
+    #[test]
+    fn enumerate_r1_three_subbands_projected_footprint() {
+        // NL = 1, r = 1: the HL/LH/HH sub-bands each span [0, 32)×[0, 32).
+        // The precinct count is taken on the resolution-level rectangle
+        // [0, 64) (r = 1 → trx1 = 64): step 16 → 4×4 = 16 precincts.
+        // r ≥ 1 projects PP - 1 = 3 onto the sub-band (footprint 8). xcb =
+        // ycb = 6 → xcb' = min(6, PPx) = 4, clamped to the footprint
+        // exponent 3 → 8×8 blocks. So every precinct holds exactly one
+        // 8×8 code-block per sub-band.
+        let levels = derive_resolution_levels(tc_aligned_64(), 1);
+        let pp = PrecinctExponents { ppx: 4, ppy: 4 };
+        let part = derive_precinct_partition(&levels[1], pp);
+        assert_eq!((part.num_wide, part.num_high), (4, 4));
+
+        let p = derive_precinct_code_blocks(&levels[1], pp, 6, 6, 0).unwrap();
+        assert_eq!(p.sub_bands.len(), 3);
+        for (band, want) in p.sub_bands.iter().zip([
+            SubBandOrientation::HL,
+            SubBandOrientation::LH,
+            SubBandOrientation::HH,
+        ]) {
+            assert_eq!(band.orientation, want);
+            assert_eq!((band.grid_wide, band.grid_high), (1, 1));
+            assert_eq!(band.code_blocks.len(), 1);
+            assert_eq!(
+                band.code_blocks[0],
+                PrecinctCodeBlock {
+                    cbx: 0,
+                    cby: 0,
+                    x0: 0,
+                    y0: 0,
+                    x1: 8,
+                    y1: 8
+                }
+            );
+        }
+
+        // Precinct 5 → (px, py) = (1, 1): each sub-band's single block is
+        // anchored at (8, 8).
+        let p5 = derive_precinct_code_blocks(&levels[1], pp, 6, 6, 5).unwrap();
+        assert_eq!((p5.px, p5.py), (1, 1));
+        assert_eq!(
+            p5.sub_bands[0].code_blocks[0],
+            PrecinctCodeBlock {
+                cbx: 0,
+                cby: 0,
+                x0: 8,
+                y0: 8,
+                x1: 16,
+                y1: 16
+            }
+        );
+    }
+
+    #[test]
+    fn enumerate_tiling_partitions_every_codeblock_exactly_once() {
+        // Across all 16 precincts of r = 1, every sub-band's code-blocks
+        // partition the sub-band exactly once: the union of all clipped
+        // code-block rectangles must cover [0, 32)×[0, 32) with no
+        // overlap. We verify by counting sample coverage for the HL band.
+        let levels = derive_resolution_levels(tc_aligned_64(), 1);
+        let pp = PrecinctExponents { ppx: 4, ppy: 4 };
+        let part = derive_precinct_partition(&levels[1], pp);
+        let n = part.num_precincts() as u32;
+
+        // Bitmap of 32×32 sub-band samples; each must be hit exactly once.
+        let mut hits = vec![0u8; 32 * 32];
+        for k in 0..n {
+            let p = derive_precinct_code_blocks(&levels[1], pp, 6, 6, k).unwrap();
+            for cell in &p.sub_bands[0].code_blocks {
+                for y in cell.y0..cell.y1 {
+                    for x in cell.x0..cell.x1 {
+                        hits[(y * 32 + x) as usize] += 1;
+                    }
+                }
+            }
+        }
+        assert!(hits.iter().all(|&h| h == 1), "every sample covered once");
+    }
+
+    #[test]
+    fn enumerate_offset_component_clips_left_edge() {
+        // Offset tile-component [5, 37)×[5, 37), NL = 0 (single LL band =
+        // the tile-component itself). PPx = PPy = 4 (step 16). Precinct
+        // count on [5, 37): ceil(37/16) - floor(5/16) = 3 - 0 = 3 wide.
+        // xcb = ycb = 3 → xcb' = min(3, PPx - 1) = 3 (8). Precinct 0
+        // (px = 0): cell anchored at floor(5/16)·16 = 0, cell [0, 16)
+        // clipped to the sub-band [5, 37) → [5, 16). Code-block 0 spans
+        // [0, 8) clipped to [5, 8) (a 3-wide block — §B.7 NOTE: blocks may
+        // extend past the sub-band edge and only the inside coefficients
+        // are coded).
+        let tc = TileComponentGeometry {
+            tcx0: 5,
+            tcy0: 5,
+            tcx1: 37,
+            tcy1: 37,
+        };
+        let levels = derive_resolution_levels(tc, 0);
+        let pp = PrecinctExponents { ppx: 4, ppy: 4 };
+        let part = derive_precinct_partition(&levels[0], pp);
+        assert_eq!(part.num_wide, 3);
+
+        let p = derive_precinct_code_blocks(&levels[0], pp, 3, 3, 0).unwrap();
+        let ll = &p.sub_bands[0];
+        // px = 0 cell [5, 16) → 2 blocks: [5, 8) and [8, 16).
+        assert_eq!(ll.grid_wide, 2);
+        assert_eq!(
+            ll.code_blocks[0],
+            PrecinctCodeBlock {
+                cbx: 0,
+                cby: 0,
+                x0: 5,
+                y0: 5,
+                x1: 8,
+                y1: 8
+            }
+        );
+        assert_eq!(ll.code_blocks[0].width(), 3);
+        assert_eq!(ll.code_blocks[1].x0, 8);
+        assert_eq!(ll.code_blocks[1].x1, 16);
+    }
+
+    #[test]
+    fn enumerate_past_subband_edge_clips_right() {
+        // Sub-band whose width is not a code-block multiple. NL = 0,
+        // tc [0, 20)×[0, 20), max-precinct PPx = PPy = 15 (one precinct).
+        // xcb = ycb = 3 → xcb' = min(3, 14) = 3 (8). Code-blocks tile
+        // [0, 20): [0, 8), [8, 16), [16, 24)→clipped to [16, 20) (4-wide,
+        // §B.7 NOTE).
+        let tc = TileComponentGeometry {
+            tcx0: 0,
+            tcy0: 0,
+            tcx1: 20,
+            tcy1: 20,
+        };
+        let levels = derive_resolution_levels(tc, 0);
+        let pp = PrecinctExponents { ppx: 15, ppy: 15 };
+        let part = derive_precinct_partition(&levels[0], pp);
+        assert_eq!(part.num_precincts(), 1);
+
+        let p = derive_precinct_code_blocks(&levels[0], pp, 3, 3, 0).unwrap();
+        let ll = &p.sub_bands[0];
+        assert_eq!(ll.grid_wide, 3);
+        assert_eq!(ll.grid_high, 3);
+        // Last column block clipped to [16, 20) (width 4).
+        let last_in_row0 = &ll.code_blocks[2];
+        assert_eq!((last_in_row0.x0, last_in_row0.x1), (16, 20));
+        assert_eq!(last_in_row0.width(), 4);
+        // Bottom-right block clipped on both axes to [16, 20)×[16, 20).
+        let last = ll.code_blocks.last().unwrap();
+        assert_eq!((last.x0, last.y0, last.x1, last.y1), (16, 16, 20, 20));
+    }
+
+    #[test]
+    fn enumerate_grid_counts_match_subband_geometry_bridge() {
+        // The per-sub-band (grid_wide, grid_high) is the exact
+        // SubBandGeometry { width, height } the packet reader consumes.
+        // For the aligned 64×64 NL = 1 component with PPx = PPy = 4, the
+        // r = 0 LL band has a 2×2 grid per precinct (4 precincts → 16
+        // total = (32/8)²), confirming the count bridges cleanly.
+        let levels = derive_resolution_levels(tc_aligned_64(), 1);
+        let pp = PrecinctExponents { ppx: 4, ppy: 4 };
+        let part = derive_precinct_partition(&levels[0], pp);
+        let mut total = 0u32;
+        for k in 0..part.num_precincts() as u32 {
+            let p = derive_precinct_code_blocks(&levels[0], pp, 6, 6, k).unwrap();
+            let g = &p.sub_bands[0];
+            total += g.grid_wide * g.grid_high;
+            assert_eq!(g.code_blocks.len() as u32, g.grid_wide * g.grid_high);
+        }
+        assert_eq!(total, 16); // (32 / 8)² code-blocks over the LL band.
+    }
+
+    #[test]
+    fn enumerate_max_precinct_single_precinct_holds_all() {
+        // Max-precinct default (PPx = PPy = 15) → one precinct per
+        // resolution level holding the entire LL grid. NL = 0, tc
+        // [0, 64)×[0, 64), xcb = ycb = 6 → xcb' = min(6, 14) = 6 (64).
+        // The single LL band is one 64×64 code-block.
+        let levels = derive_resolution_levels(tc_aligned_64(), 0);
+        let pp = PrecinctExponents { ppx: 15, ppy: 15 };
+        let part = derive_precinct_partition(&levels[0], pp);
+        assert_eq!(part.num_precincts(), 1);
+
+        let p = derive_precinct_code_blocks(&levels[0], pp, 6, 6, 0).unwrap();
+        let ll = &p.sub_bands[0];
+        assert_eq!((ll.grid_wide, ll.grid_high), (1, 1));
+        assert_eq!(
+            ll.code_blocks[0],
+            PrecinctCodeBlock {
+                cbx: 0,
+                cby: 0,
+                x0: 0,
+                y0: 0,
+                x1: 64,
+                y1: 64
+            }
+        );
+    }
+
+    #[test]
+    fn enumerate_rejects_out_of_range_precinct_index() {
+        // precinct_index ≥ numprecincts → InvalidTilePartIndex.
+        let levels = derive_resolution_levels(tc_aligned_64(), 1);
+        let pp = PrecinctExponents { ppx: 4, ppy: 4 };
+        // r = 0 has 4 precincts; index 4 is out of range.
+        assert!(matches!(
+            derive_precinct_code_blocks(&levels[0], pp, 6, 6, 4),
+            Err(Error::InvalidTilePartIndex)
+        ));
+    }
+
+    #[test]
+    fn enumerate_empty_resolution_level_rejects_any_index() {
+        // An empty resolution level has zero precincts, so even index 0
+        // is out of range. A degenerate [0, 0)×[0, 0) tile-component at
+        // NL = 0 produces a single empty resolution level.
+        let tc = TileComponentGeometry {
+            tcx0: 0,
+            tcy0: 0,
+            tcx1: 0,
+            tcy1: 0,
+        };
+        let levels = derive_resolution_levels(tc, 0);
+        let pp = PrecinctExponents { ppx: 4, ppy: 4 };
+        let part = derive_precinct_partition(&levels[0], pp);
+        assert_eq!(part.num_precincts(), 0);
+        assert!(matches!(
+            derive_precinct_code_blocks(&levels[0], pp, 6, 6, 0),
+            Err(Error::InvalidTilePartIndex)
+        ));
     }
 }

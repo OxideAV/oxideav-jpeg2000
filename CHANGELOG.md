@@ -6,6 +6,94 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 9 (2026-05-24).** Precinct → code-block enumeration
+  (T.800 §B.7 / §B.9) on top of the round-8 `PrecinctPartition` +
+  `CodeBlockDimensions` (`geometry` submodule). New
+  `geometry::derive_precinct_code_blocks(level, pp, xcb, ycb,
+  precinct_index)` returns a `PrecinctCodeBlocks { r, precinct_index,
+  px, py, sub_bands: Vec<PrecinctSubBand> }` — one `PrecinctSubBand`
+  per sub-band of the `ResolutionLevel` in §B.9 packet order (just `LL`
+  at `r = 0`; `[HL, LH, HH]` at `r ≥ 1`). Each `PrecinctSubBand`
+  carries `grid_wide` × `grid_high` (exactly the
+  `packet::SubBandGeometry { width, height }` the round-5 packet
+  reader consumes) plus a raster-order `Vec<PrecinctCodeBlock>` matching
+  the §B.10.8 walk order. Each `PrecinctCodeBlock { cbx, cby, x0, y0,
+  x1, y1 }` records its in-precinct grid index and its sample corners
+  on the sub-band domain, **clipped to both** the precinct projection
+  and the sub-band's own bounds per §B.7 NOTE (a partition cell may
+  extend past the sub-band edge; only the inside coefficients are
+  coded, so `width()` / `height()` give the real coefficient count for
+  rectangular interior blocks and a smaller-than-`2^xcb'` rectangle for
+  edge blocks).
+
+  The precinct projection onto each sub-band follows from §B.6 (precinct
+  anchored at `(0, 0)` on the resolution-level domain, step `2^PPx`),
+  §B.5 (the high-pass sub-bands at resolution level `r ≥ 1` sit at
+  decomposition level `nb = NL - r + 1`, one wavelet level finer than
+  the resolution-level domain at scale `2^(NL - r)`), and Equation B-20
+  (the reference-grid precinct step `2^(PPx + NL - r)`): dividing by the
+  sub-band scale `2^(NL - r + 1)` gives projected exponent `PPx - 1` at
+  `r ≥ 1`. At `r = 0` the LL sub-band coincides with the resolution-
+  level domain and the projection is the identity (exponent `PPx`). The
+  enumeration anchors the projected precinct partition at `(0, 0)` on
+  each sub-band (`anchor = floor(tb_lo / 2^pcb_exp)`, precinct cell `p`
+  covers `[(anchor + p)·2^pcb_exp, (anchor + p + 1)·2^pcb_exp)` clipped
+  to `[tb_lo, tb_hi)`), then enumerates the §B.7 code-block cells (step
+  `2^xcb'`, anchored at `(0, 0)`) intersecting each precinct cell.
+
+  Per §B.9 ("code-blocks confined to the relevant precinct") each
+  code-block must belong to exactly one precinct, so the enumeration
+  clamps the §B.7 effective exponent to the projected footprint
+  exponent. In a conformant stream this is a no-op (default `PPx = 15`
+  → footprint `2^14`, real code-blocks ≤ `2^6`); it matters only at the
+  degenerate literal-§B.7 edge where `r ≥ 1` and `xcb' = min(xcb, PPx)
+  = PPx > PPx - 1`, where without the clamp a single code-block would
+  span two adjacent precincts. The clamp is the only reading of §B.9
+  under which "confined to the precinct" remains well-defined and is
+  flagged in the doc comment for downstream auditors.
+
+  Ten new unit tests against the aligned 64×64 NL = 1 tile-component
+  with `PPx = PPy = 4` (4 r=0 precincts each with a 2×2 grid of 8×8 LL
+  blocks; 16 r=1 precincts each with one 8×8 block per HL/LH/HH
+  sub-band; first + last precinct corner anchoring), a tiling-coverage
+  check (all 16 precincts × all code-blocks across the HL band cover
+  every sub-band sample exactly once), an offset `[5, 37)×[5, 37)`
+  tile-component exercising left-edge clipping (precinct 0 anchored at
+  resolution-level zero, first code-block clipped to a 3-wide block at
+  `[5, 8)`), a `[0, 20)×[0, 20)` max-precinct sub-band exercising right-
+  edge §B.7-NOTE clipping (bottom-right block clipped to `[16, 20)²`),
+  the `SubBandGeometry` bridge (grid sums == `(32/8)² = 16`), max-
+  precinct single-precinct mode (one 64×64 code-block), out-of-range
+  index → `Error::InvalidTilePartIndex`, and the empty-resolution-level
+  corner. 113 tests total pass (103 prior + 10 new); cargo fmt-check +
+  clippy `-D warnings` clean (both default + `--no-default-features`
+  builds). No new error variants — the function reuses the existing
+  `Error::InvalidTilePartIndex` for the out-of-range precinct index.
+
+  Built solely against
+  `docs/image/jpeg2000/T-REC-T.800-201906-S.pdf` (§B.5 — lead-in
+  describing the high-pass sub-bands at decomposition level `nb = NL -
+  r + 1`, Equation B-15 sub-band corners on the sub-band domain; §B.6 —
+  precinct partition anchored at `(0, 0)`, step `2^PPx`; §B.7 —
+  Equation B-17 / B-18 effective code-block exponents, code-block
+  partition anchored at `(0, 0)`, §B.7 NOTE on code-blocks extending
+  past the sub-band edge; §B.9 — "the code-block contributions appear
+  in raster order, confined to the bounds established by the relevant
+  precinct" and "only code-blocks that contain samples from the
+  relevant sub-band, confined to the precinct, have any representation
+  in the packet"; §B.10.8 — the raster order the packet header walks
+  the per-precinct code-blocks in; §B.12.1.3 / Equation B-20 — the
+  `2^(PP + NL - r)` reference-grid precinct step that establishes the
+  projected precinct exponent on each sub-band when divided by the
+  sub-band scale `2^(NL - r + 1)`). No external library source —
+  OpenJPEG, OpenJPH, Kakadu, FFmpeg, libavcodec, jpeg2000-rs, etc. —
+  was consulted, quoted, paraphrased, or used as a cross-check oracle.
+  No WebSearch / WebFetch was used for any reason.
+
+  §B.12 progression-order packet iteration (Equation B-20 / B-21
+  across all five orders LRCP / RLCP / RPCL / PCRL / CPRL) and §B.8
+  layer / §B.9 packet assembly land in a later round.
+
 * **Clean-room round 8 (2026-05-24).** Precinct partitioning (T.800
   §B.6 — Equation B-16) and code-block partitioning (§B.7 — Equation
   B-17 / Equation B-18) on top of the round-7 `ResolutionLevel`
