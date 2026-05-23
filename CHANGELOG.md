@@ -6,6 +6,69 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 8 (2026-05-24).** Precinct partitioning (T.800
+  §B.6 — Equation B-16) and code-block partitioning (§B.7 — Equation
+  B-17 / Equation B-18) on top of the round-7 `ResolutionLevel`
+  (`geometry` submodule). New
+  `geometry::derive_precinct_partition(level, exponents)` takes a
+  `ResolutionLevel` and a `PrecinctExponents { ppx, ppy }` and returns
+  a `PrecinctPartition { exponents, num_wide, num_high }` whose
+  `num_wide` / `num_high` follow Equation B-16:
+  `numprecinctswide = ceil(trx1/2^PPx) - floor(trx0/2^PPx)` when
+  `trx1 > trx0` (else 0), symmetrically for `numprecinctshigh`.
+  `PrecinctPartition::num_precincts()` returns
+  `num_wide * num_high` widened to `u64`. The partition is anchored at
+  `(0, 0)` on the reduced-resolution tile-component domain, so the
+  origin term is `floor(trx0/2^PPx)` (not `ceil`), which is what lets
+  an offset tile-component straddle one extra precinct cell.
+  `geometry::precinct_exponents_at(precincts, r)` decodes the `(PPx,
+  PPy)` in force at resolution level `r` from a `COD` / `COC` precinct
+  byte vector per Table A.21 (low nibble = `PPx`, high nibble = `PPy`,
+  first byte → `r = 0` / NLLL band); an empty vector returns the
+  maximum-precinct default `PPx = PPy = 15` per Table A.13 (`Scod`
+  bit 0 clear). New
+  `geometry::derive_code_block_dimensions(r, xcb, ycb, exponents)`
+  returns `CodeBlockDimensions { xcb, ycb }` (the effective `xcb'` /
+  `ycb'`) per Equation B-17 / B-18: `xcb' = min(xcb, PPx - 1)` at
+  `r = 0`, `min(xcb, PPx)` at `r > 0` (symmetrically for `ycb'`), with
+  the `PP - 1` computed via saturating subtraction so the
+  Table-A.21-legal `PPx = PPy = 0` at the NLLL band clamps to a `1×1`
+  partition rather than wrapping. `xcb` / `ycb` are the **real**
+  exponents (Table A.18: the `COD` / `COC` stored byte `+ 2`); the
+  caller adds the `+ 2`, the function applies the §B.7 clamp only.
+  `CodeBlockDimensions::{width, height}` expose `2^xcb'` / `2^ycb'`.
+  Eleven new unit tests: max-precinct default; Table A.21 nibble
+  decode; aligned 64×64 precinct count (`NL = 1`, 16×16 precinct → 4
+  precincts at `r = 0`, 16 at `r = 1`); offset tile-component
+  exercising the `floor` origin term; single-precinct max-precinct
+  mode; empty-resolution-level zero count; code-block exponents
+  unclamped / clamped at `r > 0`, the `PP - 1` shave at `r = 0`, the
+  `PP = 0` saturation corner, and asymmetric per-axis clamping. 103
+  tests total pass (92 prior + 11 new); cargo fmt-check + clippy
+  `-D warnings` clean (both default + `--no-default-features` builds).
+  No new error variants — both functions are total (the precinct count
+  and code-block clamp never fail; geometry validity is established by
+  the `COD` / SIZ parsers upstream).
+
+  Built solely against
+  `docs/image/jpeg2000/T-REC-T.800-201906-S.pdf` (§B.6 — Equation B-16
+  precinct count, precinct anchoring at `(0, 0)`; §B.7 — Equation B-17
+  / B-18 effective code-block exponents, code-block partition anchored
+  at `(0, 0)`, §B.7 NOTE on code-blocks extending past the sub-band
+  edge; Table A.18 — `xcb = value + 2`; Table A.21 — precinct nibble
+  layout; Table A.13 — maximum-precinct `PPx = PPy = 15` default). No
+  external library source — OpenJPEG, OpenJPH, Kakadu, FFmpeg,
+  libavcodec, jpeg2000-rs, etc. — was consulted, quoted, paraphrased,
+  or used as a cross-check oracle.
+
+  §B.8 layer formation, §B.9 packet assembly, and the §B.12
+  progression-order packet iterator (Equation B-20 / B-21) land in
+  round 9. The precinct → code-block enumeration (which actual
+  code-blocks fall in a given precinct of a given sub-band, clipped
+  to both the sub-band and precinct bounds) is the bridge between this
+  round's counts and the round-5 `packet` reader's `PacketGeometry`
+  input; it lands in round 9.
+
 * **Clean-room round 7 (2026-05-22).** Per-resolution-level +
   per-sub-band geometry on top of the round-6 `TileComponentGeometry`
   (`geometry` submodule, T.800 §B.5 — Equation B-14 / Equation B-15 /

@@ -3,19 +3,23 @@
 Pure-Rust JPEG 2000 (J2K + JP2) and High-Throughput JPEG 2000 (HTJ2K)
 codec.
 
-## Status — 2026-05-22 (clean-room round 7)
+## Status — 2026-05-24 (clean-room round 8)
 
 **Codestream-structural + JP2-wrapper + tier-2 packet-header reader +
-SIZ-derived tile geometry + resolution-level / sub-band geometry.**
+SIZ-derived tile geometry + resolution-level / sub-band geometry +
+precinct / code-block partition.**
 The crate parses the JPEG 2000 Part-1 **main header** (`SOC`, `SIZ`,
 `COD`, `QCD`), walks the **tile-part chain** (`SOT` / `SOD` / `EOC`),
 decodes the **JP2 ISO BMFF box wrapper** (Annex I), reads the
 **tier-2 packet-header bit stream** (T.800 §B.10), derives **per-tile
 + per-component coordinate geometry** from the SIZ marker (T.800 §B.2
-/ §B.3 / §B.5 — Equations B-1..B-13), and now lifts each
-tile-component to **per-resolution-level + per-sub-band geometry**
-using COD/COC's `NL` (T.800 §B.5 — Equation B-14 for the resolution
-level corners, Equation B-15 + Table B.1 for the sub-band corners).
+/ §B.3 / §B.5 — Equations B-1..B-13), lifts each tile-component to
+**per-resolution-level + per-sub-band geometry** using COD/COC's `NL`
+(T.800 §B.5 — Equation B-14 for the resolution level corners, Equation
+B-15 + Table B.1 for the sub-band corners), and now partitions each
+resolution level into **precincts** (T.800 §B.6 — Equation B-16) and
+its sub-bands into **code-blocks** (T.800 §B.7 — Equation B-17 / B-18)
+from the COD/COC `PPx` / `PPy` and `xcb` / `ycb` exponents.
 
 `parse_codestream` returns a `J2kCodestream` with the main header
 plus an ordered `Vec<TilePart>`. Each `TilePart` carries its parsed
@@ -118,18 +122,40 @@ implicit non-negativity assumption). `NL = 0` collapses to a single
 Table A.15 upper bound) is handled without overflow via 64-bit
 intermediates.
 
+`geometry::derive_precinct_partition(level, exponents)` counts the
+precincts spanning one `ResolutionLevel` per T.800 §B.6 / Equation
+B-16: `numprecinctswide = ceil(trx1/2^PPx) - floor(trx0/2^PPx)` when
+`trx1 > trx0` (else 0), symmetrically for `numprecinctshigh`, returning
+a `PrecinctPartition { exponents, num_wide, num_high }` whose
+`num_precincts()` is `num_wide * num_high`. The partition is anchored
+at `(0, 0)` on the reduced-resolution domain, so the origin term is a
+**floor** (an offset tile-component can straddle one extra precinct
+cell). `geometry::precinct_exponents_at(precincts, r)` reads the
+`(PPx, PPy)` in force at resolution level `r` from a `COD` / `COC`
+precinct byte vector per Table A.21 (low nibble = `PPx`, high nibble =
+`PPy`); an empty vector means maximum-precinct mode and returns the
+Table A.13 default `PPx = PPy = 15`.
+`geometry::derive_code_block_dimensions(r, xcb, ycb, exponents)`
+applies the §B.7 clamp (Equation B-17 / B-18):
+`xcb' = min(xcb, PPx - 1)` at `r = 0`, `min(xcb, PPx)` at `r > 0`
+(symmetrically for `ycb'`), returning `CodeBlockDimensions { xcb,
+ycb }` with `width()` / `height()` = `2^xcb'` / `2^ycb'`. `xcb` /
+`ycb` are the **real** exponents (Table A.18 stored byte `+ 2`); the
+`PP - 1` shave at `r = 0` is a saturating subtraction so the
+Table-A.21-legal NLLL-band `PP = 0` clamps to a `1×1` partition.
+
 What is **not** implemented yet:
 
 * Tier-1 (EBCOT MQ-coder block coding) — the packet-header reader
   reports byte ranges per code-block, but the codeword bytes are not
   yet decoded.
-* §B.6 (precinct partitioning) + §B.7 (sub-band → code-block
-  partitioning) + §B.12 progression-order packet iteration. Round 7
-  closes resolution-level + sub-band geometry (`§B.5` Equation B-14 /
-  B-15); round 8 will derive precinct extents from
-  `geometry::ResolutionLevel` plus `COD` / `COC` precinct-size bytes,
-  partition each sub-band into code-blocks per §B.7, and emit the
-  packet-precinct sequence for each progression order.
+* Precinct → code-block **enumeration** (which code-blocks of a
+  sub-band fall in a given precinct, clipped to both bounds) + §B.12
+  progression-order packet iteration (Equation B-20 / B-21). Round 8
+  closes the precinct / code-block **counts** (§B.6 / §B.7); round 9
+  will bridge those counts to the round-5 `packet` reader's
+  `PacketGeometry` input and emit the packet-precinct sequence for
+  each progression order, plus §B.8 layer / §B.9 packet assembly.
 * §B.10.7.2 multi-codeword-segment splitting (round 5 emits one
   segment length per included code-block; termination boundaries are
   a tier-1 input we don't have yet).
@@ -192,7 +218,16 @@ consulted:
   Table B.1 sub-band orientation displacements `(xob, yob)`), §B.4
   worked example (1432×954 reference grid, 4×4 tile grid, two
   components with (1,1) and (2,2) sub-sampling, asymmetric
-  ceiling-divide on the y-axis for the sub-sampled component).
+  ceiling-divide on the y-axis for the sub-sampled component), §B.6
+  (Division of resolution levels into precincts — Equation B-16
+  precinct count, precinct partition anchored at `(0, 0)` so the
+  origin term is a floor; Table A.13 maximum-precinct `PPx = PPy = 15`
+  default; Table A.21 precinct-byte nibble layout, low = `PPx`, high =
+  `PPy`), §B.7 (Division of the sub-bands into code-blocks — Equation
+  B-17 / B-18 effective code-block exponents `xcb'` / `ycb'` clamped to
+  the precinct, code-block partition anchored at `(0, 0)`, §B.7 NOTE on
+  code-blocks extending past the sub-band edge; Table A.18 code-block
+  exponent `xcb = value + 2`).
 
 No external library source — OpenJPEG, OpenJPH, Kakadu, FFmpeg, etc.
 — was consulted, quoted, paraphrased, or used as a cross-check

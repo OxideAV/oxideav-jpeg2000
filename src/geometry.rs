@@ -1,11 +1,15 @@
 //! Image-area + tile-grid + tile-component coordinate derivation from
 //! the SIZ marker segment, plus per-resolution-level + per-sub-band
-//! geometry from the COD marker's `NL` (number of decomposition levels).
+//! geometry from the COD marker's `NL` (number of decomposition levels),
+//! plus the precinct partition (§B.6) and code-block partition (§B.7)
+//! of each resolution level.
 //!
 //! All derivations follow T.800 (ITU-T Rec. T.800 (06/2019) | ISO/IEC
-//! 15444-1) §B.2 / §B.3 / §B.5 — Equations B-1, B-2, B-3, B-4, B-5,
-//! B-6, B-7, B-8, B-9, B-10, B-11, B-12, B-13, B-14, B-15 plus Table
-//! B.1 (sub-band orientation displacements `(xob, yob)`).
+//! 15444-1) §B.2 / §B.3 / §B.5 / §B.6 / §B.7 — Equations B-1, B-2, B-3,
+//! B-4, B-5, B-6, B-7, B-8, B-9, B-10, B-11, B-12, B-13, B-14, B-15,
+//! B-16, B-17, B-18 plus Table B.1 (sub-band orientation displacements
+//! `(xob, yob)`), Table A.18 (code-block exponents), and Table A.21
+//! (precinct exponents).
 //!
 //! The tile-level entry point is [`derive_tile_geometry`]: given a
 //! parsed [`Siz`] and a tile-grid index `t` (the `Isot` value from a
@@ -42,8 +46,12 @@
 //! B-13 for the per-component sample mapping; Equation B-14
 //! resolution-level corners; Equation B-15 sub-band corners; Table
 //! B.1 sub-band orientation displacements `(xob, yob)` for the four
-//! sub-bands `LL`, `HL`, `LH`, `HH`). No external library source was
-//! consulted.
+//! sub-bands `LL`, `HL`, `LH`, `HH`); §B.6 (Equation B-16 precinct
+//! count from the `PPx` / `PPy` exponents, with Table A.21 nibble
+//! layout and the Table A.13 maximum-precinct default `PPx = PPy = 15`);
+//! §B.7 (Equation B-17 / Equation B-18 effective code-block exponents
+//! clamped to the precinct, with Table A.18 `xcb = value + 2`). No
+//! external library source was consulted.
 
 use crate::{Error, Siz};
 
@@ -660,6 +668,230 @@ pub fn derive_resolution_levels(tc: TileComponentGeometry, n_l: u8) -> Vec<Resol
         });
     }
     levels
+}
+
+// ---------------------------------------------------------------------------
+// Precinct partitioning (T.800 §B.6 — Equation B-16) and code-block
+// partitioning (T.800 §B.7 — Equation B-17 / Equation B-18).
+// ---------------------------------------------------------------------------
+
+/// The precinct exponents `(PPx, PPy)` in force at one resolution level,
+/// per T.800 §B.6 / Table A.21.
+///
+/// `PPx` / `PPy` are the base-2 exponents of the precinct width / height
+/// (the precinct is `2^PPx` wide by `2^PPy` high on the reduced-
+/// resolution tile-component domain). They are signalled per
+/// tile-component and per resolution level in the `COD` / `COC` marker
+/// (Table A.21: the low nibble of each precinct byte is `PPx`, the high
+/// nibble is `PPy`). When no user-defined precincts are present the
+/// maximum-precinct default `PPx = PPy = 15` applies at every resolution
+/// level (T.800 Table A.13 — `Scod` bit 0 clear → "Entropy coder,
+/// precincts with PPx = 15 and PPy = 15").
+///
+/// `PPx` / `PPy` may be zero only at the resolution level corresponding
+/// to the `NLLL` band (`r = 0`); at every `r ≥ 1` they are at least 1
+/// (Table A.21). This is an encoder constraint — the partition formula
+/// here does not enforce it (a malformed `PPx = 0` at `r > 0` simply
+/// yields a one-sample-wide precinct grid).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrecinctExponents {
+    /// `PPx` — precinct width exponent (precinct width = `2^PPx`).
+    pub ppx: u8,
+    /// `PPy` — precinct height exponent (precinct height = `2^PPy`).
+    pub ppy: u8,
+}
+
+/// The number of precincts spanning one tile-component resolution level,
+/// per T.800 §B.6 / Equation B-16.
+///
+/// The precinct partition is anchored at `(0, 0)` on the reduced-
+/// resolution tile-component domain, so a precinct's upper-left corner
+/// sits at an integer multiple of `(2^PPx, 2^PPy)`. Equation B-16 counts
+/// how many such anchored cells the resolution-level rectangle
+/// `[trx0, trx1) × [try0, try1)` overlaps:
+///
+/// ```text
+/// numprecinctswide = ceil(trx1 / 2^PPx) - floor(trx0 / 2^PPx)   if trx1 > trx0, else 0
+/// numprecinctshigh = ceil(try1 / 2^PPy) - floor(try0 / 2^PPy)   if try1 > try0, else 0
+/// numprecincts     = numprecinctswide * numprecinctshigh
+/// ```
+///
+/// `numprecincts` may be zero (when the resolution level is empty), and
+/// even when both dimensions are non-zero individual precincts may turn
+/// out empty after the §B.7 code-block partition (no sub-band
+/// coefficients land in them); §B.6 still requires every such precinct
+/// to be represented by a (possibly empty) packet (§B.9). The precinct
+/// index runs `0..numprecincts` in raster order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrecinctPartition {
+    /// Precinct exponents `(PPx, PPy)` used for this resolution level.
+    pub exponents: PrecinctExponents,
+    /// `numprecinctswide` per Equation B-16.
+    pub num_wide: u32,
+    /// `numprecinctshigh` per Equation B-16.
+    pub num_high: u32,
+}
+
+impl PrecinctPartition {
+    /// `numprecincts = numprecinctswide * numprecinctshigh` per §B.6.
+    ///
+    /// Widened to `u64` because both factors can in principle reach the
+    /// `u32` range for a maximal tile-component with small `PP`.
+    pub fn num_precincts(&self) -> u64 {
+        self.num_wide as u64 * self.num_high as u64
+    }
+}
+
+/// The effective code-block dimensions for the sub-bands at one
+/// resolution level, per T.800 §B.7 / Equation B-17 / Equation B-18.
+///
+/// The nominal code-block size signalled in `COD` / `COC` is `2^xcb` by
+/// `2^ycb` (Table A.18: the stored byte is `xcb - 2`, i.e. the real
+/// exponent is the stored value `+ 2`). At each resolution level the
+/// effective exponents are clamped down so a code-block never exceeds the
+/// precinct:
+///
+/// ```text
+/// xcb' = min(xcb, PPx - 1)  for r = 0,   min(xcb, PPx)  for r > 0
+/// ycb' = min(ycb, PPy - 1)  for r = 0,   min(ycb, PPy)  for r > 0
+/// ```
+///
+/// The code-block partition is, like the precinct partition, anchored at
+/// `(0, 0)`: the first column of code-blocks starts at `x = n·2^xcb'`,
+/// the first row at `y = m·2^ycb'` (`m`, `n` integers). A code-block may
+/// extend past the sub-band edge; only the coefficients inside the
+/// sub-band are coded (§B.7 NOTE).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodeBlockDimensions {
+    /// `xcb'` — effective code-block width exponent (width = `2^xcb'`).
+    pub xcb: u8,
+    /// `ycb'` — effective code-block height exponent (height = `2^ycb'`).
+    pub ycb: u8,
+}
+
+impl CodeBlockDimensions {
+    /// Nominal code-block width `2^xcb'` (`xcb'` is at most 10, so the
+    /// result fits comfortably in `u32`).
+    pub fn width(&self) -> u32 {
+        1u32 << self.xcb
+    }
+
+    /// Nominal code-block height `2^ycb'`.
+    pub fn height(&self) -> u32 {
+        1u32 << self.ycb
+    }
+}
+
+/// Look up the precinct exponents `(PPx, PPy)` in force at resolution
+/// level `r`, given the `COD` / `COC` precinct byte vector.
+///
+/// `precincts` is the raw `Vec<u8>` from a parsed `COD` / `COC`:
+///
+/// * **Empty** → maximum-precinct mode (no user-defined precincts): the
+///   default `PPx = PPy = 15` applies at every resolution level (T.800
+///   Table A.13).
+/// * **Non-empty** → one byte per resolution level in order, the first
+///   byte for `r = 0` (the `NLLL` band). Per Table A.21 the low nibble
+///   is `PPx` and the high nibble is `PPy`. If `r` is past the end of
+///   the vector (a malformed marker that signalled fewer than `NL + 1`
+///   bytes) the last byte is reused — but a well-formed `COD` always
+///   carries exactly `NL + 1` bytes (Table A.21), so the test corpus
+///   never hits the fallback.
+pub fn precinct_exponents_at(precincts: &[u8], r: u8) -> PrecinctExponents {
+    if precincts.is_empty() {
+        return PrecinctExponents { ppx: 15, ppy: 15 };
+    }
+    let idx = (r as usize).min(precincts.len() - 1);
+    let byte = precincts[idx];
+    PrecinctExponents {
+        ppx: byte & 0x0F,
+        ppy: (byte >> 4) & 0x0F,
+    }
+}
+
+/// Floor of `value / 2^exp` for a `u32` and an exponent `0..=31`.
+#[inline]
+fn floor_div_pow2(value: u32, exp: u8) -> u32 {
+    if exp >= 32 {
+        0
+    } else {
+        value >> exp
+    }
+}
+
+/// Ceiling of `value / 2^exp` for a `u32` and an exponent `0..=31`.
+#[inline]
+fn ceil_div_pow2_exp(value: u32, exp: u8) -> u32 {
+    ceil_div_pow2(value, exp as u32)
+}
+
+/// Derive the precinct partition for one resolution level per T.800 §B.6
+/// / Equation B-16.
+///
+/// `level` is the [`ResolutionLevel`] (its `(trx0, try0, trx1, try1)`
+/// rectangle drives the count) and `exponents` is the `(PPx, PPy)` in
+/// force at that level (see [`precinct_exponents_at`]).
+///
+/// Returns a [`PrecinctPartition`] carrying `numprecinctswide`,
+/// `numprecinctshigh`, and the exponents. An empty resolution level
+/// (`trx1 == trx0` or `try1 == try0`) yields a count of zero on that
+/// axis per Equation B-16's case split.
+pub fn derive_precinct_partition(
+    level: &ResolutionLevel,
+    exponents: PrecinctExponents,
+) -> PrecinctPartition {
+    let num_wide = if level.trx1 > level.trx0 {
+        ceil_div_pow2_exp(level.trx1, exponents.ppx) - floor_div_pow2(level.trx0, exponents.ppx)
+    } else {
+        0
+    };
+    let num_high = if level.try1 > level.try0 {
+        ceil_div_pow2_exp(level.try1, exponents.ppy) - floor_div_pow2(level.try0, exponents.ppy)
+    } else {
+        0
+    };
+    PrecinctPartition {
+        exponents,
+        num_wide,
+        num_high,
+    }
+}
+
+/// Derive the effective code-block dimensions at resolution level `r`
+/// per T.800 §B.7 / Equation B-17 / Equation B-18.
+///
+/// `xcb` / `ycb` are the **real** code-block exponents (i.e. the
+/// `COD` / `COC` stored byte `+ 2` per Table A.18 — the caller adds the
+/// `+ 2`; this function does the §B.7 clamp only). `r` is the resolution
+/// level and `exponents` is the `(PPx, PPy)` in force at that level.
+///
+/// ```text
+/// xcb' = min(xcb, PPx - 1)  at r = 0,   min(xcb, PPx)  at r > 0
+/// ycb' = min(ycb, PPy - 1)  at r = 0,   min(ycb, PPy)  at r > 0
+/// ```
+///
+/// `PPx - 1` / `PPy - 1` at `r = 0` use a saturating subtraction so a
+/// `PP = 0` (legal only at `r = 0`, Table A.21) clamps the effective
+/// exponent to zero (a `1×n` / `n×1` code-block partition) rather than
+/// underflowing.
+pub fn derive_code_block_dimensions(
+    r: u8,
+    xcb: u8,
+    ycb: u8,
+    exponents: PrecinctExponents,
+) -> CodeBlockDimensions {
+    let (px_bound, py_bound) = if r == 0 {
+        (
+            exponents.ppx.saturating_sub(1),
+            exponents.ppy.saturating_sub(1),
+        )
+    } else {
+        (exponents.ppx, exponents.ppy)
+    };
+    CodeBlockDimensions {
+        xcb: xcb.min(px_bound),
+        ycb: ycb.min(py_bound),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1341,5 +1573,189 @@ mod tests {
         assert_eq!(area[1].x0, 0);
         assert_eq!(area[1].x1, 34);
         assert_eq!(area[1].width(), 34);
+    }
+
+    // -- §B.6 precinct partition (Eq B-16) -----------------------------
+
+    #[test]
+    fn precinct_exponents_default_to_max_when_empty() {
+        // Table A.13: Scod bit 0 clear → "precincts with PPx = 15 and
+        // PPy = 15" at every resolution level (maximum-precinct mode).
+        for r in 0u8..=8 {
+            let pp = precinct_exponents_at(&[], r);
+            assert_eq!(pp.ppx, 15, "r = {r}");
+            assert_eq!(pp.ppy, 15, "r = {r}");
+        }
+    }
+
+    #[test]
+    fn precinct_exponents_decode_table_a21_nibbles() {
+        // Table A.21: low nibble = PPx, high nibble = PPy. Two bytes:
+        // r = 0 → 0x54 (PPx = 4, PPy = 5); r = 1 → 0x76 (PPx = 6,
+        // PPy = 7).
+        let precincts = [0x54u8, 0x76u8];
+        let r0 = precinct_exponents_at(&precincts, 0);
+        assert_eq!(r0.ppx, 4);
+        assert_eq!(r0.ppy, 5);
+        let r1 = precinct_exponents_at(&precincts, 1);
+        assert_eq!(r1.ppx, 6);
+        assert_eq!(r1.ppy, 7);
+    }
+
+    #[test]
+    fn precinct_count_aligned_tile_component() {
+        // Eq B-16. Aligned 64×64 tile-component, NL = 1, precinct
+        // exponents PPx = PPy = 4 (precinct = 16×16):
+        //   r = 0: rect [0, 32) → ceil(32/16) - floor(0/16) = 2 wide,
+        //          2 high → 4 precincts.
+        //   r = 1: rect [0, 64) → ceil(64/16) - floor(0/16) = 4 wide,
+        //          4 high → 16 precincts.
+        let tc = TileComponentGeometry {
+            tcx0: 0,
+            tcy0: 0,
+            tcx1: 64,
+            tcy1: 64,
+        };
+        let levels = derive_resolution_levels(tc, 1);
+        let pp = PrecinctExponents { ppx: 4, ppy: 4 };
+
+        let p0 = derive_precinct_partition(&levels[0], pp);
+        assert_eq!(p0.num_wide, 2);
+        assert_eq!(p0.num_high, 2);
+        assert_eq!(p0.num_precincts(), 4);
+
+        let p1 = derive_precinct_partition(&levels[1], pp);
+        assert_eq!(p1.num_wide, 4);
+        assert_eq!(p1.num_high, 4);
+        assert_eq!(p1.num_precincts(), 16);
+    }
+
+    #[test]
+    fn precinct_count_offset_tile_component_uses_floor_of_origin() {
+        // Eq B-16 subtracts floor(trx0 / 2^PPx), not ceil. A
+        // tile-component anchored away from (0, 0) can straddle one more
+        // precinct cell than its width/2^PP alone implies. NL = 0 so the
+        // single resolution level r = 0 equals the tile-component
+        // rectangle [20, 50) × [0, 16). PPx = PPy = 4 (16×16 precinct):
+        //   wide: ceil(50/16) - floor(20/16) = 4 - 1 = 3
+        //   high: ceil(16/16) - floor(0/16)  = 1 - 0 = 1
+        let tc = TileComponentGeometry {
+            tcx0: 20,
+            tcy0: 0,
+            tcx1: 50,
+            tcy1: 16,
+        };
+        let levels = derive_resolution_levels(tc, 0);
+        let pp = PrecinctExponents { ppx: 4, ppy: 4 };
+        let part = derive_precinct_partition(&levels[0], pp);
+        assert_eq!(part.num_wide, 3);
+        assert_eq!(part.num_high, 1);
+        assert_eq!(part.num_precincts(), 3);
+    }
+
+    #[test]
+    fn precinct_count_max_precincts_is_single_precinct() {
+        // PPx = PPy = 15 → precinct 32768×32768. A modest tile-component
+        // fits in one precinct per resolution level (numprecincts = 1).
+        let tc = TileComponentGeometry {
+            tcx0: 0,
+            tcy0: 0,
+            tcx1: 256,
+            tcy1: 256,
+        };
+        let levels = derive_resolution_levels(tc, 3);
+        for lvl in &levels {
+            let pp = precinct_exponents_at(&[], lvl.r);
+            let part = derive_precinct_partition(lvl, pp);
+            assert_eq!(part.num_precincts(), 1, "r = {}", lvl.r);
+        }
+    }
+
+    #[test]
+    fn precinct_count_empty_resolution_level_is_zero() {
+        // Eq B-16 case split: if trx1 == trx0 the wide count is 0 (and
+        // numprecincts is 0). A degenerate zero-width tile-component
+        // exercises the branch.
+        let tc = TileComponentGeometry {
+            tcx0: 10,
+            tcy0: 10,
+            tcx1: 10,
+            tcy1: 20,
+        };
+        let levels = derive_resolution_levels(tc, 0);
+        let pp = PrecinctExponents { ppx: 4, ppy: 4 };
+        let part = derive_precinct_partition(&levels[0], pp);
+        assert_eq!(part.num_wide, 0);
+        assert!(part.num_high > 0);
+        assert_eq!(part.num_precincts(), 0);
+    }
+
+    // -- §B.7 code-block partition (Eq B-17 / B-18) --------------------
+
+    #[test]
+    fn code_block_dims_unclamped_when_precinct_is_large() {
+        // Eq B-17 / B-18 at r > 0: xcb' = min(xcb, PPx). When PPx > xcb
+        // the code-block keeps its nominal exponent. xcb = ycb = 6
+        // (64×64 code-block), PPx = PPy = 15 → xcb' = ycb' = 6.
+        let pp = PrecinctExponents { ppx: 15, ppy: 15 };
+        let cb = derive_code_block_dimensions(2, 6, 6, pp);
+        assert_eq!(cb.xcb, 6);
+        assert_eq!(cb.ycb, 6);
+        assert_eq!(cb.width(), 64);
+        assert_eq!(cb.height(), 64);
+    }
+
+    #[test]
+    fn code_block_dims_clamped_to_precinct_above_r_zero() {
+        // Eq B-17 / B-18 at r > 0: xcb' = min(xcb, PPx). PPx = PPy = 4,
+        // nominal xcb = ycb = 6 → xcb' = ycb' = min(6, 4) = 4 (16×16).
+        let pp = PrecinctExponents { ppx: 4, ppy: 4 };
+        let cb = derive_code_block_dimensions(1, 6, 6, pp);
+        assert_eq!(cb.xcb, 4);
+        assert_eq!(cb.ycb, 4);
+        assert_eq!(cb.width(), 16);
+        assert_eq!(cb.height(), 16);
+    }
+
+    #[test]
+    fn code_block_dims_use_pp_minus_one_at_r_zero() {
+        // Eq B-17 / B-18 at r = 0: xcb' = min(xcb, PPx - 1). PPx =
+        // PPy = 4, nominal xcb = ycb = 6 → xcb' = ycb' = min(6, 3) = 3
+        // (8×8). The r = 0 case shaves one off PPx/PPy.
+        let pp = PrecinctExponents { ppx: 4, ppy: 4 };
+        let cb = derive_code_block_dimensions(0, 6, 6, pp);
+        assert_eq!(cb.xcb, 3);
+        assert_eq!(cb.ycb, 3);
+        assert_eq!(cb.width(), 8);
+        assert_eq!(cb.height(), 8);
+    }
+
+    #[test]
+    fn code_block_dims_pp_zero_at_r_zero_saturates() {
+        // Table A.21 allows PPx = PPy = 0 only at the NLLL band (r = 0).
+        // Eq B-17 then gives xcb' = min(xcb, PPx - 1) = min(xcb, 0)
+        // under saturating subtraction → 0 (a 1×1 code-block partition),
+        // not a wraparound to a giant block.
+        let pp = PrecinctExponents { ppx: 0, ppy: 0 };
+        let cb = derive_code_block_dimensions(0, 6, 6, pp);
+        assert_eq!(cb.xcb, 0);
+        assert_eq!(cb.ycb, 0);
+        assert_eq!(cb.width(), 1);
+        assert_eq!(cb.height(), 1);
+    }
+
+    #[test]
+    fn code_block_dims_asymmetric_exponents() {
+        // xcb and ycb need not be equal, and the clamp is applied
+        // independently per axis. xcb = 7, ycb = 4, PPx = 5, PPy = 6,
+        // r = 2 (r > 0 branch):
+        //   xcb' = min(7, 5) = 5 (32 wide)
+        //   ycb' = min(4, 6) = 4 (16 high)
+        let pp = PrecinctExponents { ppx: 5, ppy: 6 };
+        let cb = derive_code_block_dimensions(2, 7, 4, pp);
+        assert_eq!(cb.xcb, 5);
+        assert_eq!(cb.ycb, 4);
+        assert_eq!(cb.width(), 32);
+        assert_eq!(cb.height(), 16);
     }
 }
