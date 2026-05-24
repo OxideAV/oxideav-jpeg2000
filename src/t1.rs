@@ -9,15 +9,16 @@
 //! non-empty one all three passes run in that order; for the first
 //! non-empty bit-plane only the cleanup pass runs (§D.3).
 //!
-//! ## What round 11 covers
+//! ## What this module covers
 //!
-//! Round 11 lands the **significance propagation pass** of §D.3.1
-//! together with the **sign-bit subroutine** of §D.3.2 that fires
-//! whenever a coefficient becomes newly significant. That is one of the
-//! three Annex D coding passes; the magnitude refinement and cleanup
-//! passes are queued for the next tier-1 rounds. Both passes share the
-//! coefficient state and scan-order machinery in this module, so this
-//! round also lays out:
+//! An earlier round landed the **significance propagation pass** of
+//! §D.3.1 together with the **sign-bit subroutine** of §D.3.2 that fires
+//! whenever a coefficient becomes newly significant. This round adds the
+//! **magnitude refinement pass** of §D.3.3 (Table D.4, contexts 14, 15,
+//! 16), which refines the magnitude bit of coefficients that are already
+//! significant. Two of the three Annex D coding passes are now in place;
+//! the §D.3.4 cleanup pass is the only one still queued. All passes
+//! share the coefficient state and scan-order machinery in this module:
 //!
 //! * The [`CodeBlock`] coefficient state — sample values, per-coefficient
 //!   significance state (`σ`), and the sign bit (`χ`). §D.3 calls `σ`
@@ -42,21 +43,16 @@
 //!
 //! ## Context array layout
 //!
-//! Annex D uses 19 distinct contexts (Table D.7) but only 14 are touched
-//! by the §D.3.1 / §D.3.2 routines: labels `0..=8` for significance
-//! propagation, `9..=13` for sign. The caller owns the
-//! `[MqContext; 19]` array (see [`reset_contexts`]) so that the §D.3.3
-//! refinement labels `14..=16`, the §D.3.4 run-length label `17`, and
-//! the UNIFORM label `18` slot in cleanly when later rounds land.
+//! Annex D uses 19 distinct contexts (Table D.7) but only 17 are touched
+//! by the §D.3.1 / §D.3.2 / §D.3.3 routines: labels `0..=8` for
+//! significance propagation, `9..=13` for sign, and `14..=16` for
+//! magnitude refinement. The caller owns the `[MqContext; 19]` array
+//! (see [`reset_contexts`]) so that the §D.3.4 run-length label `17` and
+//! the UNIFORM label `18` slot in cleanly when the cleanup-pass round
+//! lands.
 //!
 //! ## What this module does NOT cover yet
 //!
-//! * The §D.3.3 magnitude refinement pass (Table D.4 — contexts 14, 15,
-//!   16). Round 11 carries the refinement-state plumbing — the "has this
-//!   coefficient already been refined?" flag and the "did this
-//!   coefficient just become significant in the current SP pass?"
-//!   carry — so the refinement pass can be added without state
-//!   refactors.
 //! * The §D.3.4 cleanup pass (run-length context, UNIFORM context,
 //!   length-4-zero-column shortcut).
 //! * The §D.4.2 / §D.5 / §D.6 termination / segmentation-symbol / raw-
@@ -71,10 +67,11 @@
 //! / sign notations; §D.3 — decoding passes prologue + Figure D.2
 //! neighbour layout; §D.3.1 + Table D.1 — significance propagation
 //! contexts; §D.3.2 + Table D.2 + Table D.3 + Equation D-1 — sign
-//! contexts and XORbit; §D.4 + Table D.7 — initial context states). The
+//! contexts and XORbit; §D.3.3 + Table D.4 — magnitude refinement
+//! contexts; §D.4 + Table D.7 — initial context states). The
 //! Figure D.2 layout is the in-PDF diagram transcribed to neighbour
-//! offsets; the Tables D.1 / D.2 / D.3 contents are transcribed verbatim
-//! from the PDF. No external library source — OpenJPEG, OpenJPH, Kakadu,
+//! offsets; the Tables D.1 / D.2 / D.3 / D.4 contents are transcribed
+//! verbatim from the PDF. No external library source — OpenJPEG, OpenJPH, Kakadu,
 //! Grok, FFmpeg, libavcodec, jpeg2000-rs, etc. — was consulted, quoted,
 //! paraphrased, or used as a cross-check oracle. No WebSearch /
 //! WebFetch was used for any reason.
@@ -97,9 +94,14 @@ pub const SP_CTX_OFFSET: usize = 0;
 /// (i.e., `9..=13` in the caller's context array).
 pub const SIGN_CTX_OFFSET: usize = 9;
 
-/// First magnitude-refinement label (Table D.4 label "14"). Round 11
-/// does not consume this; exposed so the caller can size the
-/// `[MqContext]` array correctly today and avoid a layout shift later.
+/// First magnitude-refinement label (Table D.4 label "14", the
+/// `∑(Hi+Vi+Di) = 0`, first-refinement row).
+///
+/// The three refinement labels are
+/// `REFINEMENT_CTX_OFFSET + 0 ..= REFINEMENT_CTX_OFFSET + 2` (i.e.,
+/// `14..=16` in the caller's context array): 14 for a first refinement
+/// with no significant neighbours, 15 for a first refinement with at
+/// least one significant neighbour, and 16 for any later refinement.
 pub const REFINEMENT_CTX_OFFSET: usize = 14;
 
 /// Run-length context label per Table D.7 (§D.3.4 cleanup pass).
@@ -145,8 +147,9 @@ pub fn reset_contexts() -> [MqContext; NUM_CONTEXTS] {
 ///   insignificant coefficients per §D.3.2.
 /// * `already_refined` — set by the magnitude refinement pass after the
 ///   first refinement bit lands (Table D.4's "first refinement"
-///   indicator). Round 11 carries this so the future §D.3.3 pass can
-///   read it; the SP pass itself leaves it `false`.
+///   indicator). The §D.3.3 pass reads it to pick context 16 (already
+///   refined) over 14/15 (first refinement), then sets it; the SP pass
+///   leaves it untouched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Coefficient {
     /// Reconstructed magnitude (bits arrive MSB-first).
@@ -317,6 +320,81 @@ impl CodeBlock {
         }
 
         Ok(newly)
+    }
+
+    /// Run one §D.3.3 magnitude-refinement pass over the bit-plane with
+    /// positional weight `1 << bitplane`.
+    ///
+    /// The pass walks every coefficient in §D.1 stripe-major order (the
+    /// same order as the SP pass) and refines exactly those coefficients
+    /// that are **already significant** *and* did **not** become
+    /// significant in the immediately preceding significance-propagation
+    /// pass (§D.3.3's "except those that have just become significant in
+    /// the immediately preceding significance propagation pass" — the
+    /// `newly_significant` carry tracks that set).
+    ///
+    /// For each refined coefficient one MQ decision is drawn against the
+    /// Table D.4 context: label 14 / 15 for the **first** refinement of
+    /// the coefficient (depending on whether `∑(Hi+Vi+Di) = 0` or `≥ 1`
+    /// using the *current* significance states) and label 16 for any
+    /// later refinement. The decoded bit is OR-ed into `magnitude` at the
+    /// bit-plane's positional weight and the coefficient is marked
+    /// `already_refined`.
+    ///
+    /// The caller-supplied `ctx` array must hold all 19 Annex D contexts
+    /// (see [`reset_contexts`]); the refinement pass only mutates entries
+    /// `14..=16`. The `newly_significant` carry is left intact so a
+    /// following pass on the same bit-plane (there is none in the §D.3
+    /// order, but tests may chain passes) still sees it; it is cleared at
+    /// the start of the next SP pass.
+    ///
+    /// Returns the number of coefficients refined in this pass (exposed
+    /// mainly for tests).
+    pub fn magnitude_refinement_pass(
+        &mut self,
+        bitplane: u32,
+        decoder: &mut MqDecoder<'_>,
+        ctx: &mut [MqContext; NUM_CONTEXTS],
+    ) -> Result<usize, Error> {
+        let weight: u32 = 1u32 << bitplane;
+        let mut refined = 0usize;
+
+        let mut v0 = 0usize;
+        while v0 < self.height {
+            let stripe_h = core::cmp::min(4, self.height - v0);
+            for u in 0..self.width {
+                for dv in 0..stripe_h {
+                    let v = v0 + dv;
+                    let idx = u + v * self.width;
+                    let coef = self.coefficients[idx];
+
+                    // §D.3.3: refine coefficients that are already
+                    // significant, *except* those that became significant
+                    // in the immediately preceding SP pass.
+                    if !coef.sigma || self.newly_significant[idx] {
+                        continue;
+                    }
+
+                    // Table D.4 context: the neighbour summation uses the
+                    // significance states currently known to the decoder.
+                    let label =
+                        refinement_context_label(self.neighbours(u, v), coef.already_refined);
+                    let cx = &mut ctx[REFINEMENT_CTX_OFFSET + label as usize];
+                    let bit = decoder.decode(cx);
+
+                    let mut updated = coef;
+                    if bit == 1 {
+                        updated.magnitude |= weight;
+                    }
+                    updated.already_refined = true;
+                    self.coefficients[idx] = updated;
+                    refined += 1;
+                }
+            }
+            v0 += 4;
+        }
+
+        Ok(refined)
     }
 
     /// Build a [`Neighbours`] snapshot of `(u, v)`'s 8 nearest neighbours.
@@ -680,6 +758,39 @@ fn sign_label_from_contributions(h: i8, v: i8) -> (u8, u8) {
     (label_abs - SIGN_CTX_OFFSET as u8, xor)
 }
 
+/// Map an `(8-neighbour snapshot, already-refined)` pair onto its Table
+/// D.4 magnitude-refinement context label, returned relative to
+/// [`REFINEMENT_CTX_OFFSET`] (i.e., `0..=2` for absolute labels
+/// `14..=16`).
+///
+/// Per Table D.4 the choice is:
+///
+/// * `already_refined == true`  → label 16 (the "x"/don't-care row;
+///   neighbour state is irrelevant once a coefficient has been refined
+///   at least once).
+/// * `already_refined == false` and `∑(Hi+Vi+Di) ≥ 1` → label 15 (first
+///   refinement with at least one significant neighbour).
+/// * `already_refined == false` and `∑(Hi+Vi+Di) == 0` → label 14 (first
+///   refinement with no significant neighbours).
+///
+/// The neighbour summation merges all three axes (horizontal, vertical,
+/// diagonal) into one count, using the significance states currently
+/// known to the decoder (§D.3.3).
+pub fn refinement_context_label(nb: Neighbours, already_refined: bool) -> u8 {
+    if already_refined {
+        // Label 16: REFINEMENT_CTX_OFFSET + 2.
+        return 2;
+    }
+    let sum = nb.h_sum() + nb.v_sum() + nb.d_sum();
+    if sum >= 1 {
+        // Label 15: REFINEMENT_CTX_OFFSET + 1.
+        1
+    } else {
+        // Label 14: REFINEMENT_CTX_OFFSET + 0.
+        0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1004,6 +1115,195 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -- Table D.4 magnitude-refinement context labels ----------------
+
+    #[test]
+    fn refinement_label_first_no_neighbours_is_14() {
+        // First refinement, ∑(Hi+Vi+Di) = 0 → label 14 (offset 0).
+        let nb = Neighbours::default();
+        assert_eq!(refinement_context_label(nb, false), 0);
+    }
+
+    #[test]
+    fn refinement_label_first_with_neighbour_is_15() {
+        // First refinement, at least one significant neighbour → label 15
+        // (offset 1). One diagonal neighbour is enough.
+        let nb = Neighbours::from_slots(
+            true, false, false, false, // d0 significant
+            false, false, false, false, false, false, false, false,
+        );
+        assert_eq!(refinement_context_label(nb, false), 1);
+        // A single horizontal or vertical neighbour also gives 15.
+        let nb_h = synth_neighbours(1, 0, 0);
+        assert_eq!(refinement_context_label(nb_h, false), 1);
+        let nb_v = synth_neighbours(0, 1, 0);
+        assert_eq!(refinement_context_label(nb_v, false), 1);
+    }
+
+    #[test]
+    fn refinement_label_already_refined_is_16_regardless_of_neighbours() {
+        // Once already_refined is set, the neighbour state is a
+        // don't-care: label 16 (offset 2) in all cases.
+        assert_eq!(refinement_context_label(Neighbours::default(), true), 2);
+        let busy = synth_neighbours(2, 2, 4);
+        assert_eq!(refinement_context_label(busy, true), 2);
+    }
+
+    // -- §D.3.3 magnitude refinement pass behaviour -------------------
+
+    #[test]
+    fn refinement_skips_insignificant_and_newly_significant() {
+        // A 4x1 LL block: (0,0) significant + already a prior pass (not
+        // newly significant), (1,0) newly significant, (2,0)/(3,0)
+        // insignificant. Only (0,0) should be refined.
+        let bytes = [0x84u8, 0xC7, 0x3B, 0xFC];
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 4, 1);
+        block.mark_significant_for_test(0, 0, false, 0b10); // sig, not new
+        block.mark_significant_for_test(1, 0, false, 0b10); // sig, but new
+        block.set_newly_significant_for_test(1, 0);
+
+        let mut dec = MqDecoder::new(&bytes);
+        let mut ctx = reset_contexts();
+        let refined = block
+            .magnitude_refinement_pass(0, &mut dec, &mut ctx)
+            .unwrap();
+        assert_eq!(refined, 1, "only (0,0) is eligible for refinement");
+        // (0,0) is now flagged already_refined; (1,0) is not.
+        assert!(block.coefficient(0, 0).already_refined);
+        assert!(!block.coefficient(1, 0).already_refined);
+        // Insignificant coefficients are untouched.
+        assert!(!block.coefficient(2, 0).already_refined);
+        assert!(!block.coefficient(3, 0).already_refined);
+    }
+
+    #[test]
+    fn refinement_no_eligible_coefficients_makes_no_mq_decision() {
+        // An all-insignificant block: nothing to refine, decoder must
+        // not advance.
+        let bytes = [0x84u8, 0xC7, 0x3B, 0xFC];
+        let mut block = CodeBlock::new(SubBandOrientation::HH, 5, 7);
+        let mut dec = MqDecoder::new(&bytes);
+        let bp_start = dec.byte_pointer();
+        let mut ctx = reset_contexts();
+        let refined = block
+            .magnitude_refinement_pass(3, &mut dec, &mut ctx)
+            .unwrap();
+        assert_eq!(refined, 0);
+        assert_eq!(dec.byte_pointer(), bp_start);
+    }
+
+    #[test]
+    fn refinement_first_bit_matches_context_14_reference() {
+        // A 1x1 LL block with one significant, not-yet-refined, isolated
+        // coefficient. ∑(Hi+Vi+Di)=0 + first refinement → context 14.
+        // The decoded refinement bit must equal what a fresh MQ decoder
+        // produces against a default context (label 14 starts at Table
+        // C.2 index 0 / MPS 0, like all non-special contexts).
+        let bytes = [0x84u8, 0xC7, 0x3B, 0xFC];
+        let mut ref_dec = MqDecoder::new(&bytes);
+        let mut ref_ctx = MqContext::default();
+        let expected = ref_dec.decode(&mut ref_ctx);
+
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 1, 1);
+        block.mark_significant_for_test(0, 0, false, 0b100); // magnitude MSB set
+        let mut dec = MqDecoder::new(&bytes);
+        let mut ctx = reset_contexts();
+        let refined = block
+            .magnitude_refinement_pass(0, &mut dec, &mut ctx)
+            .unwrap();
+        assert_eq!(refined, 1);
+        let c = block.coefficient(0, 0);
+        assert!(c.already_refined);
+        // Bit-plane 0 weight is 1; magnitude gains it iff the bit was 1.
+        let expected_mag = 0b100 | u32::from(expected);
+        assert_eq!(c.magnitude, expected_mag);
+    }
+
+    #[test]
+    fn refinement_second_pass_uses_context_16() {
+        // Refine the same coefficient twice. The first refinement uses
+        // context 14/15 and sets already_refined; the second must use
+        // context 16. We verify by comparing the context array state:
+        // after pass 1 only label 14 (offset 0) has moved from index 0;
+        // after pass 2 label 16 (offset 2) has also moved.
+        let bytes = [0xFFu8, 0xFF, 0xFF, 0xFF];
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 1, 1);
+        block.mark_significant_for_test(0, 0, false, 0b1000);
+        let mut dec = MqDecoder::new(&bytes);
+        let mut ctx = reset_contexts();
+
+        // Snapshot context-16 state before any refinement.
+        let ctx16_before = ctx[REFINEMENT_CTX_OFFSET + 2].index();
+
+        // Pass 1 (bit-plane 2): first refinement → context 14.
+        block
+            .magnitude_refinement_pass(2, &mut dec, &mut ctx)
+            .unwrap();
+        assert!(block.coefficient(0, 0).already_refined);
+        // Context 16 must be untouched after the *first* refinement.
+        assert_eq!(ctx[REFINEMENT_CTX_OFFSET + 2].index(), ctx16_before);
+
+        // Pass 2 (bit-plane 1): now already_refined → context 16.
+        block
+            .magnitude_refinement_pass(1, &mut dec, &mut ctx)
+            .unwrap();
+        // Context 16 must now have been exercised (its adaptive index
+        // moved away from the reset value after at least one decision).
+        assert_ne!(
+            ctx[REFINEMENT_CTX_OFFSET + 2].index(),
+            ctx16_before,
+            "context 16 should be used by the second refinement"
+        );
+    }
+
+    #[test]
+    fn refinement_context_15_used_when_neighbour_significant() {
+        // 2x1 LL block, both coefficients significant and not-new.
+        // (0,0) has a significant right neighbour (1,0) and vice-versa,
+        // so each sees ∑(H+V+D) ≥ 1 → first refinement uses context 15.
+        let bytes = [0xFFu8, 0xFF, 0xFF, 0xFF];
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 2, 1);
+        block.mark_significant_for_test(0, 0, false, 0b10);
+        block.mark_significant_for_test(1, 0, false, 0b10);
+        let mut dec = MqDecoder::new(&bytes);
+        let mut ctx = reset_contexts();
+
+        let ctx14_before = ctx[REFINEMENT_CTX_OFFSET].index();
+        let ctx15_before = ctx[REFINEMENT_CTX_OFFSET + 1].index();
+
+        let refined = block
+            .magnitude_refinement_pass(0, &mut dec, &mut ctx)
+            .unwrap();
+        assert_eq!(refined, 2);
+        // Context 15 (offset 1) must have been exercised; context 14
+        // (offset 0) must be untouched.
+        assert_ne!(ctx[REFINEMENT_CTX_OFFSET + 1].index(), ctx15_before);
+        assert_eq!(ctx[REFINEMENT_CTX_OFFSET].index(), ctx14_before);
+    }
+
+    #[test]
+    fn refinement_pass_visits_stripe_major_order() {
+        // Indirect scan-order check mirroring the SP-pass test: an
+        // all-insignificant block triggers no decisions and no state
+        // change, proving the loop ran exhaustively without entering the
+        // inner body.
+        let mut block = CodeBlock::new(SubBandOrientation::LH, 6, 10);
+        let bytes = [0x84u8, 0xC7, 0x3B, 0xFC];
+        let mut dec = MqDecoder::new(&bytes);
+        let bp_start = dec.byte_pointer();
+        let mut ctx = reset_contexts();
+        let refined = block
+            .magnitude_refinement_pass(5, &mut dec, &mut ctx)
+            .unwrap();
+        assert_eq!(refined, 0);
+        for v in 0..block.height() {
+            for u in 0..block.width() {
+                assert!(!block.coefficient(u, v).already_refined);
+            }
+        }
+        assert_eq!(dec.byte_pointer(), bp_start);
     }
 
     // -- §D.1 scan order ----------------------------------------------

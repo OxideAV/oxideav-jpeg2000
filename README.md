@@ -3,13 +3,13 @@
 Pure-Rust JPEG 2000 (J2K + JP2) and High-Throughput JPEG 2000 (HTJ2K)
 codec.
 
-## Status — 2026-05-24 (clean-room round 11)
+## Status — 2026-05-24 (clean-room round 115)
 
 **Codestream-structural + JP2-wrapper + tier-2 packet-header reader +
 SIZ-derived tile geometry + resolution-level / sub-band geometry +
 precinct / code-block partition + precinct → code-block enumeration +
 tier-1 MQ arithmetic decoder + tier-1 Annex D significance-propagation
-coding pass.**
+and magnitude-refinement coding passes.**
 The crate parses the JPEG 2000 Part-1 **main header** (`SOC`, `SIZ`,
 `COD`, `QCD`), walks the **tile-part chain** (`SOT` / `SOD` / `EOC`),
 decodes the **JP2 ISO BMFF box wrapper** (Annex I), reads the
@@ -206,13 +206,14 @@ decoder is stateless w.r.t. contexts: the caller (the Annex D
 coding-pass round) owns the `CX → MqContext` array, mirroring the
 spec's "I(CX) / MPS(CX) stored at CX" model.
 
-The `t1` submodule implements the **first Annex D Tier-1 coding pass**
-(T.800 §D.3.1 + §D.3.2) on top of the round-10 MQ decoder.
+The `t1` submodule implements **two of the three Annex D Tier-1 coding
+passes** (T.800 §D.3.1 + §D.3.2 significance propagation + sign, and
+§D.3.3 magnitude refinement) on top of the MQ decoder.
 `t1::CodeBlock::new(orientation, width, height)` builds an
 all-insignificant coefficient grid; each `t1::Coefficient` carries its
 reconstructed `magnitude` (bits arrive MSB-first), the §D.3 significance
 state `sigma`, the §D.2 sign bit `sign` (`true` = negative), and the
-`already_refined` carry the future §D.3.3 pass reads.
+`already_refined` flag the §D.3.3 pass reads and sets.
 `t1::CodeBlock::significance_propagation_pass(bitplane, decoder, ctx)`
 runs one significance-propagation pass over the bit-plane with
 positional weight `1 << bitplane`: it walks the **§D.1 stripe-major scan
@@ -230,30 +231,46 @@ accumulates the bit-plane weight into `magnitude`, marks the coefficient
 Table D.2 vertical/horizontal contributions to a Table D.3 context
 (`9..=13`) and XORbit, the MQ decision against that context is XORed with
 the XORbit per Equation D-1 (`signbit = D ⊕ XORbit`) to recover the sign.
-Neighbours outside the code-block are insignificant per §D.3. The
-caller-owned `[MqContext; 19]` array (`t1::reset_contexts()` sets the
+Neighbours outside the code-block are insignificant per §D.3.
+
+`t1::CodeBlock::magnitude_refinement_pass(bitplane, decoder, ctx)` runs
+one **§D.3.3 magnitude-refinement pass** over the same §D.1 stripe-major
+scan order. It refines exactly the coefficients that are **already
+significant** and did **not** become significant in the immediately
+preceding significance-propagation pass (tracked via the
+`newly_significant` carry). For each refined coefficient one MQ decision
+is drawn against the **Table D.4 context**
+(`t1::refinement_context_label(nb, already_refined)`): context 16 once a
+coefficient has been refined at least once (neighbour state is a
+don't-care), else context 14 / 15 for the first refinement depending on
+whether `∑(Hi+Vi+Di)` over the current significance states is `0` or
+`≥ 1`. The decoded bit is OR-ed into `magnitude` at the bit-plane weight
+and `already_refined` is set.
+
+The caller-owned `[MqContext; 19]` array (`t1::reset_contexts()` sets the
 Table D.7 initial states — label 0 → index 4, run-length label 17 →
 index 3, UNIFORM label 18 → index 46, all others index 0) reserves slots
-`14..=16` (refinement) and `17` / `18` so the refinement / cleanup
-passes drop in without a layout shift.
+`17` / `18` so the cleanup pass drops in without a layout shift;
+significance (`0..=8`), sign (`9..=13`) and refinement (`14..=16`) labels
+are all now driven.
 
 What is **not** implemented yet:
 
-* The §D.3.3 **magnitude refinement** pass (Table D.4 — contexts 14, 15,
-  16) and the §D.3.4 **cleanup** pass (Table D.1 contexts re-applied plus
-  the run-length context, the UNIFORM run-length escape, and the
-  four-zero-column shortcut of Table D.5) — the two remaining Annex D
-  coding passes. The round-11 `t1` submodule lands the significance-
-  propagation pass + sign subroutine and the shared coefficient / scan-
+* The §D.3.4 **cleanup** pass (Table D.1 contexts re-applied plus the
+  run-length context, the UNIFORM run-length escape, and the
+  four-zero-column shortcut of Table D.5) — the last of the three Annex D
+  coding passes. The `t1` submodule lands the significance-propagation +
+  sign + magnitude-refinement passes and the shared coefficient / scan-
   order machinery they sit on. The bit-plane sequencing that drives all
   three passes per code-block (cleanup-only first bit-plane, then SP →
-  MR → cleanup) lands once the other two passes do.
+  MR → cleanup) lands once the cleanup pass does.
 * The §D.4.2 / §D.5 / §D.6 termination / error-resilience segmentation
   symbol / selective arithmetic-coding bypass (raw bit) modes, and §D.7
   vertically causal context formation (a COD `Scod` bit-3 mode).
-* Tier-1 Annex D coefficient bit-modelling beyond the SP pass — the
-  packet-header reader reports byte ranges per code-block; the MQ engine
-  decodes those bytes given the context stream the `t1` passes produce.
+* Tier-1 Annex D coefficient bit-modelling beyond the SP + MR passes
+  (i.e. the cleanup pass) — the packet-header reader reports byte ranges
+  per code-block; the MQ engine decodes those bytes given the context
+  stream the `t1` passes produce.
 * The MQ **encoder** (§C.2 — INITENC / ENCODE / RENORME / BYTEOUT /
   FLUSH) and the §D.6 selective arithmetic-coding bypass (raw bit mode).
 * §B.12 progression-order packet iteration (Equation B-20 / B-21) +
@@ -368,9 +385,13 @@ consulted:
   LL/LH ↔ HL H/V-axis swap and the HH `∑(Hi+Vi)` / `∑Di` reduction),
   §D.3.2 + Table D.2 + Table D.3 + Equation D-1 (the sign-context
   two-step: vertical/horizontal contribution from neighbour signs, then
-  the 5 sign-context labels + XORbit, `signbit = D ⊕ XORbit`). Tables
-  D.1 / D.2 / D.3 are transcribed verbatim; the Figure D.1 / D.2
-  diagrams are transcribed to scan order + neighbour offsets.
+  the 5 sign-context labels + XORbit, `signbit = D ⊕ XORbit`), and
+  §D.3.3 + Table D.4 (the 3 magnitude-refinement context labels: 14 / 15
+  for a first refinement keyed on `∑(Hi+Vi+Di) = 0` vs `≥ 1`, 16 for any
+  later refinement, with the "already significant except just-made-
+  significant" eligibility rule). Tables D.1 / D.2 / D.3 / D.4 are
+  transcribed verbatim; the Figure D.1 / D.2 diagrams are transcribed to
+  scan order + neighbour offsets.
 * T.800 Annex D §D.4 (Initializing and terminating) — Table D.7 (the
   initial context states: UNIFORM index 46, run-length index 3,
   all-zero-neighbours index 4, all other contexts index 0) and §D.4.1

@@ -54,16 +54,20 @@
 //! initial states). It is the byte-consuming engine the Annex D
 //! coding passes drive.
 //!
-//! Round 11 adds the [`t1`] submodule: the first Annex D Tier-1 coding
-//! pass, the **significance propagation pass** of T.800 §D.3.1 plus the
-//! §D.3.2 sign-bit subroutine. [`t1::CodeBlock`] holds the coefficient /
-//! σ-significance / sign state; [`t1::CodeBlock::significance_propagation_pass`]
-//! walks the §D.1 stripe-major scan order, selects the Table D.1
-//! significance context (`0..=8`) per sub-band orientation from the
-//! Figure D.2 neighbour σ-states, draws the MQ decision, and on a
-//! newly-significant coefficient runs the Table D.2 / D.3 sign-context +
-//! XORbit subroutine. The magnitude refinement (§D.3.3) and cleanup
-//! (§D.3.4) passes are queued for the next tier-1 rounds.
+//! The [`t1`] submodule carries the Annex D Tier-1 coding passes.
+//! [`t1::CodeBlock`] holds the coefficient / σ-significance / sign /
+//! refinement state. The **significance propagation pass** of T.800
+//! §D.3.1 ([`t1::CodeBlock::significance_propagation_pass`]) walks the
+//! §D.1 stripe-major scan order, selects the Table D.1 significance
+//! context (`0..=8`) per sub-band orientation from the Figure D.2
+//! neighbour σ-states, draws the MQ decision, and on a newly-significant
+//! coefficient runs the Table D.2 / D.3 sign-context + XORbit
+//! subroutine (§D.3.2). The **magnitude refinement pass** of §D.3.3
+//! ([`t1::CodeBlock::magnitude_refinement_pass`]) walks the same scan
+//! order, refines the magnitude bit of already-significant coefficients
+//! (skipping those that just became significant in the preceding SP
+//! pass) using the Table D.4 context (`14..=16`). The cleanup pass
+//! (§D.3.4) is queued for the next tier-1 round.
 //!
 //! Full codestream-body decoding (the remaining Annex D coding passes,
 //! wavelet inverse transform, dequantisation, MCT) and any encoder path

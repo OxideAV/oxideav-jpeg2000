@@ -6,6 +6,56 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 115 (2026-05-24).** Second Annex D Tier-1 coding
+  pass — the **magnitude refinement pass** (T.800 §D.3.3) — on top of the
+  significance-propagation + sign passes. Extends the `t1` submodule:
+
+  - `t1::CodeBlock::magnitude_refinement_pass(bitplane, decoder, ctx)`
+    runs one MR pass over the **§D.1 stripe-major scan order** (the same
+    walk as the SP pass). It refines exactly the coefficients that are
+    **already significant** *and* did **not** just become significant in
+    the immediately preceding SP pass (tracked via the `newly_significant`
+    carry — §D.3.3). For each eligible coefficient one MQ decision is
+    drawn against the **Table D.4 context**, the decoded bit is OR-ed into
+    `magnitude` at the bit-plane weight `1 << bitplane`, and
+    `already_refined` is set. Returns the refined-coefficient count.
+  - `t1::refinement_context_label(nb, already_refined)` — Table D.4
+    mapping: context 16 once a coefficient has been refined at least once
+    (neighbour state is a don't-care), else context 14 / 15 for the first
+    refinement keyed on whether `∑(Hi+Vi+Di)` over the *current*
+    significance states is `0` or `≥ 1`. The neighbour summation merges
+    all three axes into one count (§D.3.3).
+  - `t1::REFINEMENT_CTX_OFFSET` is now consumed (labels `14..=16`); the
+    `[MqContext; 19]` array's significance (`0..=8`), sign (`9..=13`) and
+    refinement (`14..=16`) slots are all driven, leaving only `17` / `18`
+    for the cleanup pass.
+
+  Twelve new unit tests: the three Table D.4 label cases (first-no-
+  neighbours → 14, first-with-neighbour → 15, already-refined → 16
+  regardless of neighbours); the pass skipping insignificant + newly-
+  significant coefficients; the no-eligible-coefficient no-MQ-decision /
+  no-byte-consumption case; a first-refinement bit matching a reference MQ
+  decoder against context 14; the first→subsequent context transition
+  (14/15 → 16) verified via adaptive-context state movement; the context-15
+  path when a neighbour is significant; and the stripe-major scan-order
+  exhaustiveness check. 162 tests total pass (150 prior + 12 new); cargo
+  fmt-check + clippy `-D warnings` clean (both default +
+  `--no-default-features` builds). No new `Error` variants — the MR pass
+  returns the existing `Result<usize, Error>` (the refined count).
+
+  Built solely against `docs/image/jpeg2000/T-REC-T.800-201906-S.pdf`
+  Annex D (§D.3.3 + Table D.4 the 3 magnitude-refinement contexts; §D.1
+  the scan pattern; §D.3 the σ-significance state + Figure D.2 neighbour
+  layout). Table D.4 is transcribed verbatim. No external library source —
+  OpenJPEG, OpenJPH, Kakadu, Grok, FFmpeg, libavcodec, jpeg2000-rs, etc. —
+  was consulted, quoted, paraphrased, or used as a cross-check oracle. No
+  WebSearch / WebFetch was used for any reason.
+
+  The §D.3.4 cleanup pass (Table D.1 re-applied + run-length context +
+  UNIFORM escape + Table D.5 four-zero-column shortcut) is the next tier-1
+  round, followed by the bit-plane sequencing that drives all three passes
+  per code-block.
+
 * **Clean-room round 11 (2026-05-24).** First Annex D Tier-1 coding pass —
   the **significance propagation pass** (T.800 §D.3.1) plus the §D.3.2
   **sign-bit subroutine** — on top of the round-10 MQ decoder. New `t1`
