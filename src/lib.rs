@@ -51,16 +51,24 @@
 //! decoder** of T.800 Annex C §C.3 ([`mq::MqDecoder`] — INITDEC /
 //! DECODE / RENORMD / BYTEIN, with the Table C.2 [`mq::QE`]
 //! probability-estimation rows and the Table D.7 [`mq::MqContext`]
-//! initial states). It is the byte-consuming engine the future Annex D
-//! coding passes will drive.
+//! initial states). It is the byte-consuming engine the Annex D
+//! coding passes drive.
 //!
-//! Full codestream-body decoding (the Annex D coefficient bit-modelling
-//! that drives the MQ decoder, wavelet inverse transform,
-//! dequantisation, MCT) and any encoder path are **not** implemented
-//! yet — [`decode_jpeg2000`] and [`encode_jpeg2000`] both return
-//! [`Error::NotImplemented`]. The Annex D significance / refinement /
-//! cleanup coding passes (the `CX → MqContext` context labelling the
-//! [`mq`] decoder consumes) are the next tier-1 round.
+//! Round 11 adds the [`t1`] submodule: the first Annex D Tier-1 coding
+//! pass, the **significance propagation pass** of T.800 §D.3.1 plus the
+//! §D.3.2 sign-bit subroutine. [`t1::CodeBlock`] holds the coefficient /
+//! σ-significance / sign state; [`t1::CodeBlock::significance_propagation_pass`]
+//! walks the §D.1 stripe-major scan order, selects the Table D.1
+//! significance context (`0..=8`) per sub-band orientation from the
+//! Figure D.2 neighbour σ-states, draws the MQ decision, and on a
+//! newly-significant coefficient runs the Table D.2 / D.3 sign-context +
+//! XORbit subroutine. The magnitude refinement (§D.3.3) and cleanup
+//! (§D.3.4) passes are queued for the next tier-1 rounds.
+//!
+//! Full codestream-body decoding (the remaining Annex D coding passes,
+//! wavelet inverse transform, dequantisation, MCT) and any encoder path
+//! are **not** implemented yet — [`decode_jpeg2000`] and
+//! [`encode_jpeg2000`] both return [`Error::NotImplemented`].
 //!
 //! ## Clean-room provenance
 //!
@@ -85,6 +93,7 @@ pub mod geometry;
 pub mod jp2;
 pub mod mq;
 pub mod packet;
+pub mod t1;
 
 #[cfg(feature = "registry")]
 use oxideav_core::RuntimeContext;

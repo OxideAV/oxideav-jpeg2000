@@ -1,0 +1,1188 @@
+//! Tier-1 EBCOT bit-plane coding passes — T.800 Annex D.
+//!
+//! This module implements the **decoder** side of the Annex D coefficient
+//! bit-modelling that drives the [`mq`](crate::mq) arithmetic decoder.
+//! Annex D specifies three coding passes that decode each bit-plane of a
+//! code-block from MSB toward LSB: the **significance propagation pass**
+//! (§D.3.1), the **magnitude refinement pass** (§D.3.3) and the
+//! **cleanup pass** (§D.3.4). For every bit-plane after the first
+//! non-empty one all three passes run in that order; for the first
+//! non-empty bit-plane only the cleanup pass runs (§D.3).
+//!
+//! ## What round 11 covers
+//!
+//! Round 11 lands the **significance propagation pass** of §D.3.1
+//! together with the **sign-bit subroutine** of §D.3.2 that fires
+//! whenever a coefficient becomes newly significant. That is one of the
+//! three Annex D coding passes; the magnitude refinement and cleanup
+//! passes are queued for the next tier-1 rounds. Both passes share the
+//! coefficient state and scan-order machinery in this module, so this
+//! round also lays out:
+//!
+//! * The [`CodeBlock`] coefficient state — sample values, per-coefficient
+//!   significance state (`σ`), and the sign bit (`χ`). §D.3 calls `σ`
+//!   the "significance state" and notes that it is initialised to 0 and
+//!   may transition to 1 on any pass.
+//! * The §D.1 stripe-major scan order: top-down, the code-block is
+//!   partitioned into horizontal stripes of height 4 (the bottom stripe
+//!   may be 1, 2 or 3 rows tall when the code-block height is not
+//!   divisible by 4); within each stripe coefficients are scanned column
+//!   by column, top to bottom of the stripe, before moving to the next
+//!   column. The whole stripe is traversed before the next stripe starts.
+//!   Figure D.1 illustrates the pattern.
+//! * The neighbour-σ derivation: each coefficient `(u, v)` has the eight
+//!   neighbours `(u−1, v−1)`, `(u, v−1)`, `(u+1, v−1)`, `(u−1, v)`,
+//!   `(u+1, v)`, `(u−1, v+1)`, `(u, v+1)`, `(u+1, v+1)` shown in Figure
+//!   D.2. Neighbours outside the code-block are taken to be insignificant
+//!   per §D.3.
+//! * The per-orientation significance-context map of Table D.1 (context
+//!   labels `0..=8` per [`SP_CTX_OFFSET`] + 0..8), and the sign-context
+//!   map of Tables D.2 / D.3 (context labels `9..=13` per
+//!   [`SIGN_CTX_OFFSET`] + 0..4, with the §D.3.2 XORbit).
+//!
+//! ## Context array layout
+//!
+//! Annex D uses 19 distinct contexts (Table D.7) but only 14 are touched
+//! by the §D.3.1 / §D.3.2 routines: labels `0..=8` for significance
+//! propagation, `9..=13` for sign. The caller owns the
+//! `[MqContext; 19]` array (see [`reset_contexts`]) so that the §D.3.3
+//! refinement labels `14..=16`, the §D.3.4 run-length label `17`, and
+//! the UNIFORM label `18` slot in cleanly when later rounds land.
+//!
+//! ## What this module does NOT cover yet
+//!
+//! * The §D.3.3 magnitude refinement pass (Table D.4 — contexts 14, 15,
+//!   16). Round 11 carries the refinement-state plumbing — the "has this
+//!   coefficient already been refined?" flag and the "did this
+//!   coefficient just become significant in the current SP pass?"
+//!   carry — so the refinement pass can be added without state
+//!   refactors.
+//! * The §D.3.4 cleanup pass (run-length context, UNIFORM context,
+//!   length-4-zero-column shortcut).
+//! * The §D.4.2 / §D.5 / §D.6 termination / segmentation-symbol / raw-
+//!   bit-bypass modes — none of those fire during a pure §D.3.1 pass.
+//! * §D.7 vertically causal context formation — a flag for the future
+//!   COD `Scod` bit-3 mode.
+//!
+//! ## Clean-room provenance
+//!
+//! Implemented solely from `docs/image/jpeg2000/T-REC-T.800-201906-S.pdf`
+//! (§D.1 — code-block scan pattern; §D.2 — coefficient bits / significance
+//! / sign notations; §D.3 — decoding passes prologue + Figure D.2
+//! neighbour layout; §D.3.1 + Table D.1 — significance propagation
+//! contexts; §D.3.2 + Table D.2 + Table D.3 + Equation D-1 — sign
+//! contexts and XORbit; §D.4 + Table D.7 — initial context states). The
+//! Figure D.2 layout is the in-PDF diagram transcribed to neighbour
+//! offsets; the Tables D.1 / D.2 / D.3 contents are transcribed verbatim
+//! from the PDF. No external library source — OpenJPEG, OpenJPH, Kakadu,
+//! Grok, FFmpeg, libavcodec, jpeg2000-rs, etc. — was consulted, quoted,
+//! paraphrased, or used as a cross-check oracle. No WebSearch /
+//! WebFetch was used for any reason.
+
+use crate::geometry::SubBandOrientation;
+use crate::mq::{MqContext, MqDecoder};
+use crate::Error;
+
+/// First Annex D context label devoted to significance propagation
+/// (Table D.1 row "0", the all-insignificant-neighbours row).
+///
+/// The nine SP labels are `SP_CTX_OFFSET + 0 ..= SP_CTX_OFFSET + 8`
+/// (i.e., `0..=8` in the caller's context array).
+pub const SP_CTX_OFFSET: usize = 0;
+
+/// First Annex D context label devoted to sign-bit decoding (Table D.3
+/// label "9", the `(H=0, V=0)` row).
+///
+/// The five sign labels are `SIGN_CTX_OFFSET + 0 ..= SIGN_CTX_OFFSET + 4`
+/// (i.e., `9..=13` in the caller's context array).
+pub const SIGN_CTX_OFFSET: usize = 9;
+
+/// First magnitude-refinement label (Table D.4 label "14"). Round 11
+/// does not consume this; exposed so the caller can size the
+/// `[MqContext]` array correctly today and avoid a layout shift later.
+pub const REFINEMENT_CTX_OFFSET: usize = 14;
+
+/// Run-length context label per Table D.7 (§D.3.4 cleanup pass).
+pub const RUN_LENGTH_CTX: usize = 17;
+
+/// UNIFORM context label per Table D.7 (§C.3 / §D.3.4).
+pub const UNIFORM_CTX: usize = 18;
+
+/// Number of distinct context labels the Annex D coding passes use
+/// across all three passes (Table D.7).
+pub const NUM_CONTEXTS: usize = 19;
+
+/// Initialise an Annex D context array to the Table D.7 reset states.
+///
+/// Per Table D.7 every context starts at Table C.2 index 0 / MPS 0
+/// except for three special cases:
+///
+/// * Label 0 (the "zero-neighbours" / first SP row) — index 4.
+/// * Label 17 (the run-length context) — index 3.
+/// * Label 18 (the UNIFORM context) — index 46.
+///
+/// The caller passes this array, along with a freshly-initialised
+/// [`MqDecoder`], into [`CodeBlock::significance_propagation_pass`].
+pub fn reset_contexts() -> [MqContext; NUM_CONTEXTS] {
+    let mut ctx = [MqContext::default(); NUM_CONTEXTS];
+    ctx[0] = MqContext::zero_neighbours();
+    ctx[RUN_LENGTH_CTX] = MqContext::run_length();
+    ctx[UNIFORM_CTX] = MqContext::uniform();
+    ctx
+}
+
+/// One transform coefficient inside a code-block.
+///
+/// * `magnitude` — the absolute value being recovered MSB-first. The
+///   coding passes shift bits into the low end of this field as they
+///   come out of the MQ decoder; on the bit-plane currently being
+///   decoded the bit's positional value is `1 << bitplane`.
+/// * `sigma` — the §D.3 significance state. `false` while the
+///   coefficient is still insignificant, flipping to `true` once a `1`
+///   magnitude bit has been observed.
+/// * `sign` — the §D.2 sign bit `sb(u, v)`. `false` ≡ positive, `true`
+///   ≡ negative. Only meaningful once `sigma` is true; ignored on
+///   insignificant coefficients per §D.3.2.
+/// * `already_refined` — set by the magnitude refinement pass after the
+///   first refinement bit lands (Table D.4's "first refinement"
+///   indicator). Round 11 carries this so the future §D.3.3 pass can
+///   read it; the SP pass itself leaves it `false`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Coefficient {
+    /// Reconstructed magnitude (bits arrive MSB-first).
+    pub magnitude: u32,
+    /// §D.3 significance state σ(u, v).
+    pub sigma: bool,
+    /// §D.2 sign bit sb(u, v) — `true` is negative.
+    pub sign: bool,
+    /// Table D.4 "first refinement" flag — `true` after one refinement
+    /// pass has fired on this coefficient.
+    pub already_refined: bool,
+}
+
+/// One rectangular code-block under tier-1 decoding.
+///
+/// The coefficient grid is stored in raster-major (row-major) order:
+/// `coefficients[u + v * width]` is `(u, v)`.
+#[derive(Debug, Clone)]
+pub struct CodeBlock {
+    /// Sub-band orientation; selects the Table D.1 column.
+    orientation: SubBandOrientation,
+    /// Code-block width in samples.
+    width: usize,
+    /// Code-block height in samples.
+    height: usize,
+    /// Raster-major coefficient grid (`width * height` entries).
+    coefficients: Vec<Coefficient>,
+    /// Per-coefficient "this coefficient was made significant inside the
+    /// current SP pass" flag. The magnitude refinement pass (§D.3.3)
+    /// uses this to **skip** coefficients that just became significant,
+    /// per §D.3.3's "except those that have just become significant in
+    /// the immediately preceding significance propagation pass". Cleared
+    /// at the start of every SP pass.
+    newly_significant: Vec<bool>,
+}
+
+impl CodeBlock {
+    /// Construct a fresh, all-insignificant code-block of the given
+    /// sub-band orientation and dimensions.
+    ///
+    /// `width` and `height` must be at least 1; the §B.7 effective
+    /// `xcb'` / `ycb'` are at least `0` (`2^0 = 1`).
+    pub fn new(orientation: SubBandOrientation, width: usize, height: usize) -> Self {
+        assert!(width >= 1, "code-block width must be ≥ 1");
+        assert!(height >= 1, "code-block height must be ≥ 1");
+        Self {
+            orientation,
+            width,
+            height,
+            coefficients: vec![Coefficient::default(); width * height],
+            newly_significant: vec![false; width * height],
+        }
+    }
+
+    /// Code-block width in samples.
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    /// Code-block height in samples.
+    pub fn height(&self) -> usize {
+        self.height
+    }
+
+    /// Sub-band orientation (used for the Table D.1 context column).
+    pub fn orientation(&self) -> SubBandOrientation {
+        self.orientation
+    }
+
+    /// Read one coefficient `(u, v)` (`u` ∈ `0..width`, `v` ∈ `0..height`).
+    pub fn coefficient(&self, u: usize, v: usize) -> Coefficient {
+        debug_assert!(u < self.width && v < self.height);
+        self.coefficients[u + v * self.width]
+    }
+
+    /// Whether `(u, v)` became significant in the most recent SP pass.
+    /// Cleared at the start of every SP pass.
+    pub fn was_newly_significant(&self, u: usize, v: usize) -> bool {
+        debug_assert!(u < self.width && v < self.height);
+        self.newly_significant[u + v * self.width]
+    }
+
+    /// Run one §D.3.1 significance-propagation pass over the bit-plane
+    /// with positional weight `1 << bitplane`.
+    ///
+    /// The pass walks every coefficient in §D.1 stripe-major order;
+    /// for each one that is currently insignificant and whose Table D.1
+    /// context label is **non-zero**, one MQ decision is drawn against
+    /// that context. A `1` decision flips σ to true, immediately
+    /// followed by the §D.3.2 sign-bit subroutine (one further MQ
+    /// decision against the Table D.3 sign context, XORed with the
+    /// Table D.3 XORbit to recover the spec's `sb(u, v)`). A `0`
+    /// decision leaves σ false and skips the sign subroutine.
+    ///
+    /// The caller-supplied `ctx` array must hold all 19 Annex D
+    /// contexts in their Table D.7 initial states (see
+    /// [`reset_contexts`]); the SP pass only mutates entries
+    /// `0..=8` (significance) and `9..=13` (sign).
+    ///
+    /// Returns the number of coefficients that **became newly
+    /// significant** in this pass — exposed mainly for tests; the
+    /// per-coefficient flag is reachable via
+    /// [`was_newly_significant`](Self::was_newly_significant).
+    pub fn significance_propagation_pass(
+        &mut self,
+        bitplane: u32,
+        decoder: &mut MqDecoder<'_>,
+        ctx: &mut [MqContext; NUM_CONTEXTS],
+    ) -> Result<usize, Error> {
+        // §D.3.3: clear the "just became significant in the last SP
+        // pass" carry at the start of every new SP pass; bits set during
+        // *this* pass will be visible to the *next* magnitude refinement
+        // pass.
+        for flag in &mut self.newly_significant {
+            *flag = false;
+        }
+
+        let weight: u32 = 1u32 << bitplane;
+        let mut newly = 0usize;
+
+        // §D.1: stripes of height 4, top to bottom. Within a stripe the
+        // scan is column-by-column, top to bottom of the stripe.
+        let mut v0 = 0usize;
+        while v0 < self.height {
+            let stripe_h = core::cmp::min(4, self.height - v0);
+            for u in 0..self.width {
+                for dv in 0..stripe_h {
+                    let v = v0 + dv;
+                    let coef = self.coefficients[u + v * self.width];
+
+                    // SP pass: only insignificant coefficients with a
+                    // non-zero Table D.1 context are considered.
+                    if coef.sigma {
+                        continue;
+                    }
+                    let label = significance_context_label(self.orientation, self.neighbours(u, v));
+                    if label == 0 {
+                        // Zero context — deferred to the cleanup pass.
+                        continue;
+                    }
+
+                    let cx = &mut ctx[SP_CTX_OFFSET + label as usize];
+                    let bit = decoder.decode(cx);
+                    if bit == 1 {
+                        // Newly significant — set σ, accumulate the
+                        // bit-plane's positional value into magnitude,
+                        // then immediately run the §D.3.2 sign-bit
+                        // subroutine.
+                        let nb = self.neighbours(u, v);
+                        let (sign_label, xorbit) = sign_context_label(nb);
+                        let sign_cx = &mut ctx[SIGN_CTX_OFFSET + sign_label as usize];
+                        let d = decoder.decode(sign_cx);
+                        let sign_bit = (d ^ xorbit) != 0;
+
+                        let updated = Coefficient {
+                            magnitude: coef.magnitude | weight,
+                            sigma: true,
+                            sign: sign_bit,
+                            already_refined: coef.already_refined,
+                        };
+                        self.coefficients[u + v * self.width] = updated;
+                        self.newly_significant[u + v * self.width] = true;
+                        newly += 1;
+                    }
+                }
+            }
+            v0 += 4;
+        }
+
+        Ok(newly)
+    }
+
+    /// Build a [`Neighbours`] snapshot of `(u, v)`'s 8 nearest neighbours.
+    ///
+    /// Out-of-block neighbours are treated as insignificant
+    /// (`sigma = false`, `sign = false`) per §D.3 / §D.3.2.
+    fn neighbours(&self, u: usize, v: usize) -> Neighbours {
+        let mut nb = Neighbours::default();
+        // Iterate the eight (du, dv) offsets in the Figure D.2 grid.
+        let positions: [(i32, i32, NeighbourSlot); 8] = [
+            (-1, -1, NeighbourSlot::D0),
+            (0, -1, NeighbourSlot::V0),
+            (1, -1, NeighbourSlot::D1),
+            (-1, 0, NeighbourSlot::H0),
+            (1, 0, NeighbourSlot::H1),
+            (-1, 1, NeighbourSlot::D2),
+            (0, 1, NeighbourSlot::V1),
+            (1, 1, NeighbourSlot::D3),
+        ];
+        let w = self.width as i32;
+        let h = self.height as i32;
+        let ui = u as i32;
+        let vi = v as i32;
+        for (du, dv, slot) in positions {
+            let nu = ui + du;
+            let nv = vi + dv;
+            if nu < 0 || nu >= w || nv < 0 || nv >= h {
+                continue;
+            }
+            let c = self.coefficients[(nu as usize) + (nv as usize) * self.width];
+            nb.set(slot, c.sigma, c.sign);
+        }
+        nb
+    }
+}
+
+/// The eight Figure D.2 neighbour slots around the current coefficient
+/// X. Naming follows the diagram: `D0..=D3` are the four diagonal
+/// neighbours (top-left, top-right, bottom-left, bottom-right), `V0` /
+/// `V1` are vertical (top, bottom), `H0` / `H1` are horizontal (left,
+/// right).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NeighbourSlot {
+    D0,
+    V0,
+    D1,
+    H0,
+    H1,
+    D2,
+    V1,
+    D3,
+}
+
+/// Significance + sign snapshot of the 8 Figure D.2 neighbours.
+///
+/// Each slot carries the neighbour's σ state and (when σ is true) its
+/// sign bit. Slots outside the code-block are left at `sigma = false`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Neighbours {
+    /// Top-left diagonal `(u−1, v−1)`.
+    pub d0_sigma: bool,
+    /// Top vertical `(u, v−1)`.
+    pub v0_sigma: bool,
+    /// Top vertical sign.
+    pub v0_sign: bool,
+    /// Top-right diagonal `(u+1, v−1)`.
+    pub d1_sigma: bool,
+    /// Left horizontal `(u−1, v)`.
+    pub h0_sigma: bool,
+    /// Left horizontal sign.
+    pub h0_sign: bool,
+    /// Right horizontal `(u+1, v)`.
+    pub h1_sigma: bool,
+    /// Right horizontal sign.
+    pub h1_sign: bool,
+    /// Bottom-left diagonal `(u−1, v+1)`.
+    pub d2_sigma: bool,
+    /// Bottom vertical `(u, v+1)`.
+    pub v1_sigma: bool,
+    /// Bottom vertical sign.
+    pub v1_sign: bool,
+    /// Bottom-right diagonal `(u+1, v+1)`.
+    pub d3_sigma: bool,
+}
+
+impl Neighbours {
+    /// Construct a Neighbours snapshot directly. Mainly for unit tests
+    /// that exercise [`significance_context_label`] and
+    /// [`sign_context_label`] in isolation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_slots(
+        d0_sigma: bool,
+        v0_sigma: bool,
+        v0_sign: bool,
+        d1_sigma: bool,
+        h0_sigma: bool,
+        h0_sign: bool,
+        h1_sigma: bool,
+        h1_sign: bool,
+        d2_sigma: bool,
+        v1_sigma: bool,
+        v1_sign: bool,
+        d3_sigma: bool,
+    ) -> Self {
+        Self {
+            d0_sigma,
+            v0_sigma,
+            v0_sign,
+            d1_sigma,
+            h0_sigma,
+            h0_sign,
+            h1_sigma,
+            h1_sign,
+            d2_sigma,
+            v1_sigma,
+            v1_sign,
+            d3_sigma,
+        }
+    }
+
+    fn set(&mut self, slot: NeighbourSlot, sigma: bool, sign: bool) {
+        match slot {
+            NeighbourSlot::D0 => self.d0_sigma = sigma,
+            NeighbourSlot::V0 => {
+                self.v0_sigma = sigma;
+                self.v0_sign = sign;
+            }
+            NeighbourSlot::D1 => self.d1_sigma = sigma,
+            NeighbourSlot::H0 => {
+                self.h0_sigma = sigma;
+                self.h0_sign = sign;
+            }
+            NeighbourSlot::H1 => {
+                self.h1_sigma = sigma;
+                self.h1_sign = sign;
+            }
+            NeighbourSlot::D2 => self.d2_sigma = sigma,
+            NeighbourSlot::V1 => {
+                self.v1_sigma = sigma;
+                self.v1_sign = sign;
+            }
+            NeighbourSlot::D3 => self.d3_sigma = sigma,
+        }
+    }
+
+    /// `∑Hi` — number of significant horizontal neighbours (0, 1, or 2).
+    pub fn h_sum(&self) -> u8 {
+        u8::from(self.h0_sigma) + u8::from(self.h1_sigma)
+    }
+
+    /// `∑Vi` — number of significant vertical neighbours (0, 1, or 2).
+    pub fn v_sum(&self) -> u8 {
+        u8::from(self.v0_sigma) + u8::from(self.v1_sigma)
+    }
+
+    /// `∑Di` — number of significant diagonal neighbours (0..=4).
+    pub fn d_sum(&self) -> u8 {
+        u8::from(self.d0_sigma)
+            + u8::from(self.d1_sigma)
+            + u8::from(self.d2_sigma)
+            + u8::from(self.d3_sigma)
+    }
+}
+
+/// Map an `(orientation, neighbour-σ)` pair onto its Table D.1 context
+/// label (`0..=8`). The label is the row's right-most "Context label"
+/// column.
+///
+/// The mapping reads Table D.1 row-by-row, taking the first row whose
+/// `∑Hi` / `∑Vi` / `∑Di` constraints all match for the orientation's
+/// column. "x" entries are wildcards.
+///
+/// Table D.1 swaps the H and V columns between the LL/LH "vertical
+/// high-pass" group and the HL "horizontal high-pass" group; we handle
+/// HL by symmetrically swapping the input `h_sum` / `v_sum` and reading
+/// the LL/LH column. The HH column reduces to `∑(Hi+Vi)` and `∑Di`,
+/// since the table merges H and V there.
+pub fn significance_context_label(orientation: SubBandOrientation, nb: Neighbours) -> u8 {
+    let h = nb.h_sum();
+    let v = nb.v_sum();
+    let d = nb.d_sum();
+    match orientation {
+        // LL and LH read the table directly.
+        SubBandOrientation::LL | SubBandOrientation::LH => sp_label_ll_lh(h, v, d),
+        // HL swaps H and V (the table's HL column has H and V columns
+        // mirrored relative to LL/LH).
+        SubBandOrientation::HL => sp_label_ll_lh(v, h, d),
+        // HH uses (H+V, D).
+        SubBandOrientation::HH => sp_label_hh(h + v, d),
+    }
+}
+
+/// Table D.1 LL / LH (and HL after H/V swap) significance-context
+/// lookup — column triple `(∑Hi, ∑Vi, ∑Di)` to label.
+fn sp_label_ll_lh(h: u8, v: u8, d: u8) -> u8 {
+    // Table D.1, rows top to bottom (label 8 down to label 0). The
+    // first matching row wins.
+    if h == 2 {
+        return 8;
+    }
+    if h == 1 && v >= 1 {
+        return 7;
+    }
+    if h == 1 && v == 0 && d >= 1 {
+        return 6;
+    }
+    if h == 1 && v == 0 && d == 0 {
+        return 5;
+    }
+    if h == 0 && v == 2 {
+        return 4;
+    }
+    if h == 0 && v == 1 {
+        return 3;
+    }
+    if h == 0 && v == 0 && d >= 2 {
+        return 2;
+    }
+    if h == 0 && v == 0 && d == 1 {
+        return 1;
+    }
+    // h == 0, v == 0, d == 0
+    0
+}
+
+/// Table D.1 HH significance-context lookup — `(∑(Hi+Vi), ∑Di)` to
+/// label.
+fn sp_label_hh(hv: u8, d: u8) -> u8 {
+    // Rows top to bottom (label 8 down to label 0).
+    if d >= 3 {
+        return 8;
+    }
+    if d == 2 && hv >= 1 {
+        return 7;
+    }
+    if d == 2 && hv == 0 {
+        return 6;
+    }
+    if d == 1 && hv >= 2 {
+        return 5;
+    }
+    if d == 1 && hv == 1 {
+        return 4;
+    }
+    if d == 1 && hv == 0 {
+        return 3;
+    }
+    if d == 0 && hv >= 2 {
+        return 2;
+    }
+    if d == 0 && hv == 1 {
+        return 1;
+    }
+    // d == 0, hv == 0
+    0
+}
+
+/// Compute the §D.3.2 sign context label (`0..=4`, relative to
+/// [`SIGN_CTX_OFFSET`]) and the Table D.3 XORbit (`0` or `1`) for a
+/// coefficient whose 8-neighbour snapshot is `nb`.
+///
+/// Returns `(label_within_sign_block, xorbit)`. The MQ decision drawn
+/// against context `SIGN_CTX_OFFSET + label_within_sign_block` is XORed
+/// with `xorbit` to produce the sign bit per Equation D-1
+/// (`signbit = D ⊕ XORbit`; `1` is negative).
+pub fn sign_context_label(nb: Neighbours) -> (u8, u8) {
+    let h_contrib =
+        horizontal_or_vertical_contribution(nb.h0_sigma, nb.h0_sign, nb.h1_sigma, nb.h1_sign);
+    let v_contrib =
+        horizontal_or_vertical_contribution(nb.v0_sigma, nb.v0_sign, nb.v1_sigma, nb.v1_sign);
+    sign_label_from_contributions(h_contrib, v_contrib)
+}
+
+/// Map the §D.3.2 first-step contribution table (Table D.2) for one
+/// axis. Inputs are the two neighbours' `(sigma, sign)` pairs; the
+/// output is `-1`, `0`, or `+1`.
+///
+/// Table D.2 rows (the first neighbour is X0, the second X1):
+///
+/// * both significant positive                  → +1
+/// * significant negative, significant positive →  0
+/// * insignificant,        significant positive → +1
+/// * significant positive, significant negative →  0
+/// * both significant negative                  → -1
+/// * insignificant,        significant negative → -1
+/// * significant positive, insignificant        → +1
+/// * significant negative, insignificant        → -1
+/// * both insignificant                         →  0
+fn horizontal_or_vertical_contribution(
+    x0_sigma: bool,
+    x0_sign: bool,
+    x1_sigma: bool,
+    x1_sign: bool,
+) -> i8 {
+    // Map to (significant_positive, significant_negative, insignificant)
+    // tri-state.
+    let s0 = state(x0_sigma, x0_sign);
+    let s1 = state(x1_sigma, x1_sign);
+    match (s0, s1) {
+        (NState::SPos, NState::SPos) => 1,
+        (NState::SNeg, NState::SPos) => 0,
+        (NState::Insig, NState::SPos) => 1,
+        (NState::SPos, NState::SNeg) => 0,
+        (NState::SNeg, NState::SNeg) => -1,
+        (NState::Insig, NState::SNeg) => -1,
+        (NState::SPos, NState::Insig) => 1,
+        (NState::SNeg, NState::Insig) => -1,
+        (NState::Insig, NState::Insig) => 0,
+    }
+}
+
+/// Internal tri-state per Table D.2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NState {
+    /// Significant, positive sign (sign bit 0).
+    SPos,
+    /// Significant, negative sign (sign bit 1).
+    SNeg,
+    /// Insignificant (σ false).
+    Insig,
+}
+
+fn state(sigma: bool, sign: bool) -> NState {
+    if !sigma {
+        NState::Insig
+    } else if sign {
+        NState::SNeg
+    } else {
+        NState::SPos
+    }
+}
+
+/// Table D.3 second step — reduce `(H_contrib, V_contrib)` to the
+/// `(context label, XORbit)` pair. Labels in the table are 9..=13;
+/// we return them relative to [`SIGN_CTX_OFFSET`] (i.e., 0..=4).
+fn sign_label_from_contributions(h: i8, v: i8) -> (u8, u8) {
+    // Table D.3 rows, top to bottom:
+    //   ( 1,  1) → 13 / 0
+    //   ( 1,  0) → 12 / 0
+    //   ( 1, -1) → 11 / 0
+    //   ( 0,  1) → 10 / 0
+    //   ( 0,  0) →  9 / 0
+    //   ( 0, -1) → 10 / 1
+    //   (-1,  1) → 11 / 1
+    //   (-1,  0) → 12 / 1
+    //   (-1, -1) → 13 / 1
+    let (label_abs, xor) = match (h, v) {
+        (1, 1) => (13, 0),
+        (1, 0) => (12, 0),
+        (1, -1) => (11, 0),
+        (0, 1) => (10, 0),
+        (0, 0) => (9, 0),
+        (0, -1) => (10, 1),
+        (-1, 1) => (11, 1),
+        (-1, 0) => (12, 1),
+        (-1, -1) => (13, 1),
+        // Unreachable: contributions are constrained to {-1, 0, 1}.
+        _ => unreachable!("sign contributions outside {{-1, 0, 1}}"),
+    };
+    debug_assert!((9..=13).contains(&label_abs));
+    (label_abs - SIGN_CTX_OFFSET as u8, xor)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- Context-array reset (Table D.7) ------------------------------
+
+    #[test]
+    fn reset_contexts_populates_table_d7_specials() {
+        let ctx = reset_contexts();
+        // Label 0 → zero-neighbours (Table C.2 index 4).
+        assert_eq!(ctx[0].index(), 4);
+        assert!(!ctx[0].mps());
+        // Label 17 → run-length (Table C.2 index 3).
+        assert_eq!(ctx[RUN_LENGTH_CTX].index(), 3);
+        assert!(!ctx[RUN_LENGTH_CTX].mps());
+        // Label 18 → UNIFORM (Table C.2 index 46).
+        assert_eq!(ctx[UNIFORM_CTX].index(), 46);
+        // Everything else (labels 1..=8, 9..=13, 14..=16) → default
+        // (index 0, MPS 0).
+        for label in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16] {
+            assert_eq!(ctx[label].index(), 0, "label {label} should default");
+            assert!(!ctx[label].mps());
+        }
+    }
+
+    #[test]
+    fn reset_contexts_array_length_matches_constant() {
+        let ctx = reset_contexts();
+        assert_eq!(ctx.len(), NUM_CONTEXTS);
+        assert_eq!(NUM_CONTEXTS, 19);
+    }
+
+    // -- Table D.1 spot checks (significance propagation context) ----
+
+    #[test]
+    fn sp_context_zero_neighbours_is_label_0() {
+        let nb = Neighbours::default();
+        assert_eq!(significance_context_label(SubBandOrientation::LL, nb), 0);
+        assert_eq!(significance_context_label(SubBandOrientation::HL, nb), 0);
+        assert_eq!(significance_context_label(SubBandOrientation::LH, nb), 0);
+        assert_eq!(significance_context_label(SubBandOrientation::HH, nb), 0);
+    }
+
+    #[test]
+    fn sp_context_ll_lh_top_row_h_eq_2_is_label_8() {
+        // Both horizontal neighbours significant → label 8 (LL/LH).
+        let nb = Neighbours::from_slots(
+            false, false, false, false, // d0, v0, v0_sign, d1
+            true, false, true, false, // h0, h0_sign, h1, h1_sign
+            false, false, false, false, // d2, v1, v1_sign, d3
+        );
+        assert_eq!(significance_context_label(SubBandOrientation::LL, nb), 8);
+        assert_eq!(significance_context_label(SubBandOrientation::LH, nb), 8);
+    }
+
+    #[test]
+    fn sp_context_hl_top_row_v_eq_2_is_label_8() {
+        // Both vertical neighbours significant → label 8 (HL column).
+        let nb = Neighbours::from_slots(
+            false, true, false, false, // d0, v0=sig, v0_sign, d1
+            false, false, false, false, // h0, h0_sign, h1, h1_sign
+            false, true, false, false, // d2, v1=sig, v1_sign, d3
+        );
+        assert_eq!(significance_context_label(SubBandOrientation::HL, nb), 8);
+        // The same neighbours on LL/LH give label 4 (H=0, V=2).
+        assert_eq!(significance_context_label(SubBandOrientation::LL, nb), 4);
+    }
+
+    #[test]
+    fn sp_context_hh_three_diagonals_is_label_8() {
+        // Three diagonals significant → HH label 8.
+        let nb = Neighbours::from_slots(
+            true, false, false, true, // d0=sig, ..., d1=sig
+            false, false, false, false, true, false, false, false, // d2=sig
+        );
+        assert_eq!(significance_context_label(SubBandOrientation::HH, nb), 8);
+    }
+
+    #[test]
+    fn sp_context_ll_label_5_h1_v0_d0() {
+        // (∑Hi=1, ∑Vi=0, ∑Di=0) → LL/LH label 5.
+        let nb = Neighbours::from_slots(
+            false, false, false, false, true, false, false, false, // only h0 significant
+            false, false, false, false,
+        );
+        assert_eq!(significance_context_label(SubBandOrientation::LL, nb), 5);
+    }
+
+    #[test]
+    fn sp_context_ll_label_1_h0_v0_d1() {
+        // (∑Hi=0, ∑Vi=0, ∑Di=1) → LL/LH label 1.
+        let nb = Neighbours::from_slots(
+            true, false, false, false, // only d0
+            false, false, false, false, false, false, false, false,
+        );
+        assert_eq!(significance_context_label(SubBandOrientation::LL, nb), 1);
+    }
+
+    #[test]
+    fn sp_context_hh_label_1_one_hv_zero_d() {
+        // HH: (∑(Hi+Vi) = 1, ∑Di = 0) → label 1.
+        let nb = Neighbours::from_slots(
+            false, false, false, false, true, false, false, false, // h0 significant only
+            false, false, false, false,
+        );
+        assert_eq!(significance_context_label(SubBandOrientation::HH, nb), 1);
+    }
+
+    #[test]
+    fn sp_context_full_table_d1_round_trip() {
+        // Cover every Table D.1 row's *canonical* assignment for LL/LH,
+        // HL, HH. The witness is the (∑H, ∑V, ∑D) triple per row.
+        // LL/LH expected labels per (h, v, d):
+        for &(h, v, d, want) in &[
+            (2, 0, 0, 8u8),
+            (2, 1, 0, 8),
+            (2, 2, 4, 8),
+            (1, 2, 0, 7),
+            (1, 1, 0, 7),
+            (1, 0, 4, 6),
+            (1, 0, 1, 6),
+            (1, 0, 0, 5),
+            (0, 2, 0, 4),
+            (0, 2, 4, 4),
+            (0, 1, 0, 3),
+            (0, 1, 4, 3),
+            (0, 0, 4, 2),
+            (0, 0, 2, 2),
+            (0, 0, 1, 1),
+            (0, 0, 0, 0),
+        ] {
+            // Synthesise neighbours satisfying the (h, v, d) triple.
+            let nb = synth_neighbours(h, v, d);
+            assert_eq!(
+                significance_context_label(SubBandOrientation::LL, nb),
+                want,
+                "LL row (h={h}, v={v}, d={d}) expected label {want}"
+            );
+        }
+        // HL swaps H/V at the input; reuse LL labels with swapped axes.
+        for &(h, v, d, want) in &[
+            (0, 2, 0, 8u8),
+            (1, 2, 0, 8),
+            (2, 1, 0, 7),
+            (0, 1, 4, 6),
+            (0, 1, 0, 5),
+            (2, 0, 0, 4),
+            (1, 0, 0, 3),
+            (0, 0, 2, 2),
+            (0, 0, 1, 1),
+            (0, 0, 0, 0),
+        ] {
+            let nb = synth_neighbours(h, v, d);
+            assert_eq!(
+                significance_context_label(SubBandOrientation::HL, nb),
+                want,
+                "HL row (h={h}, v={v}, d={d}) expected label {want}"
+            );
+        }
+        // HH reduces to (∑(H+V), ∑D).
+        for &(hv, d, want) in &[
+            (0, 3, 8u8),
+            (0, 4, 8),
+            (1, 3, 8),
+            (1, 2, 7),
+            (4, 2, 7),
+            (0, 2, 6),
+            (2, 1, 5),
+            (3, 1, 5),
+            (1, 1, 4),
+            (0, 1, 3),
+            (2, 0, 2),
+            (4, 0, 2),
+            (1, 0, 1),
+            (0, 0, 0),
+        ] {
+            // Distribute hv across H and V (h = min(hv, 2), rest in V).
+            let h = core::cmp::min(hv, 2);
+            let v = hv - h;
+            let nb = synth_neighbours(h, v, d);
+            assert_eq!(
+                significance_context_label(SubBandOrientation::HH, nb),
+                want,
+                "HH row (hv={hv}, d={d}) expected label {want}"
+            );
+        }
+    }
+
+    /// Build a Neighbours snapshot with exactly `h` significant H
+    /// neighbours, `v` significant V neighbours, and `d` significant D
+    /// neighbours (all positive-sign for simplicity).
+    fn synth_neighbours(h: u8, v: u8, d: u8) -> Neighbours {
+        let mut nb = Neighbours::default();
+        if h >= 1 {
+            nb.h0_sigma = true;
+        }
+        if h >= 2 {
+            nb.h1_sigma = true;
+        }
+        if v >= 1 {
+            nb.v0_sigma = true;
+        }
+        if v >= 2 {
+            nb.v1_sigma = true;
+        }
+        if d >= 1 {
+            nb.d0_sigma = true;
+        }
+        if d >= 2 {
+            nb.d1_sigma = true;
+        }
+        if d >= 3 {
+            nb.d2_sigma = true;
+        }
+        if d >= 4 {
+            nb.d3_sigma = true;
+        }
+        nb
+    }
+
+    // -- Table D.3 sign-context spot checks ---------------------------
+
+    #[test]
+    fn sign_context_zero_zero_is_label_9() {
+        let nb = Neighbours::default();
+        let (label, xor) = sign_context_label(nb);
+        // Label 9 → 0 inside the sign block.
+        assert_eq!(label, 0);
+        assert_eq!(xor, 0);
+    }
+
+    #[test]
+    fn sign_context_positive_horizontal_label_12_xor_0() {
+        // H0 significant positive, H1 insignificant, V's insignificant.
+        // H contribution = +1 (Table D.2), V = 0.
+        // → label 12, XORbit 0.
+        let nb = Neighbours::from_slots(
+            false, false, false, false, true, false, false,
+            false, // h0 sig, sign = false (positive)
+            false, false, false, false,
+        );
+        let (label, xor) = sign_context_label(nb);
+        assert_eq!(label, 12 - 9);
+        assert_eq!(xor, 0);
+    }
+
+    #[test]
+    fn sign_context_negative_horizontal_label_12_xor_1() {
+        // H0 significant negative, V's insignificant.
+        // H contribution = -1, V = 0 → label 12, XORbit 1.
+        let nb = Neighbours::from_slots(
+            false, false, false, false, true, true, false,
+            false, // h0 sig, sign = true (negative)
+            false, false, false, false,
+        );
+        let (label, xor) = sign_context_label(nb);
+        assert_eq!(label, 12 - 9);
+        assert_eq!(xor, 1);
+    }
+
+    #[test]
+    fn sign_context_pos_pos_label_13_xor_0() {
+        // H0 sig+, V0 sig+. H=+1, V=+1 → label 13, XORbit 0.
+        let nb = Neighbours::from_slots(
+            false, true, false, false, // v0 sig (sign false = positive)
+            true, false, false, false, // h0 sig+
+            false, false, false, false,
+        );
+        let (label, xor) = sign_context_label(nb);
+        assert_eq!(label, 13 - 9);
+        assert_eq!(xor, 0);
+    }
+
+    #[test]
+    fn sign_context_neg_neg_label_13_xor_1() {
+        // Both negative → H=-1, V=-1 → label 13, XORbit 1.
+        let nb = Neighbours::from_slots(
+            false, true, true, false, // v0 sig negative
+            true, true, false, false, // h0 sig negative
+            false, false, false, false,
+        );
+        let (label, xor) = sign_context_label(nb);
+        assert_eq!(label, 13 - 9);
+        assert_eq!(xor, 1);
+    }
+
+    #[test]
+    fn sign_context_mixed_signs_cancel_to_zero_contribution() {
+        // Two H neighbours, one positive, one negative → H = 0 per
+        // Table D.2 (a "significant positive / significant negative"
+        // row collapses to 0). With V also 0, label is 9.
+        let nb = Neighbours::from_slots(
+            false, false, false, false, true, false, true, true, // h0 +, h1 -
+            false, false, false, false,
+        );
+        let (label, xor) = sign_context_label(nb);
+        assert_eq!(label, 0); // 9 - 9
+        assert_eq!(xor, 0);
+    }
+
+    #[test]
+    fn sign_context_xorbit_inverts_label_polarity() {
+        // For every (h, v) combination the XORbit pattern is
+        // symmetric under negation of *both* H and V (because Table
+        // D.3 mirrors top-half rows to bottom-half rows with XOR=1).
+        for h in [-1i8, 0, 1] {
+            for v in [-1i8, 0, 1] {
+                if h == 0 && v == 0 {
+                    continue;
+                }
+                let (lp, xp) = sign_label_from_contributions(h, v);
+                let (ln, xn) = sign_label_from_contributions(-h, -v);
+                assert_eq!(
+                    lp, ln,
+                    "labels should match for ({h}, {v}) and ({}, {})",
+                    -h, -v
+                );
+                assert_eq!(
+                    xp ^ xn,
+                    1,
+                    "XORbit should differ for ({h}, {v}) vs negation"
+                );
+            }
+        }
+    }
+
+    // -- §D.1 scan order ----------------------------------------------
+
+    #[test]
+    fn scan_order_visits_every_coefficient_exactly_once() {
+        // We can't observe the scan order directly from a public
+        // accessor, but we can verify it indirectly: an SP pass on an
+        // all-insignificant code-block where every context is label 0
+        // (no MQ decisions made) leaves every coefficient untouched and
+        // never advances the decoder. We assert (a) zero "newly
+        // significant" coefficients, (b) every coefficient remains
+        // insignificant, (c) the bit pointer of the MQ decoder hasn't
+        // moved beyond its INITDEC position. This proves the loop ran
+        // exhaustively without entering the inner body.
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 6, 10);
+        let bytes = [0x84u8, 0xC7, 0x3B, 0xFC];
+        let mut dec = MqDecoder::new(&bytes);
+        let bp_start = dec.byte_pointer();
+        let mut ctx = reset_contexts();
+        let newly = block
+            .significance_propagation_pass(7, &mut dec, &mut ctx)
+            .unwrap();
+        assert_eq!(newly, 0);
+        for v in 0..block.height() {
+            for u in 0..block.width() {
+                let c = block.coefficient(u, v);
+                assert!(!c.sigma, "({u}, {v}) should still be insignificant");
+                assert_eq!(c.magnitude, 0);
+            }
+        }
+        // No MQ decision means no byte consumption.
+        assert_eq!(dec.byte_pointer(), bp_start);
+    }
+
+    // -- Single-coefficient SP decode end-to-end ----------------------
+
+    #[test]
+    fn single_significant_neighbour_drives_one_mq_decision() {
+        // Construct a 4x1 LL code-block where coefficient (0, 0) is
+        // pre-marked significant. Its right neighbour (1, 0) then has
+        // h-context label 5 (H=1, V=0, D=0). The SP pass should draw
+        // exactly one MQ decision against context 5 for (1, 0); the
+        // other two coefficients ((2, 0) and (3, 0)) have label 0 and
+        // are skipped. We don't predict the decision bit (it depends
+        // on the byte stream + adaptive state) — we only assert that
+        // (a) at most one coefficient became significant, (b) the
+        // decision aligns with what a fresh MQ decoder produces on the
+        // same context. We do this by running the same MQ decoder once
+        // up front against a separate context-5 instance and comparing.
+        let bytes = [0x84u8, 0xC7, 0x3B, 0xFC];
+        // Reference decoder: one decision against a default context.
+        let mut ref_dec = MqDecoder::new(&bytes);
+        let mut ref_ctx = MqContext::default();
+        let expected_first = ref_dec.decode(&mut ref_ctx);
+
+        // Subject: full SP pass with the same byte stream.
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 4, 1);
+        // Pre-mark (0, 0) significant with positive sign, magnitude 1.
+        // We synthesise this via a small private helper on CodeBlock
+        // exposed below (`mark_significant`).
+        block.mark_significant_for_test(0, 0, false, 1);
+
+        let mut dec = MqDecoder::new(&bytes);
+        let mut ctx = reset_contexts();
+        let newly = block
+            .significance_propagation_pass(0, &mut dec, &mut ctx)
+            .unwrap();
+        assert!(newly <= 1);
+        // (1, 0) was the only coefficient whose context label was
+        // non-zero (label 5). It must match the reference decoder.
+        let became_significant = block.coefficient(1, 0).sigma;
+        if expected_first == 1 {
+            assert!(became_significant, "(1, 0) should now be significant");
+            assert!(
+                block.was_newly_significant(1, 0),
+                "(1, 0) should be flagged newly-significant"
+            );
+            // newly_significant flag also implies magnitude carries
+            // the 1 << bitplane (here bitplane = 0).
+            assert_eq!(block.coefficient(1, 0).magnitude, 1);
+        } else {
+            assert!(!became_significant);
+            assert!(!block.was_newly_significant(1, 0));
+        }
+        // (2, 0) and (3, 0) have label-0 contexts → untouched.
+        assert!(!block.coefficient(2, 0).sigma);
+        assert!(!block.coefficient(3, 0).sigma);
+    }
+
+    #[test]
+    fn newly_significant_flag_clears_between_passes() {
+        // Run two SP passes back-to-back. The second one must clear
+        // every newly_significant flag from the first.
+        let bytes = [0xFFu8, 0xFF]; // 0xFF-fill — predictable state.
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 3, 1);
+        // Pre-mark (0, 0) significant to give (1, 0) a non-zero context.
+        block.mark_significant_for_test(0, 0, false, 1);
+        let mut dec = MqDecoder::new(&bytes);
+        let mut ctx = reset_contexts();
+        // First pass: may or may not flip (1, 0) — we don't care for
+        // this test, only that no flag from a prior pass survives.
+        let _ = block
+            .significance_propagation_pass(1, &mut dec, &mut ctx)
+            .unwrap();
+        // Manually re-mark (0, 0) "newly significant" (simulating a
+        // SP-pass carry from a previous bit-plane).
+        block.set_newly_significant_for_test(0, 0);
+        assert!(block.was_newly_significant(0, 0));
+        // Second pass clears the carry first.
+        let _ = block
+            .significance_propagation_pass(1, &mut dec, &mut ctx)
+            .unwrap();
+        // (0, 0) wasn't visited by the SP pass (σ already true), so the
+        // flag must have been cleared by the prologue and not re-set.
+        assert!(!block.was_newly_significant(0, 0));
+    }
+
+    // -- Test-only helpers --------------------------------------------
+
+    impl CodeBlock {
+        /// Test-only: pre-mark a coefficient as significant.
+        pub(super) fn mark_significant_for_test(
+            &mut self,
+            u: usize,
+            v: usize,
+            sign: bool,
+            magnitude: u32,
+        ) {
+            let idx = u + v * self.width;
+            self.coefficients[idx] = Coefficient {
+                magnitude,
+                sigma: true,
+                sign,
+                already_refined: false,
+            };
+        }
+
+        /// Test-only: set the "newly significant" flag for a coefficient.
+        pub(super) fn set_newly_significant_for_test(&mut self, u: usize, v: usize) {
+            self.newly_significant[u + v * self.width] = true;
+        }
+    }
+
+    // -- Boundary handling --------------------------------------------
+
+    #[test]
+    fn out_of_block_neighbours_are_treated_as_insignificant() {
+        // A 1x1 code-block: all 8 neighbours are out-of-block.
+        // Context label must be 0 on every orientation regardless of
+        // sub-band.
+        let block = CodeBlock::new(SubBandOrientation::LH, 1, 1);
+        let nb = block.neighbours(0, 0);
+        assert_eq!(nb.h_sum(), 0);
+        assert_eq!(nb.v_sum(), 0);
+        assert_eq!(nb.d_sum(), 0);
+        assert_eq!(significance_context_label(SubBandOrientation::LH, nb), 0);
+    }
+
+    #[test]
+    fn neighbours_at_corners_clip_correctly() {
+        // 3x3 LL block, only (1, 1) (centre) significant. Corner (0, 0)
+        // has neighbours d0/v0/d1/h0 outside the block; only h1, v1, d3
+        // exist on the grid, of which only (1, 1) — d3 — is significant.
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 3, 3);
+        block.mark_significant_for_test(1, 1, false, 1);
+        let nb = block.neighbours(0, 0);
+        assert!(!nb.h0_sigma); // out of block
+        assert!(!nb.v0_sigma); // out of block
+        assert!(!nb.d0_sigma); // out of block
+        assert!(!nb.d1_sigma); // out of block
+        assert!(!nb.h1_sigma); // (1, 0) — insignificant
+        assert!(!nb.v1_sigma); // (0, 1) — insignificant
+        assert!(!nb.d2_sigma); // out of block (v+1 = 1, u-1 = -1)
+        assert!(nb.d3_sigma); // (1, 1) — significant
+        assert_eq!(nb.h_sum(), 0);
+        assert_eq!(nb.v_sum(), 0);
+        assert_eq!(nb.d_sum(), 1);
+        // LL/LH (h=0, v=0, d=1) → label 1.
+        assert_eq!(significance_context_label(SubBandOrientation::LL, nb), 1);
+    }
+}

@@ -6,6 +6,77 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 11 (2026-05-24).** First Annex D Tier-1 coding pass —
+  the **significance propagation pass** (T.800 §D.3.1) plus the §D.3.2
+  **sign-bit subroutine** — on top of the round-10 MQ decoder. New `t1`
+  submodule:
+
+  - `t1::CodeBlock::new(orientation, width, height)` — an
+    all-insignificant coefficient grid in raster-major order. Each
+    `t1::Coefficient` carries `magnitude` (reconstructed MSB-first), the
+    §D.3 significance state `sigma`, the §D.2 sign bit `sign` (`true` =
+    negative), and the `already_refined` carry the future §D.3.3 pass
+    reads.
+  - `t1::CodeBlock::significance_propagation_pass(bitplane, decoder, ctx)`
+    runs one SP pass over the bit-plane with positional weight
+    `1 << bitplane`. It walks the **§D.1 stripe-major scan order** (height-4
+    horizontal stripes top-to-bottom; column-by-column top-to-bottom within
+    each stripe — Figure D.1), and for each currently-insignificant
+    coefficient with a non-zero **Table D.1 significance context** draws one
+    MQ decision against context `0..=8`. A `1` flips `sigma`, accumulates the
+    bit-plane weight into `magnitude`, marks the coefficient newly-significant
+    (the §D.3.3 carry), and runs the **§D.3.2 sign subroutine**: the Table
+    D.2 vertical/horizontal contributions reduce to a Table D.3 context
+    (`9..=13`) + XORbit, and the MQ decision XORed with the XORbit recovers
+    the sign per Equation D-1 (`signbit = D ⊕ XORbit`).
+  - `t1::significance_context_label(orientation, nb)` — Table D.1 mapping
+    from the eight Figure D.2 neighbour σ-states: LL/LH read directly, HL
+    with the H/V axes swapped, HH from `(∑(Hi+Vi), ∑Di)`. Out-of-block
+    neighbours are insignificant per §D.3.
+  - `t1::sign_context_label(nb)` — Table D.2 → Table D.3 sign-context +
+    XORbit. `t1::Neighbours` is the 8-slot σ/sign snapshot;
+    `t1::reset_contexts()` builds the `[MqContext; 19]` array in its Table
+    D.7 initial states (label 0 → index 4, run-length label 17 → index 3,
+    UNIFORM label 18 → index 46, all others index 0), reserving slots
+    `14..=16` (refinement) and `17` / `18` so the refinement / cleanup passes
+    drop in without a layout shift.
+
+  Twenty-two new unit tests: Table D.7 context-array reset + length; Table
+  D.1 spot checks (zero-neighbours label 0 on all four orientations, the
+  LL/LH `∑Hi=2` top row, the HL `∑Vi=2` top row vs the LL `∑Vi=2` label 4,
+  the HH three-diagonal top row, labels 5 / 1 on LL, label 1 on HH) and a
+  full Table D.1 round-trip across LL / HL / HH for every row; Table D.2 /
+  D.3 sign-context spot checks (the `(0, 0)` label-9 row, positive/negative
+  horizontal → label 12 XORbit 0/1, pos-pos / neg-neg → label 13, the
+  mixed-sign-cancels-to-0 row) and the XORbit top/bottom-half symmetry; the
+  §D.1 scan order (all-zero-context pass makes no MQ decision and consumes
+  no bytes); a single-significant-neighbour end-to-end SP decode against a
+  reference MQ decoder; the newly-significant carry clearing between passes;
+  and out-of-block / corner neighbour clipping. 153 tests total pass (131
+  prior + 22 new); cargo fmt-check + clippy `-D warnings` clean (both
+  default + `--no-default-features` builds). No new `Error` variants — the
+  SP pass returns the existing `Result<usize, Error>` (the count of
+  newly-significant coefficients).
+
+  Built solely against
+  `docs/image/jpeg2000/T-REC-T.800-201906-S.pdf` Annex D (§D.1 the
+  code-block scan pattern; §D.2 the coefficient-bit / sign-bit notations;
+  §D.3 the σ-significance definition + Figure D.2 eight-neighbour layout +
+  out-of-block-is-insignificant rule; §D.3.1 + Table D.1 the 9 significance
+  contexts per orientation; §D.3.2 + Table D.2 + Table D.3 + Equation D-1 the
+  sign contexts + XORbit; §D.4 / Table D.7 the initial context states).
+  Tables D.1 / D.2 / D.3 are transcribed verbatim; Figures D.1 / D.2 are
+  transcribed to scan order + neighbour offsets. No external library source
+  — OpenJPEG, OpenJPH, Kakadu, Grok, FFmpeg, libavcodec, jpeg2000-rs, etc. —
+  was consulted, quoted, paraphrased, or used as a cross-check oracle. No
+  WebSearch / WebFetch was used for any reason.
+
+  The §D.3.3 magnitude refinement pass (Table D.4 contexts 14–16) and the
+  §D.3.4 cleanup pass (Table D.1 re-applied + run-length context + UNIFORM
+  escape + Table D.5 four-zero-column shortcut) are the next tier-1 rounds,
+  followed by the bit-plane sequencing that drives all three passes per
+  code-block.
+
 * **Clean-room round 10 (2026-05-24).** Tier-1 **MQ arithmetic decoder**
   (T.800 Annex C §C.3) — the first tier-1 code, the byte-consuming
   engine the future significance / refinement / cleanup coding passes
