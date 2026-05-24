@@ -3,11 +3,12 @@
 Pure-Rust JPEG 2000 (J2K + JP2) and High-Throughput JPEG 2000 (HTJ2K)
 codec.
 
-## Status — 2026-05-24 (clean-room round 9)
+## Status — 2026-05-24 (clean-room round 10)
 
 **Codestream-structural + JP2-wrapper + tier-2 packet-header reader +
 SIZ-derived tile geometry + resolution-level / sub-band geometry +
-precinct / code-block partition + precinct → code-block enumeration.**
+precinct / code-block partition + precinct → code-block enumeration +
+tier-1 MQ arithmetic decoder.**
 The crate parses the JPEG 2000 Part-1 **main header** (`SOC`, `SIZ`,
 `COD`, `QCD`), walks the **tile-part chain** (`SOT` / `SOD` / `EOC`),
 decodes the **JP2 ISO BMFF box wrapper** (Annex I), reads the
@@ -175,11 +176,46 @@ partition stays a tiling (no code-block claimed by two precincts) even
 at the degenerate literal-§B.7 `xcb' = PPx > PPx - 1` edge. An
 out-of-range `precinct_index` returns `Error::InvalidTilePartIndex`.
 
+The `mq` submodule implements the **tier-1 MQ arithmetic decoder**
+(T.800 Annex C §C.3) — the first tier-1 code, the byte-consuming engine
+the future significance / refinement / cleanup coding passes (Annex D)
+will drive. `mq::MqDecoder::new(bytes)` is INITDEC (§C.3.5): it primes
+the code register `C` with the first compressed byte, runs BYTEIN, then
+shifts `C` left 7 bits and decrements `CT` by 7 to align with the
+starting interval `A = 0x8000`. `mq::MqDecoder::decode(&mut MqContext)
+-> u8` is DECODE (§C.3.2): it reduces `A` by `Qe(I(CX))`, compares
+`Chigh` (the high half of the 32-bit `Chigh:Clow` register, `c >> 16`)
+to `Qe`, and — taking the MPS-path (Figure C.16) or LPS-path (Figure
+C.17) conditional MPS/LPS exchange and the §C.2.5 adaptive probability
+update — returns the binary decision `D ∈ {0, 1}`. Renormalization
+(RENORMD, §C.3.3) shifts `A` and `C` left until `A ≥ 0x8000`, pulling
+fresh bytes via BYTEIN (§C.3.4). BYTEIN compensates for the
+`0xFF`-prefixed stuff bit and synthesises the §C.3.4 / §D.4.1
+end-of-stream behaviour: a `0xFF` followed by `> 0x8F` (or off the end
+of the input) is the terminating marker, after which the decoder is fed
+`0xFF00`-fill and keeps producing decisions so the residual MPS run can
+be decoded past the signalled byte count. The MQ engine is **infallible**
+(it never errors — it extends the bit stream rather than failing), so it
+adds no new `Error` variant. `mq::QE` is T.800 Table C.2 (47
+`QeEntry { qe, nmps, nlps, switch }` rows, indices `0..=46`); the
+per-context adaptive state `(I(CX), MPS(CX))` lives in `mq::MqContext`
+with Table D.7 reset constructors (`default` index 0, `uniform` index
+46, `run_length` index 3, `zero_neighbours` index 4 — all MPS 0). The
+decoder is stateless w.r.t. contexts: the caller (the future Annex D
+coding-pass round) owns the `CX → MqContext` array, mirroring the
+spec's "I(CX) / MPS(CX) stored at CX" model.
+
 What is **not** implemented yet:
 
-* Tier-1 (EBCOT MQ-coder block coding) — the packet-header reader
-  reports byte ranges per code-block, but the codeword bytes are not
-  yet decoded.
+* Tier-1 Annex D coefficient bit-modelling — the §C.3 MQ decoder
+  (`mq` submodule) is implemented, but the significance / sign /
+  magnitude-refinement / cleanup coding passes and the context
+  labelling that decide which `MqContext` each decision uses (Annex D
+  §D.1–§D.3) are the next tier-1 round. The packet-header reader
+  reports byte ranges per code-block; the MQ engine decodes those bytes
+  given the (not-yet-built) context stream.
+* The MQ **encoder** (§C.2 — INITENC / ENCODE / RENORME / BYTEOUT /
+  FLUSH) and the §D.6 selective arithmetic-coding bypass (raw bit mode).
 * §B.12 progression-order packet iteration (Equation B-20 / B-21) +
   §B.8 layer / §B.9 packet assembly. Round 9 closes the precinct →
   code-block **enumeration** (the bridge from the §B.6 / §B.7 counts to
@@ -266,6 +302,26 @@ consulted:
   that, divided by the sub-band's `2^(NL - r + 1)` scale, yields the
   projected precinct exponent on each high-pass sub-band — `PP - 1`
   at `r ≥ 1`, `PP` at `r = 0`).
+* T.800 Annex C (Arithmetic entropy coding — decoder) — §C.1.2 (the
+  `0x8000 ≈ 0.75` fixed-point convention and the `A ∈ [0.75, 1.5)`
+  renormalization range), §C.2.5 (the probability-estimation state
+  machine driving NMPS / NLPS / SWITCH on renormalization), §C.3.1 /
+  Table C.3 (the Chigh:Clow decoder register split — comparison uses
+  Chigh alone), §C.3.2 / Figures C.15 / C.16 / C.17 (DECODE + the
+  MPS-path and LPS-path conditional MPS/LPS exchange), §C.3.3 / Figure
+  C.18 (RENORMD), §C.3.4 / Figure C.19 (BYTEIN — the `0xFF`-prefixed
+  stuff-bit rule + the `> 0x8F` marker / `0xFF`-fill end of stream),
+  §C.3.5 / Figure C.20 (INITDEC), §C.3.6 (statistics reset), and Table
+  C.2 (the 47 `Qe` / NMPS / NLPS / SWITCH rows — index 35's OCR
+  `0x02Al` resolved to `0x02A1` from its binary column). The figures
+  are images in the PDF; their register operations are transcribed from
+  the accompanying §C.3 prose to integer ops.
+* T.800 Annex D §D.4 (Initializing and terminating) — Table D.7 (the
+  initial context states: UNIFORM index 46, run-length index 3,
+  all-zero-neighbours index 4, all other contexts index 0) and §D.4.1
+  (the decoder extends the input bit stream with `0xFF` bytes until all
+  symbols are decoded — the basis for the `mq` BYTEIN end-of-stream
+  fill).
 
 No external library source — OpenJPEG, OpenJPH, Kakadu, FFmpeg, etc.
 — was consulted, quoted, paraphrased, or used as a cross-check

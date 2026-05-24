@@ -6,6 +6,74 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 10 (2026-05-24).** Tier-1 **MQ arithmetic decoder**
+  (T.800 Annex C §C.3) — the first tier-1 code, the byte-consuming
+  engine the future significance / refinement / cleanup coding passes
+  (Annex D) will drive. New `mq` submodule:
+
+  - `mq::MqDecoder<'a>` over a compressed-byte slice, holding the §C.3.1
+    register state (`A`, `C`, `CT`, `BP`). `MqDecoder::new` is INITDEC
+    (§C.3.5, Figure C.20): primes `C` with the first byte, runs BYTEIN,
+    shifts `C` left 7 and `CT -= 7` to align with the starting
+    `A = 0x8000`. `MqDecoder::decode(&mut MqContext) -> u8` is DECODE
+    (§C.3.2, Figure C.15) with the MPS-path (Figure C.16) and LPS-path
+    (Figure C.17) conditional MPS/LPS exchange and the §C.2.5 adaptive
+    probability update embedded. Private `renormd` (RENORMD, §C.3.3,
+    Figure C.18) and `bytein` (BYTEIN, §C.3.4, Figure C.19) handle
+    renormalization and the `0xFF`-prefixed stuff-bit / end-of-stream
+    marker (`0xFF` followed by `> 0x8F`, or off the end of the slice →
+    feed `0xFF00`, `CT = 8`, `BP` parked on the prefix, per §C.3.4 /
+    §D.4.1). The whole 32-bit `Chigh:Clow` code register lives in one
+    `u32`; the §C.3.2 comparison uses `c >> 16` (Chigh) against `Qe`.
+  - `mq::QE` — T.800 Table C.2 transcribed as 47 `QeEntry { qe, nmps,
+    nlps, switch }` rows (indices `0..=46`). Index 35's OCR `0x02Al` is
+    resolved to `0x02A1` from its binary column `0000 0010 1010 0001`.
+  - `mq::MqContext` — the per-context adaptive state `(I(CX), MPS(CX))`
+    with Table D.7 reset constructors (`default` index 0 / `uniform`
+    index 46 / `run_length` index 3 / `zero_neighbours` index 4, all
+    MPS 0) plus `index()` / `mps()` / `reset_to`. The decoder is
+    stateless w.r.t. contexts — the caller (the Annex D coding-pass
+    round) owns the `CX → MqContext` array, exactly mirroring the spec's
+    "I(CX) / MPS(CX) stored at CX" model.
+
+  Eighteen new unit tests: Table C.2 length / index-range / SWITCH-only-
+  at-{0,6,14} / spot values (including the resolved 0x02A1 row) / the
+  self-looping index-45 and index-46 rows; Table D.7 initial states +
+  accessors + `reset_to`; INITDEC `A = 0x8000` alignment with a
+  hand-traced known-byte case (`[0x12, 0x34]` → `C = 0x091A_0000`,
+  `CT = 1`) and the empty-input `0xFF`-fill case (`C = 0x7FFF_8000`);
+  BYTEIN stuff-bit and end-of-stream-marker handling; DECODE
+  binary-output, determinism across two decoders, the `0x8000 ≤ A <
+  0x10000` renormalization invariant over 300 decisions, UNIFORM-context
+  index stability, and `0xFF`-fill deterministic-tail behaviour. 131
+  tests total pass (113 prior + 18 new); cargo fmt-check + clippy
+  `-D warnings` clean (both default + `--no-default-features` builds).
+  No new `Error` variants — the MQ engine is infallible per §C.3.4 /
+  §D.4.1 (it never errors; it synthesises the `0xFF` end-of-stream
+  fill).
+
+  Built solely against
+  `docs/image/jpeg2000/T-REC-T.800-201906-S.pdf` Annex C (§C.1.2 the
+  `0x8000 ≈ 0.75` fixed-point convention and the `A ∈ [0.75, 1.5)`
+  renormalization range; §C.2.5 the probability-estimation state
+  machine; §C.3.1 / Table C.3 the Chigh:Clow register split; §C.3.2 /
+  Figures C.15–C.17 DECODE + MPS/LPS exchange; §C.3.3 / Figure C.18
+  RENORMD; §C.3.4 / Figure C.19 BYTEIN + the stuff-bit / marker rule;
+  §C.3.5 / Figure C.20 INITDEC; Table C.2 the Qe/NMPS/NLPS/SWITCH rows)
+  and Annex D (§D.4 / Table D.7 the initial context states; §D.4.1 the
+  decoder's `0xFF`-fill extension of the input bit stream). The
+  figures are images in the PDF; the register operations are the
+  Figures' prose descriptions transcribed to integer ops. No external
+  library source — OpenJPEG, OpenJPH, Kakadu, Grok, FFmpeg, libavcodec,
+  jpeg2000-rs, etc. — was consulted, quoted, paraphrased, or used as a
+  cross-check oracle. No WebSearch / WebFetch was used for any reason.
+
+  The Annex D context formation (significance / sign / magnitude / run-
+  length / UNIFORM context labelling that decides which `MqContext` each
+  decision uses) is the next tier-1 round; this round is the pure §C.3
+  engine it sits on. The MQ **encoder** (§C.2) and the §D.6 raw-bit
+  bypass mode land later.
+
 * **Clean-room round 9 (2026-05-24).** Precinct → code-block enumeration
   (T.800 §B.7 / §B.9) on top of the round-8 `PrecinctPartition` +
   `CodeBlockDimensions` (`geometry` submodule). New

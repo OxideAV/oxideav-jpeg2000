@@ -47,13 +47,20 @@
 //! B-15 with the orientation displacements `(xob, yob)` from Table
 //! B.1).
 //!
-//! Codestream-body decoding (tier-1 EBCOT MQ-coder, wavelet inverse
-//! transform, dequantisation, MCT) and any encoder path are **not**
-//! implemented yet — [`decode_jpeg2000`] and [`encode_jpeg2000`]
-//! both return [`Error::NotImplemented`]. Round 7 closes §B.5
-//! sub-band geometry; §B.6 precinct partitioning, §B.7 sub-band →
-//! code-block partitioning, and §B.12 progression-order iteration are
-//! queued for round 8.
+//! Round 10 adds the [`mq`] submodule: the tier-1 **MQ arithmetic
+//! decoder** of T.800 Annex C §C.3 ([`mq::MqDecoder`] — INITDEC /
+//! DECODE / RENORMD / BYTEIN, with the Table C.2 [`mq::QE`]
+//! probability-estimation rows and the Table D.7 [`mq::MqContext`]
+//! initial states). It is the byte-consuming engine the future Annex D
+//! coding passes will drive.
+//!
+//! Full codestream-body decoding (the Annex D coefficient bit-modelling
+//! that drives the MQ decoder, wavelet inverse transform,
+//! dequantisation, MCT) and any encoder path are **not** implemented
+//! yet — [`decode_jpeg2000`] and [`encode_jpeg2000`] both return
+//! [`Error::NotImplemented`]. The Annex D significance / refinement /
+//! cleanup coding passes (the `CX → MqContext` context labelling the
+//! [`mq`] decoder consumes) are the next tier-1 round.
 //!
 //! ## Clean-room provenance
 //!
@@ -76,6 +83,7 @@
 
 pub mod geometry;
 pub mod jp2;
+pub mod mq;
 pub mod packet;
 
 #[cfg(feature = "registry")]
