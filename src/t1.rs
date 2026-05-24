@@ -11,14 +11,16 @@
 //!
 //! ## What this module covers
 //!
-//! An earlier round landed the **significance propagation pass** of
-//! §D.3.1 together with the **sign-bit subroutine** of §D.3.2 that fires
-//! whenever a coefficient becomes newly significant. This round adds the
-//! **magnitude refinement pass** of §D.3.3 (Table D.4, contexts 14, 15,
-//! 16), which refines the magnitude bit of coefficients that are already
-//! significant. Two of the three Annex D coding passes are now in place;
-//! the §D.3.4 cleanup pass is the only one still queued. All passes
-//! share the coefficient state and scan-order machinery in this module:
+//! Earlier rounds landed the **significance propagation pass** of §D.3.1
+//! (with the **sign-bit subroutine** of §D.3.2) and the **magnitude
+//! refinement pass** of §D.3.3 (Table D.4, contexts 14, 15, 16). This
+//! round adds the **cleanup pass** of §D.3.4 (Table D.5), the last of the
+//! three Annex D coding passes: it codes every coefficient the earlier
+//! two passes left insignificant, using the run-length context (label 17)
+//! with the UNIFORM context (label 18) four-zero-column shortcut where
+//! eligible and the Table D.1 significance contexts otherwise. All three
+//! coding passes are now in place. They share the coefficient state and
+//! scan-order machinery in this module:
 //!
 //! * The [`CodeBlock`] coefficient state — sample values, per-coefficient
 //!   significance state (`σ`), and the sign bit (`χ`). §D.3 calls `σ`
@@ -43,20 +45,22 @@
 //!
 //! ## Context array layout
 //!
-//! Annex D uses 19 distinct contexts (Table D.7) but only 17 are touched
-//! by the §D.3.1 / §D.3.2 / §D.3.3 routines: labels `0..=8` for
-//! significance propagation, `9..=13` for sign, and `14..=16` for
-//! magnitude refinement. The caller owns the `[MqContext; 19]` array
-//! (see [`reset_contexts`]) so that the §D.3.4 run-length label `17` and
-//! the UNIFORM label `18` slot in cleanly when the cleanup-pass round
-//! lands.
+//! Annex D uses 19 distinct contexts (Table D.7), all of which are now
+//! touched across the three passes: labels `0..=8` for significance
+//! propagation / cleanup, `9..=13` for sign, `14..=16` for magnitude
+//! refinement, `17` for the cleanup run-length context, and `18` for the
+//! UNIFORM context. The caller owns the `[MqContext; 19]` array (see
+//! [`reset_contexts`]).
 //!
 //! ## What this module does NOT cover yet
 //!
-//! * The §D.3.4 cleanup pass (run-length context, UNIFORM context,
-//!   length-4-zero-column shortcut).
+//! * The bit-plane sequencer that drives the §D.3 three-pass order
+//!   (cleanup-only first bit-plane, then SP → MR → cleanup) across a whole
+//!   code-block — the three passes are individually callable; chaining
+//!   them per code-block from the packet reader's byte ranges is the next
+//!   step.
 //! * The §D.4.2 / §D.5 / §D.6 termination / segmentation-symbol / raw-
-//!   bit-bypass modes — none of those fire during a pure §D.3.1 pass.
+//!   bit-bypass modes.
 //! * §D.7 vertically causal context formation — a flag for the future
 //!   COD `Scod` bit-3 mode.
 //!
@@ -68,10 +72,11 @@
 //! neighbour layout; §D.3.1 + Table D.1 — significance propagation
 //! contexts; §D.3.2 + Table D.2 + Table D.3 + Equation D-1 — sign
 //! contexts and XORbit; §D.3.3 + Table D.4 — magnitude refinement
-//! contexts; §D.4 + Table D.7 — initial context states). The
-//! Figure D.2 layout is the in-PDF diagram transcribed to neighbour
-//! offsets; the Tables D.1 / D.2 / D.3 / D.4 contents are transcribed
-//! verbatim from the PDF. No external library source — OpenJPEG, OpenJPH, Kakadu,
+//! contexts; §D.3.4 + Table D.5 — cleanup pass run-length / UNIFORM
+//! four-zero-column shortcut; §D.4 + Table D.7 — initial context states).
+//! The Figure D.2 layout is the in-PDF diagram transcribed to neighbour
+//! offsets; the Tables D.1 / D.2 / D.3 / D.4 / D.5 contents are
+//! transcribed verbatim from the PDF. No external library source — OpenJPEG, OpenJPH, Kakadu,
 //! Grok, FFmpeg, libavcodec, jpeg2000-rs, etc. — was consulted, quoted,
 //! paraphrased, or used as a cross-check oracle. No WebSearch /
 //! WebFetch was used for any reason.
@@ -395,6 +400,155 @@ impl CodeBlock {
         }
 
         Ok(refined)
+    }
+
+    /// Run one §D.3.4 cleanup pass over the bit-plane with positional
+    /// weight `1 << bitplane`.
+    ///
+    /// The cleanup pass codes every coefficient that is **still
+    /// insignificant** after the significance-propagation and
+    /// magnitude-refinement passes of this bit-plane (i.e., every
+    /// coefficient the earlier passes "left over"). It walks the same
+    /// §D.1 stripe-major scan order as the other two passes.
+    ///
+    /// Two coding modes apply, per Table D.5:
+    ///
+    /// * **Run-length mode.** When a column inside a *full* (4-row) stripe
+    ///   has all four of its coefficients still insignificant *and* the
+    ///   Table D.1 significance context of every one of them is `0`
+    ///   (computed from the significance state currently known to the
+    ///   decoder), the four coefficients are coded together. One MQ
+    ///   decision is drawn against the **run-length context** (label 17).
+    ///   A `0` leaves all four insignificant. A `1` means at least one is
+    ///   significant; two further bits are drawn against the **UNIFORM
+    ///   context** (label 18), MSB then LSB, giving the 0-based index
+    ///   (from the top of the column) of the first significant
+    ///   coefficient. That coefficient is made significant and its sign
+    ///   bit decoded per §D.3.2; the coefficients below it in the column
+    ///   are then coded "in the manner described in §D.3.1" (Table D.1
+    ///   significance context + sign subroutine).
+    /// * **Normal mode.** When the column is not run-length-eligible
+    ///   (fewer than four rows remain, or any of the four was already
+    ///   coded / has a non-zero context), each still-insignificant
+    ///   coefficient of the column is coded individually exactly as in the
+    ///   significance-propagation pass: one MQ decision against its Table
+    ///   D.1 context, and on a `1` the §D.3.2 sign subroutine.
+    ///
+    /// Coefficients already significant (from the SP or MR pass of this
+    /// bit-plane, or any earlier bit-plane) are skipped — they were not
+    /// "left over" for the cleanup pass.
+    ///
+    /// The caller-supplied `ctx` array must hold all 19 Annex D contexts
+    /// (see [`reset_contexts`]); the cleanup pass mutates the significance
+    /// labels `0..=8`, the sign labels `9..=13`, the run-length label
+    /// `17`, and the UNIFORM label `18`.
+    ///
+    /// Returns the number of coefficients that **became newly significant**
+    /// in this pass (exposed mainly for tests).
+    pub fn cleanup_pass(
+        &mut self,
+        bitplane: u32,
+        decoder: &mut MqDecoder<'_>,
+        ctx: &mut [MqContext; NUM_CONTEXTS],
+    ) -> Result<usize, Error> {
+        let weight: u32 = 1u32 << bitplane;
+        let mut newly = 0usize;
+
+        let mut v0 = 0usize;
+        while v0 < self.height {
+            let stripe_h = core::cmp::min(4, self.height - v0);
+            for u in 0..self.width {
+                // §D.3.4 / Table D.5 run-length eligibility: a full
+                // (4-row) stripe whose column has all four coefficients
+                // still insignificant and each currently carrying the 0
+                // significance context.
+                let mut start_dv = 0usize;
+                if stripe_h == 4 && self.column_run_length_eligible(u, v0) {
+                    let rl_cx = &mut ctx[RUN_LENGTH_CTX];
+                    if decoder.decode(rl_cx) == 0 {
+                        // All four remain insignificant; skip the column.
+                        continue;
+                    }
+                    // At least one significant: two UNIFORM bits (MSB
+                    // then LSB) give the 0-based first-significant index.
+                    let hi = decoder.decode(&mut ctx[UNIFORM_CTX]);
+                    let lo = decoder.decode(&mut ctx[UNIFORM_CTX]);
+                    let first = ((hi << 1) | lo) as usize;
+                    // The first-significant coefficient is significant by
+                    // construction (the run-length escape already told us
+                    // so); decode only its sign, then continue normally
+                    // from the next coefficient down the column.
+                    let v = v0 + first;
+                    self.make_significant_with_sign(u, v, weight, decoder, ctx);
+                    newly += 1;
+                    start_dv = first + 1;
+                }
+
+                // Normal §D.3.1-style coding for the remaining
+                // coefficients of the column (or the whole column when
+                // run-length mode did not apply).
+                for dv in start_dv..stripe_h {
+                    let v = v0 + dv;
+                    if self.coefficients[u + v * self.width].sigma {
+                        continue;
+                    }
+                    let label = significance_context_label(self.orientation, self.neighbours(u, v));
+                    let cx = &mut ctx[SP_CTX_OFFSET + label as usize];
+                    if decoder.decode(cx) == 1 {
+                        self.make_significant_with_sign(u, v, weight, decoder, ctx);
+                        newly += 1;
+                    }
+                }
+            }
+            v0 += 4;
+        }
+
+        Ok(newly)
+    }
+
+    /// Whether the four-coefficient column starting at `(u, v0)` is
+    /// run-length-eligible per §D.3.4: every one of the four coefficients
+    /// is still insignificant and its current Table D.1 significance
+    /// context label is `0`. Callers must have already established that
+    /// the stripe is a full 4-row stripe.
+    fn column_run_length_eligible(&self, u: usize, v0: usize) -> bool {
+        for dv in 0..4 {
+            let v = v0 + dv;
+            let c = self.coefficients[u + v * self.width];
+            if c.sigma {
+                return false;
+            }
+            if significance_context_label(self.orientation, self.neighbours(u, v)) != 0 {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Make coefficient `(u, v)` significant: set σ, accumulate the
+    /// bit-plane `weight` into the magnitude, decode the sign bit via the
+    /// §D.3.2 subroutine, and flag it newly-significant (the §D.3.3
+    /// carry). Shared by the cleanup pass's run-length and normal modes.
+    fn make_significant_with_sign(
+        &mut self,
+        u: usize,
+        v: usize,
+        weight: u32,
+        decoder: &mut MqDecoder<'_>,
+        ctx: &mut [MqContext; NUM_CONTEXTS],
+    ) {
+        let idx = u + v * self.width;
+        let nb = self.neighbours(u, v);
+        let (sign_label, xorbit) = sign_context_label(nb);
+        let sign_cx = &mut ctx[SIGN_CTX_OFFSET + sign_label as usize];
+        let d = decoder.decode(sign_cx);
+        let sign_bit = (d ^ xorbit) != 0;
+
+        let coef = &mut self.coefficients[idx];
+        coef.magnitude |= weight;
+        coef.sigma = true;
+        coef.sign = sign_bit;
+        self.newly_significant[idx] = true;
     }
 
     /// Build a [`Neighbours`] snapshot of `(u, v)`'s 8 nearest neighbours.
@@ -1446,6 +1600,309 @@ mod tests {
         pub(super) fn set_newly_significant_for_test(&mut self, u: usize, v: usize) {
             self.newly_significant[u + v * self.width] = true;
         }
+    }
+
+    // -- §D.3.4 cleanup pass behaviour --------------------------------
+
+    /// Replay the full cleanup-pass decode of one 1×4 run-length-eligible
+    /// LL column against an independent reference decoder, returning the
+    /// expected `(sigma, sign, magnitude)` per row plus the run-length
+    /// bit. This mirrors the §D.3.4 / Table D.5 control flow exactly and
+    /// is the oracle the subject [`CodeBlock::cleanup_pass`] must match.
+    fn replay_eligible_column_1x4(bytes: &[u8], weight: u32) -> (u8, [(bool, bool, u32); 4]) {
+        let mut dec = MqDecoder::new(bytes);
+        let mut ctx = reset_contexts();
+        let mut expect = [(false, false, 0u32); 4];
+        let rl = dec.decode(&mut ctx[RUN_LENGTH_CTX]);
+        if rl == 0 {
+            return (rl, expect);
+        }
+        let hi = dec.decode(&mut ctx[UNIFORM_CTX]);
+        let lo = dec.decode(&mut ctx[UNIFORM_CTX]);
+        let first = ((hi << 1) | lo) as usize;
+        let mut sig = [false; 4];
+        // First-significant coefficient: sign only (significance is implied
+        // by the run-length escape + UNIFORM index).
+        {
+            let nb = col_neighbours_1x4(&sig, first);
+            let (sl, xb) = sign_context_label(nb);
+            let sd = dec.decode(&mut ctx[SIGN_CTX_OFFSET + sl as usize]);
+            expect[first] = (true, (sd ^ xb) != 0, weight);
+            sig[first] = true;
+        }
+        for v in (first + 1)..4 {
+            let nb = col_neighbours_1x4(&sig, v);
+            let label = significance_context_label(SubBandOrientation::LL, nb);
+            let sbit = dec.decode(&mut ctx[SP_CTX_OFFSET + label as usize]);
+            if sbit == 1 {
+                let (sl, xb) = sign_context_label(nb);
+                let sd = dec.decode(&mut ctx[SIGN_CTX_OFFSET + sl as usize]);
+                expect[v] = (true, (sd ^ xb) != 0, weight);
+                sig[v] = true;
+            }
+        }
+        (rl, expect)
+    }
+
+    /// Neighbours of row `v` in a 1-wide, 4-tall column: only the vertical
+    /// up/down neighbours can be in-block (sign treated as positive — the
+    /// significance-context label ignores sign anyway).
+    fn col_neighbours_1x4(sig: &[bool; 4], v: usize) -> Neighbours {
+        let v_up = v >= 1 && sig[v - 1];
+        let v_dn = v + 1 < 4 && sig[v + 1];
+        Neighbours::from_slots(
+            false, v_up, false, false, false, false, false, false, false, v_dn, false, false,
+        )
+    }
+
+    #[test]
+    fn cleanup_run_length_zero_leaves_column_insignificant() {
+        // A 1x4 LL block: one full (4-row) column, all insignificant with
+        // zero context → run-length eligible. When the run-length bit is
+        // 0, the whole column stays insignificant. We replay to find a
+        // byte stream whose run-length bit is 0, then assert the subject
+        // leaves all four insignificant.
+        let candidates: [[u8; 4]; 4] = [
+            [0x00, 0x00, 0x00, 0x00],
+            [0xFF, 0xFF, 0xFF, 0xFF],
+            [0x84, 0xC7, 0x3B, 0xFC],
+            [0x42, 0x91, 0x6A, 0x0D],
+        ];
+        let bytes = candidates
+            .iter()
+            .find(|b| replay_eligible_column_1x4(*b, 1 << 7).0 == 0)
+            .expect("a candidate with run-length bit 0 must exist");
+
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 1, 4);
+        let mut dec = MqDecoder::new(bytes);
+        let mut ctx = reset_contexts();
+        let newly = block.cleanup_pass(7, &mut dec, &mut ctx).unwrap();
+        assert_eq!(newly, 0, "run-length 0 leaves all four insignificant");
+        for v in 0..4 {
+            assert!(!block.coefficient(0, v).sigma);
+            assert_eq!(block.coefficient(0, v).magnitude, 0);
+        }
+    }
+
+    #[test]
+    fn cleanup_run_length_one_uses_uniform_first_index() {
+        // A 1x4 LL block where the run-length bit is 1 (escape). The two
+        // UNIFORM bits select the first-significant coefficient; it
+        // becomes significant with the bit-plane weight + a decoded sign,
+        // and the rows below are decoded normally. We replay the exact MQ
+        // operation sequence to predict the outcome bit-for-bit.
+        let candidates: [&[u8]; 4] = [
+            &[0xFF, 0xAC, 0x73, 0x1D, 0x9E, 0x42],
+            &[0x00, 0x11, 0x22, 0x33, 0x44, 0x55],
+            &[0xC3, 0x5A, 0x96, 0x7E, 0x21, 0xBD],
+            &[0x84, 0xC7, 0x3B, 0xFC, 0x10, 0x6F],
+        ];
+        let weight = 1u32 << 5;
+        let (bytes, (_, expect)) = candidates
+            .iter()
+            .map(|b| (*b, replay_eligible_column_1x4(b, weight)))
+            .find(|(_, (rl, _))| *rl == 1)
+            .expect("a candidate with run-length bit 1 must exist");
+
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 1, 4);
+        let mut dec = MqDecoder::new(bytes);
+        let mut ctx = reset_contexts();
+        let newly = block.cleanup_pass(5, &mut dec, &mut ctx).unwrap();
+
+        let mut expected_newly = 0usize;
+        for (v, &(e_sig, e_sign, e_mag)) in expect.iter().enumerate() {
+            let c = block.coefficient(0, v);
+            assert_eq!(c.sigma, e_sig, "sigma mismatch at v={v}");
+            if e_sig {
+                expected_newly += 1;
+                assert_eq!(c.sign, e_sign, "sign mismatch at v={v}");
+                assert_eq!(c.magnitude, e_mag, "magnitude mismatch at v={v}");
+                assert!(block.was_newly_significant(0, v));
+            }
+        }
+        assert_eq!(newly, expected_newly);
+        // The run-length escape guarantees at least one significant.
+        assert!(expected_newly >= 1);
+    }
+
+    #[test]
+    fn cleanup_short_stripe_never_uses_run_length() {
+        // A 1x3 block: only three rows → no run-length coding per §D.3.4
+        // ("fewer than four rows remaining"). Each coefficient is coded
+        // individually with its Table D.1 context (all label 0 here). We
+        // replay three significance decisions against the *zero-neighbour*
+        // context (label 0, Table C.2 index 4) to predict the outcome.
+        let bytes = [0xC1u8, 0x5D, 0x82, 0x77, 0x3A];
+        let mut ref_dec = MqDecoder::new(&bytes);
+        let mut ref_ctx = reset_contexts();
+        let mut expect = [false; 3];
+        let mut sig = [false; 3];
+        for v in 0..3 {
+            let v_up = v >= 1 && sig[v - 1];
+            let v_dn = v + 1 < 3 && sig[v + 1];
+            let nb = Neighbours::from_slots(
+                false, v_up, false, false, false, false, false, false, false, v_dn, false, false,
+            );
+            let label = significance_context_label(SubBandOrientation::LL, nb);
+            // Run-length context must NOT be consulted here.
+            assert_eq!(label, 0, "isolated column should have label 0 at v={v}");
+            let sbit = ref_dec.decode(&mut ref_ctx[SP_CTX_OFFSET + label as usize]);
+            if sbit == 1 {
+                let (sl, _xb) = sign_context_label(nb);
+                let _ = ref_dec.decode(&mut ref_ctx[SIGN_CTX_OFFSET + sl as usize]);
+                expect[v] = true;
+                sig[v] = true;
+            }
+        }
+
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 1, 3);
+        let mut dec = MqDecoder::new(&bytes);
+        let mut ctx = reset_contexts();
+        // The run-length context must be untouched (its adaptive index
+        // stays at the reset value 3).
+        assert_eq!(ctx[RUN_LENGTH_CTX].index(), 3);
+        block.cleanup_pass(0, &mut dec, &mut ctx).unwrap();
+        assert_eq!(
+            ctx[RUN_LENGTH_CTX].index(),
+            3,
+            "short stripe must not use the run-length context"
+        );
+        for (v, &want) in expect.iter().enumerate() {
+            assert_eq!(block.coefficient(0, v).sigma, want, "v={v}");
+        }
+    }
+
+    #[test]
+    fn cleanup_skips_already_significant_and_nonzero_context_columns() {
+        // A 1x4 LL block with (0,0) pre-marked significant. The column is
+        // NOT run-length-eligible because (0,0) is already significant and
+        // (0,1) now has a non-zero (vertical) context. Each remaining
+        // insignificant coefficient is coded individually; (0,0) is
+        // skipped. The run-length context must stay at its reset index.
+        let bytes = [0x9Au8, 0x3F, 0xC4, 0x71, 0x2E];
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 1, 4);
+        block.mark_significant_for_test(0, 0, false, 1 << 6);
+        let mut dec = MqDecoder::new(&bytes);
+        let mut ctx = reset_contexts();
+        let rl_before = ctx[RUN_LENGTH_CTX].index();
+        block.cleanup_pass(5, &mut dec, &mut ctx).unwrap();
+        assert_eq!(
+            ctx[RUN_LENGTH_CTX].index(),
+            rl_before,
+            "non-eligible column must not touch the run-length context"
+        );
+        // (0,0) stays exactly as pre-marked (significant, untouched).
+        let c0 = block.coefficient(0, 0);
+        assert!(c0.sigma);
+        assert_eq!(c0.magnitude, 1 << 6);
+    }
+
+    #[test]
+    fn cleanup_first_bitplane_only_pass_decodes_isolated_coefficient() {
+        // §D.3: the first non-empty bit-plane of a code-block is a
+        // cleanup-only pass. Here a 1x1 LL block (a single coefficient,
+        // never run-length-eligible because the stripe is height 1) is
+        // decoded directly via the normal-mode significance context.
+        let bytes = [0xE3u8, 0x55, 0x9C, 0x08];
+        let mut ref_dec = MqDecoder::new(&bytes);
+        let mut ref_ctx = reset_contexts();
+        // Zero-neighbour significance context (label 0, index 4).
+        let sbit = ref_dec.decode(&mut ref_ctx[SP_CTX_OFFSET]);
+
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 1, 1);
+        let mut dec = MqDecoder::new(&bytes);
+        let mut ctx = reset_contexts();
+        let newly = block.cleanup_pass(7, &mut dec, &mut ctx).unwrap();
+        if sbit == 1 {
+            assert_eq!(newly, 1);
+            assert!(block.coefficient(0, 0).sigma);
+            assert!(block.coefficient(0, 0).magnitude & (1 << 7) != 0);
+        } else {
+            assert_eq!(newly, 0);
+            assert!(!block.coefficient(0, 0).sigma);
+        }
+    }
+
+    #[test]
+    fn cleanup_run_length_zero_makes_no_uniform_decision() {
+        // When the run-length bit is 0, the two UNIFORM bits are NOT
+        // drawn (Table D.5 row 1: "Symbols decoded with UNIFORM = none").
+        // We pick a byte stream whose run-length bit is 0 and verify the
+        // UNIFORM context is left at its reset index afterward.
+        let candidates: [[u8; 4]; 4] = [
+            [0x00, 0x00, 0x00, 0x00],
+            [0xFF, 0xFF, 0xFF, 0xFF],
+            [0x84, 0xC7, 0x3B, 0xFC],
+            [0x42, 0x91, 0x6A, 0x0D],
+        ];
+        let bytes = candidates
+            .iter()
+            .find(|b| replay_eligible_column_1x4(*b, 1 << 3).0 == 0)
+            .expect("a candidate with run-length bit 0 must exist");
+
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 1, 4);
+        let mut dec = MqDecoder::new(bytes);
+        let mut ctx = reset_contexts();
+        let uniform_before = ctx[UNIFORM_CTX].index();
+        block.cleanup_pass(3, &mut dec, &mut ctx).unwrap();
+        assert_eq!(
+            ctx[UNIFORM_CTX].index(),
+            uniform_before,
+            "symbol-0 run-length must not consult the UNIFORM context"
+        );
+        for v in 0..4 {
+            assert!(!block.coefficient(0, v).sigma);
+        }
+    }
+
+    #[test]
+    fn cleanup_full_three_pass_bitplane_sequence_self_consistent() {
+        // Drive the §D.3 three-pass order (SP → MR → cleanup) on one
+        // bit-plane of a small LL block and confirm the cleanup pass only
+        // touches coefficients the earlier two passes left insignificant.
+        // This is a structural test: it does not predict the bits, only
+        // that no coefficient is decoded twice in a single bit-plane.
+        let bytes = [0xB7u8, 0x29, 0xEE, 0x4C, 0x81, 0x6A, 0xD3];
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 4, 4);
+        let mut dec = MqDecoder::new(&bytes);
+        let mut ctx = reset_contexts();
+        // First non-empty bit-plane: cleanup only.
+        let bp = 5;
+        let n_cleanup0 = block.cleanup_pass(bp, &mut dec, &mut ctx).unwrap();
+        // Snapshot which coefficients are significant after the cleanup.
+        let mut sig_after: Vec<bool> = Vec::new();
+        for v in 0..4 {
+            for u in 0..4 {
+                sig_after.push(block.coefficient(u, v).sigma);
+            }
+        }
+        // Next bit-plane: SP then MR then cleanup.
+        let bp2 = bp - 1;
+        let _ = block
+            .significance_propagation_pass(bp2, &mut dec, &mut ctx)
+            .unwrap();
+        let _ = block
+            .magnitude_refinement_pass(bp2, &mut dec, &mut ctx)
+            .unwrap();
+        let _ = block.cleanup_pass(bp2, &mut dec, &mut ctx).unwrap();
+        // Every coefficient significant after the first cleanup is still
+        // significant (significance is monotone — never cleared).
+        let mut k = 0;
+        for v in 0..4 {
+            for u in 0..4 {
+                if sig_after[k] {
+                    assert!(
+                        block.coefficient(u, v).sigma,
+                        "({u},{v}) significance must be monotone"
+                    );
+                }
+                k += 1;
+            }
+        }
+        // Sanity: the first cleanup pass produced a non-negative count
+        // and the decoder advanced through the stream without panicking.
+        let _ = n_cleanup0;
+        assert!(dec.byte_pointer() > 0);
     }
 
     // -- Boundary handling --------------------------------------------

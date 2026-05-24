@@ -3,13 +3,14 @@
 Pure-Rust JPEG 2000 (J2K + JP2) and High-Throughput JPEG 2000 (HTJ2K)
 codec.
 
-## Status — 2026-05-24 (clean-room round 115)
+## Status — 2026-05-24 (clean-room round 118)
 
 **Codestream-structural + JP2-wrapper + tier-2 packet-header reader +
 SIZ-derived tile geometry + resolution-level / sub-band geometry +
 precinct / code-block partition + precinct → code-block enumeration +
-tier-1 MQ arithmetic decoder + tier-1 Annex D significance-propagation
-and magnitude-refinement coding passes.**
+tier-1 MQ arithmetic decoder + all three tier-1 Annex D coding passes
+(significance-propagation + sign, magnitude-refinement, and cleanup with
+the run-length / UNIFORM four-zero-column shortcut).**
 The crate parses the JPEG 2000 Part-1 **main header** (`SOC`, `SIZ`,
 `COD`, `QCD`), walks the **tile-part chain** (`SOT` / `SOD` / `EOC`),
 decodes the **JP2 ISO BMFF box wrapper** (Annex I), reads the
@@ -206,9 +207,9 @@ decoder is stateless w.r.t. contexts: the caller (the Annex D
 coding-pass round) owns the `CX → MqContext` array, mirroring the
 spec's "I(CX) / MPS(CX) stored at CX" model.
 
-The `t1` submodule implements **two of the three Annex D Tier-1 coding
-passes** (T.800 §D.3.1 + §D.3.2 significance propagation + sign, and
-§D.3.3 magnitude refinement) on top of the MQ decoder.
+The `t1` submodule implements **all three Annex D Tier-1 coding passes**
+(T.800 §D.3.1 + §D.3.2 significance propagation + sign, §D.3.3 magnitude
+refinement, and §D.3.4 cleanup) on top of the MQ decoder.
 `t1::CodeBlock::new(orientation, width, height)` builds an
 all-insignificant coefficient grid; each `t1::Coefficient` carries its
 reconstructed `magnitude` (bits arrive MSB-first), the §D.3 significance
@@ -247,30 +248,46 @@ whether `∑(Hi+Vi+Di)` over the current significance states is `0` or
 `≥ 1`. The decoded bit is OR-ed into `magnitude` at the bit-plane weight
 and `already_refined` is set.
 
+`t1::CodeBlock::cleanup_pass(bitplane, decoder, ctx)` runs one **§D.3.4
+cleanup pass** — the last of the three Annex D passes — over the same
+§D.1 stripe-major scan order. It codes every coefficient the
+significance-propagation and magnitude-refinement passes left
+insignificant. Per Table D.5 it applies the **run-length shortcut** when
+a column inside a full (4-row) stripe has all four coefficients still
+insignificant and each currently carrying the Table D.1 context label
+`0`: one MQ decision against the run-length context (label 17) signals
+whether any of the four becomes significant; on a `1` two further bits
+against the UNIFORM context (label 18, decoded MSB-then-LSB) give the
+0-based index of the first significant coefficient, whose sign is then
+decoded per §D.3.2 and whose followers down the column are decoded "in
+the manner of §D.3.1" (Table D.1 significance context + sign).
+Run-length-ineligible columns (a short bottom stripe, an already-coded
+coefficient, or any non-zero context) fall back to per-coefficient
+significance coding with the same Table D.1 contexts and sign subroutine
+as the significance-propagation pass. Coefficients already significant in
+this bit-plane are skipped. The pass shares
+`t1::make_significant_with_sign` (set σ, accumulate the bit-plane weight,
+decode the sign, flag newly-significant) with the run-length and
+normal-mode arms.
+
 The caller-owned `[MqContext; 19]` array (`t1::reset_contexts()` sets the
 Table D.7 initial states — label 0 → index 4, run-length label 17 →
-index 3, UNIFORM label 18 → index 46, all others index 0) reserves slots
-`17` / `18` so the cleanup pass drops in without a layout shift;
-significance (`0..=8`), sign (`9..=13`) and refinement (`14..=16`) labels
-are all now driven.
+index 3, UNIFORM label 18 → index 46, all others index 0) now drives
+**every** Annex D context: significance / cleanup (`0..=8`), sign
+(`9..=13`), refinement (`14..=16`), run-length (`17`), and UNIFORM
+(`18`).
 
 What is **not** implemented yet:
 
-* The §D.3.4 **cleanup** pass (Table D.1 contexts re-applied plus the
-  run-length context, the UNIFORM run-length escape, and the
-  four-zero-column shortcut of Table D.5) — the last of the three Annex D
-  coding passes. The `t1` submodule lands the significance-propagation +
-  sign + magnitude-refinement passes and the shared coefficient / scan-
-  order machinery they sit on. The bit-plane sequencing that drives all
-  three passes per code-block (cleanup-only first bit-plane, then SP →
-  MR → cleanup) lands once the cleanup pass does.
+* The bit-plane **sequencer** that drives the §D.3 three-pass order
+  (cleanup-only first bit-plane, then SP → MR → cleanup) across a whole
+  code-block from the packet reader's per-code-block byte ranges. The
+  three passes are individually callable and self-consistent; chaining
+  them per code-block (and feeding the MQ decoder the right byte segment)
+  is the next step.
 * The §D.4.2 / §D.5 / §D.6 termination / error-resilience segmentation
   symbol / selective arithmetic-coding bypass (raw bit) modes, and §D.7
   vertically causal context formation (a COD `Scod` bit-3 mode).
-* Tier-1 Annex D coefficient bit-modelling beyond the SP + MR passes
-  (i.e. the cleanup pass) — the packet-header reader reports byte ranges
-  per code-block; the MQ engine decodes those bytes given the context
-  stream the `t1` passes produce.
 * The MQ **encoder** (§C.2 — INITENC / ENCODE / RENORME / BYTEOUT /
   FLUSH) and the §D.6 selective arithmetic-coding bypass (raw bit mode).
 * §B.12 progression-order packet iteration (Equation B-20 / B-21) +
@@ -389,9 +406,13 @@ consulted:
   §D.3.3 + Table D.4 (the 3 magnitude-refinement context labels: 14 / 15
   for a first refinement keyed on `∑(Hi+Vi+Di) = 0` vs `≥ 1`, 16 for any
   later refinement, with the "already significant except just-made-
-  significant" eligibility rule). Tables D.1 / D.2 / D.3 / D.4 are
-  transcribed verbatim; the Figure D.1 / D.2 diagrams are transcribed to
-  scan order + neighbour offsets.
+  significant" eligibility rule), and §D.3.4 + Table D.5 (the cleanup
+  pass: the run-length context for a four-zero-context column inside a
+  full 4-row stripe, the UNIFORM-context 2-bit MSB-then-LSB first-
+  significant index, and the Table D.1 fall-back for ineligible columns).
+  Tables D.1 / D.2 / D.3 / D.4 / D.5 are transcribed verbatim; the
+  Figure D.1 / D.2 diagrams are transcribed to scan order + neighbour
+  offsets.
 * T.800 Annex D §D.4 (Initializing and terminating) — Table D.7 (the
   initial context states: UNIFORM index 46, run-length index 3,
   all-zero-neighbours index 4, all other contexts index 0) and §D.4.1

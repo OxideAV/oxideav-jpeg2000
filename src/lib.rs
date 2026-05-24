@@ -66,12 +66,16 @@
 //! ([`t1::CodeBlock::magnitude_refinement_pass`]) walks the same scan
 //! order, refines the magnitude bit of already-significant coefficients
 //! (skipping those that just became significant in the preceding SP
-//! pass) using the Table D.4 context (`14..=16`). The cleanup pass
-//! (§D.3.4) is queued for the next tier-1 round.
+//! pass) using the Table D.4 context (`14..=16`). The **cleanup pass**
+//! of §D.3.4 ([`t1::CodeBlock::cleanup_pass`]) codes every coefficient
+//! the SP and MR passes left insignificant, applying the Table D.5
+//! run-length context (`17`) + UNIFORM context (`18`) four-zero-column
+//! shortcut where eligible and the Table D.1 significance contexts
+//! otherwise. All three Annex D coding passes are now in place.
 //!
-//! Full codestream-body decoding (the remaining Annex D coding passes,
-//! wavelet inverse transform, dequantisation, MCT) and any encoder path
-//! are **not** implemented yet — [`decode_jpeg2000`] and
+//! Full codestream-body decoding (the per-code-block three-pass
+//! sequencer, wavelet inverse transform, dequantisation, MCT) and any
+//! encoder path are **not** implemented yet — [`decode_jpeg2000`] and
 //! [`encode_jpeg2000`] both return [`Error::NotImplemented`].
 //!
 //! ## Clean-room provenance

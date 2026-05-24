@@ -24,6 +24,58 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 118 (2026-05-24).** Third and final Annex D Tier-1
+  coding pass — the **cleanup pass** (T.800 §D.3.4 + Table D.5) — on top
+  of the significance-propagation + sign and magnitude-refinement passes.
+  Extends the `t1` submodule:
+
+  - `t1::CodeBlock::cleanup_pass(bitplane, decoder, ctx)` runs one cleanup
+    pass over the **§D.1 stripe-major scan order**, coding every
+    coefficient the SP and MR passes left insignificant. It applies the
+    **run-length shortcut** of Table D.5 when a column inside a full
+    (4-row) stripe has all four coefficients still insignificant and each
+    carrying the Table D.1 context label `0`: one MQ decision against the
+    run-length context (label 17); on a `1`, two UNIFORM-context bits
+    (label 18, MSB-then-LSB) give the 0-based first-significant index,
+    that coefficient's sign is decoded per §D.3.2, and the followers down
+    the column are coded "in the manner of §D.3.1". Ineligible columns (a
+    short bottom stripe, an already-coded coefficient, or any non-zero
+    context) fall back to per-coefficient significance + sign coding with
+    the Table D.1 contexts. Already-significant coefficients are skipped.
+    Returns the newly-significant count.
+  - A shared `make_significant_with_sign` helper (set σ, accumulate the
+    bit-plane weight, decode the sign via §D.3.2, flag newly-significant)
+    drives both the run-length and normal-mode arms, and a
+    `column_run_length_eligible` predicate encodes the §D.3.4 four-zero-
+    context gate.
+  - `t1::RUN_LENGTH_CTX` (17) and `t1::UNIFORM_CTX` (18) are now consumed;
+    the `[MqContext; 19]` array drives **every** Annex D context.
+
+  Seven new unit tests: run-length symbol-0 leaves a 1×4 column
+  insignificant; run-length symbol-1 + UNIFORM first-index decode matched
+  bit-for-bit against a reference MQ replay (including the followers down
+  the column); the short-stripe path never consulting the run-length
+  context; the symbol-0 path never consulting the UNIFORM context;
+  skipping an already-significant / non-zero-context column; a
+  cleanup-only first-bit-plane isolated-coefficient decode; and a
+  three-pass (SP → MR → cleanup) significance-monotonicity self-check.
+  169 tests total pass (162 prior + 7 new); cargo fmt-check + clippy
+  `-D warnings` clean. No new `Error` variants — the cleanup pass returns
+  the existing `Result<usize, Error>`.
+
+  Built solely against `docs/image/jpeg2000/T-REC-T.800-201906-S.pdf`
+  Annex D (§D.3.4 + Table D.5 the cleanup-pass run-length / UNIFORM logic;
+  §D.3.1 + Table D.1 re-applied for ineligible columns; §D.3.2 sign
+  subroutine; §D.1 scan pattern; §D.4 + Table D.7 initial states). Table
+  D.5 is transcribed verbatim. No external library source — OpenJPEG,
+  OpenJPH, Kakadu, Grok, FFmpeg, libavcodec, jpeg2000-rs, etc. — was
+  consulted, quoted, paraphrased, or used as a cross-check oracle. No
+  WebSearch / WebFetch was used for any reason.
+
+  The bit-plane **sequencer** that drives the §D.3 three-pass order
+  (cleanup-only first bit-plane, then SP → MR → cleanup) per code-block
+  from the packet reader's byte ranges is the next tier-1 round.
+
 * **Clean-room round 115 (2026-05-24).** Second Annex D Tier-1 coding
   pass — the **magnitude refinement pass** (T.800 §D.3.3) — on top of the
   significance-propagation + sign passes. Extends the `t1` submodule:
@@ -68,11 +120,6 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
   OpenJPEG, OpenJPH, Kakadu, Grok, FFmpeg, libavcodec, jpeg2000-rs, etc. —
   was consulted, quoted, paraphrased, or used as a cross-check oracle. No
   WebSearch / WebFetch was used for any reason.
-
-  The §D.3.4 cleanup pass (Table D.1 re-applied + run-length context +
-  UNIFORM escape + Table D.5 four-zero-column shortcut) is the next tier-1
-  round, followed by the bit-plane sequencing that drives all three passes
-  per code-block.
 
 * **Clean-room round 11 (2026-05-24).** First Annex D Tier-1 coding pass —
   the **significance propagation pass** (T.800 §D.3.1) plus the §D.3.2
