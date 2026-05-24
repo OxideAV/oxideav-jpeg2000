@@ -945,6 +945,229 @@ pub fn refinement_context_label(nb: Neighbours, already_refined: bool) -> u8 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Bit-plane sequencer — T.800 §D.3 three-pass order across a code-block.
+// ---------------------------------------------------------------------------
+
+/// The three Annex D Tier-1 coding passes, in §D.3 order.
+///
+/// Per T.800 §D.3 — "The first bit-plane within the current block with a
+/// non-zero element has a cleanup pass only. The remaining bit-planes are
+/// decoded in three coding passes." — the natural order for the second
+/// and subsequent non-empty bit-planes is significance propagation
+/// ([`Pass::Sp`]), then magnitude refinement ([`Pass::Mr`]), then cleanup
+/// ([`Pass::Cleanup`]).
+///
+/// [`BitPlaneSequencer::next_pass`] returns the kind of the pass that
+/// will run next on its driving code-block, so callers can introspect the
+/// state machine (and tests can assert on transitions) without having to
+/// reproduce the §D.3 control flow themselves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pass {
+    /// §D.3.1 significance propagation (with the §D.3.2 sign-bit
+    /// subroutine inlined). Decodes the still-insignificant coefficients
+    /// whose Table D.1 context is non-zero.
+    Sp,
+    /// §D.3.3 magnitude refinement. Refines the magnitude bit of
+    /// already-significant coefficients that did not just become
+    /// significant in the preceding [`Pass::Sp`] pass.
+    Mr,
+    /// §D.3.4 cleanup. Codes every coefficient the [`Pass::Sp`] and
+    /// [`Pass::Mr`] passes left insignificant, with the Table D.5
+    /// run-length / UNIFORM four-zero-column shortcut where eligible.
+    Cleanup,
+}
+
+/// Drives the §D.3 three-pass order across a code-block's bit-planes
+/// from MSB toward LSB.
+///
+/// Per T.800 §D.3:
+///
+/// * The **first bit-plane within the current block with a non-zero
+///   element** is decoded with a **cleanup pass only**. The first
+///   non-empty bit-plane is `Mb − 1 − P` per §B.10.5, where `Mb` is the
+///   maximum number of magnitude bit-planes available in the sub-band
+///   (Equation E-2) and `P` is the **zero-bit-plane count** signalled in
+///   the packet header.
+/// * For **each subsequent bit-plane**, all three passes run in §D.3
+///   order: significance propagation ([`Pass::Sp`]) → magnitude
+///   refinement ([`Pass::Mr`]) → cleanup ([`Pass::Cleanup`]). Once
+///   cleanup completes, the sequencer drops the bit-plane index by one
+///   and the next pass is again significance propagation.
+///
+/// The number of passes contributed to **this packet** comes from the
+/// `coding_passes` field in the packet header (T.800 §B.10.6 / Table
+/// B.4). A single code-block may straddle multiple packets across
+/// layers: the §D.3 state is per code-block, **not** per packet, so the
+/// sequencer preserves its `next_pass` / `current_bitplane` across calls
+/// to [`Self::decode_packet`]. The next packet's `decode_packet` resumes
+/// exactly where the previous one stopped.
+///
+/// The sequencer does **not** consume bytes itself — the caller hands it
+/// a freshly-constructed [`MqDecoder`] over the byte segment the packet
+/// header allocated to this code-block. T.800 §D.4.1 explicitly allows
+/// the decoder to extend the codestream with `0xFF` bytes past the
+/// signalled count so the residual symbols of an in-progress pass can
+/// still be decoded; [`MqDecoder`] already synthesises that `0xFF` fill
+/// in [`crate::mq::MqDecoder::new`] / its BYTEIN procedure. The
+/// sequencer therefore neither tracks nor enforces a per-pass byte
+/// budget — the byte budget is the packet's responsibility, not the
+/// sequencer's.
+///
+/// ## What this sequencer does NOT cover
+///
+/// * **§D.4.2 / §D.5 termination** between coding passes. Each call to
+///   [`Self::decode_packet`] uses one [`MqDecoder`] across every pass in
+///   the call — the right behaviour when the COD `Scod` bit-2
+///   "code-block style: arithmetic coder bypass" and bit-4 "termination
+///   on each pass" flags are both clear (the common case). When per-pass
+///   termination is signalled, the caller must construct one
+///   [`MqDecoder`] per segment and call [`Self::decode_passes`] one pass
+///   at a time; that lower-level entry point is provided for exactly
+///   that reason.
+/// * **§D.6 selective arithmetic-coding bypass** (raw-bit mode). The
+///   §D.6 mode would route the significance / refinement / sign decisions
+///   for selected bit-planes to a raw-bit reader instead of the MQ
+///   decoder. A future round adds the raw-bit reader and a `bypass` flag
+///   on the sequencer to select it.
+/// * **§D.7 vertically causal context formation**. The neighbour read
+///   inside the three pass methods always uses the freshest σ-state; the
+///   §D.7 mode would clip the bottom row of each stripe.
+#[derive(Debug, Clone)]
+pub struct BitPlaneSequencer {
+    /// 0-based bit-plane index currently being decoded, MSB-first
+    /// (`Mb − 1 − P` on construction, decreasing as passes complete).
+    current_bitplane: u32,
+    /// Kind of pass that the next call to a pass driver will run.
+    next_pass: Pass,
+    /// Total passes decoded so far across every call to
+    /// [`Self::decode_packet`] / [`Self::decode_passes`]. Mainly a sanity
+    /// counter exposed via [`Self::passes_decoded`].
+    passes_decoded: u32,
+}
+
+impl BitPlaneSequencer {
+    /// Build a new sequencer for a code-block whose first non-empty
+    /// bit-plane is `starting_bitplane` (i.e. `Mb − 1 − P`).
+    ///
+    /// `starting_bitplane` must be a valid bit-plane index for the
+    /// caller's reconstruction; the sequencer itself does not validate
+    /// it against `Mb` (which is a sub-band-level quantisation property)
+    /// — that's a packet-reader responsibility.
+    ///
+    /// The first pass to run is the **cleanup-only** pass on
+    /// `starting_bitplane`, per §D.3.
+    pub fn new(starting_bitplane: u32) -> Self {
+        Self {
+            current_bitplane: starting_bitplane,
+            next_pass: Pass::Cleanup,
+            passes_decoded: 0,
+        }
+    }
+
+    /// Bit-plane index that the **next** pass will run on
+    /// (`Mb − 1 − P` on construction, decreasing as passes complete).
+    pub fn current_bitplane(&self) -> u32 {
+        self.current_bitplane
+    }
+
+    /// Kind of the **next** pass to run.
+    pub fn next_pass(&self) -> Pass {
+        self.next_pass
+    }
+
+    /// Total number of passes the sequencer has driven since construction.
+    pub fn passes_decoded(&self) -> u32 {
+        self.passes_decoded
+    }
+
+    /// Decode all coding passes signalled for one packet on this
+    /// code-block.
+    ///
+    /// `bytes` is the concatenated single codeword-segment the packet
+    /// header reserved for this code-block (§B.10.7.1). `passes` is the
+    /// pass count decoded from §B.10.6 / Table B.4. Both come from the
+    /// packet's [`crate::packet::CodeBlockContribution`].
+    ///
+    /// Each pass runs against a freshly-built [`MqDecoder`] over the
+    /// same `bytes` slice **only on the first call** for a multi-packet
+    /// code-block — subsequent calls open a fresh decoder over **their
+    /// own** bytes (because the MQ engine is reset between codeword
+    /// segments per §C.3, even when those segments span layers). The
+    /// `ctx` array is **never** reset across calls — the §D.3 contexts
+    /// persist over the lifetime of the code-block per T.800 §D.4.
+    ///
+    /// `passes == 0` is a valid no-op (the packet's
+    /// `CodeBlockContribution::included` was false and no bytes were
+    /// drawn from the body).
+    ///
+    /// Returns the **total number of newly-significant coefficients +
+    /// refined coefficients** across all passes run — exposed primarily
+    /// for tests and progress logging.
+    pub fn decode_packet(
+        &mut self,
+        block: &mut CodeBlock,
+        bytes: &[u8],
+        passes: u32,
+        ctx: &mut [MqContext; NUM_CONTEXTS],
+    ) -> Result<usize, Error> {
+        if passes == 0 {
+            return Ok(0);
+        }
+        let mut decoder = MqDecoder::new(bytes);
+        self.decode_passes(block, &mut decoder, ctx, passes)
+    }
+
+    /// Lower-level entry point: run exactly `passes` Annex D coding
+    /// passes against a caller-built [`MqDecoder`].
+    ///
+    /// Use this when you need to drive the sequencer against a specific
+    /// `MqDecoder` instance — e.g. when COD bit-4 "termination on each
+    /// pass" is set and each pass has its own codeword segment, so each
+    /// pass needs its own fresh `MqDecoder`. The high-level
+    /// [`Self::decode_packet`] wraps a single decoder across an entire
+    /// packet's worth of passes (the common case).
+    pub fn decode_passes(
+        &mut self,
+        block: &mut CodeBlock,
+        decoder: &mut MqDecoder<'_>,
+        ctx: &mut [MqContext; NUM_CONTEXTS],
+        passes: u32,
+    ) -> Result<usize, Error> {
+        let mut total = 0usize;
+        for _ in 0..passes {
+            let bitplane = self.current_bitplane;
+            let n = match self.next_pass {
+                Pass::Cleanup => {
+                    let n = block.cleanup_pass(bitplane, decoder, ctx)?;
+                    // §D.3: after cleanup on bit-plane k, drop to k-1
+                    // and the next pass is significance propagation
+                    // (unless we've finished the LSB — the sequencer
+                    // lets `current_bitplane` underflow saturating-style
+                    // because §D.3 does not define behaviour past
+                    // bit-plane 0; the caller stops asking).
+                    self.next_pass = Pass::Sp;
+                    self.current_bitplane = bitplane.saturating_sub(1);
+                    n
+                }
+                Pass::Sp => {
+                    let n = block.significance_propagation_pass(bitplane, decoder, ctx)?;
+                    self.next_pass = Pass::Mr;
+                    n
+                }
+                Pass::Mr => {
+                    let n = block.magnitude_refinement_pass(bitplane, decoder, ctx)?;
+                    self.next_pass = Pass::Cleanup;
+                    n
+                }
+            };
+            total += n;
+            self.passes_decoded = self.passes_decoded.saturating_add(1);
+        }
+        Ok(total)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1941,5 +2164,264 @@ mod tests {
         assert_eq!(nb.d_sum(), 1);
         // LL/LH (h=0, v=0, d=1) → label 1.
         assert_eq!(significance_context_label(SubBandOrientation::LL, nb), 1);
+    }
+
+    // -- Bit-plane sequencer (§D.3 three-pass order) ------------------
+
+    #[test]
+    fn sequencer_new_starts_with_cleanup_only() {
+        // §D.3: "The first bit-plane within the current block with a
+        // non-zero element has a cleanup pass only."
+        let seq = BitPlaneSequencer::new(7);
+        assert_eq!(seq.next_pass(), Pass::Cleanup);
+        assert_eq!(seq.current_bitplane(), 7);
+        assert_eq!(seq.passes_decoded(), 0);
+    }
+
+    #[test]
+    fn sequencer_first_pass_runs_cleanup_then_drops_to_sp_next_plane() {
+        // After the first (cleanup-only) pass on bit-plane K, the
+        // sequencer must advance to bit-plane K-1 with SP next.
+        let bytes = [0x42u8, 0x91, 0x6A, 0x0D];
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 4, 4);
+        let mut ctx = reset_contexts();
+        let mut seq = BitPlaneSequencer::new(7);
+        let _ = seq.decode_packet(&mut block, &bytes, 1, &mut ctx).unwrap();
+        assert_eq!(seq.next_pass(), Pass::Sp);
+        assert_eq!(seq.current_bitplane(), 6);
+        assert_eq!(seq.passes_decoded(), 1);
+    }
+
+    #[test]
+    fn sequencer_three_pass_cycle_returns_to_cleanup_one_plane_down() {
+        // §D.3 order after the first cleanup: SP → MR → cleanup. After
+        // running all three on bit-plane K, the next pass is SP on K-1.
+        let bytes = [0xB7u8, 0x29, 0xEE, 0x4C, 0x81, 0x6A, 0xD3, 0x55];
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 4, 4);
+        let mut ctx = reset_contexts();
+        let mut seq = BitPlaneSequencer::new(8);
+        // Pass 1: cleanup-only on bit-plane 8.
+        let _ = seq.decode_packet(&mut block, &bytes, 1, &mut ctx).unwrap();
+        assert_eq!(seq.next_pass(), Pass::Sp);
+        assert_eq!(seq.current_bitplane(), 7);
+        // Three more passes: SP, MR, cleanup on bit-plane 7.
+        // We use a fresh decoder (the common "termination at end of
+        // every code-block only" case across packets is the *same*
+        // decoder, but here we just want to exercise the state machine).
+        let _ = seq.decode_packet(&mut block, &bytes, 3, &mut ctx).unwrap();
+        assert_eq!(seq.next_pass(), Pass::Sp);
+        assert_eq!(seq.current_bitplane(), 6);
+        assert_eq!(seq.passes_decoded(), 4);
+    }
+
+    #[test]
+    fn sequencer_zero_passes_is_noop() {
+        // CodeBlockContribution::included = false → coding_passes = 0,
+        // so a sequencer call with `passes == 0` must not advance state
+        // or open the byte slice.
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 2, 2);
+        let mut ctx = reset_contexts();
+        let mut seq = BitPlaneSequencer::new(5);
+        let n = seq.decode_packet(&mut block, &[], 0, &mut ctx).unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(seq.next_pass(), Pass::Cleanup);
+        assert_eq!(seq.current_bitplane(), 5);
+        assert_eq!(seq.passes_decoded(), 0);
+    }
+
+    #[test]
+    fn sequencer_multiple_packets_resume_state() {
+        // A code-block split across two packets: first packet
+        // contributes 2 passes (cleanup + SP on the next plane),
+        // second packet contributes 2 more (MR + cleanup completing
+        // that plane). The sequencer state must carry across calls.
+        let bytes_a = [0xB7u8, 0x29, 0xEE, 0x4C];
+        let bytes_b = [0x55u8, 0xAA, 0xC3, 0x91];
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 4, 4);
+        let mut ctx = reset_contexts();
+        let mut seq = BitPlaneSequencer::new(6);
+        let _ = seq
+            .decode_packet(&mut block, &bytes_a, 2, &mut ctx)
+            .unwrap();
+        // After cleanup + SP: still on bit-plane 5, next pass MR.
+        assert_eq!(seq.next_pass(), Pass::Mr);
+        assert_eq!(seq.current_bitplane(), 5);
+        assert_eq!(seq.passes_decoded(), 2);
+
+        let _ = seq
+            .decode_packet(&mut block, &bytes_b, 2, &mut ctx)
+            .unwrap();
+        // After MR + cleanup: bit-plane drops to 4, next pass SP.
+        assert_eq!(seq.next_pass(), Pass::Sp);
+        assert_eq!(seq.current_bitplane(), 4);
+        assert_eq!(seq.passes_decoded(), 4);
+    }
+
+    #[test]
+    fn sequencer_first_packet_matches_standalone_cleanup_call() {
+        // The sequencer's first call (cleanup-only on the starting
+        // bit-plane) must be byte-for-byte equivalent to a direct
+        // `CodeBlock::cleanup_pass` invocation.
+        let bytes = [0xB7u8, 0x29, 0xEE, 0x4C, 0x81, 0x6A];
+        let bp = 5;
+
+        // Subject: drive via the sequencer.
+        let mut subject = CodeBlock::new(SubBandOrientation::LL, 4, 4);
+        let mut subject_ctx = reset_contexts();
+        let mut seq = BitPlaneSequencer::new(bp);
+        let subject_n = seq
+            .decode_packet(&mut subject, &bytes, 1, &mut subject_ctx)
+            .unwrap();
+
+        // Oracle: call `cleanup_pass` directly.
+        let mut oracle = CodeBlock::new(SubBandOrientation::LL, 4, 4);
+        let mut oracle_dec = MqDecoder::new(&bytes);
+        let mut oracle_ctx = reset_contexts();
+        let oracle_n = oracle
+            .cleanup_pass(bp, &mut oracle_dec, &mut oracle_ctx)
+            .unwrap();
+
+        assert_eq!(subject_n, oracle_n);
+        // The two code-blocks must end in identical coefficient state.
+        for v in 0..4 {
+            for u in 0..4 {
+                assert_eq!(
+                    subject.coefficient(u, v),
+                    oracle.coefficient(u, v),
+                    "({u},{v}) must match the standalone cleanup oracle"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sequencer_full_bitplane_sp_mr_cleanup_matches_manual_calls() {
+        // Drive the second bit-plane (post-startup) via the sequencer
+        // and via three direct pass calls; assert the coefficient
+        // state matches.
+        let bytes_first = [0xAAu8, 0x55, 0x73, 0x1F];
+        let bytes_second = [0xC3u8, 0x5A, 0x96, 0x7E, 0x21, 0xBD];
+        let bp_first = 6;
+
+        // Subject: sequencer drives the first cleanup-only pass on the
+        // first call, then the next three passes via a single
+        // `decode_packet(..., 3, ...)`.
+        let mut subject = CodeBlock::new(SubBandOrientation::LL, 4, 4);
+        let mut subject_ctx = reset_contexts();
+        let mut seq = BitPlaneSequencer::new(bp_first);
+        seq.decode_packet(&mut subject, &bytes_first, 1, &mut subject_ctx)
+            .unwrap();
+        seq.decode_packet(&mut subject, &bytes_second, 3, &mut subject_ctx)
+            .unwrap();
+        assert_eq!(seq.current_bitplane(), bp_first - 2);
+        assert_eq!(seq.next_pass(), Pass::Sp);
+        assert_eq!(seq.passes_decoded(), 4);
+
+        // Oracle: three direct calls in §D.3 order, fresh decoders for
+        // each "packet" (one for the cleanup-only first packet, one
+        // shared across SP/MR/cleanup of the second).
+        let mut oracle = CodeBlock::new(SubBandOrientation::LL, 4, 4);
+        let mut oracle_ctx = reset_contexts();
+        {
+            let mut dec = MqDecoder::new(&bytes_first);
+            oracle
+                .cleanup_pass(bp_first, &mut dec, &mut oracle_ctx)
+                .unwrap();
+        }
+        {
+            let mut dec = MqDecoder::new(&bytes_second);
+            let bp2 = bp_first - 1;
+            oracle
+                .significance_propagation_pass(bp2, &mut dec, &mut oracle_ctx)
+                .unwrap();
+            oracle
+                .magnitude_refinement_pass(bp2, &mut dec, &mut oracle_ctx)
+                .unwrap();
+            oracle.cleanup_pass(bp2, &mut dec, &mut oracle_ctx).unwrap();
+        }
+
+        for v in 0..4 {
+            for u in 0..4 {
+                assert_eq!(
+                    subject.coefficient(u, v),
+                    oracle.coefficient(u, v),
+                    "({u},{v}) sequencer / manual disagreement"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sequencer_decode_passes_runs_against_supplied_decoder() {
+        // The lower-level `decode_passes` entry point takes a caller-
+        // owned `MqDecoder`, the right shape when COD bit-4
+        // "termination on each pass" requires one decoder per pass.
+        let bytes = [0x42u8, 0x91, 0x6A, 0x0D];
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 4, 4);
+        let mut ctx = reset_contexts();
+        let mut seq = BitPlaneSequencer::new(7);
+        let mut dec = MqDecoder::new(&bytes);
+        let _ = seq
+            .decode_passes(&mut block, &mut dec, &mut ctx, 1)
+            .unwrap();
+        assert_eq!(seq.next_pass(), Pass::Sp);
+        assert_eq!(seq.current_bitplane(), 6);
+    }
+
+    #[test]
+    fn sequencer_runs_n_passes_in_one_call() {
+        // Driving N passes in one call must produce the same end state
+        // as N single-pass calls — the §D.3 state-machine transitions
+        // are independent of the call boundary.
+        let bytes = [0xB7u8, 0x29, 0xEE, 0x4C, 0x81, 0x6A, 0xD3, 0x55];
+        let bp = 5;
+
+        // Subject: one decode_passes call with N=4.
+        let mut subject = CodeBlock::new(SubBandOrientation::LL, 4, 4);
+        let mut subject_ctx = reset_contexts();
+        let mut subject_seq = BitPlaneSequencer::new(bp);
+        let mut subject_dec = MqDecoder::new(&bytes);
+        let _ = subject_seq
+            .decode_passes(&mut subject, &mut subject_dec, &mut subject_ctx, 4)
+            .unwrap();
+
+        // Oracle: four single-pass calls on the same decoder.
+        let mut oracle = CodeBlock::new(SubBandOrientation::LL, 4, 4);
+        let mut oracle_ctx = reset_contexts();
+        let mut oracle_seq = BitPlaneSequencer::new(bp);
+        let mut oracle_dec = MqDecoder::new(&bytes);
+        for _ in 0..4 {
+            let _ = oracle_seq
+                .decode_passes(&mut oracle, &mut oracle_dec, &mut oracle_ctx, 1)
+                .unwrap();
+        }
+
+        assert_eq!(subject_seq.next_pass(), oracle_seq.next_pass());
+        assert_eq!(
+            subject_seq.current_bitplane(),
+            oracle_seq.current_bitplane()
+        );
+        for v in 0..4 {
+            for u in 0..4 {
+                assert_eq!(subject.coefficient(u, v), oracle.coefficient(u, v));
+            }
+        }
+    }
+
+    #[test]
+    fn sequencer_bitplane_zero_saturates() {
+        // Driving cleanup on bit-plane 0 must not panic. §D.3 does not
+        // specify behaviour past bit-plane 0 (the LSB) — the spec relies
+        // on the caller stopping (the packet's pass count is bounded).
+        // The sequencer protects itself with a saturating decrement so
+        // a buggy caller still gets defined behaviour.
+        let bytes = [0x00u8, 0x00, 0x00, 0x00];
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 2, 2);
+        let mut ctx = reset_contexts();
+        let mut seq = BitPlaneSequencer::new(0);
+        let _ = seq.decode_packet(&mut block, &bytes, 1, &mut ctx).unwrap();
+        // current_bitplane saturates at 0; next pass is SP per §D.3.
+        assert_eq!(seq.current_bitplane(), 0);
+        assert_eq!(seq.next_pass(), Pass::Sp);
     }
 }

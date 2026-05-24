@@ -3,14 +3,16 @@
 Pure-Rust JPEG 2000 (J2K + JP2) and High-Throughput JPEG 2000 (HTJ2K)
 codec.
 
-## Status — 2026-05-24 (clean-room round 118)
+## Status — 2026-05-25 (clean-room round 122)
 
 **Codestream-structural + JP2-wrapper + tier-2 packet-header reader +
 SIZ-derived tile geometry + resolution-level / sub-band geometry +
 precinct / code-block partition + precinct → code-block enumeration +
 tier-1 MQ arithmetic decoder + all three tier-1 Annex D coding passes
 (significance-propagation + sign, magnitude-refinement, and cleanup with
-the run-length / UNIFORM four-zero-column shortcut).**
+the run-length / UNIFORM four-zero-column shortcut) + **bit-plane
+sequencer** chaining the §D.3 three-pass order across a code-block from
+the packet reader's per-packet pass counts.**
 The crate parses the JPEG 2000 Part-1 **main header** (`SOC`, `SIZ`,
 `COD`, `QCD`), walks the **tile-part chain** (`SOT` / `SOD` / `EOC`),
 decodes the **JP2 ISO BMFF box wrapper** (Annex I), reads the
@@ -277,14 +279,28 @@ index 3, UNIFORM label 18 → index 46, all others index 0) now drives
 (`9..=13`), refinement (`14..=16`), run-length (`17`), and UNIFORM
 (`18`).
 
+`t1::BitPlaneSequencer` chains the three passes per code-block in the
+§D.3 order across the packet reader's per-packet pass counts. Its state
+is per code-block, not per packet: a code-block carried in multiple
+packets across layers resumes exactly where the previous packet left it.
+`BitPlaneSequencer::new(starting_bitplane)` arms the sequencer with the
+first non-empty bit-plane (`Mb − 1 − P` per §B.10.5: `Mb` from the QCD /
+QCC quantisation marker, `P` from the packet header's zero-bit-plane
+tag tree); per §D.3 the first pass is cleanup only, after which each
+subsequent bit-plane runs significance propagation (`Pass::Sp`) → 
+magnitude refinement (`Pass::Mr`) → cleanup (`Pass::Cleanup`), then
+drops one bit-plane and starts over with significance propagation.
+`BitPlaneSequencer::decode_packet(block, bytes, passes, ctx)` builds a
+fresh [`MqDecoder`] over the packet's single codeword segment for this
+code-block and drives exactly `passes` passes (`coding_passes` from the
+contribution); `passes = 0` is a valid no-op (the contribution was not
+included in the packet). `BitPlaneSequencer::decode_passes` is the
+lower-level entry point that takes a caller-owned [`MqDecoder`], the
+right shape when COD bit-4 "termination on each pass" requires one
+decoder per pass.
+
 What is **not** implemented yet:
 
-* The bit-plane **sequencer** that drives the §D.3 three-pass order
-  (cleanup-only first bit-plane, then SP → MR → cleanup) across a whole
-  code-block from the packet reader's per-code-block byte ranges. The
-  three passes are individually callable and self-consistent; chaining
-  them per code-block (and feeding the MQ decoder the right byte segment)
-  is the next step.
 * The §D.4.2 / §D.5 / §D.6 termination / error-resilience segmentation
   symbol / selective arithmetic-coding bypass (raw bit) modes, and §D.7
   vertically causal context formation (a COD `Scod` bit-3 mode).

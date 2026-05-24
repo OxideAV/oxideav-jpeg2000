@@ -73,10 +73,20 @@
 //! shortcut where eligible and the Table D.1 significance contexts
 //! otherwise. All three Annex D coding passes are now in place.
 //!
-//! Full codestream-body decoding (the per-code-block three-pass
-//! sequencer, wavelet inverse transform, dequantisation, MCT) and any
-//! encoder path are **not** implemented yet — [`decode_jpeg2000`] and
-//! [`encode_jpeg2000`] both return [`Error::NotImplemented`].
+//! [`t1::BitPlaneSequencer`] chains those three passes across a code-block
+//! per the §D.3 three-pass order (cleanup-only on the first non-empty
+//! bit-plane, then SP → MR → cleanup on each subsequent bit-plane from
+//! MSB toward LSB). Its `decode_packet(block, bytes, passes, ctx)`
+//! consumes one packet's worth of pass-count + codeword-segment bytes
+//! straight from a [`packet::CodeBlockContribution`]; its
+//! `decode_passes(block, decoder, ctx, n)` is the lower-level entry
+//! point for the "termination on each pass" case where each pass owns
+//! its own codeword segment.
+//!
+//! Full codestream-body decoding (wavelet inverse transform,
+//! dequantisation, MCT) and any encoder path are **not** implemented yet
+//! — [`decode_jpeg2000`] and [`encode_jpeg2000`] both return
+//! [`Error::NotImplemented`].
 //!
 //! ## Clean-room provenance
 //!

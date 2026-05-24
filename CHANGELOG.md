@@ -4,6 +4,99 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+* **Clean-room round 122 (2026-05-25).** Tier-1 **bit-plane sequencer**
+  (T.800 §D.3) that chains the three Annex D coding passes across a
+  code-block from the packet reader's per-packet pass counts. New types
+  in the `t1` submodule:
+
+  - `t1::Pass` — the three §D.3 passes (`Sp` / `Mr` / `Cleanup`),
+    exposed so callers (and tests) can introspect the sequencer's
+    next-pass state without reproducing the §D.3 control flow
+    themselves.
+  - `t1::BitPlaneSequencer` — per-code-block state machine that drives
+    the §D.3 three-pass order. Constructed with
+    `BitPlaneSequencer::new(starting_bitplane)` where
+    `starting_bitplane` is the first non-empty bit-plane index
+    (`Mb − 1 − P` per §B.10.5: `Mb` from the QCD / QCC quantisation
+    marker, `P` from the §B.10.5 zero-bit-plane tag tree carried by
+    the packet header). Per §D.3 the initial pass is **cleanup only**;
+    after that, each subsequent bit-plane runs significance propagation
+    → magnitude refinement → cleanup, then drops one bit-plane and
+    starts over with significance propagation.
+  - `BitPlaneSequencer::decode_packet(block, bytes, passes, ctx)` —
+    the high-level entry point. Builds a fresh [`MqDecoder`] over the
+    single codeword segment the packet header reserved for this
+    code-block (`CodeBlockContribution::segment_lengths[0]` bytes) and
+    drives exactly `passes` Annex D passes
+    (`CodeBlockContribution::coding_passes`). `passes = 0` is a valid
+    no-op (the contribution's `included` was false and no body bytes
+    were drawn). State is **per code-block**, not per packet: a
+    multi-packet code-block resumes from the prior call's
+    `(current_bitplane, next_pass)`.
+  - `BitPlaneSequencer::decode_passes(block, decoder, ctx, passes)` —
+    lower-level entry point that takes a caller-owned [`MqDecoder`],
+    the right shape when COD bit-4 "termination on each pass" requires
+    one decoder per pass (each pass gets its own codeword segment per
+    Tables D.8 / D.9).
+  - Accessors `next_pass()` / `current_bitplane()` / `passes_decoded()`
+    surface the sequencer state for higher layers (e.g. the future
+    progression-order driver decides whether to keep advancing a
+    code-block based on its `passes_decoded` vs the per-layer
+    coding-pass total).
+
+  The MQ decoder's §C.3.4 / §D.4.1 `0xFF`-fill end-of-stream behaviour
+  means the sequencer does **not** track a per-pass byte budget — the
+  byte budget is the packet's responsibility (every pass's
+  in-progress symbols are decoded against the synthesised `0xFF` fill
+  past the signalled byte count). The sequencer also does not yet
+  implement §D.4.2 / §D.5 / §D.6 termination, segmentation symbol, or
+  raw-bit bypass — `decode_passes` runs every pass against the same
+  caller-supplied decoder.
+
+  Ten new unit tests: a fresh sequencer reports `Pass::Cleanup` at
+  `current_bitplane()`; a single-pass call advances bit-plane K → K−1
+  with the next pass = `Pass::Sp`; a three-pass call after the initial
+  cleanup completes the bit-plane and returns to `Pass::Sp` on K−1; a
+  `passes = 0` call is a noop on every accessor; a multi-packet
+  scenario (2 + 2 passes across two `decode_packet` calls) preserves
+  state across the boundary; the first cleanup-only call produces
+  byte-for-byte identical coefficient state to a direct
+  `cleanup_pass()` call; a four-pass run (cleanup-only first + SP / MR
+  / cleanup) matches a manual three-direct-calls oracle on coefficient
+  state; the lower-level `decode_passes` runs against the caller's
+  `MqDecoder` correctly; running N passes in one call equals N
+  single-pass calls on the same decoder (state-machine independence
+  from the call boundary); and a saturating bit-plane-0 corner so a
+  buggy caller still gets defined behaviour. 179 tests total pass
+  (169 prior + 10 new); cargo fmt-check + clippy `-D warnings` clean
+  (both default + `--no-default-features` builds). No new `Error`
+  variants — the sequencer reuses the existing `Result<usize, Error>`
+  shape of the per-pass methods.
+
+  Built solely against `docs/image/jpeg2000/T-REC-T.800-201906-S.pdf`
+  Annex D (§D.3 — the three-pass order: cleanup-only on the first
+  non-empty bit-plane, then SP → MR → cleanup on each subsequent
+  bit-plane from MSB toward LSB; §D.4.1 — the decoder extends the
+  input bit stream with `0xFF` bytes as needed so each pass can
+  decode its residual symbols past the signalled byte count, the
+  basis for "the sequencer does not track a per-pass byte budget")
+  and Annex B (§B.10.5 — the `Mb − 1 − P` starting bit-plane from
+  the zero-bit-plane tag tree; §B.10.6 — the §B.10.6 / Table B.4
+  Huffman that produces the per-packet pass count `coding_passes` the
+  sequencer consumes). No external library source — OpenJPEG, OpenJPH,
+  Kakadu, Grok, FFmpeg, libavcodec, jpeg2000-rs, etc. — was consulted,
+  quoted, paraphrased, or used as a cross-check oracle. No WebSearch
+  / WebFetch was used for any reason.
+
+  The next tier-1 rounds: §D.4.2 predictable-termination + §D.5
+  segmentation-symbol + §D.6 selective arithmetic-coding bypass (raw
+  bit mode); §B.12 progression-order packet iteration (LRCP / RLCP /
+  RPCL / PCRL / CPRL); and the §F inverse 9/7 / 5-3 wavelet transform
+  that consumes the sequencer's reconstructed code-block magnitudes
+  through §E dequantisation.
+
 ## [0.0.11](https://github.com/OxideAV/oxideav-jpeg2000/compare/v0.0.10...v0.0.11) - 2026-05-24
 
 ### Other
