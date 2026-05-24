@@ -6,6 +6,89 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 125 (2026-05-25).** Tier-2 **§B.12.1.1 LRCP
+  progression-order packet iterator** in a new `progression` submodule
+  — the structural bridge between the §B.6 / §B.7 / §B.9 precinct +
+  code-block enumeration of round 9 and the §B.10 per-precinct
+  packet-header reader of round 5. New types:
+
+  - `progression::PacketDescriptor { layer, resolution, component,
+    precinct }` — one descriptor per packet in codestream order, with
+    `precinct` matching the raster index handed to
+    `geometry::derive_precinct_code_blocks` and bounded by
+    `geometry::PrecinctPartition::num_precincts()`.
+  - `progression::ComponentProgressionInfo {
+    num_decomposition_levels, precincts_per_resolution }` — per-component
+    input describing `NL_i` from the component's `COD` / `COC` marker and
+    `numprecincts(r, i)` for `r = 0..=NL_i`. `precincts_per_resolution`
+    is indexed by `r`; its length must equal `NL_i + 1` (`validate()`
+    enforces this and returns `Error::InvalidPacketHeader` otherwise).
+    Accessors `max_resolution()` and `precincts_at(r)` surface the
+    component's resolution range; `precincts_at(r)` returns 0 for
+    `r > NL_i` (the §B.12 NOTE rule).
+  - `progression::lrcp_packet_order(layers, components) -> Result<
+    Vec<PacketDescriptor>, Error>` — drives the verbatim §B.12.1.1
+    four-nested loop:
+
+    ```text
+    for each l = 0..L
+      for each r = 0..=Nmax       Nmax = max_i(NL_i)
+        for each i = 0..Csiz
+          for each k = 0..numprecincts(r, i)
+            emit (l, r, i, k)
+    ```
+
+    Components with `NL_i < r` contribute no packet at that `r` per
+    the §B.12 NOTE on synchronising resolution-level indices across
+    components with different decomposition depth. Empty precincts
+    (zero code-blocks) still produce one packet each per §B.6 / §B.9.
+    Defensive: empty `components` slice → `Error::InvalidComponentCount`
+    (T.800 Table A.9 constrains `Csiz` to `1..=16384`); `layers = 0` is
+    a valid empty progression (the `POC` start/end pair can carve a
+    sub-range out of a higher `L`).
+
+  Sixteen new unit tests: the minimal `(L = 1, Csiz = 1, NL = 0)`
+  single-packet case; resolution-level order within one layer
+  (`r = 0, 1, 2`); layers-outermost ordering across two layers; the
+  component-interleave within one resolution level; raster precinct
+  order within one `(l, r, i)`; a full nested `(2 × 2 × 2 × 2)` order
+  matched against a hand-built reference sequence; the §B.12 NOTE
+  worked example transcribed verbatim (two components with 7 + 3
+  resolution levels — both interleave at `r = 0..=2`, only component 0
+  at `r = 3..=6`); the zero-precinct resolution-level corner; the
+  `layers = 0` empty corner; the empty-components rejection
+  (`Error::InvalidComponentCount`); the per-component length-mismatch
+  rejection (`Error::InvalidPacketHeader`); the `precincts_at(r)`
+  past-top-resolution returning zero; the `max_resolution()`
+  echo-NL check; a single-component LRCP ordering sanity check
+  (lexicographic `(layer, resolution, precinct)`); and a capacity-hint
+  match check (the `estimate_packet_count` upper bound equals the actual
+  output length for non-degenerate inputs). 195 tests total pass (179
+  prior + 16 new); cargo fmt-check + clippy `-D warnings` clean (both
+  default + `--no-default-features` builds). No new `Error` variants
+  beyond the two `InvalidComponentCount` and `InvalidPacketHeader`
+  reuses.
+
+  Built solely against `docs/image/jpeg2000/T-REC-T.800-201906-S.pdf`
+  §B.12 (§B.12.1.1 the LRCP four-nested `for l for r for i for k`
+  loop body, with `L` from the `COD` `SGcod` layers field and `Nmax`
+  the maximum `NL` over all components; the §B.12 NOTE on
+  synchronising the resolution-level index across components with
+  different decomposition depth; §B.6 / §B.9 on empty precincts still
+  producing packets so they remain counted in the driver's
+  `precincts_per_resolution`). No external library source — OpenJPEG,
+  OpenJPH, Kakadu, Grok, FFmpeg, libavcodec, jpeg2000-rs, etc. — was
+  consulted, quoted, paraphrased, or used as a cross-check oracle. No
+  WebSearch / WebFetch was used for any reason.
+
+  The next tier-2 rounds: the remaining four progression orders
+  (RLCP / RPCL / PCRL / CPRL) share the §B.12.1.3 / Equation B-20
+  position-iteration machinery and land separately; §B.8 layer
+  formation + §B.9 packet assembly that drives the per-precinct
+  `PrecinctState` against the emitted descriptor sequence; §F.4.4
+  inverse 9/7 + §F.4.3 inverse 5-3 wavelet; §E.1 / §E.2 dequantisation;
+  Annex G MCT.
+
 * **Clean-room round 122 (2026-05-25).** Tier-1 **bit-plane sequencer**
   (T.800 §D.3) that chains the three Annex D coding passes across a
   code-block from the packet reader's per-packet pass counts. New types

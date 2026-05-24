@@ -83,6 +83,14 @@
 //! point for the "termination on each pass" case where each pass owns
 //! its own codeword segment.
 //!
+//! The [`progression`] submodule enumerates one tile's packets in the
+//! **§B.12.1.1 LRCP** order — `for each l for each r for each i for
+//! each k` — given the per-component `(NL_i, numprecincts(r, i))`
+//! input. [`progression::lrcp_packet_order`] returns the typed
+//! [`progression::PacketDescriptor`] sequence the §B.10 packet reader
+//! consumes. The other four §B.12 progression orders (RLCP / RPCL /
+//! PCRL / CPRL) land in later rounds.
+//!
 //! Full codestream-body decoding (wavelet inverse transform,
 //! dequantisation, MCT) and any encoder path are **not** implemented yet
 //! — [`decode_jpeg2000`] and [`encode_jpeg2000`] both return
@@ -111,6 +119,7 @@ pub mod geometry;
 pub mod jp2;
 pub mod mq;
 pub mod packet;
+pub mod progression;
 pub mod t1;
 
 #[cfg(feature = "registry")]

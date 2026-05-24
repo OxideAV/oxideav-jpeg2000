@@ -3,16 +3,18 @@
 Pure-Rust JPEG 2000 (J2K + JP2) and High-Throughput JPEG 2000 (HTJ2K)
 codec.
 
-## Status — 2026-05-25 (clean-room round 122)
+## Status — 2026-05-25 (clean-room round 125)
 
 **Codestream-structural + JP2-wrapper + tier-2 packet-header reader +
 SIZ-derived tile geometry + resolution-level / sub-band geometry +
 precinct / code-block partition + precinct → code-block enumeration +
 tier-1 MQ arithmetic decoder + all three tier-1 Annex D coding passes
 (significance-propagation + sign, magnitude-refinement, and cleanup with
-the run-length / UNIFORM four-zero-column shortcut) + **bit-plane
-sequencer** chaining the §D.3 three-pass order across a code-block from
-the packet reader's per-packet pass counts.**
+the run-length / UNIFORM four-zero-column shortcut) + bit-plane
+sequencer chaining the §D.3 three-pass order across a code-block from
+the packet reader's per-packet pass counts + **§B.12.1.1 LRCP
+progression-order packet iterator** enumerating one tile's
+`(layer, resolution, component, precinct)` packet sequence.**
 The crate parses the JPEG 2000 Part-1 **main header** (`SOC`, `SIZ`,
 `COD`, `QCD`), walks the **tile-part chain** (`SOT` / `SOD` / `EOC`),
 decodes the **JP2 ISO BMFF box wrapper** (Annex I), reads the
@@ -279,6 +281,29 @@ index 3, UNIFORM label 18 → index 46, all others index 0) now drives
 (`9..=13`), refinement (`14..=16`), run-length (`17`), and UNIFORM
 (`18`).
 
+`progression::lrcp_packet_order(layers, components)` enumerates one
+tile's packets in **layer-resolution level-component-position** (LRCP)
+progression order per T.800 §B.12.1.1. It returns a
+`Vec<PacketDescriptor>` listing `(layer, resolution, component,
+precinct)` tuples in the exact four-nested order the spec specifies:
+`for each l in 0..L for each r in 0..=Nmax for each i in 0..Csiz for
+each k in 0..numprecincts(r, i)`, with `Nmax = max_i(NL_i)`. A
+component `i` with `NL_i < r` contributes no packet at `r` per the §B.12
+NOTE on synchronising the resolution-level index across components with
+different decomposition depth. Empty precincts (zero code-blocks) still
+produce one packet each per §B.6 / §B.9 — their packet bodies are empty
+but their packet headers must be written. The driver takes the
+*results* of the upstream §B.6 partition computation (one
+`ComponentProgressionInfo { num_decomposition_levels,
+precincts_per_resolution }` per component, where
+`precincts_per_resolution.len() == NL + 1`) so it stays decoupled from
+the COD / COC / SIZ marker parsing path; downstream callers can then
+drive `packet::decode_packet_header` against the emitted descriptor
+sequence with `PrecinctState` keyed by `(component, resolution,
+precinct)`. The four remaining progression orders (RLCP, RPCL, PCRL,
+CPRL) share the position-iteration machinery of §B.12.1.3 / Equation
+B-20 and land in later rounds.
+
 `t1::BitPlaneSequencer` chains the three passes per code-block in the
 §D.3 order across the packet reader's per-packet pass counts. Its state
 is per code-block, not per packet: a code-block carried in multiple
@@ -306,12 +331,12 @@ What is **not** implemented yet:
   vertically causal context formation (a COD `Scod` bit-3 mode).
 * The MQ **encoder** (§C.2 — INITENC / ENCODE / RENORME / BYTEOUT /
   FLUSH) and the §D.6 selective arithmetic-coding bypass (raw bit mode).
-* §B.12 progression-order packet iteration (Equation B-20 / B-21) +
-  §B.8 layer / §B.9 packet assembly. Round 9 closes the precinct →
-  code-block **enumeration** (the bridge from the §B.6 / §B.7 counts to
-  the round-5 `packet` reader's `PacketGeometry`); a later round will
-  drive the packet-precinct sequence for each of the five progression
-  orders across the enumerated precincts.
+* §B.12 progression-order packet iteration for **RLCP / RPCL / PCRL /
+  CPRL** (Equation B-20 / B-21). Round 125 lands **LRCP** (§B.12.1.1)
+  — the most common order, default for `Ppoc = 0x00`; the other four
+  share the position-iteration machinery of §B.12.1.3 / Equation B-20
+  and land in later rounds. §B.8 layer / §B.9 packet assembly is also
+  pending.
 * §B.10.7.2 multi-codeword-segment splitting (round 5 emits one
   segment length per included code-block; termination boundaries are
   a tier-1 input we don't have yet).
@@ -435,6 +460,12 @@ consulted:
   (the decoder extends the input bit stream with `0xFF` bytes until all
   symbols are decoded — the basis for the `mq` BYTEIN end-of-stream
   fill).
+* T.800 §B.12 (Progression order) — §B.12.1.1 (the LRCP four-nested
+  `for l for r for i for k` loop body and the `Nmax = max_i(NL_i)`
+  definition); the §B.12 NOTE (components with `NL_i < r` contribute no
+  packet at that `r` — resolution-level indices synchronise at `r = 0`);
+  §B.6 / §B.9 (empty precincts still produce packets so they remain in
+  the precinct count handed to the driver).
 
 No external library source — OpenJPEG, OpenJPH, Kakadu, FFmpeg, etc.
 — was consulted, quoted, paraphrased, or used as a cross-check
