@@ -4,6 +4,24 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ## [Unreleased]
 
+## [0.0.11](https://github.com/OxideAV/oxideav-jpeg2000/compare/v0.0.10...v0.0.11) - 2026-05-24
+
+### Other
+
+- implement §D.3.3 magnitude refinement pass (Table D.4)
+- Annex D significance-propagation coding pass (§D.3.1 + §D.3.2)
+- tier-1 MQ arithmetic decoder (T.800 Annex C §C.3)
+- precinct → code-block enumeration (T.800 §B.7 / §B.9)
+- §B.6 precinct + §B.7 code-block partition (Eq B-16/B-17/B-18)
+- round 7: per-resolution-level + per-sub-band geometry (T.800 §B.5 / Eq B-14 / Eq B-15 / Table B.1)
+- round 6: SIZ-derived per-tile + per-component geometry (T.800 §B.3 / §B.5)
+- round 5: tier-2 packet-header reading primitives (T.800 §B.10)
+- round 4: JP2 ISO BMFF box wrapper parser (T.800 Annex I)
+- round 3: typed COC/QCC/POC/RGN/PLT/PPT tile-part markers
+- round 2: SOT/SOD tile-part walker
+- round 1: clean-room main-header parser (SOC/SIZ/COD/QCD)
+- orphan rebuild: clean-room scaffold post 2026-05-20 audit
+
 ### Added
 
 * **Clean-room round 115 (2026-05-24).** Second Annex D Tier-1 coding
