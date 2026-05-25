@@ -16,11 +16,18 @@
 //! | PCRL  | §B.12.1.4 | position (y, x) → component → resolution → layer |
 //! | CPRL  | §B.12.1.5 | component → position (y, x) → resolution → layer |
 //!
-//! This module implements **LRCP** — the most common of the five and the
-//! default order signalled by `Ppoc = 0x00` (T.800 Table A.16). The other
-//! four orders share the position-iteration machinery of §B.12.1.3 /
-//! Equation B-20 (the precinct-step over `(x, y)` walked under the
-//! reference-grid divisibility conditions) and land in later rounds.
+//! This module implements **LRCP** and **RLCP** — the two progression
+//! orders that share the precinct-by-raster-index loop body and differ
+//! only in the relative order of the outer two loops. LRCP is the
+//! default order (signalled by `Ppoc = 0x00` per T.800 Table A.16) and
+//! the most common in practice; RLCP swaps `r` and `l` so the codestream
+//! is organised resolution-first (useful when low-resolution previews of
+//! every layer are wanted before any layer of any higher resolution).
+//! The remaining three orders (RPCL / PCRL / CPRL) replace the per-
+//! precinct raster index with the position-iteration machinery of
+//! §B.12.1.3 / Equation B-20 (the precinct-step over `(x, y)` walked
+//! under the reference-grid divisibility conditions) and land in later
+//! rounds.
 //!
 //! ## LRCP loop body
 //!
@@ -64,13 +71,14 @@
 //! ## Clean-room provenance
 //!
 //! Built solely against `docs/image/jpeg2000/T-REC-T.800-201906-S.pdf`
-//! §B.12 (specifically §B.12.1.1 — the four-nested `for` loop and the
-//! `Nmax` definition; the §B.12 NOTE on synchronising the resolution-level
-//! index across components with different NL; §B.6 / §B.9 on empty
-//! precincts still producing packets). No external library source —
-//! OpenJPEG, OpenJPH, Kakadu, Grok, FFmpeg, libavcodec, jpeg2000-rs, etc.
-//! — was consulted, quoted, paraphrased, or used as a cross-check oracle.
-//! No WebSearch / WebFetch was used for any reason.
+//! §B.12 (specifically §B.12.1.1 + §B.12.1.2 — the two four-nested `for`
+//! loops differing only by the outer two indices being swapped — and
+//! the `Nmax = max_i(NL_i)` definition; the §B.12 NOTE on synchronising
+//! the resolution-level index across components with different NL;
+//! §B.6 / §B.9 on empty precincts still producing packets). No external
+//! library source — OpenJPEG, OpenJPH, Kakadu, Grok, FFmpeg, libavcodec,
+//! jpeg2000-rs, etc. — was consulted, quoted, paraphrased, or used as a
+//! cross-check oracle. No WebSearch / WebFetch was used for any reason.
 
 use crate::Error;
 
@@ -267,7 +275,105 @@ pub fn lrcp_packet_order(
     Ok(out)
 }
 
-/// Saturating estimate of total packet count for the LRCP loop:
+// ---------------------------------------------------------------------------
+// RLCP iterator — T.800 §B.12.1.2.
+// ---------------------------------------------------------------------------
+
+/// Enumerate one tile's packets in **resolution level-layer-component-
+/// position** (RLCP) progression order per T.800 §B.12.1.2.
+///
+/// `layers` is `L` — the number of quality layers signalled by the `COD`
+/// marker (T.800 §A.6.1 / Table A.14). `components` carries one
+/// [`ComponentProgressionInfo`] per component, in `Csiz`-declaration order.
+///
+/// The returned vector lists every packet `(r, l, i, k)` with
+/// `r ∈ 0..=Nmax`, `l ∈ 0..L`, `i ∈ 0..components.len()`,
+/// `k ∈ 0..numprecincts(r, i)`, skipping any `(r, l, i, *)` for which
+/// `r > NL_i` (the §B.12 NOTE rule). `Nmax = max_i(NL_i)`.
+///
+/// # Loop order (verbatim per §B.12.1.2)
+///
+/// ```text
+/// for each r = 0..=Nmax
+///   for each l = 0..L
+///     for each i = 0..Csiz
+///       for each k = 0..numprecincts(r, i)
+/// ```
+///
+/// RLCP differs from [`lrcp_packet_order`] only in the position of the
+/// `r` and `l` loops: LRCP iterates layer-first (every layer's worth of
+/// resolution levels appears together), RLCP iterates resolution-first
+/// (every resolution level's worth of layers appears together). The
+/// inner two loops (`i`, `k`), the `Nmax` definition, the §B.12 NOTE
+/// rule on components with `NL_i < r`, and the §B.6 / §B.9 rule on
+/// empty precincts still producing packets are all identical.
+///
+/// # Errors
+///
+/// * [`Error::InvalidPacketHeader`] if any
+///   [`ComponentProgressionInfo::validate`] check fails (per-component
+///   `precincts_per_resolution` length mismatch).
+/// * [`Error::InvalidComponentCount`] if `components.is_empty()`
+///   (T.800 Table A.9 / §A.5: `Csiz` is constrained to `1..=16384`).
+///
+/// # Empty-corner behaviour
+///
+/// * `layers == 0` — returns an empty `Vec` (the inner `l`-loop runs
+///   `0..0`, so every `r` contributes nothing).
+/// * A component with `NL_i = 0` and `precincts_per_resolution = [0]`
+///   contributes zero packets — its innermost `k`-loop runs `0..0`.
+pub fn rlcp_packet_order(
+    layers: u16,
+    components: &[ComponentProgressionInfo],
+) -> Result<Vec<PacketDescriptor>, Error> {
+    if components.is_empty() {
+        return Err(Error::InvalidComponentCount);
+    }
+    for ci in components {
+        ci.validate()?;
+    }
+    if layers == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Nmax = max NL_i across all components. The r-loop runs 0..=Nmax;
+    // components with NL_i < r contribute nothing at that r.
+    let n_max = components
+        .iter()
+        .map(|c| c.num_decomposition_levels)
+        .max()
+        .unwrap_or(0);
+
+    // Total packet count is invariant under r↔l swap, so the LRCP
+    // estimator gives the correct capacity hint here too.
+    let cap = estimate_packet_count(layers, n_max, components);
+    let mut out = Vec::with_capacity(cap);
+
+    for r in 0..=n_max {
+        for l in 0..layers {
+            for (i, ci) in components.iter().enumerate() {
+                if r > ci.num_decomposition_levels {
+                    continue;
+                }
+                let n_pre = ci.precincts_at(r);
+                for k in 0..n_pre {
+                    out.push(PacketDescriptor {
+                        layer: l,
+                        resolution: r,
+                        component: i as u16,
+                        precinct: k,
+                    });
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Saturating estimate of total packet count for the LRCP / RLCP loop
+/// (the two orders enumerate the same set of `(l, r, i, k)` tuples and
+/// therefore have identical totals — only the order in which they're
+/// emitted differs):
 /// `L * sum_r sum_i numprecincts(r, i)` where the `r`-sum runs over
 /// `0..=NL_i`. Used only as a `Vec::with_capacity` hint.
 fn estimate_packet_count(layers: u16, n_max: u8, components: &[ComponentProgressionInfo]) -> usize {
@@ -610,5 +716,366 @@ mod tests {
             "components past their NL contribute nothing at higher r"
         );
         assert_eq!(r3_plus.len(), 4);
+    }
+
+    // -----------------------------------------------------------------------
+    // RLCP — T.800 §B.12.1.2. r↔l swap vs. LRCP; everything else identical.
+    // -----------------------------------------------------------------------
+
+    /// Single-layer, single-component, NL = 0 (1 resolution level), one
+    /// precinct. RLCP emits exactly that one packet (identical to LRCP
+    /// since the swap is degenerate when L = 1 and Nmax = 0).
+    #[test]
+    fn rlcp_minimal_one_packet() {
+        let comps = vec![ComponentProgressionInfo {
+            num_decomposition_levels: 0,
+            precincts_per_resolution: vec![1],
+        }];
+        let out = rlcp_packet_order(1, &comps).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0],
+            PacketDescriptor {
+                layer: 0,
+                resolution: 0,
+                component: 0,
+                precinct: 0
+            }
+        );
+    }
+
+    /// Resolution is the outermost index per §B.12.1.2. One component,
+    /// NL = 2 (3 resolution levels), 2 layers, one precinct per level →
+    /// emit (r=0,l=0), (r=0,l=1), (r=1,l=0), (r=1,l=1), (r=2,l=0),
+    /// (r=2,l=1).
+    #[test]
+    fn rlcp_resolution_outermost_layers_inner() {
+        let comps = vec![ComponentProgressionInfo {
+            num_decomposition_levels: 2,
+            precincts_per_resolution: vec![1, 1, 1],
+        }];
+        let out = rlcp_packet_order(2, &comps).unwrap();
+        assert_eq!(out.len(), 6);
+        let rl: Vec<(u8, u16)> = out.iter().map(|p| (p.resolution, p.layer)).collect();
+        assert_eq!(rl, vec![(0, 0), (0, 1), (1, 0), (1, 1), (2, 0), (2, 1)]);
+    }
+
+    /// Two layers, one component, one resolution, one precinct → still
+    /// 2 packets, but in l = 0, 1 (within the single r = 0). Same as
+    /// LRCP here because Nmax = 0 collapses the swap.
+    #[test]
+    fn rlcp_layers_inner_within_single_resolution() {
+        let comps = vec![ComponentProgressionInfo {
+            num_decomposition_levels: 0,
+            precincts_per_resolution: vec![1],
+        }];
+        let out = rlcp_packet_order(2, &comps).unwrap();
+        let layers: Vec<u16> = out.iter().map(|p| p.layer).collect();
+        assert_eq!(layers, vec![0, 1]);
+    }
+
+    /// One layer, three components in raster order at the same resolution
+    /// level: components interleave at r = 0 inside the (single) layer
+    /// loop.
+    #[test]
+    fn rlcp_components_interleave_within_layer() {
+        let comps = vec![
+            ComponentProgressionInfo {
+                num_decomposition_levels: 0,
+                precincts_per_resolution: vec![1],
+            },
+            ComponentProgressionInfo {
+                num_decomposition_levels: 0,
+                precincts_per_resolution: vec![1],
+            },
+            ComponentProgressionInfo {
+                num_decomposition_levels: 0,
+                precincts_per_resolution: vec![1],
+            },
+        ];
+        let out = rlcp_packet_order(1, &comps).unwrap();
+        let comps_out: Vec<u16> = out.iter().map(|p| p.component).collect();
+        assert_eq!(comps_out, vec![0, 1, 2]);
+    }
+
+    /// Within one (r, l, i), precincts are emitted in raster order
+    /// (`k = 0, 1, 2, ...`) — same innermost loop as LRCP.
+    #[test]
+    fn rlcp_precincts_in_raster_order_within_component() {
+        let comps = vec![ComponentProgressionInfo {
+            num_decomposition_levels: 0,
+            precincts_per_resolution: vec![4],
+        }];
+        let out = rlcp_packet_order(1, &comps).unwrap();
+        let ks: Vec<u32> = out.iter().map(|p| p.precinct).collect();
+        assert_eq!(ks, vec![0, 1, 2, 3]);
+    }
+
+    /// Full nested order — the spec's verbatim §B.12.1.2 loop body.
+    /// 2 layers × 2 resolutions × 2 components × 2 precincts = 16
+    /// packets, listed resolution → layer → component → precinct.
+    #[test]
+    fn rlcp_full_nested_order_2_2_2_2() {
+        let comps = vec![
+            ComponentProgressionInfo {
+                num_decomposition_levels: 1,
+                precincts_per_resolution: vec![2, 2],
+            },
+            ComponentProgressionInfo {
+                num_decomposition_levels: 1,
+                precincts_per_resolution: vec![2, 2],
+            },
+        ];
+        let out = rlcp_packet_order(2, &comps).unwrap();
+        assert_eq!(out.len(), 16);
+
+        // Hand-build the expected sequence per the §B.12.1.2 nested loop.
+        let mut expected: Vec<PacketDescriptor> = Vec::with_capacity(16);
+        for r in 0u8..=1 {
+            for l in 0u16..2 {
+                for i in 0u16..2 {
+                    for k in 0u32..2 {
+                        expected.push(PacketDescriptor {
+                            layer: l,
+                            resolution: r,
+                            component: i,
+                            precinct: k,
+                        });
+                    }
+                }
+            }
+        }
+        assert_eq!(out, expected);
+    }
+
+    /// §B.12 NOTE: components with different NL synchronise at r = 0
+    /// in RLCP exactly as in LRCP. Two components with NL = 6 and
+    /// NL = 2 respectively. At r = 3..=6 only component 0 contributes.
+    /// Verified across one layer.
+    #[test]
+    fn rlcp_components_with_different_nl_synchronise_at_r0() {
+        let comps = vec![
+            ComponentProgressionInfo {
+                num_decomposition_levels: 6,
+                precincts_per_resolution: vec![1; 7],
+            },
+            ComponentProgressionInfo {
+                num_decomposition_levels: 2,
+                precincts_per_resolution: vec![1; 3],
+            },
+        ];
+        let out = rlcp_packet_order(1, &comps).unwrap();
+        // Total per single layer: 3 r-levels × 2 components + 4 r-levels
+        // × 1 component = 10.
+        assert_eq!(out.len(), 10);
+        let pairs: Vec<(u8, u16)> = out.iter().map(|p| (p.resolution, p.component)).collect();
+        assert_eq!(
+            pairs,
+            vec![
+                (0, 0),
+                (0, 1),
+                (1, 0),
+                (1, 1),
+                (2, 0),
+                (2, 1),
+                (3, 0),
+                (4, 0),
+                (5, 0),
+                (6, 0),
+            ]
+        );
+    }
+
+    /// Empty-precinct corner: a resolution level with `numprecincts = 0`
+    /// emits zero packets at that level but does not skip the rest of
+    /// the r-loop. (§B.6 / §B.9 — identical to the LRCP corner case.)
+    #[test]
+    fn rlcp_zero_precinct_resolution_emits_nothing() {
+        let comps = vec![ComponentProgressionInfo {
+            num_decomposition_levels: 2,
+            precincts_per_resolution: vec![1, 0, 1],
+        }];
+        let out = rlcp_packet_order(1, &comps).unwrap();
+        let rs: Vec<u8> = out.iter().map(|p| p.resolution).collect();
+        assert_eq!(rs, vec![0, 2]);
+    }
+
+    /// `layers = 0` → empty progression (no packets). Inner l-loop runs
+    /// `0..0` for every r, so nothing is emitted.
+    #[test]
+    fn rlcp_zero_layers_emits_no_packets() {
+        let comps = vec![ComponentProgressionInfo {
+            num_decomposition_levels: 0,
+            precincts_per_resolution: vec![1],
+        }];
+        let out = rlcp_packet_order(0, &comps).unwrap();
+        assert!(out.is_empty());
+    }
+
+    /// Empty components vector → `Error::InvalidComponentCount`. Matches
+    /// the LRCP defensive check.
+    #[test]
+    fn rlcp_empty_components_rejected() {
+        let out = rlcp_packet_order(1, &[]);
+        assert!(matches!(out, Err(Error::InvalidComponentCount)));
+    }
+
+    /// `precincts_per_resolution.len() != NL + 1` → `Error::
+    /// InvalidPacketHeader`. Same per-component validation as LRCP.
+    #[test]
+    fn rlcp_per_component_length_mismatch_rejected() {
+        let comps = vec![ComponentProgressionInfo {
+            num_decomposition_levels: 2,
+            precincts_per_resolution: vec![1, 1],
+        }];
+        let out = rlcp_packet_order(1, &comps);
+        assert!(matches!(out, Err(Error::InvalidPacketHeader)));
+    }
+
+    /// LRCP and RLCP enumerate the **same** set of packet descriptors —
+    /// the swap only reorders them. Verify by sorting both outputs and
+    /// comparing.
+    #[test]
+    fn lrcp_and_rlcp_emit_same_multiset() {
+        let comps = vec![
+            ComponentProgressionInfo {
+                num_decomposition_levels: 2,
+                precincts_per_resolution: vec![3, 2, 1],
+            },
+            ComponentProgressionInfo {
+                num_decomposition_levels: 1,
+                precincts_per_resolution: vec![2, 1],
+            },
+        ];
+        let layers = 3;
+        let mut lrcp = lrcp_packet_order(layers, &comps).unwrap();
+        let mut rlcp = rlcp_packet_order(layers, &comps).unwrap();
+        assert_eq!(lrcp.len(), rlcp.len());
+        // Sort by (l, r, c, k) and assert equality.
+        let key = |p: &PacketDescriptor| (p.layer, p.resolution, p.component, p.precinct);
+        lrcp.sort_by_key(key);
+        rlcp.sort_by_key(key);
+        assert_eq!(lrcp, rlcp);
+    }
+
+    /// LRCP and RLCP differ as soon as both L > 1 and Nmax > 0 — the
+    /// outermost descriptor is layer-first vs. resolution-first.
+    /// Confirm the prefix actually differs on a small (L=2, NL=1) input.
+    #[test]
+    fn lrcp_and_rlcp_differ_at_outer_loop() {
+        let comps = vec![ComponentProgressionInfo {
+            num_decomposition_levels: 1,
+            precincts_per_resolution: vec![1, 1],
+        }];
+        let lrcp = lrcp_packet_order(2, &comps).unwrap();
+        let rlcp = rlcp_packet_order(2, &comps).unwrap();
+        // Both have 4 packets total.
+        assert_eq!(lrcp.len(), 4);
+        assert_eq!(rlcp.len(), 4);
+        // LRCP: (l=0,r=0), (l=0,r=1), (l=1,r=0), (l=1,r=1).
+        let lrcp_lr: Vec<(u16, u8)> = lrcp.iter().map(|p| (p.layer, p.resolution)).collect();
+        assert_eq!(lrcp_lr, vec![(0, 0), (0, 1), (1, 0), (1, 1)]);
+        // RLCP: (r=0,l=0), (r=0,l=1), (r=1,l=0), (r=1,l=1).
+        let rlcp_rl: Vec<(u8, u16)> = rlcp.iter().map(|p| (p.resolution, p.layer)).collect();
+        assert_eq!(rlcp_rl, vec![(0, 0), (0, 1), (1, 0), (1, 1)]);
+    }
+
+    /// Single-component RLCP: every emitted descriptor has `component =
+    /// 0` and the sequence sorts lexicographically by `(resolution,
+    /// layer, precinct)`.
+    #[test]
+    fn rlcp_single_component_orders_r_then_l_then_k() {
+        let comps = vec![ComponentProgressionInfo {
+            num_decomposition_levels: 1,
+            precincts_per_resolution: vec![2, 3],
+        }];
+        // r = 0 contributes 2 precincts × 2 layers = 4 packets;
+        // r = 1 contributes 3 precincts × 2 layers = 6 packets; total 10.
+        let out = rlcp_packet_order(2, &comps).unwrap();
+        assert_eq!(out.len(), 10);
+
+        // Per-resolution slice expectations.
+        let r0: Vec<(u16, u32)> = out
+            .iter()
+            .filter(|p| p.resolution == 0)
+            .map(|p| (p.layer, p.precinct))
+            .collect();
+        assert_eq!(
+            r0,
+            vec![(0, 0), (0, 1), (1, 0), (1, 1)],
+            "r=0 emits all layers (and all their precincts) before moving to r=1"
+        );
+        let r1: Vec<(u16, u32)> = out
+            .iter()
+            .filter(|p| p.resolution == 1)
+            .map(|p| (p.layer, p.precinct))
+            .collect();
+        assert_eq!(
+            r1,
+            vec![(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2)],
+            "r=1 emits all layers' worth of its 3 precincts"
+        );
+        assert!(out.iter().all(|p| p.component == 0));
+    }
+
+    /// Capacity hint is shared between LRCP and RLCP (same total). Verify
+    /// it equals the actual RLCP output length on a non-degenerate input.
+    #[test]
+    fn rlcp_capacity_estimate_matches_output_when_no_skips() {
+        let comps = vec![
+            ComponentProgressionInfo {
+                num_decomposition_levels: 1,
+                precincts_per_resolution: vec![2, 2],
+            },
+            ComponentProgressionInfo {
+                num_decomposition_levels: 1,
+                precincts_per_resolution: vec![2, 2],
+            },
+        ];
+        let n_max = 1;
+        let est = estimate_packet_count(3, n_max, &comps);
+        let out = rlcp_packet_order(3, &comps).unwrap();
+        assert_eq!(est, out.len());
+    }
+
+    /// §B.12 NOTE worked example again, but verified through RLCP. With
+    /// L = 2, total packets = 10 (per-layer) × 2 = 20. Sweep the output
+    /// and confirm: at r ∈ 3..=6, every packet has component 0; at r ∈
+    /// 0..=2, components 0 and 1 alternate within each layer.
+    #[test]
+    fn rlcp_b12_note_worked_example_two_layers() {
+        let comps = vec![
+            ComponentProgressionInfo {
+                num_decomposition_levels: 6,
+                precincts_per_resolution: vec![1; 7],
+            },
+            ComponentProgressionInfo {
+                num_decomposition_levels: 2,
+                precincts_per_resolution: vec![1; 3],
+            },
+        ];
+        let out = rlcp_packet_order(2, &comps).unwrap();
+        // 10 per layer × 2 layers = 20.
+        assert_eq!(out.len(), 20);
+        // For each r in 0..=2 the r-block contains 2 layers × 2 components
+        // = 4 packets (each precinct count is 1). For each r in 3..=6 the
+        // r-block contains 2 layers × 1 component = 2 packets.
+        let r0_block: Vec<(u16, u16)> = out
+            .iter()
+            .filter(|p| p.resolution == 0)
+            .map(|p| (p.layer, p.component))
+            .collect();
+        assert_eq!(r0_block, vec![(0, 0), (0, 1), (1, 0), (1, 1)]);
+        let r5_block: Vec<(u16, u16)> = out
+            .iter()
+            .filter(|p| p.resolution == 5)
+            .map(|p| (p.layer, p.component))
+            .collect();
+        assert_eq!(r5_block, vec![(0, 0), (1, 0)]);
+        // Every packet at r >= 3 has component 0.
+        assert!(out
+            .iter()
+            .filter(|p| p.resolution >= 3)
+            .all(|p| p.component == 0));
     }
 }

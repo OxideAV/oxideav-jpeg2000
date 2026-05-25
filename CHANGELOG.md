@@ -6,6 +6,49 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 128 (2026-05-25).** Tier-2 **§B.12.1.2 RLCP
+  progression-order packet iterator** as a sibling of round 125's LRCP
+  driver. New `progression::rlcp_packet_order(layers, components) ->
+  Result<Vec<PacketDescriptor>, Error>` walks the verbatim §B.12.1.2
+  four-nested loop:
+
+  ```text
+  for each r = 0..=Nmax         Nmax = max_i(NL_i)
+    for each l = 0..L
+      for each i = 0..Csiz
+        for each k = 0..numprecincts(r, i)
+          emit (l, r, i, k)
+  ```
+
+  RLCP differs from LRCP only in the relative order of the outer two
+  loops (resolution-first vs. layer-first). The inner two loops, the
+  per-component `ComponentProgressionInfo { num_decomposition_levels,
+  precincts_per_resolution }` input shape (`length == NL + 1`,
+  validated via `Error::InvalidPacketHeader`), the §B.12 NOTE rule
+  that a component with `NL_i < r` contributes no packet at that `r`,
+  the §B.6 / §B.9 rule that empty precincts (`numprecincts(r, i) = 0`)
+  still produce packets, and the defensive empty-components check
+  (`Error::InvalidComponentCount` per T.800 Table A.9 / §A.5's
+  `Csiz ∈ 1..=16384` bound) are all shared verbatim with the round-125
+  LRCP driver. `layers = 0` is a valid empty progression (the inner
+  `l`-loop runs `0..0` for every `r`). The `Vec::with_capacity` hint
+  is shared with LRCP — total packet count is invariant under the r↔l
+  swap.
+
+  Fourteen new RLCP-specific unit tests mirror the LRCP coverage
+  (minimal one-packet input, resolution-outermost / layer-inner
+  ordering, three-component interleave, raster-order precinct emission,
+  full nested `(L=2, Nmax=1, Csiz=2, K=2) → 16 packet` shape, the
+  §B.12 NOTE worked example with two layers — `(NL=6, NL=2)` →
+  20 packets across both layers, empty-precinct corner, zero-layers
+  empty-output, defensive `Error::InvalidComponentCount` /
+  `Error::InvalidPacketHeader` checks, single-component
+  `(r, l, k)`-lexicographic order, capacity-estimate-equals-output for
+  no-skip inputs) plus two cross-iterator equivalence tests proving
+  (a) LRCP and RLCP emit the same multiset of descriptors on a
+  non-trivial `(L=3, NL=2, NL=1)` input and (b) the two diverge at the
+  outermost loop on a small `(L=2, NL=1)` input.
+
 * **Clean-room round 125 (2026-05-25).** Tier-2 **§B.12.1.1 LRCP
   progression-order packet iterator** in a new `progression` submodule
   — the structural bridge between the §B.6 / §B.7 / §B.9 precinct +
