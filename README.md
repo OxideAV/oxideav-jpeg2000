@@ -12,11 +12,13 @@ tier-1 MQ arithmetic decoder + all three tier-1 Annex D coding passes
 (significance-propagation + sign, magnitude-refinement, and cleanup with
 the run-length / UNIFORM four-zero-column shortcut) + bit-plane
 sequencer chaining the §D.3 three-pass order across a code-block from
-the packet reader's per-packet pass counts + **§B.12.1.1 LRCP and
-§B.12.1.2 RLCP progression-order packet iterators** enumerating one
-tile's `(layer, resolution, component, precinct)` packet sequence
-under either the layer-outermost (LRCP) or resolution-outermost (RLCP)
-loop variant.**
+the packet reader's per-packet pass counts + **all five §B.12.1
+progression-order packet iterators** (§B.12.1.1 LRCP, §B.12.1.2 RLCP,
+§B.12.1.3 RPCL, §B.12.1.4 PCRL, §B.12.1.5 CPRL) enumerating one tile's
+`(layer, resolution, component, precinct)` packet sequence under the
+layer/resolution-keyed loop variants (LRCP / RLCP) or the
+reference-grid-position-keyed variants (RPCL / PCRL / CPRL, ordered by
+each precinct's Equation B-20 reference-grid corner).**
 The crate parses the JPEG 2000 Part-1 **main header** (`SOC`, `SIZ`,
 `COD`, `QCD`), walks the **tile-part chain** (`SOT` / `SOD` / `EOC`),
 decodes the **JP2 ISO BMFF box wrapper** (Annex I), reads the
@@ -305,11 +307,27 @@ precincts_per_resolution }` per component, where
 the COD / COC / SIZ marker parsing path; downstream callers can then
 drive `packet::decode_packet_header` against the emitted descriptor
 sequence with `PrecinctState` keyed by `(component, resolution,
-precinct)`. The three remaining progression orders (RPCL, PCRL, CPRL)
-replace the per-precinct raster index with the position-iteration
-machinery of §B.12.1.3 / Equation B-20 (precinct-step over `(x, y)`
-under the reference-grid divisibility conditions) and land in later
-rounds.
+precinct)`.
+
+`progression::rpcl_packet_order`, `progression::pcrl_packet_order` and
+`progression::cprl_packet_order` add the three **position-keyed**
+orders — **resolution-position-component-layer** (RPCL, T.800
+§B.12.1.3), **position-component-resolution-layer** (PCRL, §B.12.1.4)
+and **component-position-resolution-layer** (CPRL, §B.12.1.5). These
+interleave packets by **reference-grid position** rather than
+per-(resolution, component) raster index: instead of the literal `for
+y / for x` reference-grid sweep, the §B.12.1.3 NOTE permits computing
+each precinct's reference-grid top-left corner directly (Equation
+B-20's `2^(PP + NL − r)` precinct step scaled by the component
+sub-sampling `XRsiz` / `YRsiz`, anchored at the §B.6 partition origin
+and clipped to the tile origin) and ordering the visits by that corner,
+which is what these drivers do. The layer loop is innermost in all
+three. They take a richer `ComponentPositionInfo { num_decomposition_
+levels, xrsiz, yrsiz, resolutions }` per component (one
+`ResolutionPrecinctLayout { num_wide, num_high, anchor_x, anchor_y,
+trx0, try0, ppx, ppy }` per resolution level) so the precinct corner
+can be derived without re-reading the marker path. All five orders emit
+the same packet multiset for a given tile; only the ordering differs.
 
 `t1::BitPlaneSequencer` chains the three passes per code-block in the
 §D.3 order across the packet reader's per-packet pass counts. Its state
@@ -338,13 +356,13 @@ What is **not** implemented yet:
   vertically causal context formation (a COD `Scod` bit-3 mode).
 * The MQ **encoder** (§C.2 — INITENC / ENCODE / RENORME / BYTEOUT /
   FLUSH) and the §D.6 selective arithmetic-coding bypass (raw bit mode).
-* §B.12 progression-order packet iteration for **RPCL / PCRL / CPRL**
-  (Equation B-20 / B-21). Rounds 125 + 128 land **LRCP** (§B.12.1.1,
-  default for `Ppoc = 0x00`) and **RLCP** (§B.12.1.2, r↔l swap of
-  LRCP); the remaining three orders replace the per-precinct raster
-  index with the position-iteration machinery of §B.12.1.3 / Equation
-  B-20 and land in later rounds. §B.8 layer / §B.9 packet assembly is
-  also pending.
+* §B.12.2 **progression-order volumes** (the `POC` start/end bounds of
+  Equation B-21) and §B.12.3 POC-marker-driven order changes. All five
+  §B.12.1 base orders are now implemented (LRCP / RLCP rounds 125 + 128;
+  RPCL / PCRL / CPRL this round, ordered by each precinct's Equation
+  B-20 reference-grid corner), but they always sweep the full
+  zero-to-maximum range — the `POC`-bounded sub-volume restriction is
+  pending. §B.8 layer / §B.9 packet assembly is also pending.
 * §B.10.7.2 multi-codeword-segment splitting (round 5 emits one
   segment length per included code-block; termination boundaries are
   a tier-1 input we don't have yet).
@@ -468,14 +486,25 @@ consulted:
   (the decoder extends the input bit stream with `0xFF` bytes until all
   symbols are decoded — the basis for the `mq` BYTEIN end-of-stream
   fill).
-* T.800 §B.12 (Progression order) — §B.12.1.1 (the LRCP four-nested
-  `for l for r for i for k` loop body) and §B.12.1.2 (the RLCP
-  four-nested `for r for l for i for k` loop body — the same total set
-  of packets emitted in a different order); the `Nmax = max_i(NL_i)`
-  definition shared by both; the §B.12 NOTE (components with `NL_i < r`
-  contribute no packet at that `r` — resolution-level indices
-  synchronise at `r = 0`); §B.6 / §B.9 (empty precincts still produce
-  packets so they remain in the precinct count handed to the driver).
+* T.800 §B.12 (Progression order) — all five §B.12.1 base orders:
+  §B.12.1.1 (the LRCP four-nested `for l for r for i for k` loop body),
+  §B.12.1.2 (the RLCP `for r for l for i for k` loop body — the same
+  packet set emitted resolution-first), and the three position-keyed
+  orders §B.12.1.3 RPCL (`for r for y for x for i / for l`), §B.12.1.4
+  PCRL (`for y for x for i for r / for l`) and §B.12.1.5 CPRL (`for i
+  for y for x for r / for l`). The position-keyed orders use the
+  §B.12.1.3 NOTE's efficient precinct-corner enumeration (most `(x, y)`
+  reference-grid samples include no packet; the corners are computed
+  directly via Equation B-20's `2^(PP + NL − r)` precinct step scaled
+  by `XRsiz` / `YRsiz`, anchored at the §B.6 partition origin and
+  clipped to the tile origin) in place of the literal `(x, y)` sweep.
+  Also the `Nmax = max_i(NL_i)` definition shared by LRCP / RLCP; the
+  §B.12 NOTE (components with `NL_i < r` contribute no packet at that
+  `r` — resolution-level indices synchronise at `r = 0`); §B.6 / §B.9
+  (empty precincts still produce packets so they remain in the precinct
+  count / grid handed to the drivers). Not yet covered: §B.12.2
+  progression-order volumes (the Equation B-21 `POC`-bounded
+  sub-ranges) and §B.12.3 POC order changes.
 
 No external library source — OpenJPEG, OpenJPH, Kakadu, FFmpeg, etc.
 — was consulted, quoted, paraphrased, or used as a cross-check
