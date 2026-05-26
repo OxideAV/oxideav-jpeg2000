@@ -6,6 +6,61 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 143 (2026-05-26).** Tier-2 **§B.12.2 POC
+  progression-order volume iteration** layered on the five §B.12.1
+  base orders. New `progression::PocVolume {
+  component_start, component_end, resolution_start, resolution_end,
+  layer_end, order }` runtime descriptor mirroring one row of the
+  POC marker segment (T.800 §A.6.6 / Table A.32) under Equation B-21's
+  half-open bounds `CSpoc ≤ i < CEpoc`, `RSpoc ≤ r < REpoc`,
+  `0 ≤ l < LYEpoc`; `PocVolume::from_poc(&PocProgression)` adapts a
+  parsed marker entry (the `CEpoc = 0 → 256 / 16 384` footnote is
+  already resolved by `parse_poc` so the conversion is a pure copy).
+  New driver `progression::poc_volume_packet_order(volumes,
+  layers_total, components_lrcp, components_position) ->
+  Result<Vec<PacketDescriptor>, Error>` walks a sequence of volumes
+  in order; for each volume it dispatches to whichever of the five
+  §B.12.1 orders the volume's `Ppoc` selects (LRCP / RLCP consume
+  the same `ComponentProgressionInfo` slice as the base iterators;
+  RPCL / PCRL / CPRL consume the `ComponentPositionInfo` slice and
+  reuse the same `ordered_precinct_visits` reference-grid sorter
+  filtered by Equation B-21's component / resolution rectangle).
+  The §B.12.2 "no packet ever repeated in the codestream" /
+  "the layer always starts with the next one for a given
+  tile-component, resolution level and precinct" invariants are
+  enforced via a per-`(component, resolution, precinct)` "next
+  unsent layer" cursor that crosses volume boundaries (so a later
+  volume revisiting the same triple emits only layers
+  `cursor..LYEpoc`, never any layer that an earlier volume already
+  emitted). Per the spec's "the POC marker segments may describe
+  more progression order volumes than exist in the codestream" the
+  driver clamps each volume's `LYEpoc` to `layers_total` before
+  iteration, and clamps `REpoc` / `CEpoc` to the achievable
+  per-`Nmax` / `Csiz` range so an overlong volume stays bounded.
+  Reserved `Ppoc` bytes (Table A.16 reserves `0x05..=0xFF`) are
+  rejected with `Error::InvalidPacketHeader`; empty-axis volumes
+  (`CSpoc >= CEpoc`, `RSpoc >= REpoc`, `LYEpoc == 0`) contribute
+  nothing and do not advance any cursor. Validation propagates the
+  underlying base-order checks: empty / unbalanced component slices
+  return `Error::InvalidComponentCount`, malformed
+  `ComponentProgressionInfo` / `ComponentPositionInfo` return
+  `Error::InvalidPacketHeader`. 24 new unit tests cover the
+  full-cube identity vs every base order, the Equation B-21
+  half-open bounds on each axis, the layer-cursor advance across
+  chained LRCP / mixed-order / RPCL-partition volumes (including
+  the "cursor is per-triple, not global" property), the spec's
+  `LYEpoc > L` / `REpoc > Nmax + 1` / `CEpoc > Csiz` clamps, all
+  empty-axis combinations, the `PocVolume::from_poc` relabel, and
+  the reserved-`Ppoc` / empty-/unbalanced-slice / malformed-component
+  rejection paths. Built solely against
+  `docs/image/jpeg2000/T-REC-T.800-201906-S.pdf` §B.12.2 (Equation
+  B-21 + the no-repeat / next-layer invariants + the
+  more-volumes-than-codestream allowance) and §A.6.6 / Table A.32
+  (POC marker, layout already parsed in lib.rs). No external library
+  source was consulted, quoted, paraphrased, or used as a
+  cross-check oracle. No WebSearch / WebFetch was used for any
+  reason.
+
 * **Clean-room round 133 (2026-05-25).** The three remaining
   **position-keyed §B.12.1 progression orders** — §B.12.1.3 **RPCL**,
   §B.12.1.4 **PCRL** and §B.12.1.5 **CPRL** — completing all five base

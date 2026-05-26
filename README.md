@@ -3,7 +3,7 @@
 Pure-Rust JPEG 2000 (J2K + JP2) and High-Throughput JPEG 2000 (HTJ2K)
 codec.
 
-## Status — 2026-05-25 (clean-room round 125)
+## Status — 2026-05-26 (clean-room round 143)
 
 **Codestream-structural + JP2-wrapper + tier-2 packet-header reader +
 SIZ-derived tile geometry + resolution-level / sub-band geometry +
@@ -18,7 +18,17 @@ progression-order packet iterators** (§B.12.1.1 LRCP, §B.12.1.2 RLCP,
 `(layer, resolution, component, precinct)` packet sequence under the
 layer/resolution-keyed loop variants (LRCP / RLCP) or the
 reference-grid-position-keyed variants (RPCL / PCRL / CPRL, ordered by
-each precinct's Equation B-20 reference-grid corner).**
+each precinct's Equation B-20 reference-grid corner) + **§B.12.2
+POC progression-order volume iteration** (`progression::PocVolume` +
+`progression::poc_volume_packet_order`) chaining a sequence of
+`(CSpoc, CEpoc, RSpoc, REpoc, LYEpoc, Ppoc)` volumes under Equation
+B-21's half-open bounds, dispatching each volume to whichever of the
+five §B.12.1 orders its `Ppoc` selects, and enforcing the §B.12.2
+"no packet ever repeated" / "the layer always starts with the next
+one" rule via a per-`(component, resolution, precinct)` "next unsent
+layer" cursor that crosses volume boundaries (and clamping `LYEpoc`
+that exceeds `L` per the spec's allowance for POC marker segments to
+describe more volumes than the codestream carries).**
 The crate parses the JPEG 2000 Part-1 **main header** (`SOC`, `SIZ`,
 `COD`, `QCD`), walks the **tile-part chain** (`SOT` / `SOD` / `EOC`),
 decodes the **JP2 ISO BMFF box wrapper** (Annex I), reads the
@@ -356,13 +366,16 @@ What is **not** implemented yet:
   vertically causal context formation (a COD `Scod` bit-3 mode).
 * The MQ **encoder** (§C.2 — INITENC / ENCODE / RENORME / BYTEOUT /
   FLUSH) and the §D.6 selective arithmetic-coding bypass (raw bit mode).
-* §B.12.2 **progression-order volumes** (the `POC` start/end bounds of
-  Equation B-21) and §B.12.3 POC-marker-driven order changes. All five
-  §B.12.1 base orders are now implemented (LRCP / RLCP rounds 125 + 128;
-  RPCL / PCRL / CPRL this round, ordered by each precinct's Equation
-  B-20 reference-grid corner), but they always sweep the full
-  zero-to-maximum range — the `POC`-bounded sub-volume restriction is
-  pending. §B.8 layer / §B.9 packet assembly is also pending.
+* §B.12.3 POC-marker placement validation — §B.12.2 progression order
+  volume iteration is now implemented (Equation B-21 `(CSpoc, CEpoc) ×
+  (RSpoc, REpoc) × (0, LYEpoc)` bounds + the per-`(component,
+  resolution, precinct)` "next unsent layer" cursor that prevents
+  packet repetition across chained volumes), but §B.12.3 layout rules
+  ("if a POC marker is used for an individual tile, there shall be a
+  POC marker in the first tile-part header of that tile and all of
+  the progression order changes shall be signalled in the tile-part
+  headers of that tile") are not yet enforced at the codestream-walker
+  level. §B.8 layer / §B.9 packet assembly is also pending.
 * §B.10.7.2 multi-codeword-segment splitting (round 5 emits one
   segment length per included code-block; termination boundaries are
   a tier-1 input we don't have yet).

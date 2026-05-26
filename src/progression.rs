@@ -109,7 +109,7 @@
 //! source was consulted, quoted, paraphrased, or used as a cross-check
 //! oracle. No WebSearch / WebFetch was used for any reason.
 
-use crate::Error;
+use crate::{Error, PocProgression, ProgressionOrder};
 
 // ---------------------------------------------------------------------------
 // Input description — per-component decomposition + precinct counts.
@@ -833,6 +833,466 @@ pub fn cprl_packet_order(
     components: &[ComponentPositionInfo],
 ) -> Result<Vec<PacketDescriptor>, Error> {
     position_packet_order(layers, components, PositionKey::Cprl)
+}
+
+// ===========================================================================
+// §B.12.2 progression order volumes — POC marker-driven sub-range iteration.
+//
+// The POC marker (T.800 §A.6.6, Table A.32) overrides the COD's default
+// `Ppoc` order with one or more **progression order volumes**. Each volume
+// names start/end indices on the component, resolution-level and layer
+// axes, plus the order in which to walk the bounded `(l, r, i, k)` cube:
+//
+//     Equation B-21:  CSpoc ≤ i < CEpoc
+//                     RSpoc ≤ r < REpoc
+//                     0     ≤ l < LYEpoc
+//
+// Within a single volume the loop body is identical to the corresponding
+// §B.12.1 base order; the only difference is the index bounds. Across
+// volumes §B.12.2 lays down two extra invariants:
+//
+//   1. "No packet is ever repeated in the codestream" — once a packet
+//      `(l, r, i, k)` is emitted by an earlier volume, no later volume
+//      may emit it again.
+//   2. "Therefore, the layer always starts with the next one for a given
+//      tile-component, resolution level and precinct. The decoder is
+//      required to determine the next layer."
+//
+// Concretely (1) and (2) together mean: per `(component, resolution,
+// precinct)` triple, the codestream keeps a "next unsent layer" cursor;
+// when a volume visits that triple it emits layers `cursor..LYEpoc`
+// (clamped to the codestream's total layer count `L`) and advances the
+// cursor to `LYEpoc`. Volumes that revisit the same triple with a
+// `LYEpoc` that's already been reached emit nothing for that triple —
+// the inner layer loop runs `LYEpoc..LYEpoc`.
+// ===========================================================================
+
+/// One §B.12.2 **progression order volume**, ready for iteration.
+///
+/// Construct one from a parsed [`PocProgression`] via [`PocVolume::from_poc`]
+/// (which interprets the spec's `CEpoc = 0 → 256/16 384` footnote — but
+/// note [`crate::lib::parse_poc`] already normalises that, so the conversion
+/// is a straight copy when starting from a [`crate::Poc`] read out of the
+/// codestream). Direct field construction is supported for tests / tooling
+/// that builds volumes synthetically.
+///
+/// The bounds match Equation B-21 exactly: half-open on the component,
+/// resolution and layer axes (`component_start ≤ i < component_end`,
+/// `resolution_start ≤ r < resolution_end`, `0 ≤ l < layer_end`). A
+/// volume with any axis empty (e.g. `resolution_start == resolution_end`)
+/// emits zero packets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PocVolume {
+    /// `CSpoc` — first component index in the volume (inclusive).
+    pub component_start: u16,
+    /// `CEpoc` — one past the last component index in the volume.
+    /// (T.800 Table A.32 footnote: 0 in the codestream is interpreted
+    /// as 256 / 16 384; pass the already-interpreted value here.)
+    pub component_end: u16,
+    /// `RSpoc` — first resolution-level index (inclusive).
+    pub resolution_start: u8,
+    /// `REpoc` — one past the last resolution-level index.
+    pub resolution_end: u8,
+    /// `LYEpoc` — one past the last layer index. The per-triple layer
+    /// cursor advances up to (but not past) this bound.
+    pub layer_end: u16,
+    /// `Ppoc` — packet-emission order inside this volume (Table A.16).
+    pub order: ProgressionOrder,
+}
+
+impl PocVolume {
+    /// Convert a [`PocProgression`] (as carried in a parsed [`crate::Poc`]
+    /// marker segment) into a runtime [`PocVolume`]. Field-for-field: the
+    /// `CEpoc = 0 → 256/16 384` footnote interpretation is already done
+    /// by [`crate::lib::parse_poc`], so this is a pure relabel.
+    pub fn from_poc(p: &PocProgression) -> Self {
+        PocVolume {
+            component_start: p.component_start,
+            component_end: p.component_end,
+            resolution_start: p.resolution_start,
+            resolution_end: p.resolution_end,
+            layer_end: p.layer_end,
+            order: p.progression,
+        }
+    }
+
+    /// Volume covers no packets — any axis is empty.
+    fn is_empty(&self) -> bool {
+        self.component_start >= self.component_end
+            || self.resolution_start >= self.resolution_end
+            || self.layer_end == 0
+    }
+}
+
+/// Cursor key: `(component, resolution, precinct)`. The §B.12.2 "no packet
+/// repeated" rule is per-triple — every triple keeps its own "next unsent
+/// layer" counter across all volumes of a tile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct LayerCursorKey {
+    component: u16,
+    resolution: u8,
+    precinct: u32,
+}
+
+/// Per-triple "next unsent layer" cursor for one tile's worth of §B.12.2
+/// iteration. Indexed by [`LayerCursorKey`]; missing keys default to 0.
+///
+/// A `std::collections::HashMap` keeps the data structure simple and
+/// avoids pre-allocating a dense `(C × R_max × Kmax)` table on large
+/// tiles where most triples are touched at most once.
+#[derive(Debug, Default)]
+struct LayerCursors {
+    map: std::collections::HashMap<LayerCursorKey, u16>,
+}
+
+impl LayerCursors {
+    fn next(&self, key: LayerCursorKey) -> u16 {
+        self.map.get(&key).copied().unwrap_or(0)
+    }
+
+    fn advance_to(&mut self, key: LayerCursorKey, new_next: u16) {
+        let entry = self.map.entry(key).or_insert(0);
+        if new_next > *entry {
+            *entry = new_next;
+        }
+    }
+}
+
+/// Emit one volume's packets respecting Equation B-21 + the §B.12.2
+/// "no packet ever repeated" / "layer always starts with the next one"
+/// invariants.
+///
+/// `layers_total` is the codestream-wide layer count `L` from the COD.
+/// `components_lrcp` mirrors the LRCP / RLCP per-component precinct
+/// counts; `components_position` mirrors the RPCL / PCRL / CPRL
+/// per-component precinct geometry (with the reference-grid mapping
+/// needed for position ordering). Both slices describe the *same*
+/// components in the same `Csiz`-declaration order; the driver picks
+/// the slice that matches the volume's `order`.
+///
+/// Volumes with [`ProgressionOrder::Reserved`] are rejected with
+/// [`Error::InvalidPacketHeader`] since the spec doesn't define an
+/// iteration order for reserved Ppoc bytes (T.800 Table A.16 reserves
+/// 0x05..=0xFF).
+fn emit_volume_packets(
+    volume: &PocVolume,
+    layers_total: u16,
+    components_lrcp: &[ComponentProgressionInfo],
+    components_position: &[ComponentPositionInfo],
+    cursors: &mut LayerCursors,
+    out: &mut Vec<PacketDescriptor>,
+) -> Result<(), Error> {
+    if volume.is_empty() {
+        return Ok(());
+    }
+
+    // The volume's effective layer bound is min(LYEpoc, L) — the spec
+    // allows POC volumes to describe more than the codestream actually
+    // carries ("the POC marker segments may describe more progression
+    // order volumes than exist in the codestream"); we clamp so the
+    // cursor never advances past the codestream's true layer count.
+    let layer_end_eff = volume.layer_end.min(layers_total);
+    if layer_end_eff == 0 {
+        return Ok(());
+    }
+
+    match volume.order {
+        ProgressionOrder::Lrcp => {
+            emit_volume_lrcp(volume, layer_end_eff, components_lrcp, cursors, out)
+        }
+        ProgressionOrder::Rlcp => {
+            emit_volume_rlcp(volume, layer_end_eff, components_lrcp, cursors, out)
+        }
+        ProgressionOrder::Rpcl => emit_volume_position(
+            volume,
+            layer_end_eff,
+            components_position,
+            PositionKey::Rpcl,
+            cursors,
+            out,
+        ),
+        ProgressionOrder::Pcrl => emit_volume_position(
+            volume,
+            layer_end_eff,
+            components_position,
+            PositionKey::Pcrl,
+            cursors,
+            out,
+        ),
+        ProgressionOrder::Cprl => emit_volume_position(
+            volume,
+            layer_end_eff,
+            components_position,
+            PositionKey::Cprl,
+            cursors,
+            out,
+        ),
+        // T.800 Table A.16 reserves Ppoc = 0x05..=0xFF. A reserved byte
+        // has no defined iteration order; the volume can't be emitted.
+        ProgressionOrder::Reserved(_) => Err(Error::InvalidPacketHeader),
+    }
+}
+
+/// LRCP §B.12.1.1 loop, restricted to `[CSpoc, CEpoc) × [RSpoc, REpoc) ×
+/// [cursor(i,r,k), layer_end)`. `layer_end` is already clamped to `L`.
+fn emit_volume_lrcp(
+    v: &PocVolume,
+    layer_end: u16,
+    components: &[ComponentProgressionInfo],
+    cursors: &mut LayerCursors,
+    out: &mut Vec<PacketDescriptor>,
+) -> Result<(), Error> {
+    let n_max = components
+        .iter()
+        .map(|c| c.num_decomposition_levels)
+        .max()
+        .unwrap_or(0);
+    let r_lo = v.resolution_start;
+    let r_hi = v.resolution_end.min(n_max.saturating_add(1));
+    let i_hi = v.component_end.min(components.len() as u16);
+    // Layer is outermost in LRCP, so we drive the layer loop ourselves
+    // and for each (l, r, i, k) check the cursor: emit iff l ≥ cursor
+    // and l < layer_end. Cursors are advanced after the per-triple layer
+    // sweep completes for this volume (since within a volume layer runs
+    // monotonically the cursor advance is just `layer_end` once any
+    // packet was emitted at the triple — but for LRCP the outer layer
+    // loop means we re-visit each (r, i, k) once per `l`; we only
+    // advance the cursor at the volume's end).
+    for l in 0..layer_end {
+        for r in r_lo..r_hi {
+            for i in v.component_start..i_hi {
+                let ci = &components[i as usize];
+                if r > ci.num_decomposition_levels {
+                    continue;
+                }
+                let n_pre = ci.precincts_at(r);
+                for k in 0..n_pre {
+                    let key = LayerCursorKey {
+                        component: i,
+                        resolution: r,
+                        precinct: k,
+                    };
+                    if l >= cursors.next(key) {
+                        out.push(PacketDescriptor {
+                            layer: l,
+                            resolution: r,
+                            component: i,
+                            precinct: k,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    // After the volume completes, every (i, r, k) triple it touched has
+    // its cursor advanced to layer_end (the spec's "layer always starts
+    // with the next one" invariant).
+    advance_cursors_lrcp_range(v, layer_end, components, cursors);
+    Ok(())
+}
+
+/// RLCP §B.12.1.2: r↔l swap of LRCP, same volume bounds.
+fn emit_volume_rlcp(
+    v: &PocVolume,
+    layer_end: u16,
+    components: &[ComponentProgressionInfo],
+    cursors: &mut LayerCursors,
+    out: &mut Vec<PacketDescriptor>,
+) -> Result<(), Error> {
+    let n_max = components
+        .iter()
+        .map(|c| c.num_decomposition_levels)
+        .max()
+        .unwrap_or(0);
+    let r_lo = v.resolution_start;
+    let r_hi = v.resolution_end.min(n_max.saturating_add(1));
+    let i_hi = v.component_end.min(components.len() as u16);
+    for r in r_lo..r_hi {
+        for l in 0..layer_end {
+            for i in v.component_start..i_hi {
+                let ci = &components[i as usize];
+                if r > ci.num_decomposition_levels {
+                    continue;
+                }
+                let n_pre = ci.precincts_at(r);
+                for k in 0..n_pre {
+                    let key = LayerCursorKey {
+                        component: i,
+                        resolution: r,
+                        precinct: k,
+                    };
+                    if l >= cursors.next(key) {
+                        out.push(PacketDescriptor {
+                            layer: l,
+                            resolution: r,
+                            component: i,
+                            precinct: k,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    advance_cursors_lrcp_range(v, layer_end, components, cursors);
+    Ok(())
+}
+
+/// Mark every `(i, r, k)` triple inside the volume's component/resolution
+/// box as "next layer = layer_end" (clamped to monotonic). Used by both
+/// LRCP and RLCP volume drivers — both touch the same triple set, so
+/// the same advance code applies.
+fn advance_cursors_lrcp_range(
+    v: &PocVolume,
+    layer_end: u16,
+    components: &[ComponentProgressionInfo],
+    cursors: &mut LayerCursors,
+) {
+    let n_max = components
+        .iter()
+        .map(|c| c.num_decomposition_levels)
+        .max()
+        .unwrap_or(0);
+    let r_hi = v.resolution_end.min(n_max.saturating_add(1));
+    let i_hi = v.component_end.min(components.len() as u16);
+    for r in v.resolution_start..r_hi {
+        for i in v.component_start..i_hi {
+            let ci = &components[i as usize];
+            if r > ci.num_decomposition_levels {
+                continue;
+            }
+            let n_pre = ci.precincts_at(r);
+            for k in 0..n_pre {
+                cursors.advance_to(
+                    LayerCursorKey {
+                        component: i,
+                        resolution: r,
+                        precinct: k,
+                    },
+                    layer_end,
+                );
+            }
+        }
+    }
+}
+
+/// Position-keyed (RPCL / PCRL / CPRL) volume driver.
+///
+/// Reuses [`ordered_precinct_visits`] to build the same `y`-major /
+/// component-keyed precinct sequence as the base orders, then filters
+/// each visit by Equation B-21's `(CSpoc, CEpoc) × (RSpoc, REpoc)`
+/// rectangle and expands it over `[cursor, layer_end)` layers. The
+/// cursor is advanced per-triple as packets are emitted (in contrast
+/// to LRCP/RLCP the layer loop is innermost here, so each triple is
+/// visited exactly once per volume).
+fn emit_volume_position(
+    v: &PocVolume,
+    layer_end: u16,
+    components: &[ComponentPositionInfo],
+    key: PositionKey,
+    cursors: &mut LayerCursors,
+    out: &mut Vec<PacketDescriptor>,
+) -> Result<(), Error> {
+    let visits = ordered_precinct_visits(components, key);
+    let i_hi = v.component_end.min(components.len() as u16);
+    for visit in &visits {
+        if visit.component < v.component_start || visit.component >= i_hi {
+            continue;
+        }
+        if visit.resolution < v.resolution_start || visit.resolution >= v.resolution_end {
+            continue;
+        }
+        let key_cur = LayerCursorKey {
+            component: visit.component,
+            resolution: visit.resolution,
+            precinct: visit.precinct,
+        };
+        let l_lo = cursors.next(key_cur);
+        if l_lo >= layer_end {
+            continue;
+        }
+        for l in l_lo..layer_end {
+            out.push(PacketDescriptor {
+                layer: l,
+                resolution: visit.resolution,
+                component: visit.component,
+                precinct: visit.precinct,
+            });
+        }
+        cursors.advance_to(key_cur, layer_end);
+    }
+    Ok(())
+}
+
+/// Enumerate one tile's packets across a sequence of §B.12.2 progression
+/// order volumes (a parsed [`crate::Poc`] marker's `progressions` list,
+/// converted to [`PocVolume`] via [`PocVolume::from_poc`]).
+///
+/// Each volume is emitted in order; within a volume the iteration order
+/// matches the volume's `Ppoc` per §B.12.1; across volumes the
+/// "no packet ever repeated" + "layer always starts with the next one"
+/// invariants from §B.12.2 are enforced via a per-`(component,
+/// resolution, precinct)` "next unsent layer" cursor.
+///
+/// `layers_total` is the codestream's `L` (T.800 §A.6.1, COD). A volume
+/// whose `layer_end` exceeds `L` is clamped to `L`. `components_lrcp`
+/// and `components_position` describe the same components in the same
+/// `Csiz`-declaration order and must be parallel slices — LRCP / RLCP
+/// volumes consult the former, RPCL / PCRL / CPRL volumes the latter.
+///
+/// # Errors
+///
+/// * [`Error::InvalidComponentCount`] — either component slice is empty
+///   (T.800 Table A.9 constrains `Csiz` to `1..=16384`), or the slices
+///   have different lengths.
+/// * [`Error::InvalidPacketHeader`] — a [`ComponentProgressionInfo`] or
+///   [`ComponentPositionInfo`] validation check fails, or a volume's
+///   `order` is [`ProgressionOrder::Reserved`] (Table A.16 reserves
+///   `Ppoc ∈ 0x05..=0xFF`; the spec defines no iteration order for
+///   reserved bytes so the volume can't be emitted).
+///
+/// # Empty-corner behaviour
+///
+/// * Empty `volumes` slice → empty `Vec` (no packets).
+/// * `layers_total == 0` → empty `Vec` (all per-volume layer bounds
+///   clamp to 0).
+/// * A volume that's empty on any axis (`CSpoc >= CEpoc`,
+///   `RSpoc >= REpoc`, `LYEpoc == 0`) contributes nothing and does
+///   not advance any cursor — matching the spec's `for` loops, which
+///   simply don't iterate when their bounds collapse.
+pub fn poc_volume_packet_order(
+    volumes: &[PocVolume],
+    layers_total: u16,
+    components_lrcp: &[ComponentProgressionInfo],
+    components_position: &[ComponentPositionInfo],
+) -> Result<Vec<PacketDescriptor>, Error> {
+    if components_lrcp.is_empty() || components_position.is_empty() {
+        return Err(Error::InvalidComponentCount);
+    }
+    if components_lrcp.len() != components_position.len() {
+        return Err(Error::InvalidComponentCount);
+    }
+    for ci in components_lrcp {
+        ci.validate()?;
+    }
+    for ci in components_position {
+        ci.validate()?;
+    }
+    if volumes.is_empty() || layers_total == 0 {
+        return Ok(Vec::new());
+    }
+    let mut cursors = LayerCursors::default();
+    let mut out: Vec<PacketDescriptor> = Vec::new();
+    for v in volumes {
+        emit_volume_packets(
+            v,
+            layers_total,
+            components_lrcp,
+            components_position,
+            &mut cursors,
+            &mut out,
+        )?;
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -1964,5 +2424,548 @@ mod tests {
         //   y = 32: comp1 k1
         let seq: Vec<(u16, u32)> = out.iter().map(|p| (p.component, p.precinct)).collect();
         assert_eq!(seq, vec![(0, 0), (1, 0), (0, 1), (1, 1)]);
+    }
+
+    // =======================================================================
+    // §B.12.2 POC volume iteration.
+    // =======================================================================
+
+    /// Build a synthetic `ComponentProgressionInfo` for tests: NL levels,
+    /// `precincts` precincts at every resolution level.
+    fn lcomp(nl: u8, precincts: u32) -> ComponentProgressionInfo {
+        ComponentProgressionInfo {
+            num_decomposition_levels: nl,
+            precincts_per_resolution: vec![precincts; nl as usize + 1],
+        }
+    }
+
+    /// Build a parallel `ComponentPositionInfo` for the same component
+    /// shape (one resolution-level layout per `r = 0..=NL`, each carrying
+    /// a `wide × high` precinct grid). XRsiz = YRsiz = 1.
+    fn pcomp(nl: u8, wide: u32, high: u32) -> ComponentPositionInfo {
+        ComponentPositionInfo {
+            num_decomposition_levels: nl,
+            xrsiz: 1,
+            yrsiz: 1,
+            resolutions: (0..=nl).map(|_| layout(wide, high, 4, 4)).collect(),
+        }
+    }
+
+    /// A single LRCP volume covering the entire (C, R, L) cube reproduces
+    /// the LRCP base order exactly.
+    #[test]
+    fn poc_lrcp_full_cube_matches_base_lrcp() {
+        let comps_l = vec![lcomp(1, 2), lcomp(1, 2)];
+        let comps_p = vec![pcomp(1, 2, 1), pcomp(1, 2, 1)];
+        let volume = PocVolume {
+            component_start: 0,
+            component_end: 2,
+            resolution_start: 0,
+            resolution_end: 2,
+            layer_end: 3,
+            order: ProgressionOrder::Lrcp,
+        };
+        let got = poc_volume_packet_order(&[volume], 3, &comps_l, &comps_p).unwrap();
+        let expected = lrcp_packet_order(3, &comps_l).unwrap();
+        assert_eq!(got, expected);
+    }
+
+    /// A single RLCP volume covering the entire (C, R, L) cube reproduces
+    /// the RLCP base order exactly.
+    #[test]
+    fn poc_rlcp_full_cube_matches_base_rlcp() {
+        let comps_l = vec![lcomp(1, 2), lcomp(1, 2)];
+        let comps_p = vec![pcomp(1, 2, 1), pcomp(1, 2, 1)];
+        let volume = PocVolume {
+            component_start: 0,
+            component_end: 2,
+            resolution_start: 0,
+            resolution_end: 2,
+            layer_end: 3,
+            order: ProgressionOrder::Rlcp,
+        };
+        let got = poc_volume_packet_order(&[volume], 3, &comps_l, &comps_p).unwrap();
+        let expected = rlcp_packet_order(3, &comps_l).unwrap();
+        assert_eq!(got, expected);
+    }
+
+    /// Full-cube RPCL volume reproduces the base RPCL order.
+    #[test]
+    fn poc_rpcl_full_cube_matches_base_rpcl() {
+        let comps_l = vec![lcomp(1, 2), lcomp(1, 2)];
+        let comps_p = vec![pcomp(1, 2, 1), pcomp(1, 2, 1)];
+        let volume = PocVolume {
+            component_start: 0,
+            component_end: 2,
+            resolution_start: 0,
+            resolution_end: 2,
+            layer_end: 3,
+            order: ProgressionOrder::Rpcl,
+        };
+        let got = poc_volume_packet_order(&[volume], 3, &comps_l, &comps_p).unwrap();
+        let expected = rpcl_packet_order(3, &comps_p).unwrap();
+        assert_eq!(got, expected);
+    }
+
+    /// Full-cube PCRL volume reproduces the base PCRL order.
+    #[test]
+    fn poc_pcrl_full_cube_matches_base_pcrl() {
+        let comps_l = vec![lcomp(1, 2), lcomp(1, 2)];
+        let comps_p = vec![pcomp(1, 2, 1), pcomp(1, 2, 1)];
+        let volume = PocVolume {
+            component_start: 0,
+            component_end: 2,
+            resolution_start: 0,
+            resolution_end: 2,
+            layer_end: 3,
+            order: ProgressionOrder::Pcrl,
+        };
+        let got = poc_volume_packet_order(&[volume], 3, &comps_l, &comps_p).unwrap();
+        let expected = pcrl_packet_order(3, &comps_p).unwrap();
+        assert_eq!(got, expected);
+    }
+
+    /// Full-cube CPRL volume reproduces the base CPRL order.
+    #[test]
+    fn poc_cprl_full_cube_matches_base_cprl() {
+        let comps_l = vec![lcomp(1, 2), lcomp(1, 2)];
+        let comps_p = vec![pcomp(1, 2, 1), pcomp(1, 2, 1)];
+        let volume = PocVolume {
+            component_start: 0,
+            component_end: 2,
+            resolution_start: 0,
+            resolution_end: 2,
+            layer_end: 3,
+            order: ProgressionOrder::Cprl,
+        };
+        let got = poc_volume_packet_order(&[volume], 3, &comps_l, &comps_p).unwrap();
+        let expected = cprl_packet_order(3, &comps_p).unwrap();
+        assert_eq!(got, expected);
+    }
+
+    /// Equation B-21: a LRCP volume that excludes the second component
+    /// (`CEpoc = 1`) emits packets only for component 0.
+    #[test]
+    fn poc_lrcp_component_range_excludes_other_components() {
+        let comps_l = vec![lcomp(0, 1), lcomp(0, 1), lcomp(0, 1)];
+        let comps_p = vec![pcomp(0, 1, 1), pcomp(0, 1, 1), pcomp(0, 1, 1)];
+        let volume = PocVolume {
+            component_start: 0,
+            component_end: 1, // exclusive — only component 0
+            resolution_start: 0,
+            resolution_end: 1,
+            layer_end: 2,
+            order: ProgressionOrder::Lrcp,
+        };
+        let out = poc_volume_packet_order(&[volume], 2, &comps_l, &comps_p).unwrap();
+        // 1 component × 1 resolution × 1 precinct × 2 layers = 2 packets.
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|p| p.component == 0));
+    }
+
+    /// Equation B-21: a LRCP volume restricted to `r = 1..=1` (`RSpoc=1,
+    /// REpoc=2`) emits only resolution-1 packets, skipping resolution 0.
+    #[test]
+    fn poc_lrcp_resolution_range_excludes_other_resolutions() {
+        let comps_l = vec![lcomp(2, 1)];
+        let comps_p = vec![pcomp(2, 1, 1)];
+        let volume = PocVolume {
+            component_start: 0,
+            component_end: 1,
+            resolution_start: 1,
+            resolution_end: 2,
+            layer_end: 1,
+            order: ProgressionOrder::Lrcp,
+        };
+        let out = poc_volume_packet_order(&[volume], 1, &comps_l, &comps_p).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].resolution, 1);
+    }
+
+    /// Equation B-21: the layer axis runs `0 ≤ l < LYEpoc`. A volume with
+    /// `LYEpoc = 2` on a 4-layer codestream emits only layers 0, 1.
+    #[test]
+    fn poc_lrcp_layer_end_caps_layer_loop() {
+        let comps_l = vec![lcomp(0, 1)];
+        let comps_p = vec![pcomp(0, 1, 1)];
+        let volume = PocVolume {
+            component_start: 0,
+            component_end: 1,
+            resolution_start: 0,
+            resolution_end: 1,
+            layer_end: 2,
+            order: ProgressionOrder::Lrcp,
+        };
+        let out = poc_volume_packet_order(&[volume], 4, &comps_l, &comps_p).unwrap();
+        let layers: Vec<u16> = out.iter().map(|p| p.layer).collect();
+        assert_eq!(layers, vec![0, 1]);
+    }
+
+    /// §B.12.2 "no packet ever repeated" / "layer always starts with the
+    /// next one": two LRCP volumes both covering the entire (C, R)
+    /// rectangle, the first with `LYEpoc = 1` and the second with
+    /// `LYEpoc = 3`, must emit each `(r, i, k)` precinct's layer 0 in
+    /// the first volume and layers 1, 2 in the second — never layer 0
+    /// twice.
+    #[test]
+    fn poc_chained_volumes_advance_layer_cursor_no_packet_repeated() {
+        let comps_l = vec![lcomp(0, 1)];
+        let comps_p = vec![pcomp(0, 1, 1)];
+        let v1 = PocVolume {
+            component_start: 0,
+            component_end: 1,
+            resolution_start: 0,
+            resolution_end: 1,
+            layer_end: 1,
+            order: ProgressionOrder::Lrcp,
+        };
+        let v2 = PocVolume {
+            component_start: 0,
+            component_end: 1,
+            resolution_start: 0,
+            resolution_end: 1,
+            layer_end: 3,
+            order: ProgressionOrder::Lrcp,
+        };
+        let out = poc_volume_packet_order(&[v1, v2], 3, &comps_l, &comps_p).unwrap();
+        let layers: Vec<u16> = out.iter().map(|p| p.layer).collect();
+        assert_eq!(layers, vec![0, 1, 2]);
+        // And the union must equal the full 3-layer LRCP base output.
+        let full = lrcp_packet_order(3, &comps_l).unwrap();
+        assert_eq!(out, full);
+    }
+
+    /// §B.12.2 chained volumes: the layer cursor is per-`(component,
+    /// resolution, precinct)` triple, not global. Volume 1 covers only
+    /// component 0 (LYEpoc=2); volume 2 covers both components (LYEpoc=2).
+    /// Component 0's cursor advances to 2 in v1 so it emits nothing in v2;
+    /// component 1's cursor stays at 0 so v2 emits its layers 0, 1.
+    #[test]
+    fn poc_chained_volumes_cursor_is_per_triple_not_global() {
+        let comps_l = vec![lcomp(0, 1), lcomp(0, 1)];
+        let comps_p = vec![pcomp(0, 1, 1), pcomp(0, 1, 1)];
+        let v1 = PocVolume {
+            component_start: 0,
+            component_end: 1,
+            resolution_start: 0,
+            resolution_end: 1,
+            layer_end: 2,
+            order: ProgressionOrder::Lrcp,
+        };
+        let v2 = PocVolume {
+            component_start: 0,
+            component_end: 2,
+            resolution_start: 0,
+            resolution_end: 1,
+            layer_end: 2,
+            order: ProgressionOrder::Lrcp,
+        };
+        let out = poc_volume_packet_order(&[v1, v2], 2, &comps_l, &comps_p).unwrap();
+        // v1: comp0 layers 0, 1. v2: comp1 layers 0, 1 (comp0 already
+        // exhausted at layer 2).
+        let by_comp: Vec<(u16, u16)> = out.iter().map(|p| (p.component, p.layer)).collect();
+        assert_eq!(by_comp, vec![(0, 0), (0, 1), (1, 0), (1, 1)]);
+    }
+
+    /// §B.12.2 mixed-order chain: first volume LRCP for component 0
+    /// covering 2 layers; second volume CPRL for component 1 covering 2
+    /// layers. The cursor-per-triple rule is order-agnostic; the two
+    /// volumes together emit every packet exactly once.
+    #[test]
+    fn poc_chained_volumes_mix_lrcp_and_cprl() {
+        let comps_l = vec![lcomp(0, 1), lcomp(0, 1)];
+        let comps_p = vec![pcomp(0, 1, 1), pcomp(0, 1, 1)];
+        let v1 = PocVolume {
+            component_start: 0,
+            component_end: 1,
+            resolution_start: 0,
+            resolution_end: 1,
+            layer_end: 2,
+            order: ProgressionOrder::Lrcp,
+        };
+        let v2 = PocVolume {
+            component_start: 1,
+            component_end: 2,
+            resolution_start: 0,
+            resolution_end: 1,
+            layer_end: 2,
+            order: ProgressionOrder::Cprl,
+        };
+        let out = poc_volume_packet_order(&[v1, v2], 2, &comps_l, &comps_p).unwrap();
+        let by_comp: Vec<(u16, u16)> = out.iter().map(|p| (p.component, p.layer)).collect();
+        assert_eq!(by_comp, vec![(0, 0), (0, 1), (1, 0), (1, 1)]);
+    }
+
+    /// Spec allowance: "the POC marker segments may describe more
+    /// progression order volumes than exist in the codestream". A volume
+    /// with `LYEpoc = 10` on a `L = 2` codestream is clamped to L; the
+    /// emitted packet count must still match the base order's count.
+    #[test]
+    fn poc_volume_layer_end_clamps_to_total_layers() {
+        let comps_l = vec![lcomp(0, 1)];
+        let comps_p = vec![pcomp(0, 1, 1)];
+        let volume = PocVolume {
+            component_start: 0,
+            component_end: 1,
+            resolution_start: 0,
+            resolution_end: 1,
+            layer_end: 10, // > L = 2
+            order: ProgressionOrder::Lrcp,
+        };
+        let out = poc_volume_packet_order(&[volume], 2, &comps_l, &comps_p).unwrap();
+        // Layers 0, 1 — only L = 2 are real.
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].layer, 0);
+        assert_eq!(out[1].layer, 1);
+    }
+
+    /// Empty-axis volumes (`CSpoc >= CEpoc`) contribute zero packets and
+    /// do not advance any cursor.
+    #[test]
+    fn poc_empty_component_range_contributes_nothing() {
+        let comps_l = vec![lcomp(0, 1)];
+        let comps_p = vec![pcomp(0, 1, 1)];
+        let v_empty = PocVolume {
+            component_start: 1,
+            component_end: 1, // empty
+            resolution_start: 0,
+            resolution_end: 1,
+            layer_end: 2,
+            order: ProgressionOrder::Lrcp,
+        };
+        let v_full = PocVolume {
+            component_start: 0,
+            component_end: 1,
+            resolution_start: 0,
+            resolution_end: 1,
+            layer_end: 2,
+            order: ProgressionOrder::Lrcp,
+        };
+        let out = poc_volume_packet_order(&[v_empty, v_full], 2, &comps_l, &comps_p).unwrap();
+        // v_empty emits zero; v_full emits both layers (cursor untouched).
+        assert_eq!(out.len(), 2);
+    }
+
+    /// Empty-axis volume on resolution / layer also contributes zero.
+    #[test]
+    fn poc_empty_resolution_or_layer_range_contributes_nothing() {
+        let comps_l = vec![lcomp(0, 1)];
+        let comps_p = vec![pcomp(0, 1, 1)];
+        let v_resol_empty = PocVolume {
+            component_start: 0,
+            component_end: 1,
+            resolution_start: 1,
+            resolution_end: 1, // empty
+            layer_end: 2,
+            order: ProgressionOrder::Lrcp,
+        };
+        let v_layer_empty = PocVolume {
+            component_start: 0,
+            component_end: 1,
+            resolution_start: 0,
+            resolution_end: 1,
+            layer_end: 0, // empty
+            order: ProgressionOrder::Lrcp,
+        };
+        let out = poc_volume_packet_order(&[v_resol_empty, v_layer_empty], 2, &comps_l, &comps_p)
+            .unwrap();
+        assert!(out.is_empty());
+    }
+
+    /// `layers_total == 0` → empty Vec regardless of volume bounds.
+    #[test]
+    fn poc_zero_total_layers_emits_no_packets() {
+        let comps_l = vec![lcomp(0, 1)];
+        let comps_p = vec![pcomp(0, 1, 1)];
+        let v = PocVolume {
+            component_start: 0,
+            component_end: 1,
+            resolution_start: 0,
+            resolution_end: 1,
+            layer_end: 5,
+            order: ProgressionOrder::Lrcp,
+        };
+        let out = poc_volume_packet_order(&[v], 0, &comps_l, &comps_p).unwrap();
+        assert!(out.is_empty());
+    }
+
+    /// Empty volume slice → empty Vec.
+    #[test]
+    fn poc_empty_volumes_emits_no_packets() {
+        let comps_l = vec![lcomp(0, 1)];
+        let comps_p = vec![pcomp(0, 1, 1)];
+        let out = poc_volume_packet_order(&[], 4, &comps_l, &comps_p).unwrap();
+        assert!(out.is_empty());
+    }
+
+    /// Empty component slice rejected with `InvalidComponentCount`.
+    #[test]
+    fn poc_empty_components_rejected() {
+        let comps_p = vec![pcomp(0, 1, 1)];
+        let v = PocVolume {
+            component_start: 0,
+            component_end: 1,
+            resolution_start: 0,
+            resolution_end: 1,
+            layer_end: 1,
+            order: ProgressionOrder::Lrcp,
+        };
+        let out = poc_volume_packet_order(&[v], 1, &[], &comps_p);
+        assert!(matches!(out, Err(Error::InvalidComponentCount)));
+    }
+
+    /// Parallel-slice length mismatch rejected with `InvalidComponentCount`.
+    #[test]
+    fn poc_unbalanced_component_slices_rejected() {
+        let comps_l = vec![lcomp(0, 1), lcomp(0, 1)];
+        let comps_p = vec![pcomp(0, 1, 1)];
+        let v = PocVolume {
+            component_start: 0,
+            component_end: 1,
+            resolution_start: 0,
+            resolution_end: 1,
+            layer_end: 1,
+            order: ProgressionOrder::Lrcp,
+        };
+        let out = poc_volume_packet_order(&[v], 1, &comps_l, &comps_p);
+        assert!(matches!(out, Err(Error::InvalidComponentCount)));
+    }
+
+    /// T.800 Table A.16 reserves `Ppoc ∈ 0x05..=0xFF`. A volume with
+    /// a reserved order is rejected — the spec defines no iteration
+    /// order for reserved bytes.
+    #[test]
+    fn poc_reserved_progression_order_rejected() {
+        let comps_l = vec![lcomp(0, 1)];
+        let comps_p = vec![pcomp(0, 1, 1)];
+        let v = PocVolume {
+            component_start: 0,
+            component_end: 1,
+            resolution_start: 0,
+            resolution_end: 1,
+            layer_end: 1,
+            order: ProgressionOrder::Reserved(0x77),
+        };
+        let out = poc_volume_packet_order(&[v], 1, &comps_l, &comps_p);
+        assert!(matches!(out, Err(Error::InvalidPacketHeader)));
+    }
+
+    /// Per-component validation propagates: a malformed
+    /// `ComponentProgressionInfo` (length mismatch) is rejected with
+    /// `InvalidPacketHeader`.
+    #[test]
+    fn poc_invalid_component_progression_info_rejected() {
+        let comps_l = vec![ComponentProgressionInfo {
+            num_decomposition_levels: 2,
+            // length should be 3 but is 2 → invalid.
+            precincts_per_resolution: vec![1, 1],
+        }];
+        let comps_p = vec![pcomp(2, 1, 1)];
+        let v = PocVolume {
+            component_start: 0,
+            component_end: 1,
+            resolution_start: 0,
+            resolution_end: 3,
+            layer_end: 1,
+            order: ProgressionOrder::Lrcp,
+        };
+        let out = poc_volume_packet_order(&[v], 1, &comps_l, &comps_p);
+        assert!(matches!(out, Err(Error::InvalidPacketHeader)));
+    }
+
+    /// `PocVolume::from_poc` faithfully relabels a parsed `PocProgression`.
+    /// `parse_poc` (in lib.rs) already resolves the `CEpoc = 0 → 256/16 384`
+    /// footnote, so `from_poc` is a one-to-one copy.
+    #[test]
+    fn poc_volume_from_progression_relabels_fields() {
+        let p = PocProgression {
+            resolution_start: 1,
+            component_start: 0,
+            layer_end: 4,
+            resolution_end: 5,
+            component_end: 256, // already interpreted from CEpoc = 0
+            progression: ProgressionOrder::Cprl,
+        };
+        let v = PocVolume::from_poc(&p);
+        assert_eq!(v.component_start, 0);
+        assert_eq!(v.component_end, 256);
+        assert_eq!(v.resolution_start, 1);
+        assert_eq!(v.resolution_end, 5);
+        assert_eq!(v.layer_end, 4);
+        assert_eq!(v.order, ProgressionOrder::Cprl);
+    }
+
+    /// Cross-order chain: two RPCL volumes covering halves of the
+    /// resolution axis together emit every packet exactly once and in
+    /// the correct concatenated order.
+    #[test]
+    fn poc_chained_rpcl_volumes_partition_resolution_axis() {
+        let comps_l = vec![lcomp(2, 1)];
+        let comps_p = vec![pcomp(2, 1, 1)];
+        let v1 = PocVolume {
+            component_start: 0,
+            component_end: 1,
+            resolution_start: 0,
+            resolution_end: 2, // r = 0, 1
+            layer_end: 1,
+            order: ProgressionOrder::Rpcl,
+        };
+        let v2 = PocVolume {
+            component_start: 0,
+            component_end: 1,
+            resolution_start: 2,
+            resolution_end: 3, // r = 2
+            layer_end: 1,
+            order: ProgressionOrder::Rpcl,
+        };
+        let out = poc_volume_packet_order(&[v1, v2], 1, &comps_l, &comps_p).unwrap();
+        let rs: Vec<u8> = out.iter().map(|p| p.resolution).collect();
+        assert_eq!(rs, vec![0, 1, 2]);
+        // Total equals base RPCL output.
+        let base = rpcl_packet_order(1, &comps_p).unwrap();
+        assert_eq!(out, base);
+    }
+
+    /// Resolution clamp: a volume's `REpoc` exceeds `Nmax + 1` — the
+    /// driver clamps to the achievable range rather than panicking on
+    /// per-component out-of-range indices.
+    #[test]
+    fn poc_resolution_end_above_nmax_is_clamped() {
+        let comps_l = vec![lcomp(1, 1)]; // NL = 1 → r ∈ {0, 1}
+        let comps_p = vec![pcomp(1, 1, 1)];
+        let v = PocVolume {
+            component_start: 0,
+            component_end: 1,
+            resolution_start: 0,
+            resolution_end: 99, // > Nmax + 1 = 2
+            layer_end: 1,
+            order: ProgressionOrder::Lrcp,
+        };
+        let out = poc_volume_packet_order(&[v], 1, &comps_l, &comps_p).unwrap();
+        assert_eq!(out.len(), 2);
+        let rs: Vec<u8> = out.iter().map(|p| p.resolution).collect();
+        assert_eq!(rs, vec![0, 1]);
+    }
+
+    /// Component clamp: a volume's `CEpoc` exceeds `Csiz` (the parsed
+    /// component_end after the spec's 0 → 256 footnote may name a value
+    /// past the actual component count). The driver clamps to
+    /// `components.len()` so the iteration stays bounded.
+    #[test]
+    fn poc_component_end_above_csiz_is_clamped() {
+        let comps_l = vec![lcomp(0, 1), lcomp(0, 1)];
+        let comps_p = vec![pcomp(0, 1, 1), pcomp(0, 1, 1)];
+        let v = PocVolume {
+            component_start: 0,
+            component_end: 256, // > Csiz = 2 (after footnote)
+            resolution_start: 0,
+            resolution_end: 1,
+            layer_end: 1,
+            order: ProgressionOrder::Lrcp,
+        };
+        let out = poc_volume_packet_order(&[v], 1, &comps_l, &comps_p).unwrap();
+        assert_eq!(out.len(), 2);
+        let cs: Vec<u16> = out.iter().map(|p| p.component).collect();
+        assert_eq!(cs, vec![0, 1]);
     }
 }
