@@ -115,6 +115,7 @@
 
 #![warn(missing_debug_implementations)]
 
+pub mod dequant;
 pub mod geometry;
 pub mod jp2;
 pub mod mq;

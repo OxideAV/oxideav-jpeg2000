@@ -3,6 +3,63 @@
 Pure-Rust JPEG 2000 (J2K + JP2) and High-Throughput JPEG 2000 (HTJ2K)
 codec.
 
+## Status — 2026-05-29 (clean-room round 174)
+
+Round 174 adds the **tier-2 inverse-quantisation submodule** (T.800
+Annex E). The `dequant` submodule lifts a tier-1 [`t1::Coefficient`]
+to a reconstructed transform coefficient `Rqb(u, v)`. The
+implementation covers all of §E.1.1 (irreversible) and §E.1.2
+(reversible):
+
+* `dequant::StepSize { epsilon, mantissa }` — typed `(εb, µb)` pair
+  parsed from a single `SPqcd` entry. `StepSize::from_reversible_byte`
+  reads the high-5 / low-3 layout of Table A.29; 
+  `StepSize::from_irreversible_word` (and `_bytes`) reads the 5-bit
+  exponent + 11-bit mantissa big-endian word of Table A.30. Full-
+  payload parsers `parse_reversible_payload`, 
+  `parse_irreversible_payload` and `parse_derived_payload` cover the
+  three `QuantizationStyle` variants the QCD / QCC parser at lib.rs
+  already returns raw.
+* `dequant::subband_gain_log2(orientation)` — T.800 Table E.1
+  sub-band-gain exponents (`LL → 0`, `HL → 1`, `LH → 1`, `HH → 2`).
+* `dequant::nominal_dynamic_range(precision, orientation)` — Equation
+  E-4 `Rb = RI + log₂(gainb)`.
+* `dequant::derive_from_nlll(nlll, nl, nb)` — Equation E-5 expansion
+  of the single `(ε₀, µ₀)` NLLL pair to per-sub-band `(εb, µb)` under
+  `ScalarDerived` quantisation: `εb = ε₀ − NL + nb`, `µb = µ₀`. Out-
+  of-range `nb > nl` errors out with `Error::InvalidDecompositionLevels`;
+  a negative-`εb` underflow surfaces as `Error::InvalidMarkerLength`.
+* `dequant::mb(guard_bits, epsilon)` — Equation E-2 `Mb = G + εb − 1`,
+  the bit-width of the integer representation of `qb(u, v)`.
+* `dequant::irreversible_step_size(rb, step)` — Equation E-3
+  `Δb = 2^(Rb − εb) · (1 + µb / 2^11)`, returned as `f64` to retain
+  sub-bit precision (the denominator `2^11` is the 11-bit allocation
+  of `µb` in Table A.30; the exponent may be negative).
+* `dequant::qb_signed(coeff)` — Equation E-1 signed-integer recovery
+  from the tier-1 [`t1::Coefficient`]: `qb = (1 − 2·sb) · magnitude`.
+* `dequant::reconstruct_irreversible(qb, mb, nb, step, r)` — Equation
+  E-6 `Rqb = (qb ± r · 2^(Mb − Nb)) · Δb` with the `qb == 0` branch
+  collapsing to zero (no dead-zone midpoint lift). `r` is the §E.1.1.2
+  reconstruction parameter — typically `0.5`.
+* `dequant::reconstruct_reversible(qb, mb, nb, r)` — Equation E-7
+  (`Nb = Mb`: `Rqb = qb`, exact integer) or Equation E-8 (`Nb < Mb`:
+  `Rqb = qb ± r · 2^(Mb − Nb)`, `Δb = 1` per §E.1.2.1). The exact
+  path returns `qb` verbatim so round-trip integer wavelet samples
+  pass through losslessly.
+* `dequant::quantise_irreversible(ab, step)` — Equation E-9 (§E.2,
+  informative): `qb = sign(ab) · ⌊|ab| / Δb⌋`. Used by the test
+  suite to validate the round-trip `encode → reconstruct` bound
+  without any external reference; the decoder never invokes this.
+
+42 new unit tests cover every equation in isolation plus a worked
+example (8-bit grayscale, NL = 1, `ScalarDerived` NLLL gives the
+three sub-band step sizes Δ_LL = 1.0, Δ_HL = Δ_LH = 2.0, Δ_HH = 4.0
+under Rb_LL = 8, Rb_HL = Rb_LH = 9, Rb_HH = 10), Equation-E-9 round-
+trip bounds (dead-zone bin: |Rqb − ab| ≤ Δb; mid-tread bin: ≤ Δb/2,
+exhaustive over a representative ab range), the malformed-payload
+rejection paths, and the boundary cases (εb = 0, εb = 31, full-
+mantissa 2047, zero / positive / negative qb).
+
 ## Status — 2026-05-26 (clean-room round 143)
 
 **Codestream-structural + JP2-wrapper + tier-2 packet-header reader +
@@ -380,7 +437,6 @@ What is **not** implemented yet:
   segment length per included code-block; termination boundaries are
   a tier-1 input we don't have yet).
 * Inverse 5-3 and 9-7 wavelet transforms.
-* Dequantisation (E.1 / E.2 reconstruction formulas).
 * Multiple-component-transform (MCT, Annex G).
 * `pclr` / `cmap` / `cdef` / `res` JP2 boxes (skipped silently;
   `jp2h` enforces `ihdr` first + at least one `colr` only).

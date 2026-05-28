@@ -6,6 +6,58 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 174 (2026-05-29).** Tier-2 **inverse-quantisation
+  submodule** (T.800 Annex E). New `dequant::StepSize { epsilon,
+  mantissa }` parses single `SPqcd` entries per Tables A.29 / A.30
+  (reversible: 8-bit, εb in high 5 bits, low 3 reserved; irreversible:
+  16-bit big-endian, εb in high 5 bits, µb in low 11 bits), with the
+  full-payload helpers `parse_reversible_payload` /
+  `parse_irreversible_payload` / `parse_derived_payload` matching the
+  three `QuantizationStyle` variants of the existing QCD / QCC parser.
+  New `dequant::subband_gain_log2(orientation)` transcribes Table E.1
+  (`LL → 0`, `HL → 1`, `LH → 1`, `HH → 2`). New
+  `dequant::nominal_dynamic_range(precision, orientation)` implements
+  Equation E-4 `Rb = RI + log₂(gainb)`. New
+  `dequant::derive_from_nlll(nlll, nl, nb)` implements Equation E-5
+  derived-quantisation expansion: `(εb, µb) = (ε₀ − NL + nb, µ₀)`,
+  with `Error::InvalidDecompositionLevels` on `nb > nl` and
+  `Error::InvalidMarkerLength` on the `εb` underflow corner. New
+  `dequant::mb(guard_bits, epsilon)` implements Equation E-2
+  `Mb = G + εb − 1`. New
+  `dequant::irreversible_step_size(rb, step)` implements Equation
+  E-3 `Δb = 2^(Rb − εb) · (1 + µb / 2^11)` as `f64` (the negative-
+  exponent corner `εb > Rb` is handled). New
+  `dequant::qb_signed(coeff)` implements Equation E-1's `(1 − 2·sb)`
+  sign multiplication from a tier-1 [`t1::Coefficient`]. New
+  `dequant::reconstruct_irreversible(qb, mb, nb, step, r)` implements
+  Equation E-6 with `r` (the §E.1.1.2 reconstruction parameter,
+  typically 0.5) and the `qb == 0` dead-zone-bin → 0 branch. New
+  `dequant::reconstruct_reversible(qb, mb, nb, r)` implements Equations
+  E-7 (full decode: `Rqb = qb` exact integer pass-through) and E-8
+  (truncated bit-plane: `Rqb = qb ± r · 2^(Mb − Nb)` with `Δb = 1`).
+  Informative encoder-side `dequant::quantise_irreversible(ab, step)`
+  implements Equation E-9 (§E.2) for round-trip validation; the
+  decoder never calls it. 42 new unit tests cover the SPqcd byte /
+  word decoders, the gain table, the dynamic-range / derived-εb /
+  Mb / step-size equations, qb_signed, both reconstruction modes
+  (positive / negative / zero qb, full and truncated decode), the
+  worked example (8-bit grayscale, NL = 1, ScalarDerived NLLL =
+  (8, 0) → (Δ_LL, Δ_HL, Δ_HH) = (1.0, 2.0, 4.0)), the Equation-E-9
+  round-trip error bound (|Rqb − ab| ≤ Δb in the dead-zone bin, ≤
+  Δb/2 in every other bin under r = 0.5), the malformed-payload
+  rejection paths (odd-length irreversible payload →
+  `InvalidMarkerLength`; out-of-range `nb` →
+  `InvalidDecompositionLevels`), and the boundary corners (εb = 0,
+  εb = 31, µb = 0 / 1024 / 2047, `nb = nl`, `nb = 0`). Built solely
+  against `docs/image/jpeg2000/T-REC-T.800-201906-S.pdf` Annex E
+  (§E.1 prologue + Equations E-1 / E-2; §E.1.1.1 + Equations E-3 /
+  E-4 / E-5 + Table E.1; §E.1.1.2 + Equation E-6; §E.1.2.1; §E.1.2.2
+  + Equations E-7 / E-8; §E.2 + Equation E-9) and §A.6.4 + Tables
+  A.28 / A.29 / A.30 (SPqcd byte / 16-bit-word layouts). No external
+  library source was consulted, quoted, paraphrased, or used as a
+  cross-check oracle. No WebSearch / WebFetch was used for any
+  reason.
+
 * **Clean-room round 143 (2026-05-26).** Tier-2 **§B.12.2 POC
   progression-order volume iteration** layered on the five §B.12.1
   base orders. New `progression::PocVolume {
