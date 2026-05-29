@@ -4,6 +4,19 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ## [Unreleased]
 
+## [0.0.12](https://github.com/OxideAV/oxideav-jpeg2000/compare/v0.0.11...v0.0.12) - 2026-05-29
+
+### Other
+
+- T.800 Annex F.3 inverse discrete wavelet transform submodule
+- T.800 Annex E inverse quantisation submodule
+- §B.12.2 POC progression-order volume iteration
+- RPCL / PCRL / CPRL position-keyed iterators (T.800 §B.12.1.3–5)
+- RLCP packet iterator (T.800 §B.12.1.2)
+- LRCP packet iterator (T.800 §B.12.1.1)
+- bit-plane sequencer chaining §D.3 three-pass order per code-block
+- land the §D.3.4 cleanup pass (Annex D third coding pass)
+
 ### Added
 
 * **Clean-room round 181 (2026-05-29).** **Inverse discrete wavelet
