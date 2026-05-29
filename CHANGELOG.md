@@ -6,6 +6,56 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 181 (2026-05-29).** **Inverse discrete wavelet
+  transform submodule** (T.800 Annex F.3). New `dwt::pseo(i, i0,
+  il)` implements Equation F-4's closed-form periodic-symmetric-
+  extension index, generalised to arbitrary out-of-range `i: i32`
+  per the §F.3.7 higher-decomposition-level rider. New
+  `dwt::extension_amounts_5x3` / `dwt::extension_amounts_9x7`
+  transcribe Tables F.2 and F.3 (minimum left/right extension
+  parameters keyed on `i0` / `il` parity). New
+  `dwt::idwt_1d_5x3(y, x, i0, il)` implements 1D_SR for the 5-3
+  reversible filter (§F.3.6 length-one parity rule + §F.3.7
+  periodic-symmetric extension + §F.3.8.1 Equations F-5 and F-6
+  with floor-division `⌊·/4⌋` / `⌊·/2⌋` per the §F prologue's
+  round-toward-minus-infinity convention). New
+  `dwt::idwt_1d_9x7(y, x, i0, il)` implements 1D_SR for the 9-7
+  irreversible filter (§F.3.6 length-one + §F.3.7 extension +
+  §F.3.8.2 Equation F-7's six-step lifting in the spec-mandated
+  STEP1 → STEP6 order, with the `(α, β, γ, δ, K)` parameters of
+  Table F.4 exposed as named `pub const`s: `ALPHA_9X7` =
+  `-1.586_134_342_059_924`, `BETA_9X7` = `-0.052_980_118_572_961`,
+  `GAMMA_9X7` = `0.882_911_075_530_934`, `DELTA_9X7` =
+  `0.443_506_852_043_971`, `K_9X7` = `1.230_174_104_914_001`). The
+  9-7 working buffer is sized dynamically to the actual spec-
+  mandated intermediate-step access range — always ≥ Table F.3
+  minimums per the §F.3.7 "values equal to or greater than … will
+  produce the same array X" rider. New `dwt::interleave_2d_i32` /
+  `dwt::interleave_2d_f64` implement §F.3.3 2D_INTERLEAVE: place
+  LL / HL / LH / HH on the `(2u, 2v)` / `(2u+1, 2v)` / `(2u, 2v+1)`
+  / `(2u+1, 2v+1)` lattice, with the §F.3.3 sub-band-dimension
+  consistency check (`LL.w == LH.w`, `HL.w == HH.w`,
+  `LL.h == HL.h`, `LH.h == HH.h`). New `dwt::hor_sr_{5x3,9x7}` /
+  `dwt::ver_sr_{5x3,9x7}` implement §F.3.4 / §F.3.5 row-wise and
+  column-wise applications of the 1D inverse filter. New
+  `dwt::sr_2d_{5x3,9x7}` implement §F.3.2 single-level 2D_SR:
+  `2D_INTERLEAVE` → `HOR_SR` → `VER_SR`. New `dwt::kernel_for(t)`
+  dispatches a Table A.20 transformation byte to a `KernelKind`
+  (`Reversible5x3` / `Irreversible9x7`). New
+  `dwt::interleave_position(orientation, u, v)` round-trip helper
+  computes the `(2u + d_u, 2v + d_v)` position of a sub-band sample
+  in the interleaved 2D array. 32 new unit tests cover the §F.3
+  surface: `pseo` reflection / period / length-one corner; Tables
+  F.2 / F.3 extension amounts; 5-3 length-one parity and zero-
+  signal and **bit-exact round-trip** through an in-test forward
+  5-3 (constant, ramp, sawtooth, odd-length, odd-origin); 9-7
+  length-one parity and zero-signal and structural properties
+  (DC-coefficient → constant in interior across even/odd lengths
+  and origins; linearity `f(s·y) = s·f(y)`; additivity
+  `f(a + b) = f(a) + f(b)`; impulse-response decay); §F.3.3 lattice
+  placement and validation failure; §F.3.2 5-3 round-trip on an 8×8
+  image through forward 5-3 → inverse 2D_SR; Table A.20 dispatch.
+
 * **Clean-room round 174 (2026-05-29).** Tier-2 **inverse-quantisation
   submodule** (T.800 Annex E). New `dequant::StepSize { epsilon,
   mantissa }` parses single `SPqcd` entries per Tables A.29 / A.30

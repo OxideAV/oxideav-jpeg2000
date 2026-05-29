@@ -3,6 +3,89 @@
 Pure-Rust JPEG 2000 (J2K + JP2) and High-Throughput JPEG 2000 (HTJ2K)
 codec.
 
+## Status — 2026-05-29 (clean-room round 181)
+
+Round 181 adds the **inverse discrete wavelet transform submodule**
+(T.800 Annex F.3). The new `dwt` submodule implements the §F.3
+sub-band reconstruction path that lifts the de-quantised wavelet
+coefficients of [`crate::dequant`] back to image-domain samples
+for a tile-component:
+
+* `dwt::pseo(i, i0, il)` — Equation F-4's closed-form periodic-
+  symmetric-extension index. Returns a valid in-range index in
+  `[i0, il)` for any `i: i32`, supporting the §F.3.7 generalisation
+  to extension distances exceeding the signal length (required at
+  higher decomposition levels).
+* `dwt::extension_amounts_5x3` / `dwt::extension_amounts_9x7` —
+  Tables F.2 and F.3 minimum-extension parameters keyed on the
+  parity of `i0` and `il`.
+* `dwt::idwt_1d_5x3(y, x, i0, il)` — 1D_SR for the 5-3 reversible
+  filter (§F.3.6 + §F.3.7 + §F.3.8.1). Length-one parity rule plus
+  Equations F-5 / F-6 with floor-division (`⌊·/4⌋` / `⌊·/2⌋`)
+  matching the §F prologue's round-toward-minus-infinity convention.
+* `dwt::idwt_1d_9x7(y, x, i0, il)` — 1D_SR for the 9-7 irreversible
+  filter (§F.3.6 + §F.3.7 + §F.3.8.2). Length-one parity rule plus
+  Equation F-7's six-step lifting (`STEP1` scaling `X(2n) =
+  K · Yext(2n)`, `STEP2` scaling `X(2n+1) = (1/K) · Yext(2n+1)`,
+  `STEP3` even-update `X(2n) -= δ · (X(2n-1) + X(2n+1))`,
+  `STEP4` odd-update `X(2n+1) -= γ · (X(2n) + X(2n+2))`,
+  `STEP5` even-update `X(2n) -= β · (X(2n-1) + X(2n+1))`,
+  `STEP6` odd-update `X(2n+1) -= α · (X(2n) + X(2n+2))`)
+  with the `(α, β, γ, δ, K)` parameters of Table F.4 as named `pub
+  const`s (`ALPHA_9X7`, `BETA_9X7`, `GAMMA_9X7`, `DELTA_9X7`,
+  `K_9X7`). The working buffer is sized dynamically to the actual
+  spec-mandated intermediate-step access range (always ≥ Table F.3
+  minimums, per §F.3.7's "values equal to or greater than … will
+  produce the same array X" rider).
+* `dwt::interleave_2d_i32` / `dwt::interleave_2d_f64` — §F.3.3
+  2D_INTERLEAVE: place LL / HL / LH / HH coefficients at the
+  `(2u, 2v)` / `(2u+1, 2v)` / `(2u, 2v+1)` / `(2u+1, 2v+1)` lattice
+  positions of a single 2D array. Validates the §F.3.3 sample-grid
+  consistency (`LL.w == LH.w`, `HL.w == HH.w`, `LL.h == HL.h`,
+  `LH.h == HH.h`).
+* `dwt::hor_sr_5x3` / `dwt::ver_sr_5x3` / `dwt::hor_sr_9x7` /
+  `dwt::ver_sr_9x7` — §F.3.4 / §F.3.5 row-wise / column-wise
+  applications of the 1D inverse filter to the interleaved array.
+* `dwt::sr_2d_5x3` / `dwt::sr_2d_9x7` — §F.3.2 single-level 2D_SR:
+  `2D_INTERLEAVE` followed by `HOR_SR` followed by `VER_SR`,
+  returning the reconstructed `(lev - 1) LL` sub-band.
+* `dwt::kernel_for(WaveletTransform)` — dispatch helper from the
+  Table A.20 transformation byte to the `KernelKind` enum
+  (`Reversible5x3` / `Irreversible9x7`).
+* `dwt::interleave_position(SubBandOrientation, u, v)` — round-
+  trip helper: given a §F.3.3 sub-band position, compute the
+  corresponding `(2u + d_u, 2v + d_v)` position in the interleaved
+  array.
+
+32 new unit tests cover the §F.3 path:
+
+* `pseo` reflection / period / length-one degenerate corner.
+* `extension_amounts_{5x3,9x7}` Tables F.2 / F.3.
+* `idwt_1d_5x3` length-one parity + zero-signal + **bit-exact
+  round-trip** through an in-test forward 5-3 (constant, ramp,
+  sawtooth, odd-length, odd-origin signals).
+* `idwt_1d_9x7` length-one parity + zero-signal + structural
+  properties on the inverse filter alone (DC-coefficient
+  reconstructs to a constant signal in the interior across
+  even/odd lengths and origins; linearity `f(s·y) = s·f(y)`;
+  additivity `f(a + b) = f(a) + f(b)`; impulse-response decay
+  away from the impulse position).
+* `interleave_2d_*` lattice placement and §F.3.3 sub-band-grid
+  validation failure path.
+* `sr_2d_5x3` 8×8 round-trip end-to-end through forward 5-3 →
+  inverse 2D_SR.
+* `kernel_for` Table A.20 dispatch.
+
+The 9-7 path's "validate against a forward DWT in the same test"
+strategy is replaced with linearity / additivity / DC / impulse
+properties because the encoder's boundary-extension handling is a
+separate informative §F.4 procedure (and outside this round's
+scope); the structural tests pin down the §F.3.8.2 step order and
+sign conventions of Equation F-7 against the spec text directly,
+without requiring an encoder oracle.
+
+Previous round status follows:
+
 ## Status — 2026-05-29 (clean-room round 174)
 
 Round 174 adds the **tier-2 inverse-quantisation submodule** (T.800
