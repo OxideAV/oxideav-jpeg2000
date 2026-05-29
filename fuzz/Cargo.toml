@@ -1,0 +1,73 @@
+[package]
+name = "oxideav-jpeg2000-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone sub-package owned by cargo-fuzz. Lives outside the umbrella
+# `[workspace] members = ["crates/*"]` glob via `[workspace]` of its own
+# so the umbrella's `cargo build` doesn't try to compile the libFuzzer
+# harnesses (which require nightly + libfuzzer_sys runtime).
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+# JPEG 2000's wire format is a layered parse: T.800 §A delimiting markers
+# (SOC / SIZ / COD / QCD / SOT / SOD / EOC) walking the main header + the
+# tile-part chain, T.800 Annex I framing the JP2 ISO BMFF box wrapper
+# around an embedded codestream (`jP  ` signature, `ftyp`, `jp2h` superbox
+# with `ihdr` + optional `bpcc` + `colr`, `jp2c` payload), and T.800
+# Annex C / §C.3 supplying the MQ arithmetic decoder that the future
+# tier-1 coding-pass surface drives.
+#
+# Each byte along every one of those paths is attacker-controlled when a
+# third party hands us a `.j2k` / `.jp2` sample. There is no external
+# library oracle we can pull in (OpenJPEG / OpenJPH / Kakadu are off the
+# clean-room wall), so this fuzz crate is parse-only: feed arbitrary
+# bytes to the four public parsing entry points AND drive a fixed number
+# of MQ decisions over arbitrary bytes, asserting every call returns a
+# `Result` (or completes infallibly) rather than panicking,
+# integer-overflowing (debug), indexing out of bounds, or allocating an
+# attacker-controlled buffer.
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.oxideav-jpeg2000]
+path = ".."
+# The parser surface lives at the crate root and is always compiled (no
+# feature gate); the `registry` default feature only pulls in
+# `oxideav-core`'s `Decoder` / `Encoder` traits which we don't need
+# here. Drop it to keep the build minimal.
+default-features = false
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "parse_codestream"
+path = "fuzz_targets/parse_codestream.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_j2k_header"
+path = "fuzz_targets/parse_j2k_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_jp2"
+path = "fuzz_targets/parse_jp2.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mq_decoder"
+path = "fuzz_targets/mq_decoder.rs"
+test = false
+doc = false
+bench = false

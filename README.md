@@ -3,6 +3,51 @@
 Pure-Rust JPEG 2000 (J2K + JP2) and High-Throughput JPEG 2000 (HTJ2K)
 codec.
 
+## Status — 2026-05-30 (clean-room round 187)
+
+Round 187 stands up the **cargo-fuzz harness** under `fuzz/`. The
+standalone `oxideav-jpeg2000-fuzz` sub-package (its own `[workspace]`
+table so the umbrella's `cargo build` doesn't drag the libFuzzer
+runtime in) carries four panic-free libFuzzer targets:
+
+* `parse_codestream` — drives [`parse_codestream`] over arbitrary
+  attacker-controlled bytes, exercising T.800 §A.4 delimiting markers
+  (SOC / SOT / SOD / EOC), §A.5.1 SIZ parsing (including the
+  `Csiz`-driven per-component triple table), §A.6.1 COD parsing
+  (including the `NL`-keyed variable-length precinct-byte tail),
+  §A.6.4 QCD parsing (all three quantisation styles), and the §A.2 /
+  Tables A.2 / A.3 marker allow-lists used to validate the tile-part
+  walker. 64 KiB input cap.
+* `parse_j2k_header` — drives the lower-level [`parse_j2k_header`]
+  main-header entry point at a higher rate per second (no tile-part
+  walk), so libFuzzer can steer mutations toward the SIZ
+  component-table arithmetic and the COD precinct-byte tail without
+  spending coverage budget on the tile-part chain. 256 KiB input cap
+  (allows exploration of the maximum-`Csiz = 16384` corner per Table
+  A.10).
+* `parse_jp2` — drives [`jp2::parse_jp2`] over arbitrary bytes,
+  exercising the T.800 Annex I ISO BMFF box-wrapper surface — §I.4
+  box layout in all three length encodings (`LBox`, `LBox = 1 +
+  XLBox`, `LBox = 0` = "until EOF"), §I.5.1 `jP  ` signature, §I.5.2
+  `ftyp`, §I.5.3 `jp2h` superbox (`ihdr` + `bpcc` + `colr` in both
+  `METH = 1` enumerated and `METH = 2` ICC-profile forms), and §I.5.4
+  `jp2c` payload offset / length arithmetic. 256 KiB input cap.
+* `mq_decoder` — drives [`mq::MqDecoder`] for up to 4 096 decisions
+  over arbitrary bytes, cycling through the four Table D.7 initial
+  contexts (`MqContext::default` / `uniform` / `run_length` /
+  `zero_neighbours`) so each context's §C.2.5 adaptive probability
+  transition is exercised on every fourth decision. Surfaces any
+  bit-shift / integer-overflow / unbounded-loop corner the §C.3 spec's
+  prose doesn't make obvious in the §C.3.5 INITDEC + §C.3.4 BYTEIN +
+  §C.3.3 RENORMD + §C.3.2 DECODE chain. 64 KiB input cap.
+
+The `.github/workflows/fuzz.yml` shared workflow's 30-minute daily
+budget is now split roughly evenly across the four targets. Round 187
+closes the open CI gap noted by the prior `no fuzz targets discovered
+under fuzz/fuzz_targets/` failure.
+
+Previous round status follows:
+
 ## Status — 2026-05-29 (clean-room round 181)
 
 Round 181 adds the **inverse discrete wavelet transform submodule**
