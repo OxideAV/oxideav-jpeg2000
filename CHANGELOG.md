@@ -4,6 +4,13 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ## [Unreleased]
 
+## [0.0.13](https://github.com/OxideAV/oxideav-jpeg2000/compare/v0.0.12...v0.0.13) - 2026-05-30
+
+### Other
+
+- code-block → sub-band scatter + Annex E dequant bridge
+- stand up cargo-fuzz harness for parser surface + MQ decoder
+
 ### Added
 
 * **Clean-room round 192 (2026-05-30).** **Code-block → sub-band
