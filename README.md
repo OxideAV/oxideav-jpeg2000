@@ -3,6 +3,97 @@
 Pure-Rust JPEG 2000 (J2K + JP2) and High-Throughput JPEG 2000 (HTJ2K)
 codec.
 
+## Status — 2026-05-30 (clean-room round 192)
+
+Round 192 lands the **code-block → sub-band reassembly bridge**
+(`reassemble` submodule, T.800 §B.7 / §B.9 + Annex E). This is the
+piece that takes tier-1's per-code-block [`t1::CodeBlock`] (magnitude
++ sign) and scatters every coefficient — Annex-E-dequantised — into a
+per-sub-band coefficient array sized exactly to feed
+[`dwt::sr_2d_5x3`] / [`dwt::sr_2d_9x7`]:
+
+* `reassemble::CodedCodeBlock<'a>` — one decoded code-block (borrowed
+  [`t1::CodeBlock`] + its clipped sub-band placement from
+  [`geometry::PrecinctCodeBlock`] + uniform `Nb` per the §B.10.5 zero-
+  bit-plane truncation model).
+* `reassemble::SubBandQuantization` + `::resolve(precision, guard_bits,
+  orientation, step)` — bundles `(εb, µb, Mb, Rb)` so the caller
+  resolves Equation E-2 (`Mb = G + εb − 1`) and Equation E-4 (`Rb =
+  RI + log₂(gainb)`) once per (sub-band × component) and passes the
+  result straight through.
+* `reassemble::reassemble_subband_5x3(band, blocks, mb, r)` — the
+  reversible path. For each [`CodedCodeBlock`] it scatters
+  `placement.x0 - band.tbx0` / `placement.y0 - band.tby0` offsets,
+  calls `dequant::qb_signed` then `dequant::reconstruct_reversible`
+  (Equations E-7 / E-8: `Δb = 1`, exact integer at `Nb = Mb` and
+  `r · 2^(Mb − Nb)` midpoint lift otherwise), then truncates toward
+  zero into `i32` with `i32::MIN` / `i32::MAX` saturation.
+* `reassemble::reassemble_subband_9x7(band, blocks, quant, r)` — the
+  irreversible path. Same scatter; Equation E-6
+  (`Rqb = (qb + sign(qb) · r · 2^(Mb − Nb)) · Δb`) through
+  `dequant::reconstruct_irreversible`, output stays in `f64`.
+* `reassemble::BlockSource<'a>` trait + the blanket impl on
+  `&[&[CodedCodeBlock<'a>]]` — directs each sub-band's reassembly to
+  the matching code-block slice by orientation (so the caller can
+  collect blocks in whatever order its §B.12 progression walker
+  produced, and the bridge picks the right group per
+  `SubBandOrientation`).
+* `reassemble::reassemble_resolution_5x3(level, source, mb_per_band,
+  r)` and `_9x7(level, source, quant_per_band, r)` — assemble all
+  sub-bands of one [`ResolutionLevel`] into the four-tuple of (slice,
+  `(w, h)`) the [`dwt::sr_2d_*`] entry points consume. The result is
+  a `ResolutionArrays5x3` / `ResolutionArrays9x7` struct whose `ll` /
+  `ll_dims` are empty at `r ≥ 1` (the caller carries the LL band
+  forward from the previous step's inverse 2D_SR output).
+
+[`t1::CodeBlock`] grows a `from_coefficients(orientation, width,
+height, Vec<Coefficient>)` constructor — useful for the reassembly
+bridge's test suite to drive a known coefficient state into the
+scatter without first running the §D.3 passes, and a small piece of
+public API the future fuzzing of the reassembly path will need.
+
+22 new unit tests cover the bridge:
+
+* Single-sub-band scatter of one block and of two blocks side-by-
+  side (raster placement); placement with a non-`(0, 0)` band origin
+  (`tbx0` / `tby0` subtraction).
+* Reversible Equation E-8 midpoint lift (`Nb < Mb` carries a `r ·
+  2^(Mb − Nb)` magnitude / sign-preserving offset).
+* Rejection paths: placement outside the sub-band rectangle,
+  orientation mismatch, [`CodeBlock`] dimensions vs.
+  [`PrecinctCodeBlock`] clipped extent mismatch, and two code-blocks
+  claiming the same coefficient.
+* Empty sub-band returns an empty `Vec`.
+* Irreversible scatter with non-unit `Δb` (`Rb = 9`, `εb = 8` ⇒
+  `Δb = 2`); the Equation-E-6 midpoint at `r = 0.5` even when `Nb =
+  Mb` (the irreversible path always lifts); the `r = 0` no-midpoint
+  identity; the `qb = 0` always-zero special case.
+* `r_qb_to_i32` saturation above / below `i32` range, NaN handling,
+  and the truncate-toward-zero rounding of Equation E-8's lift.
+* `SubBandQuantization::resolve` for `LL` (`Rb = RI + 0`), `HH` (`Rb =
+  RI + 2`), and the §B.12.1.3 sample-precision pass-through.
+* `ResolutionArrays5x3` round-trip through `dwt::sr_2d_5x3` on a 4×4
+  tile-component, `NL = 1`, all-zero high-pass bands and `LL = 5`
+  (constant signal): the reconstructed image is `5` at every pixel,
+  validating that the four scatter targets line up exactly with the
+  inverse 2D_SR's expected input shape.
+* `BlockSource` orientation matching: HH-listed-first still
+  dispatches HL / LH / HH calls to the right slices.
+* `mb_per_band` length validation rejects an array-vs.-sub-band-count
+  mismatch with `Error::InvalidMarkerLength`.
+
+Pending after r192:
+
+* Per-coefficient (not per-block) `Nb` — a code-block can mix
+  per-pass `Nb` values when the packet header's pass count stops
+  mid-bit-plane. The bridge accepts uniform-`Nb` for now; the future
+  per-pass tracking will be threaded through [`BitPlaneSequencer`].
+* Multiple-component transformation (MCT, Annex G).
+* Tile reconstruction wiring (the §B.12 walk + per-resolution
+  inverse 2D_SR cascade across resolution levels).
+
+Previous round status follows:
+
 ## Status — 2026-05-30 (clean-room round 187)
 
 Round 187 stands up the **cargo-fuzz harness** under `fuzz/`. The

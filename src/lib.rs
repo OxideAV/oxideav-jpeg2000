@@ -122,6 +122,7 @@ pub mod jp2;
 pub mod mq;
 pub mod packet;
 pub mod progression;
+pub mod reassemble;
 pub mod t1;
 
 #[cfg(feature = "registry")]

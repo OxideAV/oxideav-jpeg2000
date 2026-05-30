@@ -209,6 +209,35 @@ impl CodeBlock {
         }
     }
 
+    /// Construct a code-block directly from a flat row-major coefficient
+    /// vector — useful for sibling modules (e.g. [`crate::reassemble`])
+    /// that need to round-trip a fully-decoded code-block through their
+    /// own logic, and for tests that want to drive a known state into
+    /// the reassembly bridge without first running the §D.3 passes.
+    ///
+    /// Panics if `coefficients.len() != width * height`.
+    pub fn from_coefficients(
+        orientation: SubBandOrientation,
+        width: usize,
+        height: usize,
+        coefficients: Vec<Coefficient>,
+    ) -> Self {
+        assert!(width >= 1, "code-block width must be ≥ 1");
+        assert!(height >= 1, "code-block height must be ≥ 1");
+        assert_eq!(
+            coefficients.len(),
+            width * height,
+            "coefficients length must equal width * height",
+        );
+        Self {
+            orientation,
+            width,
+            height,
+            coefficients,
+            newly_significant: vec![false; width * height],
+        }
+    }
+
     /// Code-block width in samples.
     pub fn width(&self) -> usize {
         self.width

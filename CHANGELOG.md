@@ -4,6 +4,54 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+* **Clean-room round 192 (2026-05-30).** **Code-block → sub-band
+  reassembly bridge** (T.800 §B.7 / §B.9 + Annex E). New `reassemble`
+  submodule:
+  * `reassemble::CodedCodeBlock<'a>` — one decoded code-block
+    (borrowed `t1::CodeBlock` + its clipped sub-band placement from
+    `geometry::PrecinctCodeBlock` + uniform `Nb` per the §B.10.5
+    zero-bit-plane truncation model).
+  * `reassemble::SubBandQuantization` + `::resolve(precision,
+    guard_bits, orientation, step)` — bundles `(εb, µb, Mb, Rb)` so
+    Equation E-2 (`Mb = G + εb − 1`) and Equation E-4 (`Rb = RI +
+    log₂(gainb)`) are resolved once per (sub-band × component).
+  * `reassemble::reassemble_subband_5x3(band, blocks, mb, r)` — the
+    reversible path. Scatters each `CodedCodeBlock` into an `i32`
+    array sized exactly `(tbx1 − tbx0) × (tby1 − tby0)` via
+    `dequant::qb_signed` + `dequant::reconstruct_reversible`
+    (Equations E-7 / E-8 — exact integer at `Nb = Mb`, midpoint
+    `r · 2^(Mb − Nb)` lift otherwise), truncating toward zero into
+    `i32` with saturation at `i32::MIN` / `i32::MAX`.
+  * `reassemble::reassemble_subband_9x7(band, blocks, quant, r)` —
+    the irreversible path. Equation E-6
+    (`Rqb = (qb + sign(qb) · r · 2^(Mb − Nb)) · Δb`) through
+    `dequant::reconstruct_irreversible`, output in `f64`.
+  * `reassemble::BlockSource<'a>` trait + the blanket impl on
+    `&[&[CodedCodeBlock<'a>]]` so the bridge picks the right group
+    per `SubBandOrientation` regardless of insertion order.
+  * `reassemble::reassemble_resolution_5x3` /
+    `reassemble::reassemble_resolution_9x7` — assemble all sub-bands
+    of one `ResolutionLevel` into the four-tuple of (slice, `(w, h)`)
+    the `dwt::sr_2d_*` entry points consume.
+
+  `t1::CodeBlock` grows a `from_coefficients(orientation, width,
+  height, Vec<Coefficient>)` constructor — useful for the reassembly
+  bridge's test suite to drive a known coefficient state into the
+  scatter without first running the §D.3 passes.
+
+  22 new unit tests cover the bridge (single-sub-band scatter, two-
+  block side-by-side, non-zero band origin, Equation-E-8 truncated-
+  block midpoint lift, four placement / dimension / orientation /
+  overlap rejection paths, empty sub-band, irreversible scatter with
+  non-unit `Δb`, Equation-E-6 midpoint at `r = 0.5` / `r = 0` /
+  `qb = 0` corners, `r_qb_to_i32` saturation + NaN + truncate-toward-
+  zero rounding, `SubBandQuantization::resolve` for LL / HH,
+  `ResolutionArrays5x3` round-trip through `dwt::sr_2d_5x3` on a 4×4
+  constant signal, `BlockSource` orientation matching independent of
+  insertion order, and `mb_per_band` length validation).
+
 ## [0.0.12](https://github.com/OxideAV/oxideav-jpeg2000/compare/v0.0.11...v0.0.12) - 2026-05-29
 
 ### Other
