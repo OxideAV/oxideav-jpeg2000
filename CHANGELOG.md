@@ -4,6 +4,38 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+* **Clean-room round 195 (2026-05-31).** **Multi-component
+  transformation** (T.800 Annex G). New `mct` submodule:
+  * `mct::inverse_rct(c0, c1, c2)` — §G.2.2 inverse Reversible
+    Component Transform. `i32` in / `i32` out, three slices in place;
+    Equations G-6 / G-7 / G-8 with `⌊·/4⌋` realised as an
+    arithmetic right-shift of two (floors toward minus infinity per
+    the Annex F prologue).
+  * `mct::forward_rct(c0, c1, c2)` — §G.2.1 forward RCT (Equations
+    G-3 / G-4 / G-5). Encoder-only; exposed so the test battery can
+    round-trip §G.2.1 → §G.2.2 without an encoder-side glue layer.
+  * `mct::inverse_ict(c0, c1, c2)` — §G.3.2 inverse Irreversible
+    Component Transform. `f32` in / `f32` out, the 3×3 inverse-
+    Y'CbCr matrix of Equations G-12 / G-13 / G-14 (literals `1.402`,
+    `0.34413`, `0.71414`, `1.772`); §G.3.2's closing precision note
+    applies.
+  * `mct::forward_ict(c0, c1, c2)` — §G.3.1 forward ICT (Equations
+    G-9 / G-10 / G-11). Encoder-only; exposed for round-trip tests.
+  * `mct::inverse_dc_level_shift_unsigned(samples, precision)` —
+    §G.1.2 inverse DC level shift for unsigned tile-components
+    (`+2^(Ssiz − 1)`). `precision` clamped to `1..=31` (the `i32`
+    shift bound; Table A.11's full `Ssiz ≤ 38` range is deferred to
+    an `i64`-widened surface in the tile-reconstruction round).
+  * 12 new unit tests — §G.2.1 / §G.2.2 worked examples, RCT
+    round-trip across the 8-bit unit axes + a 17-step `0..=255³`
+    grid (3 375 triples), negative-sum `⌊·/4⌋` floor probes, ICT
+    round-trip within `5e-3` ULPs, the textbook
+    `(255, 0, 0) → (76.245, -43.031, 127.5)` Y'CbCr-601 red check,
+    length-mismatch / out-of-range-precision rejection, empty-slice
+    no-op.
+
 ## [0.0.13](https://github.com/OxideAV/oxideav-jpeg2000/compare/v0.0.12...v0.0.13) - 2026-05-30
 
 ### Other

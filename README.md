@@ -3,6 +3,88 @@
 Pure-Rust JPEG 2000 (J2K + JP2) and High-Throughput JPEG 2000 (HTJ2K)
 codec.
 
+## Status — 2026-05-31 (clean-room round 195)
+
+Round 195 lands the **multi-component transformation** (`mct`
+submodule, T.800 Annex G). This is the post-DWT step that lifts the
+three reconstructed tile-components `(Y0, Y1, Y2)` back into colour-
+space samples `(I0, I1, I2)` when the COD marker's MCT byte (Table
+A.16 `0` / `1`) signals that a forward RCT or ICT was applied. Both
+inverse paths plus the inverse §G.1.2 DC level shift are now in
+crate:
+
+* `mct::inverse_rct(c0, c1, c2)` — T.800 §G.2.2 inverse Reversible
+  Component Transform. `i32` in / `i32` out, three slices in place.
+  Equations G-6 / G-7 / G-8 verbatim, with `⌊·/4⌋` realised as an
+  arithmetic right-shift of two (floors toward minus infinity for
+  negative `Y1 + Y2` sums too, matching the Annex F prologue).
+* `mct::forward_rct(c0, c1, c2)` — T.800 §G.2.1 forward RCT
+  (Equations G-3 / G-4 / G-5). Encoder-only; exposed now so the
+  round-trip test battery can exercise §G.2.1 → §G.2.2 in pure-Rust
+  without an encoder-side glue layer.
+* `mct::inverse_ict(c0, c1, c2)` — T.800 §G.3.2 inverse Irreversible
+  Component Transform. `f32` in / `f32` out, the 3×3 inverse-Y'CbCr
+  matrix of Equations G-12 / G-13 / G-14 (literals `1.402`,
+  `0.34413`, `0.71414`, `1.772`). §G.3.2's closing note about
+  unspecified coefficient precision applies.
+* `mct::forward_ict(c0, c1, c2)` — T.800 §G.3.1 forward ICT
+  (Equations G-9 / G-10 / G-11). Encoder-only; exposed for the
+  round-trip test battery for the same reason as `forward_rct`.
+* `mct::inverse_dc_level_shift_unsigned(samples, precision)` — T.800
+  §G.1.2 inverse DC level shift for unsigned tile-components
+  (`+2^(Ssiz - 1)`). `precision ≤ 31` (the `i32` shift bound;
+  Table A.11's full `Ssiz ≤ 38` range is deferred to an `i64` widen
+  callable from the tile-reconstruction round).
+
+12 new unit tests cover the submodule:
+
+* `forward_rct_matches_g_2_1_worked_example` — `(200, 100, 50)` →
+  `(112, -50, 100)` per the §G.2.1 equations.
+* `inverse_rct_matches_g_2_2_worked_example` — the §G.2.1 example
+  fed back through §G.2.2 recovers `(200, 100, 50)` exactly.
+* `rct_roundtrips_unit_axes` — for every `k ∈ 0..=255`, the four
+  axes (grayscale + R + G + B) self-cancel through §G.2.1 then
+  §G.2.2.
+* `rct_roundtrips_full_8bit_cube_diagonal_slice` — 3 375
+  `(R, G, B)` triples on a 17-step `0..=255³` grid all self-cancel.
+* `inverse_rct_floor_division_handles_negative_sums` — three spot
+  checks at `Y1 + Y2 ∈ {-1, -4, -5}` prove `⌊·/4⌋` floors toward
+  minus infinity (not toward zero) on the negative side.
+* `ict_roundtrips_8bit_axes_within_tolerance` — `(R, G, B) =
+  (200, 100, 50)` plus the grayscale axis `k ∈ {0, 32, …, 224}`
+  self-cancel through §G.3.1 then §G.3.2 within `5e-3` ULPs.
+* `forward_ict_red_matches_y_cb_cr_601_textbook` — `(255, 0, 0)`
+  forward-ICT gives `(76.245, -43.031, 127.5)`, the textbook
+  Y'CbCr-601 red triple, confirming none of the §G.3.1 coefficients
+  are transposed or signed wrong.
+* `length_mismatch_returns_invalid_marker_length` — both RCT
+  directions and both ICT directions return
+  `Error::InvalidMarkerLength` on slice-length mismatch instead of
+  panicking.
+* `inverse_dc_level_shift_unsigned_8bit` / `_12bit` —
+  Ssiz = 8 ⇒ `+128`, Ssiz = 12 ⇒ `+2048`.
+* `inverse_dc_level_shift_rejects_invalid_precision` — `0` and `32`
+  both report `Error::InvalidSamplePrecision`; `1` and `31` both
+  succeed.
+* `empty_inputs_are_a_noop` — empty slices through all four
+  transforms succeed silently.
+
+Pending after r195:
+
+* Per-coefficient (not per-block) `Nb` — a code-block can mix
+  per-pass `Nb` values when the packet header's pass count stops
+  mid-bit-plane. The reassembly bridge still accepts uniform-`Nb`.
+* `Ssiz ≥ 32` DC level-shift (needs an `i64`-widening surface).
+* Encoder MCT toggle in `encode_jpeg2000` (the forward primitives
+  already exist; what's missing is the tile-reconstruction wiring
+  that picks between them based on `Cod::mct`).
+* Tile reconstruction wiring (the §B.12 walk + per-resolution
+  inverse 2D_SR cascade across resolution levels — once that lands,
+  the COD MCT byte will be the one-line switch between
+  `inverse_rct` / `inverse_ict` / no-op).
+
+Previous round status follows:
+
 ## Status — 2026-05-30 (clean-room round 192)
 
 Round 192 lands the **code-block → sub-band reassembly bridge**
@@ -656,7 +738,6 @@ What is **not** implemented yet:
   segment length per included code-block; termination boundaries are
   a tier-1 input we don't have yet).
 * Inverse 5-3 and 9-7 wavelet transforms.
-* Multiple-component-transform (MCT, Annex G).
 * `pclr` / `cmap` / `cdef` / `res` JP2 boxes (skipped silently;
   `jp2h` enforces `ihdr` first + at least one `colr` only).
 * HTJ2K Part-15 block coder.

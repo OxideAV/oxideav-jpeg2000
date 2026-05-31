@@ -119,6 +119,7 @@ pub mod dequant;
 pub mod dwt;
 pub mod geometry;
 pub mod jp2;
+pub mod mct;
 pub mod mq;
 pub mod packet;
 pub mod progression;
