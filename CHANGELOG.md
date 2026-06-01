@@ -6,6 +6,32 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 201 (2026-06-01).** §G.1 **DC level-shifting**
+  surface completed in `mct`. New entry points:
+  * `mct::forward_dc_level_shift_unsigned(samples, precision)` —
+    T.800 §G.1.1 Equation G-1 (`I'(x, y) = I(x, y) − 2^(Ssiz − 1)`).
+    `i32` in / `i32` out, `precision ∈ 1..=31`.
+  * `mct::forward_dc_level_shift_unsigned_i64(samples, precision)` /
+    `mct::inverse_dc_level_shift_unsigned_i64(samples, precision)` —
+    `i64`-widened pair covering the full Table A.11 range
+    (`precision ∈ 1..=38`). Removes the prior round's `Ssiz ≤ 31`
+    cap.
+  * `mct::forward_dc_level_shift(samples, precision, is_signed)` /
+    `mct::inverse_dc_level_shift(samples, precision, is_signed)` —
+    signed-aware dispatchers. `is_signed == true` is a no-op per
+    the §G.1.1 / §G.1.2 prologue "unsigned only" rule; otherwise
+    forwards to the bare unsigned primitive. Validates `precision`
+    against Table A.11 even on the signed pass-through branch.
+  * `mct::clamp_to_dynamic_range(samples, precision, is_signed)` —
+    the §G.1.2 NOTE's "typical solution" clip to the original
+    dynamic range (`[0, 2^Ssiz − 1]` unsigned;
+    `[-2^(Ssiz-1), 2^(Ssiz-1) − 1]` signed).
+  * 17 new unit tests — §G.1.1 / §G.1.2 8-bit / 12-bit worked
+    examples and round-trips, `i64` 32-bit + 38-bit round-trips,
+    out-of-range precision rejection on every surface, signed-
+    dispatcher no-op probes, and clip helper coverage across
+    unsigned 8 / 12 / 31-bit and signed 8 / 16-bit ranges.
+
 * **Clean-room round 195 (2026-05-31).** **Multi-component
   transformation** (T.800 Annex G). New `mct` submodule:
   * `mct::inverse_rct(c0, c1, c2)` — §G.2.2 inverse Reversible

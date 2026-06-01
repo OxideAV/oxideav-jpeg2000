@@ -50,11 +50,30 @@
 //! §G.1.1 (forward) and §G.1.2 (inverse) DC-level-shift the unsigned
 //! components by `±2^(Ssiz - 1)`. The shift is applied **before** the
 //! forward RCT/ICT in the encoder, and **after** the inverse RCT/ICT
-//! in the decoder. This module exposes
-//! [`inverse_dc_level_shift_unsigned`] for the inverse direction; it
-//! is a simple per-sample add that does not depend on which (if any)
-//! component transform was used (signed components per §G.1.2 are not
-//! level-shifted at all).
+//! in the decoder. Signed components (Ssiz MSB = `1`, per T.800
+//! Table A.11) are **not** level-shifted at all.
+//!
+//! Four pairs of primitives are exposed:
+//!
+//! * [`forward_dc_level_shift_unsigned`] / [`inverse_dc_level_shift_unsigned`]
+//!   — Equations G-1 / G-2 verbatim on `i32` slices, valid for
+//!   `precision ∈ 1..=31`.
+//! * [`forward_dc_level_shift_unsigned_i64`] /
+//!   [`inverse_dc_level_shift_unsigned_i64`] — the `i64`-widened
+//!   variants for `precision ∈ 1..=38` (the full Table A.11 range);
+//!   used by the tile-reconstruction surface when an `Ssiz` byte
+//!   carries a value the `i32` primitives cannot represent.
+//! * [`forward_dc_level_shift`] / [`inverse_dc_level_shift`] — the
+//!   signed-aware dispatchers that take the SIZ component's
+//!   `is_signed` flag (the parsed Ssiz MSB) and apply the unsigned
+//!   shift only when `is_signed == false`. These are the entry
+//!   points the tile-reconstruction round will call once per
+//!   component.
+//! * [`clamp_to_dynamic_range`] — the §G.1.2 NOTE's "typical
+//!   solution" for the overflow/underflow caused by quantization,
+//!   clipping reconstructed samples to the original
+//!   `[0, 2^Ssiz - 1]` (unsigned) or
+//!   `[-2^(Ssiz-1), 2^(Ssiz-1) - 1]` (signed) range.
 //!
 //! ## What this module does NOT cover
 //!
@@ -296,20 +315,59 @@ pub fn forward_ict(c0: &mut [f32], c1: &mut [f32], c2: &mut [f32]) -> Result<(),
 }
 
 // ---------------------------------------------------------------------------
-// §G.1 — DC level shifting (inverse direction).
+// §G.1 — DC level shifting.
 // ---------------------------------------------------------------------------
+
+/// Forward DC level shift for an unsigned tile-component — T.800 §G.1.1.
+///
+/// Per Equation G-1, when the MSB of `Ssiz` is zero (i.e. the
+/// component is unsigned per Table A.11), the encoder subtracts the
+/// same `2^(Ssiz - 1)` quantity from every sample before the
+/// forward multiple-component transform — or, if no MCT is used,
+/// before the forward wavelet transform of Annex F:
+///
+/// ```text
+/// I'(x, y) = I(x, y) - 2^(Ssiz - 1)
+/// ```
+///
+/// `precision` is the per-component bit depth `Ssiz` as recorded in
+/// the SIZ marker (T.800 §A.5.1; see [`crate::SizComponent::precision`]).
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidSamplePrecision`] if `precision` is `0`
+/// or greater than `31`. The `i32` coefficient slice cannot
+/// represent the `1 << (precision - 1)` shift for `precision ≥ 32`;
+/// callers with `Ssiz ≥ 32` must use
+/// [`forward_dc_level_shift_unsigned_i64`] instead.
+pub fn forward_dc_level_shift_unsigned(samples: &mut [i32], precision: u8) -> Result<(), Error> {
+    if precision == 0 || precision > 31 {
+        return Err(Error::InvalidSamplePrecision);
+    }
+    let shift: i32 = 1_i32 << (precision - 1);
+    for s in samples.iter_mut() {
+        *s = s.wrapping_sub(shift);
+    }
+    Ok(())
+}
 
 /// Inverse DC level shift for an unsigned tile-component — T.800 §G.1.2.
 ///
-/// Per §G.1.2, after the inverse multiple-component transform, each
-/// unsigned tile-component is level-shifted by `+2^(Ssiz - 1)` to
-/// restore the original unsigned-sample dynamic range.
+/// Per §G.1.2 (Equation G-2), after the inverse multiple-component
+/// transform, each unsigned tile-component is level-shifted by
+/// `+2^(Ssiz - 1)` to restore the original unsigned-sample dynamic
+/// range:
+///
+/// ```text
+/// I(x, y) = I'(x, y) + 2^(Ssiz - 1)
+/// ```
 ///
 /// `precision` is the per-component bit depth `Ssiz` as recorded in
 /// the SIZ marker (T.800 §A.5.1; see [`crate::SizComponent::precision`]).
 /// Caller is responsible for skipping this step on signed components
 /// (the SIZ marker's `Ssiz` high bit, see Table A.11; §G.1.2 only
-/// shifts unsigned components).
+/// shifts unsigned components) — [`inverse_dc_level_shift`] is the
+/// signed-aware wrapper.
 ///
 /// # Errors
 ///
@@ -317,21 +375,175 @@ pub fn forward_ict(c0: &mut [f32], c1: &mut [f32], c2: &mut [f32]) -> Result<(),
 /// greater than `31`. T.800 Table A.11 admits `Ssiz` up to 38 bits,
 /// but the `i32` coefficient slice cannot represent the
 /// `1 << (precision - 1)` shift for `precision ≥ 32`; callers with
-/// `Ssiz ≥ 32` must widen to `i64` first (deferred to the tile-
-/// reconstruction round).
+/// `Ssiz ≥ 32` must use [`inverse_dc_level_shift_unsigned_i64`].
 pub fn inverse_dc_level_shift_unsigned(samples: &mut [i32], precision: u8) -> Result<(), Error> {
-    // T.800 Table A.11 admits `Ssiz` up to 38 bits, but this
-    // module's coefficient slices are `i32`; the shift `1 <<
-    // (precision - 1)` can therefore only be expressed losslessly
-    // for `precision ≤ 31`. Higher-precision components require the
-    // caller to widen to `i64` first (deferred — see the tile-
-    // reconstruction round in `README.md`'s Roadmap).
     if precision == 0 || precision > 31 {
         return Err(Error::InvalidSamplePrecision);
     }
     let shift: i32 = 1_i32 << (precision - 1);
     for s in samples.iter_mut() {
         *s = s.wrapping_add(shift);
+    }
+    Ok(())
+}
+
+/// `i64`-widened forward DC level shift — T.800 §G.1.1 for the full
+/// Table A.11 `Ssiz ≤ 38` range.
+///
+/// Use when the SIZ-marker component precision exceeds 31 bits and
+/// the caller has already widened its sample buffer to `i64`. Same
+/// Equation G-1 semantics as [`forward_dc_level_shift_unsigned`].
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidSamplePrecision`] if `precision` is `0`
+/// or greater than `38` (the T.800 Table A.11 upper bound on
+/// `Ssiz`).
+pub fn forward_dc_level_shift_unsigned_i64(
+    samples: &mut [i64],
+    precision: u8,
+) -> Result<(), Error> {
+    if precision == 0 || precision > 38 {
+        return Err(Error::InvalidSamplePrecision);
+    }
+    let shift: i64 = 1_i64 << (precision - 1);
+    for s in samples.iter_mut() {
+        *s = s.wrapping_sub(shift);
+    }
+    Ok(())
+}
+
+/// `i64`-widened inverse DC level shift — T.800 §G.1.2 for the full
+/// Table A.11 `Ssiz ≤ 38` range.
+///
+/// Use when the SIZ-marker component precision exceeds 31 bits and
+/// the caller has already widened its sample buffer to `i64`. Same
+/// Equation G-2 semantics as [`inverse_dc_level_shift_unsigned`].
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidSamplePrecision`] if `precision` is `0`
+/// or greater than `38` (the T.800 Table A.11 upper bound on
+/// `Ssiz`).
+pub fn inverse_dc_level_shift_unsigned_i64(
+    samples: &mut [i64],
+    precision: u8,
+) -> Result<(), Error> {
+    if precision == 0 || precision > 38 {
+        return Err(Error::InvalidSamplePrecision);
+    }
+    let shift: i64 = 1_i64 << (precision - 1);
+    for s in samples.iter_mut() {
+        *s = s.wrapping_add(shift);
+    }
+    Ok(())
+}
+
+/// Signed-aware forward DC level shift — T.800 §G.1.1 dispatcher.
+///
+/// Bridges the SIZ marker's per-component `Ssiz` MSB
+/// (`is_signed == true` ⇒ the MSB is `1`, per Table A.11) and the
+/// §G.1.1 prologue rule that "DC level shifting is performed on
+/// samples of components that are unsigned only". When `is_signed`
+/// is `true` the call is a no-op; otherwise it forwards to
+/// [`forward_dc_level_shift_unsigned`].
+///
+/// This is the entry point a tile-reconstruction surface should
+/// call once per component prior to the forward MCT (or, when no
+/// MCT is used, prior to the forward 2D DWT).
+///
+/// # Errors
+///
+/// Propagates any error from [`forward_dc_level_shift_unsigned`]
+/// when `is_signed == false`.
+pub fn forward_dc_level_shift(
+    samples: &mut [i32],
+    precision: u8,
+    is_signed: bool,
+) -> Result<(), Error> {
+    if is_signed {
+        // §G.1.1 prologue: signed components are not level-shifted.
+        // Still validate `precision` so the caller cannot smuggle an
+        // out-of-range Ssiz past this gate.
+        if precision == 0 || precision > 38 {
+            return Err(Error::InvalidSamplePrecision);
+        }
+        return Ok(());
+    }
+    forward_dc_level_shift_unsigned(samples, precision)
+}
+
+/// Signed-aware inverse DC level shift — T.800 §G.1.2 dispatcher.
+///
+/// Mirror of [`forward_dc_level_shift`] for the decoder side. When
+/// `is_signed == true` the call is a no-op (the §G.1.2 prologue:
+/// "Inverse DC level shifting is performed on reconstructed samples
+/// of components that are unsigned only"); otherwise it forwards to
+/// [`inverse_dc_level_shift_unsigned`].
+///
+/// # Errors
+///
+/// Propagates any error from [`inverse_dc_level_shift_unsigned`]
+/// when `is_signed == false`.
+pub fn inverse_dc_level_shift(
+    samples: &mut [i32],
+    precision: u8,
+    is_signed: bool,
+) -> Result<(), Error> {
+    if is_signed {
+        if precision == 0 || precision > 38 {
+            return Err(Error::InvalidSamplePrecision);
+        }
+        return Ok(());
+    }
+    inverse_dc_level_shift_unsigned(samples, precision)
+}
+
+/// Clip reconstructed samples to their original dynamic range —
+/// the "typical solution" recommended by the §G.1.2 NOTE.
+///
+/// The §G.1.2 NOTE warns that "due to quantization effects, the
+/// reconstructed samples I(x, y) may exceed the dynamic range of the
+/// original samples" and observes that "clipping the value to the
+/// nearest value within the original dynamic range is a typical
+/// solution". The procedure is *not* normative — this helper is
+/// what a decoder caller should reach for once it has run the
+/// inverse 2D DWT and the inverse MCT (and, for unsigned
+/// components, [`inverse_dc_level_shift_unsigned`]).
+///
+/// The clip range is determined by Table A.11 from `precision`
+/// (`Ssiz`'s low 7 bits) and `is_signed` (`Ssiz`'s MSB):
+///
+/// * **Unsigned**: `[0, 2^precision - 1]`.
+/// * **Signed**:   `[-2^(precision - 1), 2^(precision - 1) - 1]`.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidSamplePrecision`] if `precision` is `0`
+/// or greater than `31`. Callers handling `Ssiz ≥ 32` should clamp
+/// in their own `i64` surface (the formula is the same one bit
+/// wider).
+pub fn clamp_to_dynamic_range(
+    samples: &mut [i32],
+    precision: u8,
+    is_signed: bool,
+) -> Result<(), Error> {
+    if precision == 0 || precision > 31 {
+        return Err(Error::InvalidSamplePrecision);
+    }
+    let (lo, hi) = if is_signed {
+        let half = 1_i32 << (precision - 1);
+        (-half, half - 1)
+    } else {
+        let span = if precision == 31 {
+            i32::MAX
+        } else {
+            (1_i32 << precision) - 1
+        };
+        (0, span)
+    };
+    for s in samples.iter_mut() {
+        *s = (*s).clamp(lo, hi);
     }
     Ok(())
 }
@@ -611,5 +823,263 @@ mod tests {
         let mut c: [f32; 0] = [];
         assert!(inverse_ict(&mut a, &mut b, &mut c).is_ok());
         assert!(forward_ict(&mut a, &mut b, &mut c).is_ok());
+    }
+
+    // -------------------------------------------------------------------
+    // §G.1.1 — Forward DC level shift coverage.
+    // -------------------------------------------------------------------
+
+    /// §G.1.1 — Ssiz = 8 ⇒ shift = `-128`.
+    #[test]
+    fn forward_dc_level_shift_unsigned_8bit() {
+        let mut s = [0_i32, 127, 128, 129, 255];
+        forward_dc_level_shift_unsigned(&mut s, 8).unwrap();
+        assert_eq!(s, [-128_i32, -1, 0, 1, 127]);
+    }
+
+    /// §G.1.1 — Ssiz = 12 ⇒ shift = `-2048`.
+    #[test]
+    fn forward_dc_level_shift_unsigned_12bit() {
+        let mut s = [0_i32, 2047, 2048, 4095];
+        forward_dc_level_shift_unsigned(&mut s, 12).unwrap();
+        assert_eq!(s, [-2048_i32, -1, 0, 2047]);
+    }
+
+    /// Out-of-range precision is reported on the forward path too.
+    #[test]
+    fn forward_dc_level_shift_rejects_invalid_precision() {
+        let mut s = [0_i32; 4];
+        assert_eq!(
+            forward_dc_level_shift_unsigned(&mut s, 0),
+            Err(Error::InvalidSamplePrecision)
+        );
+        assert_eq!(
+            forward_dc_level_shift_unsigned(&mut s, 32),
+            Err(Error::InvalidSamplePrecision)
+        );
+        assert!(forward_dc_level_shift_unsigned(&mut s, 1).is_ok());
+        assert!(forward_dc_level_shift_unsigned(&mut s, 31).is_ok());
+    }
+
+    /// §G.1.1 → §G.1.2 round-trip on the full unsigned 8-bit
+    /// range — the encoder shift followed by the decoder shift is
+    /// the identity on every sample.
+    #[test]
+    fn dc_level_shift_round_trip_8bit_full_range() {
+        let mut s: Vec<i32> = (0..256_i32).collect();
+        let original = s.clone();
+        forward_dc_level_shift_unsigned(&mut s, 8).unwrap();
+        // After the forward shift, the centred dynamic range is
+        // [-128, 127].
+        assert_eq!(s[0], -128);
+        assert_eq!(s[255], 127);
+        inverse_dc_level_shift_unsigned(&mut s, 8).unwrap();
+        assert_eq!(s, original);
+    }
+
+    /// §G.1.1 → §G.1.2 round-trip across 12-bit range with a stride.
+    #[test]
+    fn dc_level_shift_round_trip_12bit_stride() {
+        let mut s: Vec<i32> = (0..4096_i32).step_by(7).collect();
+        let original = s.clone();
+        forward_dc_level_shift_unsigned(&mut s, 12).unwrap();
+        inverse_dc_level_shift_unsigned(&mut s, 12).unwrap();
+        assert_eq!(s, original);
+    }
+
+    // -------------------------------------------------------------------
+    // §G.1 — `i64`-widened path for Ssiz ∈ 32..=38 (Table A.11).
+    // -------------------------------------------------------------------
+
+    /// §G.1.1 / §G.1.2 — Ssiz = 32 round-trip in the `i64` surface.
+    #[test]
+    fn dc_level_shift_i64_round_trip_32bit() {
+        // A handful of probes spanning the full unsigned 32-bit range
+        // (the `i32`-only primitives reject `precision = 32`).
+        let mut s: Vec<i64> = vec![
+            0,
+            1,
+            i64::from(i32::MAX) + 1, // 2^31 — exactly the midpoint
+            (1_i64 << 32) - 1,       // 2^32 - 1 (top of 32-bit range)
+        ];
+        let original = s.clone();
+        forward_dc_level_shift_unsigned_i64(&mut s, 32).unwrap();
+        // After the forward shift the dynamic range is centred on
+        // zero: `[-2^31, 2^31 - 1]`.
+        assert_eq!(s[0], -(1_i64 << 31));
+        assert_eq!(s[2], 0);
+        assert_eq!(s[3], (1_i64 << 31) - 1);
+        inverse_dc_level_shift_unsigned_i64(&mut s, 32).unwrap();
+        assert_eq!(s, original);
+    }
+
+    /// §G.1.1 / §G.1.2 — Ssiz = 38 (Table A.11's upper bound) round-
+    /// trips through the `i64` surface.
+    #[test]
+    fn dc_level_shift_i64_round_trip_38bit() {
+        let span: i64 = (1_i64 << 38) - 1;
+        let mut s: Vec<i64> = vec![0, 1, 1_i64 << 37, span];
+        let original = s.clone();
+        forward_dc_level_shift_unsigned_i64(&mut s, 38).unwrap();
+        assert_eq!(s[0], -(1_i64 << 37));
+        assert_eq!(s[2], 0);
+        assert_eq!(s[3], (1_i64 << 37) - 1);
+        inverse_dc_level_shift_unsigned_i64(&mut s, 38).unwrap();
+        assert_eq!(s, original);
+    }
+
+    /// Out-of-range precision rejection on the `i64` path: 0 and
+    /// 39+ are errors; 1 and 38 are accepted (the Table A.11 ends).
+    #[test]
+    fn dc_level_shift_i64_rejects_invalid_precision() {
+        let mut s = [0_i64; 4];
+        assert_eq!(
+            forward_dc_level_shift_unsigned_i64(&mut s, 0),
+            Err(Error::InvalidSamplePrecision)
+        );
+        assert_eq!(
+            forward_dc_level_shift_unsigned_i64(&mut s, 39),
+            Err(Error::InvalidSamplePrecision)
+        );
+        assert_eq!(
+            inverse_dc_level_shift_unsigned_i64(&mut s, 0),
+            Err(Error::InvalidSamplePrecision)
+        );
+        assert_eq!(
+            inverse_dc_level_shift_unsigned_i64(&mut s, 39),
+            Err(Error::InvalidSamplePrecision)
+        );
+        assert!(forward_dc_level_shift_unsigned_i64(&mut s, 1).is_ok());
+        assert!(forward_dc_level_shift_unsigned_i64(&mut s, 38).is_ok());
+        assert!(inverse_dc_level_shift_unsigned_i64(&mut s, 1).is_ok());
+        assert!(inverse_dc_level_shift_unsigned_i64(&mut s, 38).is_ok());
+    }
+
+    // -------------------------------------------------------------------
+    // §G.1 — signed-aware dispatcher.
+    // -------------------------------------------------------------------
+
+    /// Signed components are pass-through under both directions
+    /// (§G.1.1 / §G.1.2 prologue: "unsigned only"). The buffer must
+    /// be unchanged when `is_signed == true`.
+    #[test]
+    fn dc_level_shift_signed_dispatcher_is_noop() {
+        let original = vec![-128_i32, -1, 0, 1, 127];
+        let mut s = original.clone();
+        forward_dc_level_shift(&mut s, 8, true).unwrap();
+        assert_eq!(s, original);
+        inverse_dc_level_shift(&mut s, 8, true).unwrap();
+        assert_eq!(s, original);
+
+        // 12-bit signed range probe.
+        let original = vec![-2048_i32, -1, 0, 2047];
+        let mut s = original.clone();
+        forward_dc_level_shift(&mut s, 12, true).unwrap();
+        assert_eq!(s, original);
+        inverse_dc_level_shift(&mut s, 12, true).unwrap();
+        assert_eq!(s, original);
+    }
+
+    /// Unsigned dispatch forwards to the bare primitive; the
+    /// `is_signed == false` 8-bit path round-trips for the
+    /// `[0, 255]` range.
+    #[test]
+    fn dc_level_shift_unsigned_dispatcher_round_trips_8bit() {
+        let mut s: Vec<i32> = (0..256_i32).collect();
+        let original = s.clone();
+        forward_dc_level_shift(&mut s, 8, false).unwrap();
+        inverse_dc_level_shift(&mut s, 8, false).unwrap();
+        assert_eq!(s, original);
+    }
+
+    /// Signed dispatcher with out-of-range Ssiz still reports an
+    /// error (the dispatcher validates `precision` so callers can't
+    /// smuggle a malformed Ssiz past it).
+    #[test]
+    fn dc_level_shift_signed_dispatcher_validates_precision() {
+        let mut s = [0_i32; 4];
+        assert_eq!(
+            forward_dc_level_shift(&mut s, 0, true),
+            Err(Error::InvalidSamplePrecision)
+        );
+        assert_eq!(
+            forward_dc_level_shift(&mut s, 39, true),
+            Err(Error::InvalidSamplePrecision)
+        );
+        assert_eq!(
+            inverse_dc_level_shift(&mut s, 0, true),
+            Err(Error::InvalidSamplePrecision)
+        );
+        assert_eq!(
+            inverse_dc_level_shift(&mut s, 39, true),
+            Err(Error::InvalidSamplePrecision)
+        );
+        assert!(forward_dc_level_shift(&mut s, 8, true).is_ok());
+        assert!(forward_dc_level_shift(&mut s, 38, true).is_ok());
+    }
+
+    // -------------------------------------------------------------------
+    // §G.1.2 NOTE — dynamic-range clipping.
+    // -------------------------------------------------------------------
+
+    /// Unsigned 8-bit clip: any sample outside `[0, 255]` is pulled
+    /// to the nearest endpoint; in-range samples are untouched.
+    #[test]
+    fn clamp_dynamic_range_unsigned_8bit() {
+        let mut s = [-10_i32, 0, 1, 254, 255, 256, 1_000_000];
+        clamp_to_dynamic_range(&mut s, 8, false).unwrap();
+        assert_eq!(s, [0_i32, 0, 1, 254, 255, 255, 255]);
+    }
+
+    /// Unsigned 12-bit clip: range `[0, 4095]`.
+    #[test]
+    fn clamp_dynamic_range_unsigned_12bit() {
+        let mut s = [-1_i32, 0, 4095, 4096, i32::MAX];
+        clamp_to_dynamic_range(&mut s, 12, false).unwrap();
+        assert_eq!(s, [0_i32, 0, 4095, 4095, 4095]);
+    }
+
+    /// Signed 8-bit clip: range `[-128, 127]`.
+    #[test]
+    fn clamp_dynamic_range_signed_8bit() {
+        let mut s = [-200_i32, -128, 0, 127, 200];
+        clamp_to_dynamic_range(&mut s, 8, true).unwrap();
+        assert_eq!(s, [-128_i32, -128, 0, 127, 127]);
+    }
+
+    /// Signed 16-bit clip: range `[-32_768, 32_767]`.
+    #[test]
+    fn clamp_dynamic_range_signed_16bit() {
+        let mut s = [-40_000_i32, -32_768, 0, 32_767, 40_000];
+        clamp_to_dynamic_range(&mut s, 16, true).unwrap();
+        assert_eq!(s, [-32_768_i32, -32_768, 0, 32_767, 32_767]);
+    }
+
+    /// `precision = 31` is accepted on the unsigned side; the upper
+    /// bound saturates at `i32::MAX` (since `1 << 31` overflows the
+    /// signed type — we represent `2^31 - 1`'s upper bound via
+    /// `i32::MAX` explicitly).
+    #[test]
+    fn clamp_dynamic_range_unsigned_31bit_upper_bound() {
+        let mut s = [-1_i32, 0, i32::MAX];
+        clamp_to_dynamic_range(&mut s, 31, false).unwrap();
+        assert_eq!(s, [0_i32, 0, i32::MAX]);
+    }
+
+    /// Out-of-range `precision` on the clip helper is reported, not
+    /// panicked.
+    #[test]
+    fn clamp_dynamic_range_rejects_invalid_precision() {
+        let mut s = [0_i32; 4];
+        assert_eq!(
+            clamp_to_dynamic_range(&mut s, 0, false),
+            Err(Error::InvalidSamplePrecision)
+        );
+        assert_eq!(
+            clamp_to_dynamic_range(&mut s, 32, false),
+            Err(Error::InvalidSamplePrecision)
+        );
+        assert!(clamp_to_dynamic_range(&mut s, 1, false).is_ok());
+        assert!(clamp_to_dynamic_range(&mut s, 31, true).is_ok());
     }
 }

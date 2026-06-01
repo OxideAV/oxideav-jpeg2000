@@ -3,6 +3,91 @@
 Pure-Rust JPEG 2000 (J2K + JP2) and High-Throughput JPEG 2000 (HTJ2K)
 codec.
 
+## Status — 2026-06-01 (clean-room round 201)
+
+Round 201 closes the **§G.1 DC level-shifting** surface in the `mct`
+submodule. The crate now exposes the full forward + inverse
+symmetric pair, the `i64`-widened variants that cover the Table A.11
+`Ssiz ≤ 38` range, the signed-aware dispatchers a tile-reconstruction
+caller will use, and the §G.1.2-NOTE recommended clip-to-dynamic-
+range helper:
+
+* `mct::forward_dc_level_shift_unsigned(samples, precision)` —
+  T.800 §G.1.1 Equation G-1 (`I'(x, y) = I(x, y) − 2^(Ssiz − 1)`).
+  `i32` in / `i32` out, `precision ∈ 1..=31`.
+* `mct::forward_dc_level_shift_unsigned_i64(samples, precision)` /
+  `mct::inverse_dc_level_shift_unsigned_i64(samples, precision)` —
+  `i64`-widened pair covering the full Table A.11 range
+  (`precision ∈ 1..=38`). The previous round capped `Ssiz` at `31`
+  because the `i32` shift bound couldn't represent `1 << 31`; the
+  `i64` surface lifts that.
+* `mct::forward_dc_level_shift(samples, precision, is_signed)` /
+  `mct::inverse_dc_level_shift(samples, precision, is_signed)` —
+  signed-aware dispatchers. When `is_signed == true` the call is a
+  no-op (per the §G.1.1 / §G.1.2 prologue "unsigned only" rule);
+  otherwise it forwards to the bare unsigned primitive. These are
+  the entry points the tile-reconstruction round will call once per
+  component without each call site repeating the SIZ-marker MSB
+  check.
+* `mct::clamp_to_dynamic_range(samples, precision, is_signed)` —
+  the §G.1.2 NOTE's "typical solution" to the quantisation-driven
+  overflow / underflow problem ("clipping the value to the nearest
+  value within the original dynamic range"). Returns samples to
+  `[0, 2^Ssiz − 1]` (unsigned) or `[-2^(Ssiz-1), 2^(Ssiz-1) − 1]`
+  (signed).
+
+17 new unit tests cover the additions, bringing the `mct` module to
+29 unit tests total (381 lib tests in the suite):
+
+* `forward_dc_level_shift_unsigned_8bit` /
+  `_12bit` — `(0, 127, 128, 129, 255)` → `(-128, -1, 0, 1, 127)`
+  for Ssiz = 8; same shape at Ssiz = 12.
+* `forward_dc_level_shift_rejects_invalid_precision` — `0` and
+  `32` both reject; `1` and `31` both succeed.
+* `dc_level_shift_round_trip_8bit_full_range` —
+  `[0..=255]` → forward → `[-128..=127]` → inverse → `[0..=255]`.
+* `dc_level_shift_round_trip_12bit_stride` — `0..4096 step 7`
+  self-cancels through §G.1.1 → §G.1.2.
+* `dc_level_shift_i64_round_trip_32bit` — Ssiz = 32 probes at `0`,
+  `1`, `2^31` (the midpoint), `2^32 − 1` (top of unsigned range);
+  forward yields `[-2^31, 2^31 − 1]` centring, inverse restores.
+* `dc_level_shift_i64_round_trip_38bit` — Ssiz = 38 (Table A.11
+  upper bound) round-trips the `0`, `1`, `2^37`, `2^38 − 1` probes.
+* `dc_level_shift_i64_rejects_invalid_precision` — `0` and `39+`
+  both reject across the `i64` pair; `1` and `38` both succeed.
+* `dc_level_shift_signed_dispatcher_is_noop` — `is_signed = true`
+  leaves the buffer untouched on both directions, at 8-bit and
+  12-bit ranges.
+* `dc_level_shift_unsigned_dispatcher_round_trips_8bit` — the
+  dispatcher forwards correctly when `is_signed = false`.
+* `dc_level_shift_signed_dispatcher_validates_precision` — the
+  signed-side no-op path still rejects out-of-range Ssiz.
+* `clamp_dynamic_range_unsigned_8bit` / `_12bit` — `[-10..=1_000_000]`
+  → `[0..=255]`; `[-1, i32::MAX]` → `[0, 4095]`.
+* `clamp_dynamic_range_signed_8bit` / `_16bit` — `[-200..=200]` →
+  `[-128..=127]`; `[-40_000..=40_000]` → `[-32_768..=32_767]`.
+* `clamp_dynamic_range_unsigned_31bit_upper_bound` — Ssiz = 31
+  saturates at `i32::MAX` (`2^31 − 1`).
+* `clamp_dynamic_range_rejects_invalid_precision` — `0` and `32`
+  both reject; `1` and `31` both succeed.
+
+Pending after r201:
+
+* Per-coefficient (not per-block) `Nb` — a code-block can mix
+  per-pass `Nb` values when the packet header's pass count stops
+  mid-bit-plane. The reassembly bridge still accepts uniform-`Nb`.
+* Encoder MCT toggle in `encode_jpeg2000` (the forward §G.2.1 /
+  §G.3.1 primitives plus the §G.1.1 forward DC level shift now
+  exist; what's missing is the tile-reconstruction wiring that
+  picks between them based on `Cod::mct`).
+* Tile reconstruction wiring (the §B.12 walk + per-resolution
+  inverse 2D_SR cascade across resolution levels — once that lands,
+  `forward_dc_level_shift` / `inverse_dc_level_shift` /
+  `clamp_to_dynamic_range` are the one-line per-component switches
+  threaded between the MCT and the wavelet pass).
+
+Previous round status follows:
+
 ## Status — 2026-05-31 (clean-room round 195)
 
 Round 195 lands the **multi-component transformation** (`mct`
