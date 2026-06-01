@@ -6,6 +6,37 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 208 (2026-06-02).** §F.3.1 **IDWT cascade** added
+  to the `reassemble` submodule. The cascade is the §F.3.1
+  "iterate 2D_SR over the levLL band, NL times" loop that turns a
+  per-resolution-level layout (from
+  `geometry::derive_resolution_levels`) and a `BlockSource` into the
+  reconstructed tile-component coefficient grid:
+  * `reassemble::idwt_5x3(levels, source, mb_per_level, r)` — the
+    reversible 5-3 path. Reassembles the NLLL band at `levels[0]`,
+    then for each `k = 1..=NL` reassembles the `[HL, LH, HH]` triple
+    at `levels[k]` and folds them through `dwt::sr_2d_5x3` with origin
+    `(levels[k].trx0, levels[k].try0)`, carrying the resulting LL
+    forward to the next iteration. Returns the final
+    `Interleaved2D<i32>` at full tile-component resolution.
+  * `reassemble::idwt_9x7(levels, source, quant_per_level, r)` — the
+    irreversible 9-7 counterpart on `f64`. Same cascade structure;
+    the per-band reassembly takes a `SubBandQuantization` rather than
+    a bare `Mb` and the 2D sub-band reconstruction runs `sr_2d_9x7`.
+  * Handles the NL = 0 corner (no decomposition was applied at the
+    encoder) per §F.3.1's "the sub-band a0LL is the output array
+    I(x, y)" rule: returns the LL band itself wrapped in an
+    `Interleaved2D` of the same extent.
+  * 7 new unit tests — NL = 0 / NL = 1 / NL = 2 constant-signal
+    round-trips (proving the cascade's LL-carry-forward wiring lines
+    up with the inverse 2D_SR's expected input shape), an `(i0, j0)`
+    parity differentiation probe (two byte-identical NL = 1 cascades
+    that differ only in `(trx0, try0)` — their outputs must diverge,
+    proving the cascade forwards the resolution-level origin into
+    `sr_2d_5x3`), `mb_per_level` length-vs.-levels-length rejection,
+    empty-`levels` rejection, and the 9-7 NL = 0 path. Suite is now
+    388 lib tests (was 381).
+
 * **Clean-room round 201 (2026-06-01).** §G.1 **DC level-shifting**
   surface completed in `mct`. New entry points:
   * `mct::forward_dc_level_shift_unsigned(samples, precision)` —

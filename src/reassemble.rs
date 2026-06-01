@@ -78,6 +78,7 @@ use crate::dequant::{
     irreversible_step_size, nominal_dynamic_range, qb_signed, reconstruct_irreversible,
     reconstruct_reversible, subband_gain_log2, StepSize,
 };
+use crate::dwt::{sr_2d_5x3, sr_2d_9x7, Interleaved2D};
 use crate::geometry::{PrecinctCodeBlock, ResolutionLevel, SubBand, SubBandOrientation};
 use crate::t1::CodeBlock;
 use crate::Error;
@@ -522,6 +523,182 @@ pub fn reassemble_resolution_9x7<'a, S: BlockSource<'a>>(
         }
     }
     Ok(out)
+}
+
+// =====================================================================
+// §F.3.1 — IDWT cascade across resolution levels.
+// =====================================================================
+
+/// Walk every resolution level of one tile-component, feeding
+/// [`reassemble_resolution_5x3`] into [`sr_2d_5x3`] iteratively, and
+/// return the reconstructed tile-component coefficient grid (5-3
+/// reversible path, T.800 §F.3.1).
+///
+/// `levels` is the per-resolution layout from
+/// [`crate::geometry::derive_resolution_levels`] — a `Vec<ResolutionLevel>`
+/// of length `NL + 1`, `levels[0]` carrying the single `LL` sub-band and
+/// `levels[r]` (for `r ≥ 1`) carrying the `[HL, LH, HH]` triple at
+/// decomposition level `nb = NL - r + 1`.
+///
+/// `source` is a [`BlockSource`] that, given any sub-band reference,
+/// returns the decoded code-blocks for that sub-band (the caller's
+/// §B.12 progression-order walk is responsible for accumulating these).
+///
+/// `mb_per_level` carries one `mb_per_band` slice per resolution
+/// level — `mb_per_level[0]` has length 1 (the LL band), and
+/// `mb_per_level[r]` for `r ≥ 1` has length 3 (the HL / LH / HH bands).
+/// Each entry is the Equation E-2 `Mb` for that (sub-band × component).
+///
+/// `r` is the §E.1.1.2 reconstruction parameter (the spec allows
+/// `0 ≤ r < 1`; pass `0.5` for the conventional midpoint).
+///
+/// The walk follows T.800 §F.3.1 verbatim: start by reassembling the
+/// `NL`-level NLLL band (`levels[0]`'s only sub-band); then for each
+/// `k = 1..=NL`, reassemble the `[HL, LH, HH]` triple at `levels[k]`,
+/// feed them with the carried-forward LL into [`sr_2d_5x3`] with origin
+/// `(levels[k].trx0, levels[k].try0)`, and carry the resulting
+/// `(k-1) LL → k LL` array forward to the next iteration. After `NL`
+/// iterations the carried array is the `0LL = a0LL` output, i.e. the
+/// reconstructed tile-component sample grid `I(x, y)` (before DC
+/// level-shift and any §G inverse component transform).
+///
+/// At `NL == 0` the cascade is a no-op: the function returns the
+/// `LL` band itself wrapped in an [`Interleaved2D`] of the tile-
+/// component's full extent. This matches the §F.3.1 "the sub-band
+/// `a0LL` is the output array I(x, y)" rule when no decomposition was
+/// applied at the encoder.
+///
+/// # Errors
+///
+/// * [`Error::InvalidMarkerLength`] if `mb_per_level.len() != levels.len()`.
+/// * Any error propagated from [`reassemble_resolution_5x3`] or
+///   [`sr_2d_5x3`].
+pub fn idwt_5x3<'a, S: BlockSource<'a>>(
+    levels: &[ResolutionLevel],
+    source: &S,
+    mb_per_level: &[Vec<u32>],
+    r: f64,
+) -> Result<Interleaved2D<i32>, Error> {
+    if levels.is_empty() || mb_per_level.len() != levels.len() {
+        return Err(Error::InvalidMarkerLength);
+    }
+
+    // Step 1 — reassemble the NLLL band at levels[0].
+    let level0 = &levels[0];
+    let arrays0 = reassemble_resolution_5x3(level0, source, &mb_per_level[0], r)?;
+    let mut carry_ll = arrays0.ll;
+    let mut carry_dims = arrays0.ll_dims;
+
+    // Step 2 — NL == 0: the NLLL band IS the tile-component (§F.3.1
+    // "the sub-band a0LL is the output array I(x, y)" when no
+    // decomposition was applied).
+    let n_l = level0.n_l;
+    if n_l == 0 {
+        // Wrap LL into an Interleaved2D of the same extent. The
+        // interleave is trivially the same array — at NL = 0 every
+        // sample is an LL coefficient.
+        return Ok(Interleaved2D {
+            data: carry_ll,
+            width: carry_dims.0,
+            height: carry_dims.1,
+        });
+    }
+
+    // Step 3 — cascade k = 1..=NL.
+    //
+    // §F.3.1 produces (lev - 1) LL from lev LL/HL/LH/HH. In our
+    // (r-keyed) representation, "lev LL" is the LL of the previous
+    // iteration (`carry_ll`) and "lev HL/LH/HH" are the high-pass
+    // bands of `levels[k]`. The output is the LL of resolution
+    // level k — its origin on the tile-component domain is
+    // `(levels[k].trx0, levels[k].try0)`.
+    for k in 1..=(n_l as usize) {
+        let level_k = &levels[k];
+        let arrays_k = reassemble_resolution_5x3(level_k, source, &mb_per_level[k], r)?;
+        let i0 = level_k.trx0 as i32;
+        let j0 = level_k.try0 as i32;
+        let interleaved = sr_2d_5x3(
+            &carry_ll,
+            carry_dims,
+            &arrays_k.hl,
+            arrays_k.hl_dims,
+            &arrays_k.lh,
+            arrays_k.lh_dims,
+            &arrays_k.hh,
+            arrays_k.hh_dims,
+            i0,
+            j0,
+        )?;
+        carry_dims = (interleaved.width, interleaved.height);
+        carry_ll = interleaved.data;
+    }
+
+    Ok(Interleaved2D {
+        data: carry_ll,
+        width: carry_dims.0,
+        height: carry_dims.1,
+    })
+}
+
+/// `f64` 9-7 irreversible counterpart of [`idwt_5x3`] (T.800 §F.3.1).
+///
+/// The cascade structure is identical — the only differences are the
+/// per-band reassembly call ([`reassemble_resolution_9x7`] requires a
+/// [`SubBandQuantization`] per band rather than a bare `Mb`) and the
+/// 2D sub-band reconstruction call ([`sr_2d_9x7`] operating on `f64`).
+///
+/// `quant_per_level[0]` has length 1 (LL); `quant_per_level[k]` for
+/// `k ≥ 1` has length 3 (`[HL, LH, HH]` in that order).
+pub fn idwt_9x7<'a, S: BlockSource<'a>>(
+    levels: &[ResolutionLevel],
+    source: &S,
+    quant_per_level: &[Vec<SubBandQuantization>],
+    r: f64,
+) -> Result<Interleaved2D<f64>, Error> {
+    if levels.is_empty() || quant_per_level.len() != levels.len() {
+        return Err(Error::InvalidMarkerLength);
+    }
+
+    let level0 = &levels[0];
+    let arrays0 = reassemble_resolution_9x7(level0, source, &quant_per_level[0], r)?;
+    let mut carry_ll = arrays0.ll;
+    let mut carry_dims = arrays0.ll_dims;
+
+    let n_l = level0.n_l;
+    if n_l == 0 {
+        return Ok(Interleaved2D {
+            data: carry_ll,
+            width: carry_dims.0,
+            height: carry_dims.1,
+        });
+    }
+
+    for k in 1..=(n_l as usize) {
+        let level_k = &levels[k];
+        let arrays_k = reassemble_resolution_9x7(level_k, source, &quant_per_level[k], r)?;
+        let i0 = level_k.trx0 as i32;
+        let j0 = level_k.try0 as i32;
+        let interleaved = sr_2d_9x7(
+            &carry_ll,
+            carry_dims,
+            &arrays_k.hl,
+            arrays_k.hl_dims,
+            &arrays_k.lh,
+            arrays_k.lh_dims,
+            &arrays_k.hh,
+            arrays_k.hh_dims,
+            i0,
+            j0,
+        )?;
+        carry_dims = (interleaved.width, interleaved.height);
+        carry_ll = interleaved.data;
+    }
+
+    Ok(Interleaved2D {
+        data: carry_ll,
+        width: carry_dims.0,
+        height: carry_dims.1,
+    })
 }
 
 // =====================================================================
@@ -1299,5 +1476,614 @@ mod tests {
         // E-8 lift may produce non-integer values; truncate toward zero.
         assert_eq!(r_qb_to_i32(3.7), 3);
         assert_eq!(r_qb_to_i32(-3.7), -3);
+    }
+
+    // ---------------------------------------------------------------
+    // §F.3.1 IDWT cascade.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn idwt_5x3_nl_zero_returns_ll_unchanged() {
+        // NL = 0: only resolution level r = 0 with one LL sub-band that
+        // is the full tile-component. The cascade is a no-op.
+        let level = ResolutionLevel {
+            r: 0,
+            n_l: 0,
+            trx0: 0,
+            try0: 0,
+            trx1: 4,
+            try1: 2,
+            sub_bands: vec![SubBand {
+                orientation: SubBandOrientation::LL,
+                nb: 0,
+                tbx0: 0,
+                tby0: 0,
+                tbx1: 4,
+                tby1: 2,
+            }],
+        };
+        let block = make_block(
+            SubBandOrientation::LL,
+            4,
+            2,
+            &[
+                (1, false),
+                (2, false),
+                (3, false),
+                (4, false),
+                (5, false),
+                (6, false),
+                (7, false),
+                (8, false),
+            ],
+        );
+        let placement = PrecinctCodeBlock {
+            cbx: 0,
+            cby: 0,
+            x0: 0,
+            y0: 0,
+            x1: 4,
+            y1: 2,
+        };
+        let blocks: &[CodedCodeBlock<'_>] = &[CodedCodeBlock {
+            placement,
+            coefficients: &block,
+            nb: 8,
+        }];
+        let groups: Vec<&[CodedCodeBlock<'_>]> = vec![blocks];
+        let source = groups.as_slice();
+        let mb_per_level: Vec<Vec<u32>> = vec![vec![8]];
+        let out = idwt_5x3(&[level], &source, &mb_per_level, 0.5).unwrap();
+        // NL = 0 returns the LL band itself, raw qb_signed values.
+        assert_eq!(out.data, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!((out.width, out.height), (4, 2));
+    }
+
+    #[test]
+    fn idwt_5x3_nl_one_constant_signal_round_trip() {
+        // NL = 1, 4×4 tile-component. Constant signal x[i,j] = 5 → the
+        // forward 5-3 DWT produces LL = 5, HL = LH = HH = 0. The
+        // cascade must reconstruct the same constant.
+        let level0 = ResolutionLevel {
+            r: 0,
+            n_l: 1,
+            trx0: 0,
+            try0: 0,
+            trx1: 2,
+            try1: 2,
+            sub_bands: vec![SubBand {
+                orientation: SubBandOrientation::LL,
+                nb: 1,
+                tbx0: 0,
+                tby0: 0,
+                tbx1: 2,
+                tby1: 2,
+            }],
+        };
+        let level1 = ResolutionLevel {
+            r: 1,
+            n_l: 1,
+            trx0: 0,
+            try0: 0,
+            trx1: 4,
+            try1: 4,
+            sub_bands: vec![
+                SubBand {
+                    orientation: SubBandOrientation::HL,
+                    nb: 1,
+                    tbx0: 0,
+                    tby0: 0,
+                    tbx1: 2,
+                    tby1: 2,
+                },
+                SubBand {
+                    orientation: SubBandOrientation::LH,
+                    nb: 1,
+                    tbx0: 0,
+                    tby0: 0,
+                    tbx1: 2,
+                    tby1: 2,
+                },
+                SubBand {
+                    orientation: SubBandOrientation::HH,
+                    nb: 1,
+                    tbx0: 0,
+                    tby0: 0,
+                    tbx1: 2,
+                    tby1: 2,
+                },
+            ],
+        };
+        // LL = constant 5 (four samples).
+        let ll_block = make_block(SubBandOrientation::LL, 2, 2, &[(5, false); 4]);
+        let hl_block = make_block(SubBandOrientation::HL, 2, 2, &[(0, false); 4]);
+        let lh_block = make_block(SubBandOrientation::LH, 2, 2, &[(0, false); 4]);
+        let hh_block = make_block(SubBandOrientation::HH, 2, 2, &[(0, false); 4]);
+        let placement = PrecinctCodeBlock {
+            cbx: 0,
+            cby: 0,
+            x0: 0,
+            y0: 0,
+            x1: 2,
+            y1: 2,
+        };
+        let ll_blocks: &[CodedCodeBlock<'_>] = &[CodedCodeBlock {
+            placement,
+            coefficients: &ll_block,
+            nb: 8,
+        }];
+        let hl_blocks: &[CodedCodeBlock<'_>] = &[CodedCodeBlock {
+            placement,
+            coefficients: &hl_block,
+            nb: 8,
+        }];
+        let lh_blocks: &[CodedCodeBlock<'_>] = &[CodedCodeBlock {
+            placement,
+            coefficients: &lh_block,
+            nb: 8,
+        }];
+        let hh_blocks: &[CodedCodeBlock<'_>] = &[CodedCodeBlock {
+            placement,
+            coefficients: &hh_block,
+            nb: 8,
+        }];
+        // Source enumerates every code-block group; BlockSource picks
+        // the matching orientation per call.
+        let groups: Vec<&[CodedCodeBlock<'_>]> = vec![ll_blocks, hl_blocks, lh_blocks, hh_blocks];
+        let source = groups.as_slice();
+        let mb_per_level: Vec<Vec<u32>> = vec![vec![8], vec![8, 8, 8]];
+        let out = idwt_5x3(&[level0, level1], &source, &mb_per_level, 0.5).unwrap();
+        assert_eq!((out.width, out.height), (4, 4));
+        for px in &out.data {
+            assert_eq!(*px, 5);
+        }
+    }
+
+    #[test]
+    fn idwt_5x3_nl_two_constant_signal_round_trip() {
+        // NL = 2, 8×8 tile-component. Same constant-signal property:
+        // x[i,j] = 7 → only the NLLL band carries the signal, every
+        // high-pass band is zero. After two cascade iterations, the
+        // reconstructed tile-component is constant 7 throughout.
+        let level0 = ResolutionLevel {
+            r: 0,
+            n_l: 2,
+            trx0: 0,
+            try0: 0,
+            trx1: 2,
+            try1: 2,
+            sub_bands: vec![SubBand {
+                orientation: SubBandOrientation::LL,
+                nb: 2,
+                tbx0: 0,
+                tby0: 0,
+                tbx1: 2,
+                tby1: 2,
+            }],
+        };
+        // r = 1: HL/LH/HH at 2×2 each (lev = NL = 2).
+        let level1 = ResolutionLevel {
+            r: 1,
+            n_l: 2,
+            trx0: 0,
+            try0: 0,
+            trx1: 4,
+            try1: 4,
+            sub_bands: vec![
+                SubBand {
+                    orientation: SubBandOrientation::HL,
+                    nb: 2,
+                    tbx0: 0,
+                    tby0: 0,
+                    tbx1: 2,
+                    tby1: 2,
+                },
+                SubBand {
+                    orientation: SubBandOrientation::LH,
+                    nb: 2,
+                    tbx0: 0,
+                    tby0: 0,
+                    tbx1: 2,
+                    tby1: 2,
+                },
+                SubBand {
+                    orientation: SubBandOrientation::HH,
+                    nb: 2,
+                    tbx0: 0,
+                    tby0: 0,
+                    tbx1: 2,
+                    tby1: 2,
+                },
+            ],
+        };
+        // r = 2: HL/LH/HH at 4×4 each (lev = 1).
+        let level2 = ResolutionLevel {
+            r: 2,
+            n_l: 2,
+            trx0: 0,
+            try0: 0,
+            trx1: 8,
+            try1: 8,
+            sub_bands: vec![
+                SubBand {
+                    orientation: SubBandOrientation::HL,
+                    nb: 1,
+                    tbx0: 0,
+                    tby0: 0,
+                    tbx1: 4,
+                    tby1: 4,
+                },
+                SubBand {
+                    orientation: SubBandOrientation::LH,
+                    nb: 1,
+                    tbx0: 0,
+                    tby0: 0,
+                    tbx1: 4,
+                    tby1: 4,
+                },
+                SubBand {
+                    orientation: SubBandOrientation::HH,
+                    nb: 1,
+                    tbx0: 0,
+                    tby0: 0,
+                    tbx1: 4,
+                    tby1: 4,
+                },
+            ],
+        };
+        // LL = constant 7 (four samples at NLLL = 2x2).
+        let ll_block = make_block(SubBandOrientation::LL, 2, 2, &[(7, false); 4]);
+        let zero_2x2_hl = make_block(SubBandOrientation::HL, 2, 2, &[(0, false); 4]);
+        let zero_2x2_lh = make_block(SubBandOrientation::LH, 2, 2, &[(0, false); 4]);
+        let zero_2x2_hh = make_block(SubBandOrientation::HH, 2, 2, &[(0, false); 4]);
+        let zero_4x4_hl = make_block(SubBandOrientation::HL, 4, 4, &[(0, false); 16]);
+        let zero_4x4_lh = make_block(SubBandOrientation::LH, 4, 4, &[(0, false); 16]);
+        let zero_4x4_hh = make_block(SubBandOrientation::HH, 4, 4, &[(0, false); 16]);
+        let placement_2x2 = PrecinctCodeBlock {
+            cbx: 0,
+            cby: 0,
+            x0: 0,
+            y0: 0,
+            x1: 2,
+            y1: 2,
+        };
+        let placement_4x4 = PrecinctCodeBlock {
+            cbx: 0,
+            cby: 0,
+            x0: 0,
+            y0: 0,
+            x1: 4,
+            y1: 4,
+        };
+        let ll_blocks: &[CodedCodeBlock<'_>] = &[CodedCodeBlock {
+            placement: placement_2x2,
+            coefficients: &ll_block,
+            nb: 8,
+        }];
+        let hl2x2_blocks: &[CodedCodeBlock<'_>] = &[CodedCodeBlock {
+            placement: placement_2x2,
+            coefficients: &zero_2x2_hl,
+            nb: 8,
+        }];
+        let lh2x2_blocks: &[CodedCodeBlock<'_>] = &[CodedCodeBlock {
+            placement: placement_2x2,
+            coefficients: &zero_2x2_lh,
+            nb: 8,
+        }];
+        let hh2x2_blocks: &[CodedCodeBlock<'_>] = &[CodedCodeBlock {
+            placement: placement_2x2,
+            coefficients: &zero_2x2_hh,
+            nb: 8,
+        }];
+        let hl4x4_blocks: &[CodedCodeBlock<'_>] = &[CodedCodeBlock {
+            placement: placement_4x4,
+            coefficients: &zero_4x4_hl,
+            nb: 8,
+        }];
+        let lh4x4_blocks: &[CodedCodeBlock<'_>] = &[CodedCodeBlock {
+            placement: placement_4x4,
+            coefficients: &zero_4x4_lh,
+            nb: 8,
+        }];
+        let hh4x4_blocks: &[CodedCodeBlock<'_>] = &[CodedCodeBlock {
+            placement: placement_4x4,
+            coefficients: &zero_4x4_hh,
+            nb: 8,
+        }];
+        // BlockSource picks by orientation; the §B.7 NOTE is that any
+        // arbitrary ordering of the groups is fine — but our
+        // `BlockSource for &[&[CodedCodeBlock]]` blanket impl picks the
+        // FIRST group whose first block matches the requested
+        // orientation. Because the same orientation appears at two
+        // different sub-band sizes (r=1: 2x2; r=2: 4x4) we cannot use
+        // the blanket impl as-is — each level needs its own source.
+        //
+        // For this test we drive `idwt_5x3` with a custom per-level
+        // source by composing a closure into a thin BlockSource impl
+        // below.
+        struct PerLevelSource<'a> {
+            ll: &'a [CodedCodeBlock<'a>],
+            hl_r1: &'a [CodedCodeBlock<'a>],
+            lh_r1: &'a [CodedCodeBlock<'a>],
+            hh_r1: &'a [CodedCodeBlock<'a>],
+            hl_r2: &'a [CodedCodeBlock<'a>],
+            lh_r2: &'a [CodedCodeBlock<'a>],
+            hh_r2: &'a [CodedCodeBlock<'a>],
+        }
+        impl<'a> BlockSource<'a> for PerLevelSource<'a> {
+            fn blocks_for(&self, band: &SubBand) -> &[CodedCodeBlock<'a>] {
+                // Pick by (orientation, sub-band width) — the per-level
+                // size disambiguates r=1 vs r=2 HL/LH/HH groups.
+                let w = band.width();
+                match band.orientation {
+                    SubBandOrientation::LL => self.ll,
+                    SubBandOrientation::HL => {
+                        if w == 2 {
+                            self.hl_r1
+                        } else {
+                            self.hl_r2
+                        }
+                    }
+                    SubBandOrientation::LH => {
+                        if w == 2 {
+                            self.lh_r1
+                        } else {
+                            self.lh_r2
+                        }
+                    }
+                    SubBandOrientation::HH => {
+                        if w == 2 {
+                            self.hh_r1
+                        } else {
+                            self.hh_r2
+                        }
+                    }
+                }
+            }
+        }
+        let source = PerLevelSource {
+            ll: ll_blocks,
+            hl_r1: hl2x2_blocks,
+            lh_r1: lh2x2_blocks,
+            hh_r1: hh2x2_blocks,
+            hl_r2: hl4x4_blocks,
+            lh_r2: lh4x4_blocks,
+            hh_r2: hh4x4_blocks,
+        };
+        let mb_per_level: Vec<Vec<u32>> = vec![vec![8], vec![8, 8, 8], vec![8, 8, 8]];
+        let out = idwt_5x3(&[level0, level1, level2], &source, &mb_per_level, 0.5).unwrap();
+        assert_eq!((out.width, out.height), (8, 8));
+        for px in &out.data {
+            assert_eq!(*px, 7);
+        }
+    }
+
+    #[test]
+    fn idwt_5x3_rejects_mb_per_level_length_mismatch() {
+        let level = ResolutionLevel {
+            r: 0,
+            n_l: 0,
+            trx0: 0,
+            try0: 0,
+            trx1: 1,
+            try1: 1,
+            sub_bands: vec![SubBand {
+                orientation: SubBandOrientation::LL,
+                nb: 0,
+                tbx0: 0,
+                tby0: 0,
+                tbx1: 1,
+                tby1: 1,
+            }],
+        };
+        let groups: Vec<&[CodedCodeBlock<'_>]> = Vec::new();
+        let source = groups.as_slice();
+        // mb_per_level has length 0; levels has length 1 → reject.
+        let mb_per_level: Vec<Vec<u32>> = Vec::new();
+        let res = idwt_5x3(&[level], &source, &mb_per_level, 0.5);
+        assert_eq!(res, Err(Error::InvalidMarkerLength));
+    }
+
+    #[test]
+    fn idwt_5x3_rejects_empty_levels() {
+        let groups: Vec<&[CodedCodeBlock<'_>]> = Vec::new();
+        let source = groups.as_slice();
+        let mb_per_level: Vec<Vec<u32>> = Vec::new();
+        let res = idwt_5x3(&[], &source, &mb_per_level, 0.5);
+        assert_eq!(res, Err(Error::InvalidMarkerLength));
+    }
+
+    #[test]
+    fn idwt_9x7_nl_zero_returns_ll_unchanged() {
+        // NL = 0 irreversible path: NLLL band IS the output. We need a
+        // SubBandQuantization with Mb >= nb so the reversible-style
+        // exact match holds via reconstruct_irreversible; pick a unit
+        // step at r = 0 (no midpoint lift) so qb · Δb is the recovered
+        // value.
+        let level = ResolutionLevel {
+            r: 0,
+            n_l: 0,
+            trx0: 0,
+            try0: 0,
+            trx1: 2,
+            try1: 2,
+            sub_bands: vec![SubBand {
+                orientation: SubBandOrientation::LL,
+                nb: 0,
+                tbx0: 0,
+                tby0: 0,
+                tbx1: 2,
+                tby1: 2,
+            }],
+        };
+        let block = make_block(
+            SubBandOrientation::LL,
+            2,
+            2,
+            &[(1, false), (2, false), (3, false), (4, false)],
+        );
+        let placement = PrecinctCodeBlock {
+            cbx: 0,
+            cby: 0,
+            x0: 0,
+            y0: 0,
+            x1: 2,
+            y1: 2,
+        };
+        let blocks: &[CodedCodeBlock<'_>] = &[CodedCodeBlock {
+            placement,
+            coefficients: &block,
+            nb: 8,
+        }];
+        let groups: Vec<&[CodedCodeBlock<'_>]> = vec![blocks];
+        let source = groups.as_slice();
+        // εb = 8, µb = 0; RI = 8, guard_bits = 1; LL has gain log2 = 0
+        // so Rb = RI = 8. Mb = G + εb - 1 = 8.
+        let step = StepSize {
+            epsilon: 8,
+            mantissa: 0,
+        };
+        let q = SubBandQuantization::resolve(8, 1, SubBandOrientation::LL, step).unwrap();
+        let quant_per_level: Vec<Vec<SubBandQuantization>> = vec![vec![q]];
+        // r = 0.0 keeps the midpoint lift out so qb · Δb is the value.
+        let out = idwt_9x7(&[level], &source, &quant_per_level, 0.0).unwrap();
+        assert_eq!((out.width, out.height), (2, 2));
+        // With Δb = 2^(Rb - εb) · (1 + µb/2^11) = 2^0 · 1 = 1 (when
+        // εb == Rb), the recovered Rqb is exactly qb_signed. Confirm
+        // four input coefficients round-trip.
+        assert!((out.data[0] - 1.0).abs() < 1e-9);
+        assert!((out.data[1] - 2.0).abs() < 1e-9);
+        assert!((out.data[2] - 3.0).abs() < 1e-9);
+        assert!((out.data[3] - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn idwt_5x3_propagates_resolution_origin_to_sr_2d() {
+        // Probe that `(i0, j0) = (levels[k].trx0, levels[k].try0)` is
+        // actually being forwarded — not always `(0, 0)`. Build two
+        // NL = 1 cascades that are byte-identical except for trx0/try0
+        // (i.e. only the cascade's `(i0, j0)` plumbing differs) and
+        // confirm the outputs diverge. The §F.3.6 / §F.3.7 boundary-
+        // parity rules guarantee the lifting filter responds to
+        // different `(i0, j0)` parities; if `idwt_5x3` were always
+        // calling `sr_2d_5x3(.., 0, 0)`, the two outputs would coincide.
+        let make_level0 = |trx0: u32, try0: u32, trx1: u32, try1: u32| ResolutionLevel {
+            r: 0,
+            n_l: 1,
+            trx0,
+            try0,
+            trx1,
+            try1,
+            sub_bands: vec![SubBand {
+                orientation: SubBandOrientation::LL,
+                nb: 1,
+                tbx0: trx0,
+                tby0: try0,
+                tbx1: trx1,
+                tby1: try1,
+            }],
+        };
+        let make_level1 = |trx0: u32, try0: u32, trx1: u32, try1: u32| ResolutionLevel {
+            r: 1,
+            n_l: 1,
+            trx0,
+            try0,
+            trx1,
+            try1,
+            sub_bands: vec![
+                SubBand {
+                    orientation: SubBandOrientation::HL,
+                    nb: 1,
+                    tbx0: 0,
+                    tby0: 0,
+                    tbx1: 2,
+                    tby1: 2,
+                },
+                SubBand {
+                    orientation: SubBandOrientation::LH,
+                    nb: 1,
+                    tbx0: 0,
+                    tby0: 0,
+                    tbx1: 2,
+                    tby1: 2,
+                },
+                SubBand {
+                    orientation: SubBandOrientation::HH,
+                    nb: 1,
+                    tbx0: 0,
+                    tby0: 0,
+                    tbx1: 2,
+                    tby1: 2,
+                },
+            ],
+        };
+        // Use a non-constant LL so the boundary-extension parity
+        // surface fires differently for even-vs-odd `i0`.
+        // LL = [[1, 5], [3, 7]] (raster row-major).
+        let ll_block = make_block(
+            SubBandOrientation::LL,
+            2,
+            2,
+            &[(1, false), (5, false), (3, false), (7, false)],
+        );
+        let hl_block = make_block(SubBandOrientation::HL, 2, 2, &[(0, false); 4]);
+        let lh_block = make_block(SubBandOrientation::LH, 2, 2, &[(0, false); 4]);
+        let hh_block = make_block(SubBandOrientation::HH, 2, 2, &[(0, false); 4]);
+
+        let run_cascade = |trx0_l0: u32, try0_l0: u32, trx0_l1: u32, try0_l1: u32| -> Vec<i32> {
+            let level0 = make_level0(trx0_l0, try0_l0, trx0_l0 + 2, try0_l0 + 2);
+            let level1 = make_level1(trx0_l1, try0_l1, trx0_l1 + 4, try0_l1 + 4);
+            let ll_placement = PrecinctCodeBlock {
+                cbx: 0,
+                cby: 0,
+                x0: trx0_l0,
+                y0: try0_l0,
+                x1: trx0_l0 + 2,
+                y1: try0_l0 + 2,
+            };
+            let high_placement = PrecinctCodeBlock {
+                cbx: 0,
+                cby: 0,
+                x0: 0,
+                y0: 0,
+                x1: 2,
+                y1: 2,
+            };
+            let ll_blocks: &[CodedCodeBlock<'_>] = &[CodedCodeBlock {
+                placement: ll_placement,
+                coefficients: &ll_block,
+                nb: 8,
+            }];
+            let hl_blocks: &[CodedCodeBlock<'_>] = &[CodedCodeBlock {
+                placement: high_placement,
+                coefficients: &hl_block,
+                nb: 8,
+            }];
+            let lh_blocks: &[CodedCodeBlock<'_>] = &[CodedCodeBlock {
+                placement: high_placement,
+                coefficients: &lh_block,
+                nb: 8,
+            }];
+            let hh_blocks: &[CodedCodeBlock<'_>] = &[CodedCodeBlock {
+                placement: high_placement,
+                coefficients: &hh_block,
+                nb: 8,
+            }];
+            let groups: Vec<&[CodedCodeBlock<'_>]> =
+                vec![ll_blocks, hl_blocks, lh_blocks, hh_blocks];
+            let source = groups.as_slice();
+            let mb_per_level: Vec<Vec<u32>> = vec![vec![8], vec![8, 8, 8]];
+            let out = idwt_5x3(&[level0, level1], &source, &mb_per_level, 0.5).unwrap();
+            assert_eq!((out.width, out.height), (4, 4));
+            out.data
+        };
+
+        let out_even_origin = run_cascade(0, 0, 0, 0);
+        let out_odd_origin = run_cascade(0, 0, 1, 0);
+        assert_ne!(
+            out_even_origin, out_odd_origin,
+            "different (i0, j0) parities must produce different reconstructions \
+             (proving idwt_5x3 forwards levels[k].trx0/try0 into sr_2d_5x3)",
+        );
     }
 }

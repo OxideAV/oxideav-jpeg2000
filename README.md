@@ -3,6 +3,81 @@
 Pure-Rust JPEG 2000 (J2K + JP2) and High-Throughput JPEG 2000 (HTJ2K)
 codec.
 
+## Status — 2026-06-02 (clean-room round 208)
+
+Round 208 lands the **§F.3.1 IDWT cascade** in the `reassemble`
+submodule — the resolution-level loop the spec describes verbatim:
+initialise `lev` to `NL`, iterate the §F.3.2 `2D_SR` procedure over the
+`levLL` band produced at each iteration, decrement `lev` each pass,
+until `NL` iterations are done; the final `a0LL` is the output
+`I(x, y)`. The cascade ties three previously-isolated submodules into
+the single end-to-end inverse path:
+
+* `reassemble::idwt_5x3(levels, source, mb_per_level, r)` — reversible
+  5-3 path. Reassembles the `NLLL` band at `levels[0]`, then for each
+  `k = 1..=NL` reassembles the `[HL, LH, HH]` triple at `levels[k]`
+  and folds them through `dwt::sr_2d_5x3` with origin
+  `(levels[k].trx0, levels[k].try0)`. The resulting `(k − 1) LL → k LL`
+  array is carried forward into the next iteration. After `NL`
+  iterations the carried array is the reconstructed tile-component
+  coefficient grid `I(x, y)` returned as an `Interleaved2D<i32>` at
+  full tile-component resolution.
+* `reassemble::idwt_9x7(levels, source, quant_per_level, r)` —
+  irreversible 9-7 counterpart on `f64`. Same cascade structure; the
+  per-band reassembly takes a `SubBandQuantization` rather than a bare
+  `Mb` and the inner 2D sub-band reconstruction runs `dwt::sr_2d_9x7`.
+* Handles the `NL = 0` corner (no decomposition applied at the
+  encoder) per §F.3.1's "the sub-band `a0LL` is the output array
+  `I(x, y)`" rule: returns the `LL` band wrapped in an `Interleaved2D`
+  of the same extent.
+
+7 new unit tests cover the cascade (suite total: 388 lib tests, was
+381):
+
+* `idwt_5x3_nl_zero_returns_ll_unchanged` — NL = 0 no-op identity at
+  4×2.
+* `idwt_5x3_nl_one_constant_signal_round_trip` — NL = 1, 4×4
+  tile-component, `LL = constant 5`, zero high-pass → reconstructs to
+  a 4×4 grid of `5` (validating the LL-carry-forward + sub-band sizing
+  contract against `dwt::sr_2d_5x3`).
+* `idwt_5x3_nl_two_constant_signal_round_trip` — NL = 2, 8×8
+  tile-component, `LL = constant 7`, every high-pass band zero →
+  reconstructs to a constant grid of `7`. Drives a per-level
+  `BlockSource` so the two HL / LH / HH triples (one at 2×2, one at
+  4×4) are dispatched to their matching code-block group by sub-band
+  width.
+* `idwt_5x3_propagates_resolution_origin_to_sr_2d` — two byte-
+  identical NL = 1 cascades that differ only in the resolution
+  level's `(trx0, try0)` — their outputs diverge under the §F.3.7
+  even-vs-odd boundary-extension parity rule. Proves the cascade
+  actually forwards the resolution-level origin into `sr_2d_5x3`
+  (i.e. it isn't hard-wired to `(0, 0)`).
+* `idwt_5x3_rejects_mb_per_level_length_mismatch` /
+  `idwt_5x3_rejects_empty_levels` — input-shape rejection paths.
+* `idwt_9x7_nl_zero_returns_ll_unchanged` — irreversible NL = 0
+  identity at 2×2 (`(εb, µb) = (8, 0)`, RI = 8, guard_bits = 1, LL
+  gain = 1 → Δb = 1; `r = 0` so no midpoint lift; the recovered Rqb
+  is exactly the signed magnitude).
+
+Pending after r208:
+
+* Per-coefficient (not per-block) `Nb` — a code-block can mix
+  per-pass `Nb` values when the packet header's pass count stops
+  mid-bit-plane. The cascade inherits `reassemble_subband_*`'s
+  uniform-`Nb` contract.
+* Tile-component reconstruction wiring (the §B.12 progression-walker
+  output → `BlockSource` adapter, plus the per-component MCT inverse
+  + DC level-shift threading once `idwt_*` returns). The `mct::`
+  primitives from r195 / r201 are the one-line switches the
+  threading layer will call between this cascade and the final pixel
+  output.
+* Encoder MCT toggle in `encode_jpeg2000` (forward §G.2.1 / §G.3.1
+  + forward §G.1.1 primitives already exist; the missing piece is
+  the tile-reconstruction wiring picking between them based on
+  `Cod::mct`).
+
+Previous round status follows:
+
 ## Status — 2026-06-01 (clean-room round 201)
 
 Round 201 closes the **§G.1 DC level-shifting** surface in the `mct`
