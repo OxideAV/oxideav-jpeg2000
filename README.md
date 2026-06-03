@@ -3,6 +3,107 @@
 Pure-Rust JPEG 2000 (J2K + JP2) and High-Throughput JPEG 2000 (HTJ2K)
 codec.
 
+## Status — 2026-06-04 (clean-room round 227)
+
+Round 227 lands the T.800 **§D.6 selective arithmetic-coding bypass**
+surface — the §D.6 raw-bit reader plus the raw-mode SP and MR coding
+pass entry points, plus the sequencer-level toggle the COD / COC
+Table A.19 flag drives:
+
+* `RawBitReader<'a>` — bit-stuffed raw-bit reader implementing the §D.6
+  stuff-bit rule. `read_bit()` returns one payload bit MSB-first per
+  byte; after a `0xFF` byte the top bit of the next byte is the stuff
+  bit and is discarded before the next payload bit is produced.
+  `bits_consumed()` / `bytes_consumed()` expose progress; exhausting the
+  segment surfaces `Error::UnexpectedEof`.
+* `CodeBlock::significance_propagation_pass_raw(bitplane, raw)` — the
+  raw-mode SP pass. Mirrors the AC SP pass in §D.1 scan order, the
+  "non-zero Table D.1 context only" filter, and the §D.3.3
+  newly-significant carry, but reads each per-coefficient decision bit
+  (and sign bit on `1`) from the supplied `RawBitReader` instead of the
+  MQ decoder. §D.6 Equation D-2 (`signbit = raw_value`) collapses the
+  XORbit-with-sign-context XOR to the identity — the raw bit is the
+  sign bit directly.
+* `CodeBlock::magnitude_refinement_pass_raw(bitplane, raw)` — the
+  raw-mode MR pass. Mirrors the AC MR pass in scan order and the
+  §D.3.3 "skip already-significant + newly-significant" filter; each
+  refinable coefficient consumes one raw bit, OR-ed into `magnitude` at
+  `1 << bitplane`.
+* `BitPlaneSequencer::with_selective_arithmetic_coding_bypass(enabled)`
+  / `BitPlaneSequencer::selective_arithmetic_coding_bypass()` — builder
+  + accessor for the §D.6 toggle. Default `false`. The toggle is taken
+  from the COD / COC Table A.19
+  `CodeBlockStyle::selective_arithmetic_coding_bypass` bit.
+* `BitPlaneSequencer::raw_mode_for_next_pass()` — dispatcher-side
+  query. Returns `true` iff the toggle is on, the next pass is SP or
+  MR, and at least three full SP/MR/Cleanup sets have already run
+  (i.e. the next pass would fire on bit-plane 5 or later — the start
+  of the §D.6 raw region per Table D.9). The cleanup pass remains AC
+  for every bit-plane. The §D.6-aware packet-reader integration
+  consults this between passes to pick between the AC and raw entry
+  points.
+
+18 new lib tests cover the addition (suite total: 428 lib tests, was
+410):
+
+* `raw_bit_reader_msb_first_within_byte` — MSB-first packing inside one
+  byte (`0b1010_0110` → `[1,0,1,0,0,1,1,0]`).
+* `raw_bit_reader_crosses_byte_boundary` — two-byte sequence with no
+  `0xFF` shows no stuff bit between them.
+* `raw_bit_reader_drops_stuff_bit_after_ff` — after a `0xFF` byte the
+  top bit of the next byte is discarded; the next seven payload bits
+  are the byte's lower seven; `bits_consumed` counts payload only.
+* `raw_bit_reader_consecutive_ff_bytes_each_introduce_stuff_bit` —
+  `0xFF, 0xFF, 0x00` produces 8 + 7 + 7 = 22 payload bits.
+* `raw_bit_reader_unexpected_eof_when_exhausted` /
+  `raw_bit_reader_empty_input_eofs_on_first_read` /
+  `raw_bit_reader_ff_then_eof` — EoF paths.
+* `sp_raw_pass_decodes_two_significant_with_signs` — seeded 2x2 LL
+  block consumes five raw bits (decision + sign per significant
+  coefficient, decision-only on the zero rejection); §D.6 Eq. D-2
+  sign-as-raw verified.
+* `sp_raw_pass_skips_zero_context_coefficients` — an empty raw stream
+  is enough for a 4x4 LL block with no significant seeds (every
+  coefficient's context is zero, every one is deferred to cleanup).
+* `sp_raw_pass_eof_propagates` — EoF on the raw stream surfaces
+  `UnexpectedEof` through the pass.
+* `mr_raw_pass_refines_already_significant` — two seeded sigificant
+  coefficients each consume one raw bit; bit `1` OR-s into the
+  magnitude, bit `0` only flips `already_refined`.
+* `mr_raw_pass_skips_newly_significant_carry` — §D.3.3 carry skips a
+  newly-significant coefficient on the MR raw pass.
+* `mr_raw_pass_skips_insignificant` — no significant coefficients →
+  zero raw bits consumed.
+* `sequencer_with_selective_arithmetic_coding_bypass_toggles` — builder
+  monotonicity in both directions; default off.
+* `sequencer_raw_mode_off_when_bypass_off` — `raw_mode_for_next_pass`
+  is `false` at every state when the toggle is off.
+* `sequencer_raw_mode_on_after_three_full_bitplane_sets` — walks the
+  pass-state cursor manually: AC for the first 10 passes (bit-plane 1
+  cleanup + bit-planes 2..=4 SP/MR/Cleanup); raw for SP/MR of
+  bit-plane 5 onwards; cleanup always AC.
+* `sequencer_bypass_off_dispatch_unchanged` — with the toggle off,
+  `decode_packet` matches `cleanup_pass` byte-for-byte on a known
+  stream (the §D.6 path is wholly inert).
+* `sp_raw_pass_clears_newly_significant_carry` — the §D.3.3 carry is
+  cleared at the top of every SP pass, raw included.
+
+Pending after r227:
+
+* §D.4.2 arithmetic-coder termination + per-pass termination
+  segmentation when the COD `termination_on_each_coding_pass` flag
+  is set (the lower-level `decode_passes` entry already supports
+  one-decoder-per-segment dispatch — the missing piece is the
+  packet-reader emitting per-pass byte ranges).
+* Packet-reader wiring that emits one raw-bit codeword segment per
+  §D.6 raw SP / MR pass and routes the sequencer through the new
+  raw-mode pass entry points. The sequencer-level
+  `raw_mode_for_next_pass` query is the switch the wiring will
+  consult between passes; the per-pass segment byte ranges still
+  need to be teased out of the packet header.
+
+Previous round status follows:
+
 ## Status — 2026-06-03 (clean-room round 220)
 
 Round 220 lands the T.800 **§D.7 vertically-causal context formation**

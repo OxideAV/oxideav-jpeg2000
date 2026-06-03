@@ -59,14 +59,26 @@
 //!   code-block — the three passes are individually callable; chaining
 //!   them per code-block from the packet reader's byte ranges is the next
 //!   step.
-//! * The §D.4.2 / §D.6 termination / raw-bit-bypass modes. **§D.5
-//!   error-resilience segmentation symbols are now wired** via
+//! * The §D.4.2 termination modes (per-pass / predictable). **§D.5
+//!   error-resilience segmentation symbols are wired** via
 //!   [`decode_segmentation_symbol`] and the
 //!   [`BitPlaneSequencer::with_segmentation_symbols`] toggle that the
 //!   COD / COC Table A.19 flag (decoded into
-//!   [`crate::CodeBlockStyle::segmentation_symbols`]) drives.
-//! * §D.7 vertically causal context formation — a flag for the future
-//!   COD `Scod` bit-3 mode.
+//!   [`crate::CodeBlockStyle::segmentation_symbols`]) drives. **§D.6
+//!   selective arithmetic-coding bypass is wired** via the
+//!   [`RawBitReader`] (with the §D.6 stuff-bit rule), the
+//!   [`CodeBlock::significance_propagation_pass_raw`] /
+//!   [`CodeBlock::magnitude_refinement_pass_raw`] raw-mode pass
+//!   entry points, and the
+//!   [`BitPlaneSequencer::with_selective_arithmetic_coding_bypass`]
+//!   toggle plus the
+//!   [`BitPlaneSequencer::raw_mode_for_next_pass`] dispatch query that
+//!   the COD / COC Table A.19 flag (decoded into
+//!   [`crate::CodeBlockStyle::selective_arithmetic_coding_bypass`])
+//!   drives.
+//! * §D.7 vertically causal context formation is wired via
+//!   [`CodeBlock::with_vertically_causal_context`] and the matching
+//!   [`BitPlaneSequencer::with_vertically_causal_context`] toggle.
 //!
 //! ## Clean-room provenance
 //!
@@ -172,6 +184,133 @@ pub fn decode_segmentation_symbol(
         Ok(())
     } else {
         Err(Error::SegmentationSymbolMismatch)
+    }
+}
+
+/// T.800 §D.6 raw-bit reader for the selective arithmetic-coding bypass.
+///
+/// When the COD / COC Table A.19
+/// [`crate::CodeBlockStyle::selective_arithmetic_coding_bypass`] flag is
+/// set, every §D.3.1 significance-propagation pass and every §D.3.3
+/// magnitude-refinement pass from the fourth set onward (i.e. starting
+/// with the fifth bit-plane per Table D.9) returns its decoded bits
+/// directly from the codeword segment rather than through the MQ
+/// arithmetic decoder. The bits are packed **most-significant-bit-first
+/// per byte** with one stuffing rule: any byte equal to `0xFF` is
+/// followed by a byte whose top bit was inserted by the encoder solely
+/// to break the marker prefix, and that top bit is discarded by the
+/// decoder before any payload bits are read from the following byte.
+///
+/// This reader implements the read side of that rule:
+///
+/// * `next_bit()` returns the next payload bit (`0` or `1`).
+/// * After a `0xFF` byte has been fully consumed (all eight payload
+///   bits delivered), the very next bit read from the next byte is the
+///   stuff bit; the reader discards it and returns the second bit of
+///   that byte as the first bit of the byte's payload. Subsequent reads
+///   from the same byte deliver its remaining six bits unchanged.
+/// * Exhausting the byte slice while there are still bits to read
+///   surfaces [`Error::UnexpectedEof`]; the §D.6 segment must be long
+///   enough to carry every bit the §D.3 pass requests.
+///
+/// The reader does **not** validate the §D.6 "last byte is not `0xFF`"
+/// rule — that's an encoder-side guarantee. The decoder only cares
+/// about consuming the right number of bits.
+///
+/// Clean-room provenance: the rule "throws out the first bit after an
+/// 0xFF byte value" comes verbatim from §D.6 paragraph 3, and the
+/// MSB-first byte packing from the §D.6 encoder paragraph ("bits are
+/// packed into bytes from the most significant bit to the least
+/// significant bit").
+#[derive(Debug, Clone)]
+pub struct RawBitReader<'a> {
+    bytes: &'a [u8],
+    /// Index of the next byte to load when `bits_remaining == 0`.
+    byte_pos: usize,
+    /// Current byte's payload (MSB-first); only the high `bits_remaining`
+    /// bits are still valid.
+    current_byte: u8,
+    /// Number of unread bits left in `current_byte` (0..=8).
+    bits_remaining: u8,
+    /// `true` iff the previously consumed byte was `0xFF`; the very next
+    /// bit read from the new byte is the §D.6 stuff bit and gets discarded
+    /// before the next payload bit is returned.
+    prev_was_ff: bool,
+    /// Total payload bits consumed since construction (stuff bits not
+    /// counted). Useful for callers that need to know how many bits a
+    /// pass drew from the segment.
+    bits_consumed: usize,
+}
+
+impl<'a> RawBitReader<'a> {
+    /// Wrap a §D.6 raw-bit codeword segment.
+    pub fn new(bytes: &'a [u8]) -> Self {
+        Self {
+            bytes,
+            byte_pos: 0,
+            current_byte: 0,
+            bits_remaining: 0,
+            prev_was_ff: false,
+            bits_consumed: 0,
+        }
+    }
+
+    /// Number of payload bits the reader has produced so far.
+    pub fn bits_consumed(&self) -> usize {
+        self.bits_consumed
+    }
+
+    /// Number of bytes wholly or partially consumed from the underlying
+    /// slice — exposed for tests and progress logging.
+    pub fn bytes_consumed(&self) -> usize {
+        if self.bits_remaining == 0 {
+            self.byte_pos
+        } else {
+            // The current byte has been loaded but not exhausted.
+            self.byte_pos
+        }
+    }
+
+    /// Read one payload bit. Returns `Ok(0)` or `Ok(1)`.
+    ///
+    /// Surfaces [`Error::UnexpectedEof`] if no more bytes remain to load
+    /// when the bit cache is empty.
+    pub fn read_bit(&mut self) -> Result<u8, Error> {
+        if self.bits_remaining == 0 {
+            self.load_next_byte()?;
+        }
+        let bit = (self.current_byte >> 7) & 1;
+        self.current_byte <<= 1;
+        self.bits_remaining -= 1;
+        self.bits_consumed += 1;
+        Ok(bit)
+    }
+
+    /// Internal: pull the next byte off `bytes`, honouring the §D.6
+    /// stuff-bit rule. After a `0xFF` byte was just consumed, the new
+    /// byte's most-significant bit is the stuff bit — drop it from the
+    /// payload (the next `read_bit` therefore returns the second-from-top
+    /// bit of the loaded byte). Records whether the newly loaded byte
+    /// itself is `0xFF` so the next call repeats the rule on the byte
+    /// after it.
+    fn load_next_byte(&mut self) -> Result<(), Error> {
+        if self.byte_pos >= self.bytes.len() {
+            return Err(Error::UnexpectedEof);
+        }
+        let raw = self.bytes[self.byte_pos];
+        self.byte_pos += 1;
+        if self.prev_was_ff {
+            // §D.6 stuff bit — drop the top bit before exposing the
+            // remaining seven as payload. The dropped bit is not counted
+            // in `bits_consumed`.
+            self.current_byte = raw << 1;
+            self.bits_remaining = 7;
+        } else {
+            self.current_byte = raw;
+            self.bits_remaining = 8;
+        }
+        self.prev_was_ff = raw == 0xFF;
+        Ok(())
     }
 }
 
@@ -644,6 +783,140 @@ impl CodeBlock {
         }
 
         Ok(newly)
+    }
+
+    /// Run one §D.6 **raw-mode** significance-propagation pass over the
+    /// bit-plane with positional weight `1 << bitplane`.
+    ///
+    /// Mirrors [`Self::significance_propagation_pass`] in scan order,
+    /// the "non-zero context only" filter, and the sign-bit subroutine,
+    /// but draws its bits straight from a [`RawBitReader`] rather than
+    /// the MQ arithmetic decoder. Per T.800 §D.6 Equation D-2 the
+    /// raw-mode sign bit is `signbit = raw_value` — i.e. the XOR with
+    /// the Table D.3 XORbit collapses to the identity and only the raw
+    /// bit value is read.
+    ///
+    /// This is the §D.6 SP path the COD / COC
+    /// [`crate::CodeBlockStyle::selective_arithmetic_coding_bypass`]
+    /// flag turns on starting with the **fourth** SP coding pass (i.e.
+    /// the SP pass on bit-plane 5 per Table D.9). The caller is
+    /// responsible for the bit-plane-counting that picks AC vs. raw —
+    /// the pass method does not check.
+    ///
+    /// The `ctx` array is **not** referenced here (no MQ contexts are
+    /// touched in raw mode) but the §D.3 significance state of the
+    /// code-block is still threaded through so the Table D.1 context
+    /// label can be computed to drive the "non-zero context = read
+    /// this bit, zero context = defer to cleanup" filter (§D.6 retains
+    /// the §D.3.1 filter — only the bit's source changes).
+    ///
+    /// Returns the number of coefficients that **became newly
+    /// significant** in this pass.
+    pub fn significance_propagation_pass_raw(
+        &mut self,
+        bitplane: u32,
+        raw: &mut RawBitReader<'_>,
+    ) -> Result<usize, Error> {
+        // §D.3.3: clear the "just became significant in the last SP
+        // pass" carry at the start of every new SP pass; the §D.6 raw
+        // path keeps the same MR-skip semantics as the AC path.
+        for flag in &mut self.newly_significant {
+            *flag = false;
+        }
+
+        let weight: u32 = 1u32 << bitplane;
+        let mut newly = 0usize;
+
+        let mut v0 = 0usize;
+        while v0 < self.height {
+            let stripe_h = core::cmp::min(4, self.height - v0);
+            for u in 0..self.width {
+                for dv in 0..stripe_h {
+                    let v = v0 + dv;
+                    let coef = self.coefficients[u + v * self.width];
+                    if coef.sigma {
+                        continue;
+                    }
+                    let label = significance_context_label(
+                        self.orientation,
+                        self.neighbours_in_stripe(u, v, v0, stripe_h),
+                    );
+                    if label == 0 {
+                        // Zero context — deferred to the cleanup pass,
+                        // exactly as in the AC path.
+                        continue;
+                    }
+                    let bit = raw.read_bit()?;
+                    if bit == 1 {
+                        // §D.6 Equation D-2: signbit = raw_value (no
+                        // XOR-with-XORbit redirection).
+                        let sign_bit = raw.read_bit()? == 1;
+                        let updated = Coefficient {
+                            magnitude: coef.magnitude | weight,
+                            sigma: true,
+                            sign: sign_bit,
+                            already_refined: coef.already_refined,
+                        };
+                        self.coefficients[u + v * self.width] = updated;
+                        self.newly_significant[u + v * self.width] = true;
+                        newly += 1;
+                    }
+                }
+            }
+            v0 += 4;
+        }
+
+        Ok(newly)
+    }
+
+    /// Run one §D.6 **raw-mode** magnitude-refinement pass over the
+    /// bit-plane with positional weight `1 << bitplane`.
+    ///
+    /// Mirrors [`Self::magnitude_refinement_pass`] in scan order and
+    /// the "refine the already-significant, skip the newly-significant"
+    /// filter (§D.3.3) but draws its refinement bits straight from a
+    /// [`RawBitReader`] rather than the MQ arithmetic decoder. Per
+    /// T.800 §D.6 the per-coefficient bit is a single raw bit (the
+    /// AC-side Table D.4 context label has no role in raw mode).
+    ///
+    /// This is the §D.6 MR path the COD / COC
+    /// [`crate::CodeBlockStyle::selective_arithmetic_coding_bypass`]
+    /// flag turns on starting with the **fourth** MR coding pass.
+    ///
+    /// Returns the number of coefficients refined in this pass.
+    pub fn magnitude_refinement_pass_raw(
+        &mut self,
+        bitplane: u32,
+        raw: &mut RawBitReader<'_>,
+    ) -> Result<usize, Error> {
+        let weight: u32 = 1u32 << bitplane;
+        let mut refined = 0usize;
+
+        let mut v0 = 0usize;
+        while v0 < self.height {
+            let stripe_h = core::cmp::min(4, self.height - v0);
+            for u in 0..self.width {
+                for dv in 0..stripe_h {
+                    let v = v0 + dv;
+                    let idx = u + v * self.width;
+                    let coef = self.coefficients[idx];
+                    if !coef.sigma || self.newly_significant[idx] {
+                        continue;
+                    }
+                    let bit = raw.read_bit()?;
+                    let mut updated = coef;
+                    if bit == 1 {
+                        updated.magnitude |= weight;
+                    }
+                    updated.already_refined = true;
+                    self.coefficients[idx] = updated;
+                    refined += 1;
+                }
+            }
+            v0 += 4;
+        }
+
+        Ok(refined)
     }
 
     /// Whether the four-coefficient column starting at `(u, v0)` is
@@ -1286,6 +1559,26 @@ pub struct BitPlaneSequencer {
     /// three §D.3 pass methods read the §D.7-clipped Figure D.2
     /// neighbour set on the bottom row of each stripe.
     vertically_causal_context: bool,
+    /// Whether the COD / COC Table A.19
+    /// `selective_arithmetic_coding_bypass` flag is set for this
+    /// code-block (T.800 §D.6).
+    ///
+    /// When `true`, the SP and MR coding passes starting with the
+    /// **fourth** SP / MR set (i.e. the SP / MR passes that fire on
+    /// bit-plane 5 onwards per Table D.9) read their per-coefficient
+    /// bits from a [`RawBitReader`] instead of the MQ arithmetic
+    /// decoder. The cleanup pass remains AC-coded throughout.
+    ///
+    /// The sequencer surface in this round exposes the flag and tracks
+    /// it on construction; the dispatch wiring that picks between AC
+    /// and raw mode per coding pass lives in
+    /// [`Self::raw_mode_for_next_pass`] — the packet-reader integration
+    /// supplies the matching [`RawBitReader`] segments and calls the
+    /// dedicated raw-mode pass entry points
+    /// ([`CodeBlock::significance_propagation_pass_raw`] /
+    /// [`CodeBlock::magnitude_refinement_pass_raw`]) when the
+    /// sequencer indicates the next SP / MR pass should run raw.
+    selective_arithmetic_coding_bypass: bool,
 }
 
 impl BitPlaneSequencer {
@@ -1309,6 +1602,7 @@ impl BitPlaneSequencer {
             passes_decoded: 0,
             segmentation_symbols: false,
             vertically_causal_context: false,
+            selective_arithmetic_coding_bypass: false,
         }
     }
 
@@ -1358,6 +1652,80 @@ impl BitPlaneSequencer {
     /// Whether T.800 §D.7 vertically-causal context formation is on.
     pub fn vertically_causal_context(&self) -> bool {
         self.vertically_causal_context
+    }
+
+    /// Builder — enable T.800 §D.6 selective arithmetic-coding bypass
+    /// for this code-block.
+    ///
+    /// When enabled, the sequencer reports `true` from
+    /// [`Self::raw_mode_for_next_pass`] for every SP / MR coding pass
+    /// from the **fourth** SP / MR set onward (i.e. the SP / MR passes
+    /// that fire on bit-plane 5 onwards per Table D.9). The cleanup
+    /// pass remains AC-coded for every bit-plane regardless of the
+    /// toggle.
+    ///
+    /// The dispatch into the raw-mode pass methods
+    /// ([`CodeBlock::significance_propagation_pass_raw`] /
+    /// [`CodeBlock::magnitude_refinement_pass_raw`]) is the
+    /// packet-reader integration's responsibility — the sequencer's
+    /// [`Self::decode_passes`] entry point still drives every pass
+    /// through the AC path. Callers that wire §D.6 in feed
+    /// [`Self::raw_mode_for_next_pass`] back into their pass-dispatch
+    /// loop to pick the right entry point on the next iteration.
+    ///
+    /// The flag is taken from the COD / COC Table A.19
+    /// [`crate::CodeBlockStyle::selective_arithmetic_coding_bypass`]
+    /// bit.
+    pub fn with_selective_arithmetic_coding_bypass(mut self, enabled: bool) -> Self {
+        self.selective_arithmetic_coding_bypass = enabled;
+        self
+    }
+
+    /// Whether T.800 §D.6 selective arithmetic-coding bypass is on.
+    pub fn selective_arithmetic_coding_bypass(&self) -> bool {
+        self.selective_arithmetic_coding_bypass
+    }
+
+    /// Whether the **next** pass to run (per [`Self::next_pass`]) is
+    /// in §D.6 raw mode for this sequencer's current state.
+    ///
+    /// Returns `true` iff all three of the following hold:
+    ///
+    /// 1. The sequencer has [`Self::selective_arithmetic_coding_bypass`]
+    ///    set (the COD / COC Table A.19 bit).
+    /// 2. The next pass is significance-propagation
+    ///    ([`Pass::Sp`]) or magnitude-refinement ([`Pass::Mr`]) — the
+    ///    cleanup pass is always AC per Table D.9.
+    /// 3. At least three previous SP/MR pairs have already run — i.e.
+    ///    the bit-plane this pass would fire on is the fifth or later
+    ///    (Table D.9 starts the raw mode at the fourth significance
+    ///    propagation pass).
+    ///
+    /// The pass-driver loop in a §D.6-aware packet reader consults
+    /// this before each pass to decide whether to feed the
+    /// [`CodeBlock`] the AC entry point
+    /// ([`CodeBlock::significance_propagation_pass`] /
+    /// [`CodeBlock::magnitude_refinement_pass`]) or the raw one
+    /// ([`CodeBlock::significance_propagation_pass_raw`] /
+    /// [`CodeBlock::magnitude_refinement_pass_raw`]).
+    ///
+    /// The "fifth bit-plane" count is taken from the sequencer's
+    /// [`Self::passes_decoded`] cursor. A fresh sequencer ahead of its
+    /// very first pass has `passes_decoded == 0`. Per §D.3, the first
+    /// non-empty bit-plane has only a cleanup pass (one pass); the next
+    /// three bit-planes each have SP, MR, cleanup (nine passes total).
+    /// The tenth pass (`passes_decoded == 10`) is therefore the SP of
+    /// the fifth bit-plane — the first raw-mode pass per Table D.9. The
+    /// sequencer reports raw mode iff `passes_decoded >= 10` *and* the
+    /// next pass is SP or MR.
+    pub fn raw_mode_for_next_pass(&self) -> bool {
+        if !self.selective_arithmetic_coding_bypass {
+            return false;
+        }
+        match self.next_pass {
+            Pass::Sp | Pass::Mr => self.passes_decoded >= 10,
+            Pass::Cleanup => false,
+        }
     }
 
     /// Bit-plane index that the **next** pass will run on
@@ -3152,5 +3520,386 @@ mod tests {
             differs,
             "§D.7 on vs. off must change at least one coefficient inside the bottom row of the first stripe",
         );
+    }
+
+    // -- §D.6 selective arithmetic-coding bypass -----------------------
+
+    #[test]
+    fn raw_bit_reader_msb_first_within_byte() {
+        // §D.6 packs the encoder's raw bits MSB-first per byte.
+        let mut r = RawBitReader::new(&[0b1010_0110]);
+        let bits: Vec<u8> = (0..8).map(|_| r.read_bit().unwrap()).collect();
+        assert_eq!(bits, vec![1, 0, 1, 0, 0, 1, 1, 0]);
+        assert_eq!(r.bits_consumed(), 8);
+    }
+
+    #[test]
+    fn raw_bit_reader_crosses_byte_boundary() {
+        // Two bytes of distinct payloads — bit 8 must be the MSB of
+        // the second byte, no stuff bit between them (the first byte
+        // is 0x55, not 0xFF, so the §D.6 stuff-bit rule does not fire).
+        let mut r = RawBitReader::new(&[0x55, 0xAA]);
+        let bits: Vec<u8> = (0..16).map(|_| r.read_bit().unwrap()).collect();
+        assert_eq!(
+            bits,
+            vec![
+                // 0x55 = 0101_0101
+                0, 1, 0, 1, 0, 1, 0, 1, // 0xAA = 1010_1010
+                1, 0, 1, 0, 1, 0, 1, 0,
+            ]
+        );
+    }
+
+    #[test]
+    fn raw_bit_reader_drops_stuff_bit_after_ff() {
+        // §D.6: after a 0xFF byte, the top bit of the next byte is
+        // the stuff bit and the decoder discards it. The next byte's
+        // payload is its lower seven bits, MSB-first.
+        //
+        // First byte 0xFF (all eight bits = 1).
+        // Second byte 0b1_010_1010: top bit is the stuff bit; payload
+        // is `010_1010` (seven bits).
+        let mut r = RawBitReader::new(&[0xFF, 0b1010_1010]);
+        // Read the eight bits of 0xFF.
+        for _ in 0..8 {
+            assert_eq!(r.read_bit().unwrap(), 1);
+        }
+        // Now the stuff bit (top of next byte = 1) is discarded; the
+        // next payload bit is `0` (bit 6 of the second byte).
+        let payload: Vec<u8> = (0..7).map(|_| r.read_bit().unwrap()).collect();
+        assert_eq!(payload, vec![0, 1, 0, 1, 0, 1, 0]);
+        // 8 + 7 = 15 payload bits consumed; the stuff bit is not
+        // counted as a payload bit.
+        assert_eq!(r.bits_consumed(), 15);
+    }
+
+    #[test]
+    fn raw_bit_reader_consecutive_ff_bytes_each_introduce_stuff_bit() {
+        // 0xFF, 0xFF, 0x00 — both 0xFF bytes are followed by a stuff
+        // bit. The third byte's top bit is the stuff bit after the
+        // second 0xFF (regardless of being zero); payload is the
+        // remaining seven bits of 0x00 = `0000000`.
+        let mut r = RawBitReader::new(&[0xFF, 0xFF, 0x00]);
+        // Eight payload bits from first 0xFF.
+        for _ in 0..8 {
+            assert_eq!(r.read_bit().unwrap(), 1);
+        }
+        // Seven payload bits from second 0xFF (top bit is the stuff
+        // bit after the first 0xFF).
+        for _ in 0..7 {
+            assert_eq!(r.read_bit().unwrap(), 1);
+        }
+        // Seven payload bits from 0x00 (top bit is the stuff bit
+        // after the second 0xFF).
+        for _ in 0..7 {
+            assert_eq!(r.read_bit().unwrap(), 0);
+        }
+        assert_eq!(r.bits_consumed(), 22);
+    }
+
+    #[test]
+    fn raw_bit_reader_unexpected_eof_when_exhausted() {
+        // Two-bit slice (one byte): the 9th read surfaces UnexpectedEof.
+        let mut r = RawBitReader::new(&[0xAB]);
+        for _ in 0..8 {
+            r.read_bit().unwrap();
+        }
+        assert_eq!(r.read_bit(), Err(Error::UnexpectedEof));
+    }
+
+    #[test]
+    fn raw_bit_reader_empty_input_eofs_on_first_read() {
+        let mut r = RawBitReader::new(&[]);
+        assert_eq!(r.read_bit(), Err(Error::UnexpectedEof));
+    }
+
+    #[test]
+    fn raw_bit_reader_ff_then_eof() {
+        // 0xFF followed by no byte: the 9th read tries to load the
+        // next byte (which would carry the stuff bit) and surfaces
+        // UnexpectedEof.
+        let mut r = RawBitReader::new(&[0xFF]);
+        for _ in 0..8 {
+            assert_eq!(r.read_bit().unwrap(), 1);
+        }
+        assert_eq!(r.read_bit(), Err(Error::UnexpectedEof));
+    }
+
+    #[test]
+    fn sp_raw_pass_decodes_two_significant_with_signs() {
+        // Code-block: 2x2 LL. Pre-seed (0,0) as already significant so
+        // its non-zero neighbour pushes (1,0) and (0,1) into Table D.1
+        // label != 0. Then the raw SP pass should read one bit per
+        // candidate (and one sign bit per `1`).
+        //
+        // We arrange the raw stream so:
+        //   - (0,0) is sigma=true, so the SP pass skips it.
+        //   - (1,0) decision bit = 1, sign bit = 0 (positive).
+        //   - (0,1) decision bit = 1, sign bit = 1 (negative).
+        //   - (1,1) — after the two new significances its context is
+        //     non-zero too; we put a `0` decision bit (no sign read).
+        //
+        // §D.1 scan-order over a 2x2 stripe (stripe_h = 2, full
+        // column-first traversal): column 0 → (0,0), (0,1); column 1
+        // → (1,0), (1,1).  But coefficient (0,0) is already significant,
+        // so the order of reads becomes:
+        //   1) (0,1) decision bit
+        //   2) (0,1) sign bit (if decision = 1)
+        //   3) (1,0) decision bit
+        //   4) (1,0) sign bit (if decision = 1)
+        //   5) (1,1) decision bit
+        //   6) (1,1) sign bit (if decision = 1)
+        //
+        // Stream bits, MSB-first: 1 (sig 0,1), 1 (neg sign), 1 (sig 1,0),
+        // 0 (positive sign), 0 (no sig 1,1), then padding zeros to byte.
+        //   1 1 1 0 0 0 0 0 = 0b1110_0000 = 0xE0
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 2, 2);
+        block.mark_significant_for_test(0, 0, false, 1 << 3);
+        let mut raw = RawBitReader::new(&[0xE0]);
+        let newly = block
+            .significance_propagation_pass_raw(3, &mut raw)
+            .unwrap();
+        assert_eq!(newly, 2, "two coefficients should become significant");
+        assert!(block.coefficient(0, 0).sigma);
+        assert!(block.coefficient(0, 1).sigma);
+        assert!(block.coefficient(0, 1).sign);
+        assert_eq!(block.coefficient(0, 1).magnitude, 1 << 3);
+        assert!(block.coefficient(1, 0).sigma);
+        assert!(!block.coefficient(1, 0).sign);
+        assert_eq!(block.coefficient(1, 0).magnitude, 1 << 3);
+        assert!(!block.coefficient(1, 1).sigma);
+        // §D.6 Eq. D-2 — five payload bits consumed total (one zero-
+        // context coefficient was skipped, but our seed makes every
+        // remaining coefficient non-zero-context).
+        assert_eq!(raw.bits_consumed(), 5);
+    }
+
+    #[test]
+    fn sp_raw_pass_skips_zero_context_coefficients() {
+        // No significant seeds — every Table D.1 context label is 0
+        // → the §D.6 raw SP pass reads no bits at all.
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 4, 4);
+        let mut raw = RawBitReader::new(&[]);
+        let newly = block
+            .significance_propagation_pass_raw(5, &mut raw)
+            .unwrap();
+        assert_eq!(newly, 0);
+        assert_eq!(raw.bits_consumed(), 0);
+        // No coefficient should be touched.
+        for v in 0..4 {
+            for u in 0..4 {
+                assert!(!block.coefficient(u, v).sigma);
+            }
+        }
+    }
+
+    #[test]
+    fn sp_raw_pass_eof_propagates() {
+        // Pre-seed so the SP pass reads at least one bit; then give it
+        // an empty raw stream.
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 2, 2);
+        block.mark_significant_for_test(0, 0, false, 1);
+        let mut raw = RawBitReader::new(&[]);
+        assert_eq!(
+            block.significance_propagation_pass_raw(0, &mut raw),
+            Err(Error::UnexpectedEof),
+        );
+    }
+
+    #[test]
+    fn mr_raw_pass_refines_already_significant() {
+        // Pre-seed (0,0) and (1,0) as already significant with
+        // magnitude carrying the higher bit. Run the §D.6 raw MR
+        // pass over bit-plane 2: each coefficient consumes one raw
+        // bit; on `1` the bit is OR-ed into magnitude at `1 << 2`.
+        //
+        // Scan order (stripe_h = 2): column 0 → (0,0), (0,1); column
+        // 1 → (1,0), (1,1). Skips (0,1) and (1,1) — not significant.
+        // So two raw bits get consumed: one for (0,0), one for (1,0).
+        //
+        // Stream: 1 (refine 0,0), 0 (don't refine 1,0), then padding.
+        //   = 0b1000_0000 = 0x80
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 2, 2);
+        block.mark_significant_for_test(0, 0, false, 1 << 4);
+        block.mark_significant_for_test(1, 0, true, 1 << 4);
+        let mut raw = RawBitReader::new(&[0x80]);
+        let refined = block.magnitude_refinement_pass_raw(2, &mut raw).unwrap();
+        assert_eq!(refined, 2);
+        // (0,0) refined to `(1<<4) | (1<<2)`.
+        assert_eq!(block.coefficient(0, 0).magnitude, (1 << 4) | (1 << 2));
+        assert!(block.coefficient(0, 0).already_refined);
+        // (1,0) refined with bit 0 — magnitude unchanged.
+        assert_eq!(block.coefficient(1, 0).magnitude, 1 << 4);
+        assert!(block.coefficient(1, 0).already_refined);
+        assert_eq!(raw.bits_consumed(), 2);
+    }
+
+    #[test]
+    fn mr_raw_pass_skips_newly_significant_carry() {
+        // §D.3.3 carry: a coefficient marked newly-significant in the
+        // immediately preceding SP pass must NOT be refined this round.
+        // The raw MR path inherits the same filter.
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 2, 2);
+        block.mark_significant_for_test(0, 0, false, 1);
+        block.mark_significant_for_test(1, 0, false, 1);
+        block.set_newly_significant_for_test(1, 0);
+        // Only (0,0) should consume a raw bit.
+        let mut raw = RawBitReader::new(&[0x80]); // first bit = 1
+        let refined = block.magnitude_refinement_pass_raw(0, &mut raw).unwrap();
+        assert_eq!(refined, 1);
+        assert!(block.coefficient(0, 0).already_refined);
+        assert!(!block.coefficient(1, 0).already_refined);
+        assert_eq!(raw.bits_consumed(), 1);
+    }
+
+    #[test]
+    fn mr_raw_pass_skips_insignificant() {
+        // A 2x2 block with nothing pre-marked: every coefficient is
+        // insignificant → MR raw reads no bits.
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 2, 2);
+        let mut raw = RawBitReader::new(&[]);
+        let refined = block.magnitude_refinement_pass_raw(7, &mut raw).unwrap();
+        assert_eq!(refined, 0);
+        assert_eq!(raw.bits_consumed(), 0);
+    }
+
+    #[test]
+    fn sequencer_with_selective_arithmetic_coding_bypass_toggles() {
+        // Builder is monotonic in either direction; default off.
+        let seq_off = BitPlaneSequencer::new(7);
+        assert!(!seq_off.selective_arithmetic_coding_bypass());
+        let seq_on = BitPlaneSequencer::new(7).with_selective_arithmetic_coding_bypass(true);
+        assert!(seq_on.selective_arithmetic_coding_bypass());
+        let seq_back = seq_on.with_selective_arithmetic_coding_bypass(false);
+        assert!(!seq_back.selective_arithmetic_coding_bypass());
+    }
+
+    #[test]
+    fn sequencer_raw_mode_off_when_bypass_off() {
+        // With the §D.6 toggle off, raw_mode_for_next_pass is false at
+        // every state.
+        let mut seq = BitPlaneSequencer::new(7);
+        assert!(!seq.raw_mode_for_next_pass());
+        // Pretend we have driven 10 passes — still false because the
+        // toggle is off.
+        for _ in 0..10 {
+            seq.passes_decoded = seq.passes_decoded.saturating_add(1);
+        }
+        assert!(!seq.raw_mode_for_next_pass());
+    }
+
+    #[test]
+    fn sequencer_raw_mode_on_after_three_full_bitplane_sets() {
+        // With the §D.6 toggle on:
+        //   - Pass 1 (cleanup of bit-plane 1, passes_decoded=0): AC (Cleanup).
+        //   - Passes 2-10 (3 sets of SP/MR/Cleanup on bit-planes 2-4):
+        //     all AC.
+        //   - Pass 11 (SP of bit-plane 5, passes_decoded=10): RAW.
+        //
+        // Drive the sequencer's pass-state cursor manually (the
+        // dispatcher in this round still goes through the AC path; we
+        // just check the query side that the wiring will consult).
+        let mut seq = BitPlaneSequencer::new(7).with_selective_arithmetic_coding_bypass(true);
+        // passes_decoded = 0, next_pass = Cleanup → AC.
+        assert!(!seq.raw_mode_for_next_pass());
+
+        // Walk the §D.3 pass order forwards by hand: after the first
+        // cleanup, next_pass becomes Sp; then Mr; then Cleanup; cycle.
+        // Use the same transitions the decode_passes loop uses.
+        let mut next = [Pass::Sp, Pass::Mr, Pass::Cleanup].iter().cycle();
+        seq.next_pass = *next.next().unwrap(); // Sp
+        seq.passes_decoded = 1;
+        // 1 pass done → bit-plane 1 cleanup done. Still AC.
+        assert!(!seq.raw_mode_for_next_pass());
+
+        // Walk through bit-planes 2, 3, 4 (3 sets of 3 passes = 9
+        // additional passes).
+        for _ in 0..9 {
+            seq.passes_decoded += 1;
+            seq.next_pass = *next.next().unwrap();
+        }
+        // After 1 + 9 = 10 passes, next_pass is Sp (start of
+        // bit-plane 5). Raw mode kicks in.
+        assert_eq!(seq.passes_decoded, 10);
+        assert_eq!(seq.next_pass, Pass::Sp);
+        assert!(seq.raw_mode_for_next_pass());
+
+        // After the SP of bit-plane 5, next_pass is Mr → still raw.
+        seq.passes_decoded += 1;
+        seq.next_pass = *next.next().unwrap();
+        assert!(seq.raw_mode_for_next_pass());
+
+        // After the MR of bit-plane 5, next_pass is Cleanup →
+        // always AC per Table D.9 last row.
+        seq.passes_decoded += 1;
+        seq.next_pass = *next.next().unwrap();
+        assert_eq!(seq.next_pass, Pass::Cleanup);
+        assert!(!seq.raw_mode_for_next_pass());
+
+        // After the Cleanup of bit-plane 5, next_pass is Sp of
+        // bit-plane 6 → raw again.
+        seq.passes_decoded += 1;
+        seq.next_pass = *next.next().unwrap();
+        assert_eq!(seq.next_pass, Pass::Sp);
+        assert!(seq.raw_mode_for_next_pass());
+    }
+
+    #[test]
+    fn sequencer_bypass_off_dispatch_unchanged() {
+        // With the §D.6 toggle off, decode_packet over a known stream
+        // is byte-for-byte identical to a bare cleanup_pass — i.e.
+        // the toggle's state is the only switch, exactly like §D.5.
+        let bytes = [0xC1u8, 0x5D, 0x82, 0x77, 0x3A, 0xE6];
+
+        let mut subj_block = CodeBlock::new(SubBandOrientation::LL, 2, 2);
+        let mut subj_ctx = reset_contexts();
+        let mut seq = BitPlaneSequencer::new(0).with_selective_arithmetic_coding_bypass(false);
+        assert!(!seq.selective_arithmetic_coding_bypass());
+        let subj_n = seq
+            .decode_packet(&mut subj_block, &bytes, 1, &mut subj_ctx)
+            .expect("disabled §D.6 path must not fail");
+
+        let mut oracle_block = CodeBlock::new(SubBandOrientation::LL, 2, 2);
+        let mut oracle_ctx = reset_contexts();
+        let mut oracle_dec = MqDecoder::new(&bytes);
+        let oracle_n = oracle_block
+            .cleanup_pass(0, &mut oracle_dec, &mut oracle_ctx)
+            .expect("oracle cleanup must not fail");
+
+        assert_eq!(subj_n, oracle_n);
+        for v in 0..2 {
+            for u in 0..2 {
+                let s = subj_block.coefficient(u, v);
+                let o = oracle_block.coefficient(u, v);
+                assert_eq!(s.sigma, o.sigma);
+                assert_eq!(s.sign, o.sign);
+                assert_eq!(s.magnitude, o.magnitude);
+            }
+        }
+    }
+
+    #[test]
+    fn sp_raw_pass_clears_newly_significant_carry() {
+        // §D.3.3: the SP pass clears the newly-significant carry at
+        // the start of every pass. The raw SP path must mirror this.
+        // Set the carry on (0,0) and then drive a raw SP pass; the
+        // carry must have been cleared before the pass body runs.
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 2, 2);
+        block.mark_significant_for_test(0, 0, false, 1);
+        block.set_newly_significant_for_test(0, 0);
+        // Pre-significant coefficients are skipped, so (0,0) does not
+        // consume a bit. (0,1), (1,0), (1,1) each acquire a non-zero
+        // Table D.1 context from (0,0)'s significance — feed them
+        // `0` decision bits. Five raw bits at most are needed; pad
+        // with zeros.
+        let mut raw = RawBitReader::new(&[0x00, 0x00]);
+        let _ = block
+            .significance_propagation_pass_raw(2, &mut raw)
+            .unwrap();
+        // Carry on (0,0) must have been cleared at the top of the
+        // pass; pre-marked significant coefficient is otherwise
+        // untouched.
+        assert!(!block.was_newly_significant(0, 0));
+        assert!(block.coefficient(0, 0).sigma);
     }
 }

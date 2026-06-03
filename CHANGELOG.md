@@ -6,6 +6,50 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 227 (2026-06-04).** T.800 §D.6 **selective
+  arithmetic-coding bypass** raw-bit reader plus the raw-mode SP /
+  MR coding pass entry points and the sequencer-level toggle.
+  * `RawBitReader<'a>` — bit-stuffed raw-bit reader. `read_bit()`
+    returns one payload bit MSB-first per byte; after a `0xFF` byte
+    the top bit of the next byte is the §D.6 stuff bit and is
+    discarded before the next payload bit is produced.
+    `bits_consumed()` / `bytes_consumed()` expose progress;
+    exhausting the segment surfaces `Error::UnexpectedEof`.
+  * `CodeBlock::significance_propagation_pass_raw(bitplane, raw)` —
+    raw-mode SP pass. Same §D.1 scan, same "non-zero Table D.1
+    context only" filter, same §D.3.3 newly-significant carry, but
+    each per-coefficient decision (and sign on a `1`) is read from
+    the supplied `RawBitReader`. §D.6 Equation D-2 collapses the
+    sign-context XOR — the raw bit is the sign bit directly.
+  * `CodeBlock::magnitude_refinement_pass_raw(bitplane, raw)` —
+    raw-mode MR pass. Same scan + filter as the AC variant; one raw
+    bit per refinable coefficient is OR-ed into `magnitude` at the
+    bit-plane's positional weight.
+  * `BitPlaneSequencer::with_selective_arithmetic_coding_bypass(enabled)`
+    / `BitPlaneSequencer::selective_arithmetic_coding_bypass()` —
+    builder + accessor for the §D.6 toggle. Default `false`.
+  * `BitPlaneSequencer::raw_mode_for_next_pass()` — dispatch query.
+    Returns `true` iff the toggle is on, the next pass is SP or MR,
+    and the sequencer has driven at least 10 passes (i.e. the next
+    SP / MR pass would fire on bit-plane 5 or later per Table D.9).
+    The cleanup pass remains AC for every bit-plane.
+  * 18 new lib tests covering: `RawBitReader` MSB-first byte
+    packing, byte-boundary crossing, stuff-bit drop after a single
+    `0xFF`, consecutive `0xFF` stuff bits, EoF paths (empty input,
+    exhaustion, `0xFF`-then-EoF); raw SP pass decoding two
+    significant coefficients with §D.6 Eq. D-2 sign reads; raw SP
+    pass skipping zero-context coefficients; raw SP pass propagating
+    `UnexpectedEof`; raw MR pass refining two already-significant
+    coefficients; raw MR pass honouring the §D.3.3 newly-significant
+    carry; raw MR pass on a fully-insignificant block; sequencer
+    builder monotonicity; `raw_mode_for_next_pass` returning false
+    while bypass is off; the pass-state walk from bit-plane 1
+    cleanup through bit-plane 5 SP showing AC → AC → raw transition
+    at the right place; the toggle-off `decode_packet` matching the
+    bare `cleanup_pass` byte-for-byte; and the §D.3.3 carry-clearing
+    behaviour on the raw SP pass. Suite is now 428 lib tests (was
+    410).
+
 * **Clean-room round 220 (2026-06-03).** T.800 §D.7
   **vertically-causal context formation** toggle wired into the tier-1
   decoder.
