@@ -223,6 +223,11 @@ pub enum Error {
     /// tile-part body before all geometry-required packets were
     /// decoded.
     PacketHeaderOverrun,
+    /// The T.800 §D.5 error-resilience segmentation symbol decoded at
+    /// the end of a cleanup pass was not the required value `0xA`
+    /// (binary `1010`). Indicates that bit errors corrupted this
+    /// bit-plane's compressed image data.
+    SegmentationSymbolMismatch,
 }
 
 impl core::fmt::Display for Error {
@@ -276,6 +281,10 @@ impl core::fmt::Display for Error {
                     "JPEG 2000: packet-header walker overran the tile-part body"
                 )
             }
+            Error::SegmentationSymbolMismatch => write!(
+                f,
+                "JPEG 2000: §D.5 segmentation symbol decoded != 0xA (bit-plane corruption)"
+            ),
         }
     }
 }
@@ -378,6 +387,80 @@ impl WaveletTransform {
     }
 }
 
+/// Decoded view of the `SPcod` / `SPcoc` **code-block style** byte
+/// (T.800 Table A.19).
+///
+/// The byte signals six independent flags that control the tier-1
+/// coding-pass behaviour. The two high bits (`0xC0`) are reserved per
+/// the Table A.19 prose ("Decoders may ignore the first and second most
+/// significant bits …; encoders that conform to this Recommendation |
+/// International Standard shall set these bits to 0"); they remain
+/// available via [`Self::reserved_high_bits`] for diagnostic logging
+/// without affecting any of the six flag accessors.
+///
+/// Construct via [`Self::from_byte`] (always succeeds; reserved bits are
+/// preserved verbatim).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodeBlockStyle {
+    raw: u8,
+}
+
+impl CodeBlockStyle {
+    /// Decode the `SPcod` / `SPcoc` byte. All six Table A.19 flags
+    /// become individually queryable via the accessor methods; the two
+    /// reserved high bits are preserved in `raw`.
+    pub const fn from_byte(b: u8) -> Self {
+        Self { raw: b }
+    }
+
+    /// Raw byte exactly as decoded from the codestream.
+    pub const fn raw(self) -> u8 {
+        self.raw
+    }
+
+    /// `Scod` bit 0 (`0x01`) — selective arithmetic coding bypass
+    /// (T.800 §D.6).
+    pub const fn selective_arithmetic_coding_bypass(self) -> bool {
+        self.raw & 0x01 != 0
+    }
+
+    /// `Scod` bit 1 (`0x02`) — reset context probabilities on coding
+    /// pass boundaries.
+    pub const fn reset_context_probabilities(self) -> bool {
+        self.raw & 0x02 != 0
+    }
+
+    /// `Scod` bit 2 (`0x04`) — termination on each coding pass
+    /// (T.800 §D.4.2).
+    pub const fn termination_on_each_coding_pass(self) -> bool {
+        self.raw & 0x04 != 0
+    }
+
+    /// `Scod` bit 3 (`0x08`) — vertically causal context formation
+    /// (T.800 §D.7).
+    pub const fn vertically_causal_context(self) -> bool {
+        self.raw & 0x08 != 0
+    }
+
+    /// `Scod` bit 4 (`0x10`) — predictable termination (T.800 §D.4.2).
+    pub const fn predictable_termination(self) -> bool {
+        self.raw & 0x10 != 0
+    }
+
+    /// `Scod` bit 5 (`0x20`) — error-resilience segmentation symbols
+    /// (T.800 §D.5).
+    pub const fn segmentation_symbols(self) -> bool {
+        self.raw & 0x20 != 0
+    }
+
+    /// The two high bits (`0xC0`) reserved per Table A.19's "decoders
+    /// may ignore" prose. Exposed for diagnostic-only inspection;
+    /// none of the six flag accessors above are affected.
+    pub const fn reserved_high_bits(self) -> u8 {
+        self.raw & 0xC0
+    }
+}
+
 /// Parsed COD marker segment (T.800 §A.6.1, Tables A.12 / A.14 / A.15).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cod {
@@ -410,6 +493,15 @@ pub struct Cod {
     /// User-defined precinct sizes when `user_defined_precincts` is true,
     /// `NL+1` bytes per Table A.21. Empty when maximum-precincts mode.
     pub precincts: Vec<u8>,
+}
+
+impl Cod {
+    /// Decode the `code_block_style` byte into individually-queryable
+    /// Table A.19 flags. The byte is preserved verbatim in
+    /// [`Self::code_block_style`]; this accessor is a pure view.
+    pub const fn code_block_style_flags(&self) -> CodeBlockStyle {
+        CodeBlockStyle::from_byte(self.code_block_style)
+    }
 }
 
 /// Quantisation style, T.800 Table A.28 (low 5 bits of Sqcd).
@@ -513,6 +605,15 @@ pub struct Coc {
     /// User-defined precinct sizes when `user_defined_precincts` is true,
     /// `NL+1` bytes per T.800 Table A.21. Empty when maximum-precincts.
     pub precincts: Vec<u8>,
+}
+
+impl Coc {
+    /// Decode the `code_block_style` byte into individually-queryable
+    /// Table A.19 flags. The byte is preserved verbatim in
+    /// [`Self::code_block_style`]; this accessor is a pure view.
+    pub const fn code_block_style_flags(&self) -> CodeBlockStyle {
+        CodeBlockStyle::from_byte(self.code_block_style)
+    }
 }
 
 /// Parsed QCC marker segment (T.800 §A.6.5, Tables A.31 / A.28).
@@ -2387,5 +2488,102 @@ mod tests {
         let bytes = synth_tile_part_with_markers(&coc, &[0u8; 4]);
         let err = parse_codestream(&bytes).unwrap_err();
         assert_eq!(err, Error::InvalidDecompositionLevels);
+    }
+
+    // -- Table A.19 CodeBlockStyle ------------------------------------
+
+    #[test]
+    fn code_block_style_zero_has_no_flags_set() {
+        let s = CodeBlockStyle::from_byte(0x00);
+        assert!(!s.selective_arithmetic_coding_bypass());
+        assert!(!s.reset_context_probabilities());
+        assert!(!s.termination_on_each_coding_pass());
+        assert!(!s.vertically_causal_context());
+        assert!(!s.predictable_termination());
+        assert!(!s.segmentation_symbols());
+        assert_eq!(s.reserved_high_bits(), 0);
+        assert_eq!(s.raw(), 0);
+    }
+
+    #[test]
+    fn code_block_style_per_bit_table_a19() {
+        // Each Table A.19 row, in isolation.
+        let bypass = CodeBlockStyle::from_byte(0x01);
+        assert!(bypass.selective_arithmetic_coding_bypass());
+        assert!(!bypass.segmentation_symbols());
+
+        let reset = CodeBlockStyle::from_byte(0x02);
+        assert!(reset.reset_context_probabilities());
+        assert!(!reset.selective_arithmetic_coding_bypass());
+
+        let term_each = CodeBlockStyle::from_byte(0x04);
+        assert!(term_each.termination_on_each_coding_pass());
+        assert!(!term_each.reset_context_probabilities());
+
+        let vcc = CodeBlockStyle::from_byte(0x08);
+        assert!(vcc.vertically_causal_context());
+        assert!(!vcc.termination_on_each_coding_pass());
+
+        let pterm = CodeBlockStyle::from_byte(0x10);
+        assert!(pterm.predictable_termination());
+        assert!(!pterm.vertically_causal_context());
+
+        let seg = CodeBlockStyle::from_byte(0x20);
+        assert!(seg.segmentation_symbols());
+        assert!(!seg.predictable_termination());
+    }
+
+    #[test]
+    fn code_block_style_all_six_flags_combined() {
+        let s = CodeBlockStyle::from_byte(0x3F);
+        assert!(s.selective_arithmetic_coding_bypass());
+        assert!(s.reset_context_probabilities());
+        assert!(s.termination_on_each_coding_pass());
+        assert!(s.vertically_causal_context());
+        assert!(s.predictable_termination());
+        assert!(s.segmentation_symbols());
+        assert_eq!(s.reserved_high_bits(), 0);
+    }
+
+    #[test]
+    fn code_block_style_preserves_reserved_high_bits() {
+        // Table A.19 prose: "Decoders may ignore the first and second
+        // most significant bits …" — we preserve them for inspection.
+        let s = CodeBlockStyle::from_byte(0xC0);
+        assert!(!s.selective_arithmetic_coding_bypass());
+        assert!(!s.segmentation_symbols());
+        assert_eq!(s.reserved_high_bits(), 0xC0);
+        assert_eq!(s.raw(), 0xC0);
+
+        // Reserved + segmentation symbols.
+        let s2 = CodeBlockStyle::from_byte(0xE0);
+        assert!(s2.segmentation_symbols());
+        assert_eq!(s2.reserved_high_bits(), 0xC0);
+    }
+
+    #[test]
+    fn cod_code_block_style_flags_routes_through_byte() {
+        // Verify the COD parser routes the SPcod code-block-style byte
+        // through to the [`CodeBlockStyle`] view.
+        let mut bytes = synth_minimal_header();
+        // The minimal header places code_block_style at the COD's
+        // SPcod[8] byte position (the value we wrote above is 0).
+        // Locate the marker and overwrite that byte directly so we
+        // test both the parser's byte placement and the accessor.
+        let cod_at = bytes
+            .windows(2)
+            .position(|w| u16::from_be_bytes([w[0], w[1]]) == MARKER_COD)
+            .expect("COD marker present");
+        // After [SOC + SIZ], the COD layout is:
+        //   marker(2) | Lcod(2) | Scod(1) | Progression(1) | Layers(2)
+        //     | MCT(1) | NL(1) | xcb(1) | ycb(1) | code_block_style(1)
+        // → code_block_style is at offset 2+2+1+1+2+1+1+1+1 = 12 from
+        // the marker.
+        bytes[cod_at + 12] = 0x20;
+        let h = parse_j2k_header(&bytes).expect("parse");
+        let flags = h.cod.code_block_style_flags();
+        assert!(flags.segmentation_symbols());
+        assert!(!flags.predictable_termination());
+        assert_eq!(h.cod.code_block_style, 0x20);
     }
 }

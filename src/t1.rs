@@ -59,8 +59,12 @@
 //!   code-block — the three passes are individually callable; chaining
 //!   them per code-block from the packet reader's byte ranges is the next
 //!   step.
-//! * The §D.4.2 / §D.5 / §D.6 termination / segmentation-symbol / raw-
-//!   bit-bypass modes.
+//! * The §D.4.2 / §D.6 termination / raw-bit-bypass modes. **§D.5
+//!   error-resilience segmentation symbols are now wired** via
+//!   [`decode_segmentation_symbol`] and the
+//!   [`BitPlaneSequencer::with_segmentation_symbols`] toggle that the
+//!   COD / COC Table A.19 flag (decoded into
+//!   [`crate::CodeBlockStyle::segmentation_symbols`]) drives.
 //! * §D.7 vertically causal context formation — a flag for the future
 //!   COD `Scod` bit-3 mode.
 //!
@@ -118,6 +122,58 @@ pub const UNIFORM_CTX: usize = 18;
 /// Number of distinct context labels the Annex D coding passes use
 /// across all three passes (Table D.7).
 pub const NUM_CONTEXTS: usize = 19;
+
+/// T.800 §D.5 error-resilience segmentation symbol value.
+///
+/// When the COD / COC Table A.19 `segmentation_symbols` flag is set, the
+/// encoder appends this 4-bit value (binary `1010`, hex `0xA`) to the
+/// end of every cleanup pass, coded under the UNIFORM context. The
+/// decoder reads back four UNIFORM bits in MSB-first order; if their
+/// concatenation matches this constant the cleanup pass is intact, if
+/// not the bit-plane carries an error per §D.5.
+pub const SEGMENTATION_SYMBOL: u8 = 0xA;
+
+/// Decode the T.800 §D.5 error-resilience segmentation symbol.
+///
+/// Reads four bits from `decoder` against the UNIFORM context (Table
+/// D.7 label 18 — Table C.2 index 46), concatenates them MSB-first into
+/// a 4-bit value, and verifies the result equals [`SEGMENTATION_SYMBOL`]
+/// (`0xA` = `1010`).
+///
+/// Returns:
+///
+/// * `Ok(())` — the four UNIFORM bits decoded to `1010`. The bit-plane
+///   is intact per §D.5.
+/// * `Err(Error::SegmentationSymbolMismatch)` — the four UNIFORM bits
+///   decoded to some other value. Per §D.5 this signals that bit errors
+///   occurred in this bit-plane's compressed image data; the caller may
+///   discard the bit-plane or surface the error to the layer above.
+///
+/// The caller is responsible for invoking this only when the COD / COC
+/// [`crate::CodeBlockStyle::segmentation_symbols`] flag is set (the
+/// symbol is not present otherwise — calling this on an unmarked stream
+/// would consume four bits the cleanup pass did not produce). The four
+/// MQ decisions modify the UNIFORM context's state only via the
+/// Table C.2 NMPS / NLPS transitions exactly like any other UNIFORM
+/// decode — the symbol is not "free."
+///
+/// T.800 §D.5 explicitly permits this to be used "with or without the
+/// predictable termination" (the §D.4.2 termination is independent).
+pub fn decode_segmentation_symbol(
+    decoder: &mut MqDecoder<'_>,
+    ctx: &mut [MqContext; NUM_CONTEXTS],
+) -> Result<(), Error> {
+    let b3 = decoder.decode(&mut ctx[UNIFORM_CTX]);
+    let b2 = decoder.decode(&mut ctx[UNIFORM_CTX]);
+    let b1 = decoder.decode(&mut ctx[UNIFORM_CTX]);
+    let b0 = decoder.decode(&mut ctx[UNIFORM_CTX]);
+    let value = (b3 << 3) | (b2 << 2) | (b1 << 1) | b0;
+    if value == SEGMENTATION_SYMBOL {
+        Ok(())
+    } else {
+        Err(Error::SegmentationSymbolMismatch)
+    }
+}
 
 /// Initialise an Annex D context array to the Table D.7 reset states.
 ///
@@ -1043,9 +1099,25 @@ pub enum Pass {
 /// budget — the byte budget is the packet's responsibility, not the
 /// sequencer's.
 ///
+/// ## §D.5 segmentation-symbol mode
+///
+/// When the COD / COC Table A.19 segmentation-symbols flag is set, the
+/// encoder writes the four-bit `0xA` symbol against the UNIFORM context
+/// at the end of every cleanup pass (with or without the §D.4.2
+/// predictable-termination flag, per §D.5 NOTE). Enable the matching
+/// decoder by passing
+/// [`with_segmentation_symbols(true)`](Self::with_segmentation_symbols)
+/// when constructing the sequencer — the cleanup-pass branch then drains
+/// the symbol via [`decode_segmentation_symbol`] before advancing the
+/// bit-plane cursor, and any non-`0xA` result raises
+/// [`Error::SegmentationSymbolMismatch`] (the partially-completed
+/// [`CodeBlock`] is left visible to the caller for diagnostic purposes).
+/// The four UNIFORM decisions modify the UNIFORM context's state per
+/// Table C.2 NMPS / NLPS exactly like any other UNIFORM decode.
+///
 /// ## What this sequencer does NOT cover
 ///
-/// * **§D.4.2 / §D.5 termination** between coding passes. Each call to
+/// * **§D.4.2 termination** between coding passes. Each call to
 ///   [`Self::decode_packet`] uses one [`MqDecoder`] across every pass in
 ///   the call — the right behaviour when the COD `Scod` bit-2
 ///   "code-block style: arithmetic coder bypass" and bit-4 "termination
@@ -1073,6 +1145,12 @@ pub struct BitPlaneSequencer {
     /// [`Self::decode_packet`] / [`Self::decode_passes`]. Mainly a sanity
     /// counter exposed via [`Self::passes_decoded`].
     passes_decoded: u32,
+    /// Whether the COD / COC Table A.19 segmentation-symbols flag is
+    /// set for this code-block. When true the sequencer decodes the
+    /// §D.5 four-bit segmentation symbol against the UNIFORM context
+    /// at the end of every cleanup pass and returns
+    /// [`Error::SegmentationSymbolMismatch`] on a non-`0xA` value.
+    segmentation_symbols: bool,
 }
 
 impl BitPlaneSequencer {
@@ -1085,13 +1163,40 @@ impl BitPlaneSequencer {
     /// — that's a packet-reader responsibility.
     ///
     /// The first pass to run is the **cleanup-only** pass on
-    /// `starting_bitplane`, per §D.3.
+    /// `starting_bitplane`, per §D.3. Segmentation-symbol checking is
+    /// off by default; enable it with
+    /// [`Self::with_segmentation_symbols`] when the COD / COC
+    /// [`crate::CodeBlockStyle::segmentation_symbols`] flag is set.
     pub fn new(starting_bitplane: u32) -> Self {
         Self {
             current_bitplane: starting_bitplane,
             next_pass: Pass::Cleanup,
             passes_decoded: 0,
+            segmentation_symbols: false,
         }
+    }
+
+    /// Builder — enable T.800 §D.5 error-resilience segmentation-symbol
+    /// decoding for this code-block.
+    ///
+    /// When enabled, [`Self::decode_passes`] and [`Self::decode_packet`]
+    /// invoke [`decode_segmentation_symbol`] against the same
+    /// [`MqDecoder`] / context array at the end of every cleanup pass.
+    /// A non-`0xA` decoded value propagates
+    /// [`Error::SegmentationSymbolMismatch`] up through the pass driver
+    /// and the partially-completed [`CodeBlock`] state is left visible
+    /// to the caller for inspection / discard.
+    ///
+    /// The flag is taken from the COD / COC Table A.19
+    /// [`crate::CodeBlockStyle::segmentation_symbols`] bit.
+    pub fn with_segmentation_symbols(mut self, enabled: bool) -> Self {
+        self.segmentation_symbols = enabled;
+        self
+    }
+
+    /// Whether T.800 §D.5 segmentation-symbol checking is enabled.
+    pub fn segmentation_symbols(&self) -> bool {
+        self.segmentation_symbols
     }
 
     /// Bit-plane index that the **next** pass will run on
@@ -1169,6 +1274,15 @@ impl BitPlaneSequencer {
             let n = match self.next_pass {
                 Pass::Cleanup => {
                     let n = block.cleanup_pass(bitplane, decoder, ctx)?;
+                    // §D.5: when the COD / COC Table A.19 flag is set
+                    // the encoder appended the 4-bit symbol `1010` at
+                    // the end of every cleanup pass (UNIFORM context).
+                    // Drain it now — a mismatch raises
+                    // SegmentationSymbolMismatch and leaves the
+                    // partially-completed CodeBlock state visible.
+                    if self.segmentation_symbols {
+                        decode_segmentation_symbol(decoder, ctx)?;
+                    }
                     // §D.3: after cleanup on bit-plane k, drop to k-1
                     // and the next pass is significance propagation
                     // (unless we've finished the LSB — the sequencer
@@ -2452,5 +2566,181 @@ mod tests {
         // current_bitplane saturates at 0; next pass is SP per §D.3.
         assert_eq!(seq.current_bitplane(), 0);
         assert_eq!(seq.next_pass(), Pass::Sp);
+    }
+
+    // -- §D.5 segmentation symbol -------------------------------------
+
+    /// Replay four UNIFORM decisions over `bytes` from a fresh
+    /// [`MqDecoder`] / context array and reconstruct the resulting
+    /// 4-bit symbol the same way [`decode_segmentation_symbol`] does
+    /// (MSB-first). Used to probe candidate byte streams for ones that
+    /// decode to a chosen target.
+    fn replay_four_uniform_bits(bytes: &[u8]) -> u8 {
+        let mut dec = MqDecoder::new(bytes);
+        let mut ctx = reset_contexts();
+        let b3 = dec.decode(&mut ctx[UNIFORM_CTX]);
+        let b2 = dec.decode(&mut ctx[UNIFORM_CTX]);
+        let b1 = dec.decode(&mut ctx[UNIFORM_CTX]);
+        let b0 = dec.decode(&mut ctx[UNIFORM_CTX]);
+        (b3 << 3) | (b2 << 2) | (b1 << 1) | b0
+    }
+
+    /// Brute-force-search the 16-bit seed space until we find one
+    /// 6-byte stream whose four UNIFORM decisions decode to `target`,
+    /// and return it. The construction `(seed * 0x9E37) ^ (i * 0xC3A5)`
+    /// is just a deterministic mixer; what we need is coverage of the
+    /// 16 possible 4-bit outputs which a few-hundred seeds always
+    /// reach.
+    fn find_bytes_decoding_to(target: u8) -> Vec<u8> {
+        for seed in 0u32..=0xFFFF {
+            let mut bytes = [0u8; 12];
+            for (i, b) in bytes.iter_mut().enumerate() {
+                let mix = seed.wrapping_mul(0x9E37).wrapping_add((i as u32) * 0xC3A5);
+                *b = (mix >> ((i % 4) * 4)) as u8;
+            }
+            if replay_four_uniform_bits(&bytes) == target {
+                return bytes.to_vec();
+            }
+        }
+        panic!("no candidate byte stream decoded to target 0x{target:X}");
+    }
+
+    #[test]
+    fn segmentation_symbol_constant_matches_d5() {
+        // §D.5 fixes the symbol at the four-bit value `1010` = 0xA.
+        assert_eq!(SEGMENTATION_SYMBOL, 0x0A);
+    }
+
+    #[test]
+    fn decode_segmentation_symbol_accepts_target_0xa() {
+        // Find a candidate stream whose four UNIFORM bits land on
+        // `1010` and verify the decoder accepts it.
+        let bytes = find_bytes_decoding_to(0xA);
+        let mut dec = MqDecoder::new(&bytes);
+        let mut ctx = reset_contexts();
+        decode_segmentation_symbol(&mut dec, &mut ctx).expect("0xA must succeed");
+    }
+
+    #[test]
+    fn decode_segmentation_symbol_rejects_non_0xa_values() {
+        // Sweep all 15 non-`1010` 4-bit values that the decoder must
+        // reject as bit-plane corruption per §D.5.
+        for target in 0u8..=0xF {
+            if target == 0xA {
+                continue;
+            }
+            let bytes = find_bytes_decoding_to(target);
+            let mut dec = MqDecoder::new(&bytes);
+            let mut ctx = reset_contexts();
+            assert_eq!(
+                decode_segmentation_symbol(&mut dec, &mut ctx),
+                Err(Error::SegmentationSymbolMismatch),
+                "target 0x{target:X} should mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_segmentation_symbol_consumes_four_uniform_decisions() {
+        // Independent of the result, the symbol decoder always draws
+        // exactly four UNIFORM decisions. Verify by comparing the
+        // UNIFORM context state after the decoder against a manual
+        // replay of four `dec.decode(&mut ctx[UNIFORM_CTX])` calls.
+        let bytes = [0xC3u8, 0x5A, 0x96, 0x7E, 0x21, 0xBD];
+        let mut subject_dec = MqDecoder::new(&bytes);
+        let mut subject_ctx = reset_contexts();
+        let _ = decode_segmentation_symbol(&mut subject_dec, &mut subject_ctx);
+
+        let mut oracle_dec = MqDecoder::new(&bytes);
+        let mut oracle_ctx = reset_contexts();
+        for _ in 0..4 {
+            let _ = oracle_dec.decode(&mut oracle_ctx[UNIFORM_CTX]);
+        }
+        assert_eq!(
+            subject_ctx[UNIFORM_CTX].index(),
+            oracle_ctx[UNIFORM_CTX].index()
+        );
+        assert_eq!(
+            subject_ctx[UNIFORM_CTX].mps(),
+            oracle_ctx[UNIFORM_CTX].mps()
+        );
+    }
+
+    #[test]
+    fn segmentation_symbol_off_matches_bare_cleanup_pass() {
+        // With segmentation_symbols off (the default), the sequencer
+        // must match an isolated `cleanup_pass` call bit-for-bit on
+        // the same byte stream — i.e. the §D.5 path consumed exactly
+        // zero UNIFORM decisions, exactly zero coefficient updates.
+        let bytes = [0xC1u8, 0x5D, 0x82, 0x77, 0x3A, 0xE6];
+
+        let mut subj_block = CodeBlock::new(SubBandOrientation::LL, 2, 2);
+        let mut subj_ctx = reset_contexts();
+        let mut seq = BitPlaneSequencer::new(0).with_segmentation_symbols(false);
+        assert!(!seq.segmentation_symbols());
+        let subj_n = seq
+            .decode_packet(&mut subj_block, &bytes, 1, &mut subj_ctx)
+            .expect("disabled D.5 path must not fail");
+
+        let mut oracle_block = CodeBlock::new(SubBandOrientation::LL, 2, 2);
+        let mut oracle_ctx = reset_contexts();
+        let mut oracle_dec = MqDecoder::new(&bytes);
+        let oracle_n = oracle_block
+            .cleanup_pass(0, &mut oracle_dec, &mut oracle_ctx)
+            .expect("oracle cleanup must not fail");
+
+        assert_eq!(subj_n, oracle_n);
+        for v in 0..2 {
+            for u in 0..2 {
+                let s = subj_block.coefficient(u, v);
+                let o = oracle_block.coefficient(u, v);
+                assert_eq!(s.sigma, o.sigma, "sigma at ({u},{v})");
+                assert_eq!(s.sign, o.sign, "sign at ({u},{v})");
+                assert_eq!(s.magnitude, o.magnitude, "magnitude at ({u},{v})");
+            }
+        }
+        // The UNIFORM context must have been touched identically.
+        assert_eq!(
+            subj_ctx[UNIFORM_CTX].index(),
+            oracle_ctx[UNIFORM_CTX].index()
+        );
+    }
+
+    #[test]
+    fn sequencer_with_segmentation_symbols_enables_flag() {
+        // Builder threads through; default is off, on after toggle.
+        let seq_off = BitPlaneSequencer::new(7);
+        assert!(!seq_off.segmentation_symbols());
+        let seq_on = BitPlaneSequencer::new(7).with_segmentation_symbols(true);
+        assert!(seq_on.segmentation_symbols());
+        // Toggle back off.
+        let seq_back = seq_on.with_segmentation_symbols(false);
+        assert!(!seq_back.segmentation_symbols());
+    }
+
+    #[test]
+    fn sequencer_propagates_segmentation_symbol_mismatch() {
+        // Drive an empty 2x2 code-block through one cleanup pass with
+        // segmentation-symbols on. The 2x2 block triggers no
+        // significance-pass or run-length decisions on the zero stream
+        // (every coefficient is insignificant, columns are short of 4
+        // rows so run-length mode is ineligible per §D.3.4), so the
+        // symbol decoder reads the first four UNIFORM bits straight off
+        // the §C.3.5 INITDEC-primed state. Those bits are not `1010`,
+        // so the sequencer must propagate
+        // `SegmentationSymbolMismatch`.
+        //
+        // First confirm the assumption: the first four UNIFORM
+        // decisions over the zero stream do NOT decode to 0xA.
+        let bytes = [0x00u8, 0x00, 0x00, 0x00];
+        assert_ne!(replay_four_uniform_bits(&bytes), 0xA);
+
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 2, 2);
+        let mut ctx = reset_contexts();
+        let mut seq = BitPlaneSequencer::new(0).with_segmentation_symbols(true);
+        assert_eq!(
+            seq.decode_packet(&mut block, &bytes, 1, &mut ctx),
+            Err(Error::SegmentationSymbolMismatch),
+        );
     }
 }

@@ -3,6 +3,97 @@
 Pure-Rust JPEG 2000 (J2K + JP2) and High-Throughput JPEG 2000 (HTJ2K)
 codec.
 
+## Status — 2026-06-03 (clean-room round 214)
+
+Round 214 lands the T.800 **§D.5 error-resilience segmentation symbol**
+and the Table A.19 code-block-style flag surface that the COD / COC
+parsers store but were not previously decoded:
+
+* `CodeBlockStyle::from_byte(u8)` — typed view of the SPcod / SPcoc
+  Table A.19 byte. Six accessors return one flag each:
+  `selective_arithmetic_coding_bypass` (bit 0, §D.6),
+  `reset_context_probabilities` (bit 1),
+  `termination_on_each_coding_pass` (bit 2, §D.4.2),
+  `vertically_causal_context` (bit 3, §D.7),
+  `predictable_termination` (bit 4, §D.4.2), and
+  `segmentation_symbols` (bit 5, §D.5). The two high bits Table A.19
+  reserves are preserved verbatim via `reserved_high_bits` for
+  diagnostic-only inspection. `Cod::code_block_style_flags()` and
+  `Coc::code_block_style_flags()` thread the stored byte through.
+* `t1::SEGMENTATION_SYMBOL` (= `0xA`) and
+  `t1::decode_segmentation_symbol(decoder, ctx)`. The standalone
+  decoder reads four UNIFORM decisions MSB-first and verifies the
+  4-bit result against `0xA` (binary `1010`). Returns `Ok(())` on
+  match, `Err(Error::SegmentationSymbolMismatch)` on any other
+  4-bit value — the §D.5 "bit-plane carries an error" outcome. The
+  four UNIFORM decisions consume their Table C.2 NMPS / NLPS
+  transitions exactly like any other UNIFORM decode (the symbol is
+  not "free").
+* `BitPlaneSequencer::with_segmentation_symbols(enabled)` —
+  builder-style toggle the COD / COC Table A.19 flag drives. When
+  on, the cleanup-pass branch in `decode_passes` / `decode_packet`
+  calls `decode_segmentation_symbol` against the same `MqDecoder`
+  / context array after the cleanup pass returns and propagates
+  `SegmentationSymbolMismatch` up. Default off — with the toggle
+  clear, the cleanup-pass flow is byte-for-byte identical to the
+  round-208 sequencer (verified by a bit-for-bit oracle test).
+* `Error::SegmentationSymbolMismatch` — new variant carrying the
+  §D.5 bit-plane-corruption outcome through the public surface.
+
+12 new lib tests cover the addition (suite total: 400 lib tests, was
+388):
+
+* `code_block_style_zero_has_no_flags_set` — all six accessors
+  return `false` for `0x00`; `reserved_high_bits == 0`.
+* `code_block_style_per_bit_table_a19` — each Table A.19 flag in
+  isolation: `0x01..=0x20`.
+* `code_block_style_all_six_flags_combined` — `0x3F` sets every
+  bit; reserved high bits clear.
+* `code_block_style_preserves_reserved_high_bits` — `0xC0` (the
+  two-bit reserved field set) preserves the bits through `raw()`
+  and `reserved_high_bits()` without affecting any flag; `0xE0`
+  (reserved + segmentation symbol) decodes one flag plus the two
+  reserved bits.
+* `cod_code_block_style_flags_routes_through_byte` — the COD parser
+  stores byte `0x20` at the SPcod code-block-style position; the
+  accessor decodes `segmentation_symbols == true`.
+* `segmentation_symbol_constant_matches_d5` — `SEGMENTATION_SYMBOL
+  == 0x0A`.
+* `decode_segmentation_symbol_accepts_target_0xa` — a byte stream
+  whose four UNIFORM decisions land on `1010` decodes successfully.
+* `decode_segmentation_symbol_rejects_non_0xa_values` — sweeps all
+  15 non-`1010` 4-bit values; each rejects with
+  `SegmentationSymbolMismatch`.
+* `decode_segmentation_symbol_consumes_four_uniform_decisions` —
+  the UNIFORM context's `index` and `mps` after the call match a
+  manual replay of four `dec.decode(&mut ctx[UNIFORM_CTX])` calls.
+* `segmentation_symbol_off_matches_bare_cleanup_pass` — with the
+  toggle clear, `decode_packet` produces identical coefficient
+  state and UNIFORM context state to an isolated `cleanup_pass`
+  call.
+* `sequencer_with_segmentation_symbols_enables_flag` — the builder
+  toggles the flag in both directions; default is off.
+* `sequencer_propagates_segmentation_symbol_mismatch` — with the
+  toggle on, a cleanup pass over a zero stream (whose first four
+  UNIFORM bits are not `1010`) propagates
+  `SegmentationSymbolMismatch` through `decode_packet`.
+
+Pending after r214:
+
+* §D.4.2 arithmetic-coder termination + per-pass termination
+  segmentation when the COD `termination_on_each_coding_pass` flag
+  is set (the lower-level `decode_passes` entry already supports
+  one-decoder-per-segment dispatch — the missing piece is the
+  packet-reader emitting per-pass byte ranges).
+* §D.6 selective arithmetic-coding bypass (raw-bit mode). Adds the
+  bit-stuffed raw-bit reader from §D.6's bit-stuffing rule + a
+  `bypass` toggle on the sequencer.
+* §D.7 vertically causal context formation toggle. The neighbour
+  read inside the three pass methods always uses the freshest
+  σ-state; the §D.7 mode clips the bottom row of each stripe.
+
+Previous round status follows:
+
 ## Status — 2026-06-02 (clean-room round 208)
 
 Round 208 lands the **§F.3.1 IDWT cascade** in the `reassemble`
@@ -879,9 +970,13 @@ decoder per pass.
 
 What is **not** implemented yet:
 
-* The §D.4.2 / §D.5 / §D.6 termination / error-resilience segmentation
-  symbol / selective arithmetic-coding bypass (raw bit) modes, and §D.7
-  vertically causal context formation (a COD `Scod` bit-3 mode).
+* The §D.4.2 termination + §D.6 selective arithmetic-coding bypass
+  (raw bit) modes, and §D.7 vertically causal context formation (a
+  COD `Scod` bit-3 mode). **§D.5 error-resilience segmentation
+  symbols are now decoded** (round 214) via
+  `t1::decode_segmentation_symbol` and the
+  `BitPlaneSequencer::with_segmentation_symbols` toggle that the
+  Table A.19 COD / COC flag drives.
 * The MQ **encoder** (§C.2 — INITENC / ENCODE / RENORME / BYTEOUT /
   FLUSH) and the §D.6 selective arithmetic-coding bypass (raw bit mode).
 * §B.12.3 POC-marker placement validation — §B.12.2 progression order
@@ -1015,6 +1110,22 @@ consulted:
   (the decoder extends the input bit stream with `0xFF` bytes until all
   symbols are decoded — the basis for the `mq` BYTEIN end-of-stream
   fill).
+* T.800 Annex D §D.5 (Error resilience segmentation symbol) — the four-
+  bit `1010` (= `0xA`) symbol coded under the UNIFORM context at the
+  end of every cleanup pass when the COD / COC Table A.19
+  segmentation-symbols flag is set, decoded MSB-first; a non-`0xA`
+  decoded value flags bit-plane corruption. The §D.5 NOTE on
+  independence from the §D.4.2 predictable-termination flag is the
+  basis for the toggle living on the sequencer rather than being gated
+  by termination.
+* T.800 §A.6.1 / §A.6.2 — Table A.19 SPcod / SPcoc code-block-style
+  byte: bit 0 selective arithmetic-coding bypass, bit 1 reset context
+  probabilities on coding pass boundaries, bit 2 termination on each
+  coding pass, bit 3 vertically causal context, bit 4 predictable
+  termination, bit 5 segmentation symbols. The two-bit reserved high
+  field (the Table A.19 "Decoders may ignore the first and second
+  most significant bits …" prose) is preserved in raw form for
+  diagnostic inspection.
 * T.800 §B.12 (Progression order) — all five §B.12.1 base orders:
   §B.12.1.1 (the LRCP four-nested `for l for r for i for k` loop body),
   §B.12.1.2 (the RLCP `for r for l for i for k` loop body — the same

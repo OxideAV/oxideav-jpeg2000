@@ -6,6 +6,44 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 214 (2026-06-03).** T.800 §D.5 **error-resilience
+  segmentation symbol** decoding and the Table A.19 code-block-style
+  flag surface.
+  * `CodeBlockStyle::from_byte(u8)` decodes the SPcod / SPcoc
+    code-block-style byte into six individually-queryable flags
+    (`selective_arithmetic_coding_bypass`,
+    `reset_context_probabilities`, `termination_on_each_coding_pass`,
+    `vertically_causal_context`, `predictable_termination`,
+    `segmentation_symbols`) per Table A.19. The two reserved high
+    bits are preserved verbatim via `reserved_high_bits`.
+  * `Cod::code_block_style_flags()` and `Coc::code_block_style_flags()`
+    convenience accessors decode the raw byte that the parser stores.
+  * `t1::SEGMENTATION_SYMBOL = 0xA` — the §D.5 reference symbol
+    (binary `1010`).
+  * `t1::decode_segmentation_symbol(decoder, ctx)` reads four UNIFORM
+    decisions MSB-first and verifies the result against
+    `SEGMENTATION_SYMBOL`. Returns `Ok(())` on match,
+    `Err(Error::SegmentationSymbolMismatch)` otherwise (the §D.5
+    "bit-plane carries a bit error" outcome).
+  * `BitPlaneSequencer::with_segmentation_symbols(enabled)` builder
+    threads the COD / COC flag through to the cleanup-pass branch:
+    when on, the sequencer drains the four-bit symbol after every
+    cleanup pass against the same `MqDecoder` / context array and
+    propagates `SegmentationSymbolMismatch` up through
+    `decode_packet` / `decode_passes`. Default off (the cleanup-pass
+    flow is byte-for-byte unchanged when the COD / COC flag is
+    clear).
+  * `Error::SegmentationSymbolMismatch` — new variant carrying the
+    §D.5 mismatch outcome.
+  * 12 new lib tests covering Table A.19 per-bit decoding,
+    all-flags-set, reserved-high-bit preservation, COD parser
+    routing, the `0xA` constant, accept / reject sweep over all 16
+    4-bit values, UNIFORM context consumption, the
+    segmentation-off bit-for-bit oracle match against bare
+    `cleanup_pass`, builder threading, and end-to-end sequencer
+    propagation of the mismatch. Suite is now 400 lib tests
+    (was 388).
+
 * **Clean-room round 208 (2026-06-02).** §F.3.1 **IDWT cascade** added
   to the `reassemble` submodule. The cascade is the §F.3.1
   "iterate 2D_SR over the levLL band, NL times" loop that turns a
