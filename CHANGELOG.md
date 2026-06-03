@@ -6,6 +6,43 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 220 (2026-06-03).** T.800 §D.7
+  **vertically-causal context formation** toggle wired into the tier-1
+  decoder.
+  * `CodeBlock::with_vertically_causal_context(enabled)` /
+    `CodeBlock::vertically_causal_context()` — builder + accessor.
+    When `true`, the §D.3 pass methods (significance propagation,
+    magnitude refinement, cleanup) clip the three Figure D.2
+    below-row neighbour slots `D2`, `V1`, `D3` to insignificant for
+    any coefficient sitting on the **bottom row of its 4-row stripe**
+    — exactly the §D.7 worked example ("Figure D.1 bit 15 is decoded
+    assuming D2 = V1 = D3 = 0"). Coefficients above the stripe
+    bottom retain the full Figure D.2 neighbour read.
+  * `BitPlaneSequencer::with_vertically_causal_context(enabled)` /
+    `BitPlaneSequencer::vertically_causal_context()` — the
+    sequencer-level twin. `decode_passes` / `decode_packet` push the
+    toggle onto the supplied `CodeBlock` at the start of every call
+    so the COD / COC Table A.19 bit drives the entire packet-level
+    pipeline from a single sequencer-level flag.
+  * The §D.3.4 cleanup pass's run-length escape now consults the
+    §D.7-clipped Table D.1 context label for the column's bottom
+    coefficient via the same stripe-aware neighbour read, so the
+    run-length decisions stay consistent with the per-coefficient
+    SP pass under the toggle.
+  * Default `false` everywhere — the round-208 (un-clipped)
+    behaviour is byte-for-byte preserved when the toggle is clear.
+  * 10 new lib tests covering: both constructor defaults, builder
+    monotonicity on both `CodeBlock` and `BitPlaneSequencer`, the
+    stripe-aware neighbour read matching the bare `neighbours()`
+    everywhere when off, the bottom-row `D2 / V1 / D3` clip when on,
+    above-stripe-bottom positions left untouched even with the
+    toggle on, the short trailing-stripe corner, idempotent
+    sequencer-to-block toggle sync, the `cleanup_pass` byte-for-byte
+    baseline match with the toggle off, and a fixture demonstrating
+    that the toggle does change the SP pass's coefficient grid when
+    the next-stripe row carries significance. Suite is now 410 lib
+    tests (was 400).
+
 * **Clean-room round 214 (2026-06-03).** T.800 §D.5 **error-resilience
   segmentation symbol** decoding and the Table A.19 code-block-style
   flag surface.

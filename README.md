@@ -3,6 +3,86 @@
 Pure-Rust JPEG 2000 (J2K + JP2) and High-Throughput JPEG 2000 (HTJ2K)
 codec.
 
+## Status — 2026-06-03 (clean-room round 220)
+
+Round 220 lands the T.800 **§D.7 vertically-causal context formation**
+toggle — the third Table A.19 error-resilience flag now wired into the
+tier-1 decoder (the others, §D.5 and the half of §D.4.2 the sequencer
+already exposes, landed earlier):
+
+* `CodeBlock::with_vertically_causal_context(enabled)` — builder-style
+  toggle on the code-block. Default `false` (the round-208 neighbour
+  read). When set, the three §D.3 pass methods (significance
+  propagation, magnitude refinement, cleanup) clip the Figure D.2
+  below-row slots — `D2`, `V1`, `D3` — to insignificant for any
+  coefficient sitting on the **bottom row of its 4-row stripe**. This
+  is the §D.7 worked example verbatim: Figure D.1's bit 15 (the
+  bottom of the first stripe) is decoded assuming `D2 = V1 = D3 = 0`.
+  Coefficients above the stripe bottom retain their full Figure D.2
+  neighbour set unchanged.
+* `CodeBlock::vertically_causal_context()` — accessor for the flag.
+* `BitPlaneSequencer::with_vertically_causal_context(enabled)` and
+  `BitPlaneSequencer::vertically_causal_context()` — the
+  sequencer-level twin. `decode_passes` / `decode_packet` push the
+  flag onto the supplied [`CodeBlock`] at the start of every call so
+  the COD / COC Table A.19 bit can drive the entire packet-level
+  pipeline from one toggle on the sequencer.
+* The stripe-aware neighbour read also threads through
+  `column_run_length_eligible`: the §D.3.4 cleanup pass's run-length
+  escape now consults the §D.7-clipped Table D.1 context label for
+  the column's bottom coefficient too, so the run-length escape
+  decisions stay consistent with the per-coefficient SP pass under
+  the toggle.
+
+10 new lib tests cover the addition (suite total: 410 lib tests, was
+400):
+
+* `code_block_vertically_causal_default_off` — both constructors
+  start with the flag clear.
+* `code_block_with_vertically_causal_toggles_both_directions` — the
+  builder is monotonic in either direction.
+* `neighbours_in_stripe_off_matches_neighbours` — across every
+  position of a populated `3x5` block, the §D.7-off neighbour read
+  is identical to the un-stripe-aware `neighbours()`.
+* `neighbours_in_stripe_clips_d2_v1_d3_on_stripe_bottom` — with the
+  flag on, the bottom row of the first stripe reads `D2`, `V1`, `D3`
+  as zero; rows above the stripe bottom are unaffected.
+* `neighbours_in_stripe_off_does_not_clip_even_on_stripe_bottom` —
+  with the flag off, the same fixture still reads the next stripe's
+  significance state into the below-row slots (the round-208
+  behaviour).
+* `neighbours_in_stripe_short_stripe_treats_top_as_bottom` — the
+  trailing partial stripe (`stripe_h == 1`) treats its single row as
+  the stripe bottom and clips accordingly.
+* `sequencer_with_vertically_causal_context_enables_flag` — the
+  sequencer builder is monotonic.
+* `sequencer_pushes_vertically_causal_toggle_onto_block` — a
+  zero-pass `decode_passes` call still pushes the flag onto the
+  block; the next call with the flag cleared pulls it back off
+  (idempotent sync).
+* `vertically_causal_off_matches_baseline_cleanup_pass` — the §D.7
+  "off path stays byte-for-byte" guarantee: a sequencer with the
+  flag clear produces the same coefficient grid as a bare
+  `cleanup_pass` call across an 8-row LL block.
+* `vertically_causal_on_diverges_from_baseline_when_bottom_row_decisions_fire`
+  — a fixture pre-marking row 4 (the top of the next stripe) all
+  significant exposes the toggle: the SP pass produces a different
+  coefficient grid inside the first stripe depending on whether the
+  flag is on.
+
+Pending after r220:
+
+* §D.4.2 arithmetic-coder termination + per-pass termination
+  segmentation when the COD `termination_on_each_coding_pass` flag
+  is set (the lower-level `decode_passes` entry already supports
+  one-decoder-per-segment dispatch — the missing piece is the
+  packet-reader emitting per-pass byte ranges).
+* §D.6 selective arithmetic-coding bypass (raw-bit mode). Adds the
+  bit-stuffed raw-bit reader from §D.6's bit-stuffing rule + a
+  `bypass` toggle on the sequencer.
+
+Previous round status follows:
+
 ## Status — 2026-06-03 (clean-room round 214)
 
 Round 214 lands the T.800 **§D.5 error-resilience segmentation symbol**

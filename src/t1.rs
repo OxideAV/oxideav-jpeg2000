@@ -245,6 +245,20 @@ pub struct CodeBlock {
     /// the immediately preceding significance propagation pass". Cleared
     /// at the start of every SP pass.
     newly_significant: Vec<bool>,
+    /// Whether the COD / COC Table A.19 `vertically_causal_context`
+    /// flag is set for this code-block (T.800 §D.7).
+    ///
+    /// When `true`, the §D.3 passes treat the three "below the current
+    /// stripe" neighbour slots (`D2`, `V1`, `D3` of Figure D.2) as
+    /// insignificant for any coefficient sitting on the **bottom row of
+    /// its 4-row stripe** — i.e. they are read as zero exactly the same
+    /// way out-of-block neighbours are read as zero. Coefficients above
+    /// the bottom row of the stripe see their full Figure D.2 neighbour
+    /// set unchanged. Default `false` (full Figure D.2 neighbour read
+    /// everywhere, identical to the round-208 behaviour).
+    ///
+    /// Toggle via [`Self::with_vertically_causal_context`].
+    vertically_causal: bool,
 }
 
 impl CodeBlock {
@@ -262,6 +276,7 @@ impl CodeBlock {
             height,
             coefficients: vec![Coefficient::default(); width * height],
             newly_significant: vec![false; width * height],
+            vertically_causal: false,
         }
     }
 
@@ -291,7 +306,39 @@ impl CodeBlock {
             height,
             coefficients,
             newly_significant: vec![false; width * height],
+            vertically_causal: false,
         }
+    }
+
+    /// Enable the T.800 §D.7 vertically-causal context-formation toggle.
+    ///
+    /// When the COD / COC Table A.19
+    /// [`crate::CodeBlockStyle::vertically_causal_context`] bit is set
+    /// for this code-block, call this with `true` **before** invoking
+    /// any of the §D.3 pass methods. The pass methods then read the
+    /// Figure D.2 neighbour slots `D2`, `V1`, `D3` (the three slots in
+    /// the row immediately *below* the current row) as insignificant
+    /// for every coefficient sitting on the bottom row of its 4-row
+    /// stripe — i.e. those three slots are clipped to zero the same way
+    /// out-of-block neighbours are clipped to zero. Coefficients above
+    /// the bottom row of the stripe still see their full Figure D.2
+    /// neighbour set: the §D.7 mode only modifies bits at stripe
+    /// position 3 (the bottom of each four-row band, per the §D.7
+    /// "Figure D.1 bit 15" worked example).
+    ///
+    /// Builder-style: returns `self` so it can be chained with
+    /// [`Self::from_coefficients`] / [`Self::new`].
+    ///
+    /// Default is `false` (no clipping; identical neighbour reads to
+    /// the round-208 behaviour).
+    pub fn with_vertically_causal_context(mut self, enabled: bool) -> Self {
+        self.vertically_causal = enabled;
+        self
+    }
+
+    /// Whether T.800 §D.7 vertically-causal context formation is on.
+    pub fn vertically_causal_context(&self) -> bool {
+        self.vertically_causal
     }
 
     /// Code-block width in samples.
@@ -375,7 +422,10 @@ impl CodeBlock {
                     if coef.sigma {
                         continue;
                     }
-                    let label = significance_context_label(self.orientation, self.neighbours(u, v));
+                    let label = significance_context_label(
+                        self.orientation,
+                        self.neighbours_in_stripe(u, v, v0, stripe_h),
+                    );
                     if label == 0 {
                         // Zero context — deferred to the cleanup pass.
                         continue;
@@ -388,7 +438,7 @@ impl CodeBlock {
                         // bit-plane's positional value into magnitude,
                         // then immediately run the §D.3.2 sign-bit
                         // subroutine.
-                        let nb = self.neighbours(u, v);
+                        let nb = self.neighbours_in_stripe(u, v, v0, stripe_h);
                         let (sign_label, xorbit) = sign_context_label(nb);
                         let sign_cx = &mut ctx[SIGN_CTX_OFFSET + sign_label as usize];
                         let d = decoder.decode(sign_cx);
@@ -467,8 +517,10 @@ impl CodeBlock {
 
                     // Table D.4 context: the neighbour summation uses the
                     // significance states currently known to the decoder.
-                    let label =
-                        refinement_context_label(self.neighbours(u, v), coef.already_refined);
+                    let label = refinement_context_label(
+                        self.neighbours_in_stripe(u, v, v0, stripe_h),
+                        coef.already_refined,
+                    );
                     let cx = &mut ctx[REFINEMENT_CTX_OFFSET + label as usize];
                     let bit = decoder.decode(cx);
 
@@ -564,7 +616,7 @@ impl CodeBlock {
                     // so); decode only its sign, then continue normally
                     // from the next coefficient down the column.
                     let v = v0 + first;
-                    self.make_significant_with_sign(u, v, weight, decoder, ctx);
+                    self.make_significant_with_sign(u, v, weight, v0, stripe_h, decoder, ctx);
                     newly += 1;
                     start_dv = first + 1;
                 }
@@ -577,10 +629,13 @@ impl CodeBlock {
                     if self.coefficients[u + v * self.width].sigma {
                         continue;
                     }
-                    let label = significance_context_label(self.orientation, self.neighbours(u, v));
+                    let label = significance_context_label(
+                        self.orientation,
+                        self.neighbours_in_stripe(u, v, v0, stripe_h),
+                    );
                     let cx = &mut ctx[SP_CTX_OFFSET + label as usize];
                     if decoder.decode(cx) == 1 {
-                        self.make_significant_with_sign(u, v, weight, decoder, ctx);
+                        self.make_significant_with_sign(u, v, weight, v0, stripe_h, decoder, ctx);
                         newly += 1;
                     }
                 }
@@ -596,6 +651,11 @@ impl CodeBlock {
     /// is still insignificant and its current Table D.1 significance
     /// context label is `0`. Callers must have already established that
     /// the stripe is a full 4-row stripe.
+    ///
+    /// The label is computed with the **stripe-aware** neighbour read —
+    /// when the §D.7 vertically-causal flag is set, the bottom row of
+    /// the stripe reads its `D2 / V1 / D3` slots as zero, exactly the
+    /// way the §D.3 passes themselves read them.
     fn column_run_length_eligible(&self, u: usize, v0: usize) -> bool {
         for dv in 0..4 {
             let v = v0 + dv;
@@ -603,7 +663,9 @@ impl CodeBlock {
             if c.sigma {
                 return false;
             }
-            if significance_context_label(self.orientation, self.neighbours(u, v)) != 0 {
+            if significance_context_label(self.orientation, self.neighbours_in_stripe(u, v, v0, 4))
+                != 0
+            {
                 return false;
             }
         }
@@ -614,16 +676,24 @@ impl CodeBlock {
     /// bit-plane `weight` into the magnitude, decode the sign bit via the
     /// §D.3.2 subroutine, and flag it newly-significant (the §D.3.3
     /// carry). Shared by the cleanup pass's run-length and normal modes.
+    ///
+    /// `stripe_v0` / `stripe_h` thread the current stripe extent into
+    /// the §D.3.2 sign-context neighbour read so the §D.7
+    /// vertically-causal flag (when set on the code-block) clips the
+    /// below-stripe `V1` slot to zero for bottom-row coefficients.
+    #[allow(clippy::too_many_arguments)]
     fn make_significant_with_sign(
         &mut self,
         u: usize,
         v: usize,
         weight: u32,
+        stripe_v0: usize,
+        stripe_h: usize,
         decoder: &mut MqDecoder<'_>,
         ctx: &mut [MqContext; NUM_CONTEXTS],
     ) {
         let idx = u + v * self.width;
-        let nb = self.neighbours(u, v);
+        let nb = self.neighbours_in_stripe(u, v, stripe_v0, stripe_h);
         let (sign_label, xorbit) = sign_context_label(nb);
         let sign_cx = &mut ctx[SIGN_CTX_OFFSET + sign_label as usize];
         let d = decoder.decode(sign_cx);
@@ -636,10 +706,15 @@ impl CodeBlock {
         self.newly_significant[idx] = true;
     }
 
-    /// Build a [`Neighbours`] snapshot of `(u, v)`'s 8 nearest neighbours.
+    /// Build a [`Neighbours`] snapshot of `(u, v)`'s 8 nearest neighbours,
+    /// **without** the §D.7 stripe clipping.
     ///
     /// Out-of-block neighbours are treated as insignificant
     /// (`sigma = false`, `sign = false`) per §D.3 / §D.3.2.
+    ///
+    /// The §D.3 pass methods go through
+    /// [`Self::neighbours_in_stripe`] instead — that path layers the
+    /// §D.7 vertically-causal clip on top of this read.
     fn neighbours(&self, u: usize, v: usize) -> Neighbours {
         let mut nb = Neighbours::default();
         // Iterate the eight (du, dv) offsets in the Figure D.2 grid.
@@ -665,6 +740,48 @@ impl CodeBlock {
             }
             let c = self.coefficients[(nu as usize) + (nv as usize) * self.width];
             nb.set(slot, c.sigma, c.sign);
+        }
+        nb
+    }
+
+    /// Build a [`Neighbours`] snapshot for the §D.3 pass methods.
+    ///
+    /// `stripe_v0` is the top row of the 4-row stripe currently being
+    /// scanned and `stripe_h` is its height (`1..=4`; less than `4` only
+    /// when the block height is not a multiple of four and the bottom
+    /// partial stripe is in progress). The current coefficient `(u, v)`
+    /// lies inside the stripe (`stripe_v0 <= v < stripe_v0 + stripe_h`).
+    ///
+    /// When the §D.7 vertically-causal flag is **off** (default), this
+    /// is a straight pass-through to [`Self::neighbours`] — the full
+    /// Figure D.2 neighbour set is read.
+    ///
+    /// When the §D.7 vertically-causal flag is **on** and `(u, v)`
+    /// sits on the **bottom row of the stripe** (`v == stripe_v0 +
+    /// stripe_h - 1`), the three "below the current row" Figure D.2
+    /// slots — `D2`, `V1`, `D3` — are clipped to insignificant
+    /// (`sigma = false`, `sign = false`) regardless of whether the
+    /// next row exists in the code-block. Coefficients above the
+    /// stripe bottom (`v < stripe_v0 + stripe_h - 1`) see their
+    /// full neighbour set unchanged: the stripe's bottom row is the
+    /// only one whose `D2 / V1 / D3` slots would otherwise reach
+    /// into the *next* stripe (the four-row layout sketched in §D.7
+    /// — Figure D.1 bit 15 is the worked example).
+    fn neighbours_in_stripe(
+        &self,
+        u: usize,
+        v: usize,
+        stripe_v0: usize,
+        stripe_h: usize,
+    ) -> Neighbours {
+        let mut nb = self.neighbours(u, v);
+        if self.vertically_causal && stripe_h > 0 && v == stripe_v0 + stripe_h - 1 {
+            // §D.7: clip D2, V1, D3 to insignificant on the bottom row
+            // of the current stripe.
+            nb.d2_sigma = false;
+            nb.v1_sigma = false;
+            nb.v1_sign = false;
+            nb.d3_sigma = false;
         }
         nb
     }
@@ -1131,9 +1248,20 @@ pub enum Pass {
 ///   for selected bit-planes to a raw-bit reader instead of the MQ
 ///   decoder. A future round adds the raw-bit reader and a `bypass` flag
 ///   on the sequencer to select it.
-/// * **§D.7 vertically causal context formation**. The neighbour read
-///   inside the three pass methods always uses the freshest σ-state; the
-///   §D.7 mode would clip the bottom row of each stripe.
+/// ## §D.7 vertically-causal context formation
+///
+/// When the COD / COC Table A.19
+/// [`crate::CodeBlockStyle::vertically_causal_context`] flag is set,
+/// enable the matching neighbour clip by calling
+/// [`with_vertically_causal_context(true)`](Self::with_vertically_causal_context)
+/// **before** invoking [`Self::decode_packet`] / [`Self::decode_passes`].
+/// The sequencer pushes the toggle onto the supplied [`CodeBlock`] at
+/// the start of the call so the three §D.3 pass methods consult the
+/// §D.7-clipped Figure D.2 neighbour set for any coefficient sitting on
+/// the bottom row of its 4-row stripe (the spec's worked-example bit
+/// 15). Coefficients above the stripe bottom see their full neighbour
+/// set unchanged. Default off — the round-208 (non-clipped) behaviour
+/// is byte-for-byte preserved.
 #[derive(Debug, Clone)]
 pub struct BitPlaneSequencer {
     /// 0-based bit-plane index currently being decoded, MSB-first
@@ -1151,6 +1279,13 @@ pub struct BitPlaneSequencer {
     /// at the end of every cleanup pass and returns
     /// [`Error::SegmentationSymbolMismatch`] on a non-`0xA` value.
     segmentation_symbols: bool,
+    /// Whether the COD / COC Table A.19 vertically-causal-context flag
+    /// is set for this code-block. When true the sequencer pushes the
+    /// matching toggle onto the [`CodeBlock`] at the start of every
+    /// [`Self::decode_packet`] / [`Self::decode_passes`] call so the
+    /// three §D.3 pass methods read the §D.7-clipped Figure D.2
+    /// neighbour set on the bottom row of each stripe.
+    vertically_causal_context: bool,
 }
 
 impl BitPlaneSequencer {
@@ -1173,6 +1308,7 @@ impl BitPlaneSequencer {
             next_pass: Pass::Cleanup,
             passes_decoded: 0,
             segmentation_symbols: false,
+            vertically_causal_context: false,
         }
     }
 
@@ -1197,6 +1333,31 @@ impl BitPlaneSequencer {
     /// Whether T.800 §D.5 segmentation-symbol checking is enabled.
     pub fn segmentation_symbols(&self) -> bool {
         self.segmentation_symbols
+    }
+
+    /// Builder — enable T.800 §D.7 vertically-causal context formation
+    /// for this code-block.
+    ///
+    /// When enabled, [`Self::decode_passes`] / [`Self::decode_packet`]
+    /// push the toggle onto the supplied [`CodeBlock`] at the start of
+    /// the call (via [`CodeBlock::with_vertically_causal_context`]). The
+    /// three §D.3 pass methods then clip the §D.7 below-stripe slots
+    /// (`D2`, `V1`, `D3` of Figure D.2) to insignificant for any
+    /// coefficient sitting on the **bottom row of its 4-row stripe** —
+    /// the spec's "Figure D.1 bit 15" worked example. Coefficients
+    /// above the stripe bottom retain the full Figure D.2 neighbour
+    /// read.
+    ///
+    /// The flag is taken from the COD / COC Table A.19
+    /// [`crate::CodeBlockStyle::vertically_causal_context`] bit.
+    pub fn with_vertically_causal_context(mut self, enabled: bool) -> Self {
+        self.vertically_causal_context = enabled;
+        self
+    }
+
+    /// Whether T.800 §D.7 vertically-causal context formation is on.
+    pub fn vertically_causal_context(&self) -> bool {
+        self.vertically_causal_context
     }
 
     /// Bit-plane index that the **next** pass will run on
@@ -1268,6 +1429,11 @@ impl BitPlaneSequencer {
         ctx: &mut [MqContext; NUM_CONTEXTS],
         passes: u32,
     ) -> Result<usize, Error> {
+        // Push the sequencer's §D.7 vertically-causal toggle onto the
+        // block before any pass runs. The block is the owner of the
+        // neighbour-read clip and the sequencer is the owner of the
+        // packet-level flag — this is the one-line sync between them.
+        block.vertically_causal = self.vertically_causal_context;
         let mut total = 0usize;
         for _ in 0..passes {
             let bitplane = self.current_bitplane;
@@ -2741,6 +2907,250 @@ mod tests {
         assert_eq!(
             seq.decode_packet(&mut block, &bytes, 1, &mut ctx),
             Err(Error::SegmentationSymbolMismatch),
+        );
+    }
+
+    // -- §D.7 vertically-causal context formation ---------------------
+
+    #[test]
+    fn code_block_vertically_causal_default_off() {
+        // Default constructors leave §D.7 off — the round-208 read.
+        let block = CodeBlock::new(SubBandOrientation::LL, 4, 4);
+        assert!(!block.vertically_causal_context());
+        let block2 = CodeBlock::from_coefficients(
+            SubBandOrientation::HL,
+            2,
+            2,
+            vec![Coefficient::default(); 4],
+        );
+        assert!(!block2.vertically_causal_context());
+    }
+
+    #[test]
+    fn code_block_with_vertically_causal_toggles_both_directions() {
+        // Builder is monotonic in either direction.
+        let block_on =
+            CodeBlock::new(SubBandOrientation::LL, 4, 4).with_vertically_causal_context(true);
+        assert!(block_on.vertically_causal_context());
+        let block_back = block_on.with_vertically_causal_context(false);
+        assert!(!block_back.vertically_causal_context());
+    }
+
+    #[test]
+    fn neighbours_in_stripe_off_matches_neighbours() {
+        // With the §D.7 flag off, the stripe-aware neighbour read is a
+        // pass-through to the standard neighbour read on every position.
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 3, 5);
+        // Populate a few coefficients so the read has something to mirror.
+        block.mark_significant_for_test(0, 0, false, 1);
+        block.mark_significant_for_test(1, 1, true, 1);
+        block.mark_significant_for_test(2, 4, false, 1);
+        for v in 0..5 {
+            for u in 0..3 {
+                // Try every stripe layout the §D.3 pass loops will use:
+                // v0 = 0 stripe_h = 4 covers rows 0..=3; v0 = 4 covers row 4.
+                let v0 = (v / 4) * 4;
+                let stripe_h = core::cmp::min(4, 5 - v0);
+                assert_eq!(
+                    block.neighbours_in_stripe(u, v, v0, stripe_h),
+                    block.neighbours(u, v),
+                    "(u={u}, v={v}) must be identical with §D.7 off",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn neighbours_in_stripe_clips_d2_v1_d3_on_stripe_bottom() {
+        // The §D.7 worked example: bit 15 (bottom of stripe) reads
+        // D2 = V1 = D3 = 0. Set up a 3x5 LL block with the row BELOW
+        // the bottom of the first stripe (row 4, i.e. (0,4), (1,4),
+        // (2,4)) all significant. Without §D.7 they show up as the
+        // D2/V1/D3 neighbours of (1, 3); with §D.7 they read as zero.
+        let mut block =
+            CodeBlock::new(SubBandOrientation::LL, 3, 5).with_vertically_causal_context(true);
+        block.mark_significant_for_test(0, 4, false, 1);
+        block.mark_significant_for_test(1, 4, false, 1);
+        block.mark_significant_for_test(2, 4, false, 1);
+
+        // §D.7-off baseline: D2, V1, D3 are all significant for (1, 3).
+        let baseline = block.neighbours(1, 3);
+        assert!(baseline.d2_sigma);
+        assert!(baseline.v1_sigma);
+        assert!(baseline.d3_sigma);
+
+        // Stripe v0 = 0, stripe_h = 4 — (1, 3) is on the bottom row.
+        let clipped = block.neighbours_in_stripe(1, 3, 0, 4);
+        assert!(!clipped.d2_sigma);
+        assert!(!clipped.v1_sigma);
+        assert!(!clipped.v1_sign);
+        assert!(!clipped.d3_sigma);
+        // Above-stripe-bottom positions are unaffected even with the
+        // flag set: at v = 2, D2/V1/D3 reach into row 3 (inside the
+        // stripe), so the clip does not fire.
+        let inside = block.neighbours_in_stripe(1, 2, 0, 4);
+        assert_eq!(inside, block.neighbours(1, 2));
+    }
+
+    #[test]
+    fn neighbours_in_stripe_off_does_not_clip_even_on_stripe_bottom() {
+        // With §D.7 off the bottom-row neighbour read sees the next
+        // stripe — the round-208 behaviour. Same fixture as the
+        // previous test, vertically_causal flag left clear.
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 3, 5);
+        block.mark_significant_for_test(0, 4, false, 1);
+        block.mark_significant_for_test(1, 4, false, 1);
+        block.mark_significant_for_test(2, 4, false, 1);
+        let nb = block.neighbours_in_stripe(1, 3, 0, 4);
+        assert!(nb.d2_sigma);
+        assert!(nb.v1_sigma);
+        assert!(nb.d3_sigma);
+    }
+
+    #[test]
+    fn neighbours_in_stripe_short_stripe_treats_top_as_bottom() {
+        // When the trailing partial stripe has stripe_h = 1, the
+        // single row is itself the "bottom" of the stripe and §D.7
+        // clips its D2/V1/D3. Set up an 3x5 block where row 4 is the
+        // partial bottom stripe (stripe_v0 = 4, stripe_h = 1) and the
+        // (hypothetical) next stripe rows (which don't exist — block
+        // ends at v = 4) wouldn't carry anything anyway, so this test
+        // confirms the partial-stripe code path stays well-behaved.
+        let block =
+            CodeBlock::new(SubBandOrientation::LL, 3, 5).with_vertically_causal_context(true);
+        let nb = block.neighbours_in_stripe(1, 4, 4, 1);
+        // No coefficient set anywhere — every slot is zero regardless,
+        // but the clip must not panic and must return the expected
+        // all-zero Neighbours value.
+        assert!(!nb.d2_sigma);
+        assert!(!nb.v1_sigma);
+        assert!(!nb.d3_sigma);
+        assert!(!nb.v0_sigma);
+        assert!(!nb.h0_sigma);
+        assert!(!nb.h1_sigma);
+        assert!(!nb.d0_sigma);
+        assert!(!nb.d1_sigma);
+    }
+
+    #[test]
+    fn sequencer_with_vertically_causal_context_enables_flag() {
+        // Builder threads through; default off, on after toggle.
+        let seq_off = BitPlaneSequencer::new(7);
+        assert!(!seq_off.vertically_causal_context());
+        let seq_on = BitPlaneSequencer::new(7).with_vertically_causal_context(true);
+        assert!(seq_on.vertically_causal_context());
+        let seq_back = seq_on.with_vertically_causal_context(false);
+        assert!(!seq_back.vertically_causal_context());
+    }
+
+    #[test]
+    fn sequencer_pushes_vertically_causal_toggle_onto_block() {
+        // decode_passes / decode_packet must sync the sequencer's flag
+        // onto the supplied block at the start of the call so the
+        // block's neighbour read picks it up. Use a zero-pass call so
+        // no MQ state is touched — the sync line runs before the loop.
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 4, 4);
+        assert!(!block.vertically_causal_context());
+        let mut ctx = reset_contexts();
+        let mut seq = BitPlaneSequencer::new(5).with_vertically_causal_context(true);
+        // Direct decode_passes call to exercise the sync at the entry
+        // point that drives the passes (decode_packet wraps this one).
+        let mut decoder = MqDecoder::new(&[0u8; 4]);
+        let _ = seq
+            .decode_passes(&mut block, &mut decoder, &mut ctx, 0)
+            .unwrap();
+        assert!(block.vertically_causal_context());
+
+        // And the reverse direction — turning the flag off later
+        // resets the block's view on the next call.
+        let mut seq_off = BitPlaneSequencer::new(5);
+        let mut decoder2 = MqDecoder::new(&[0u8; 4]);
+        let _ = seq_off
+            .decode_passes(&mut block, &mut decoder2, &mut ctx, 0)
+            .unwrap();
+        assert!(!block.vertically_causal_context());
+    }
+
+    #[test]
+    fn vertically_causal_off_matches_baseline_cleanup_pass() {
+        // With the toggle off, a full cleanup pass on an 8-tall block
+        // must produce byte-for-byte identical state to a baseline
+        // CodeBlock that never saw the toggle. This is the §D.7
+        // "off path stays the round-208 byte-for-byte" guarantee.
+        let bytes = [0xB7u8, 0x29, 0xEE, 0x4C, 0x81, 0x6A, 0xD3, 0x55];
+
+        let mut baseline = CodeBlock::new(SubBandOrientation::LL, 4, 8);
+        let mut ctx_b = reset_contexts();
+        let mut dec_b = MqDecoder::new(&bytes);
+        baseline.cleanup_pass(6, &mut dec_b, &mut ctx_b).unwrap();
+
+        let mut probe = CodeBlock::new(SubBandOrientation::LL, 4, 8);
+        let mut ctx_p = reset_contexts();
+        let mut seq = BitPlaneSequencer::new(6).with_vertically_causal_context(false);
+        let mut dec_p = MqDecoder::new(&bytes);
+        seq.decode_passes(&mut probe, &mut dec_p, &mut ctx_p, 1)
+            .unwrap();
+
+        for v in 0..8 {
+            for u in 0..4 {
+                assert_eq!(
+                    baseline.coefficient(u, v),
+                    probe.coefficient(u, v),
+                    "(u={u}, v={v}) must match baseline with §D.7 off",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn vertically_causal_on_diverges_from_baseline_when_bottom_row_decisions_fire() {
+        // Construct a fixture where §D.7 must change the decoder's
+        // labelling on a stripe-bottom coefficient: pre-mark every
+        // coefficient on row 4 (the top of the next stripe) as
+        // significant. The (u, 3) coefficients sit on the bottom row
+        // of the first stripe (v0 = 0, stripe_h = 4) and their
+        // significance-propagation context now differs between §D.7-on
+        // and §D.7-off — off sees D2/V1/D3 significant, on reads zero.
+        //
+        // Walking the SP pass with a fixed MQ stream must therefore
+        // produce a different coefficient grid in at least one cell.
+        let bytes = [0xB7u8, 0x29, 0xEE, 0x4C, 0x81, 0x6A, 0xD3, 0x55];
+
+        let mut on_block =
+            CodeBlock::new(SubBandOrientation::LL, 4, 8).with_vertically_causal_context(true);
+        let mut off_block = CodeBlock::new(SubBandOrientation::LL, 4, 8);
+        for block in [&mut on_block, &mut off_block] {
+            for u in 0..4 {
+                block.mark_significant_for_test(u, 4, false, 0b1000);
+            }
+        }
+
+        let mut ctx_on = reset_contexts();
+        let mut dec_on = MqDecoder::new(&bytes);
+        on_block
+            .significance_propagation_pass(3, &mut dec_on, &mut ctx_on)
+            .unwrap();
+
+        let mut ctx_off = reset_contexts();
+        let mut dec_off = MqDecoder::new(&bytes);
+        off_block
+            .significance_propagation_pass(3, &mut dec_off, &mut ctx_off)
+            .unwrap();
+
+        // Some coefficient inside the first stripe (rows 0..=3) must
+        // differ between the two runs; otherwise the §D.7 clip didn't
+        // actually affect any decision.
+        let mut differs = false;
+        for v in 0..4 {
+            for u in 0..4 {
+                if on_block.coefficient(u, v) != off_block.coefficient(u, v) {
+                    differs = true;
+                }
+            }
+        }
+        assert!(
+            differs,
+            "§D.7 on vs. off must change at least one coefficient inside the bottom row of the first stripe",
         );
     }
 }
