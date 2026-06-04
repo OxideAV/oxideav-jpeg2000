@@ -6,6 +6,43 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 235 (2026-06-05).** T.800 §D.4.2 **termination
+  dispatch** surface on `BitPlaneSequencer` — the COD / COC Table A.19
+  bit-2 (`termination_on_each_coding_pass`) toggle plus the combined
+  classifier that tells a packet reader which passes own their own
+  terminated codeword segment under bit-2 alone, bit-0 (§D.6 bypass)
+  alone, both bits, or neither.
+  * `BitPlaneSequencer::with_termination_on_each_coding_pass(enabled)`
+    / `BitPlaneSequencer::termination_on_each_coding_pass()` — builder
+    + accessor for the Table A.19 bit-2 flag. Default `false`.
+  * `BitPlaneSequencer::next_pass_is_terminated()` — the §D.4.2 /
+    Table D.9 dispatch predicate. Returns `true` iff the **next** pass
+    (per `next_pass()` / `current_bitplane()`) owns its own terminated
+    codeword segment, per the spec's three-way state space: bit-2 →
+    every pass terminated (including every §D.6 raw pass); neither
+    bit → the default single-segment packet of §D.4.1 (false for
+    every pass); bit-0 alone → Table D.9 schedule with the fourth
+    cleanup, every bp5+ MR raw, and every bp5+ Cleanup AC pass
+    terminated, the bp5+ SP raw passes not, and the bp1/2/3 cleanups
+    and pre-bypass SP/MR passes all unterminated.
+  * The sequencer itself still drives every pass against the supplied
+    `MqDecoder`; termination is a packet-reader-level concern (which
+    decoder to feed each pass), not a sequencer-internal one. The
+    lower-level `decode_passes` entry point lets a §D.4.2-aware
+    caller construct one `MqDecoder` per terminated segment and
+    drive the sequencer one pass at a time.
+  * 12 new lib tests covering: bit-2 default off; builder
+    monotonicity; predicate `false` for every state under no-flags;
+    predicate `true` for every state under bit-2 alone; bit-2 wins
+    over bit-0 at the bp5 SP boundary; the full Table D.9 row
+    schedule under bit-0 alone for `passes_decoded == 0..=12`; the
+    bp6 / bp7 SP/MR/Cleanup repeat pattern; bit-2 alone (no bypass)
+    terminates every AC pass; the bp4-cleanup gate row isolated; the
+    bp1/2/3 cleanups stay unterminated under bypass-only; the
+    predicate consults `passes_decoded` and not just `next_pass`;
+    §D.5 / §D.7 toggles do not affect the §D.4.2 classification.
+    Suite is now 440 lib tests (was 428).
+
 * **Clean-room round 227 (2026-06-04).** T.800 §D.6 **selective
   arithmetic-coding bypass** raw-bit reader plus the raw-mode SP /
   MR coding pass entry points and the sequencer-level toggle.

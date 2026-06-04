@@ -3,6 +3,76 @@
 Pure-Rust JPEG 2000 (J2K + JP2) and High-Throughput JPEG 2000 (HTJ2K)
 codec.
 
+## Status — 2026-06-05 (clean-room round 235)
+
+Round 235 lands the T.800 **§D.4.2 termination dispatch** surface on
+`BitPlaneSequencer` — the COD / COC Table A.19 bit-2
+(`termination_on_each_coding_pass`) toggle plus the combined
+classifier that tells a packet reader which passes own their own
+terminated codeword segment under bit-2 alone, bit-0 (§D.6 bypass)
+alone, both bits, or neither:
+
+* `BitPlaneSequencer::with_termination_on_each_coding_pass(enabled)` /
+  `BitPlaneSequencer::termination_on_each_coding_pass()` — builder +
+  accessor for the Table A.19 bit-2 flag. Default `false`.
+* `BitPlaneSequencer::next_pass_is_terminated()` — the §D.4.2 /
+  Table D.9 dispatch predicate. Returns `true` iff the **next** pass
+  (per `next_pass()` / `current_bitplane()`) owns its own terminated
+  codeword segment, per:
+  * Bit-2 set: every pass terminated (including every §D.6 raw pass),
+    per the spec's "If termination on each coding pass is selected,
+    then every pass is terminated (including both raw passes)."
+  * Bit-2 clear, bit-0 clear: the default single-segment packet of
+    §D.4.1 — `false` for every pass.
+  * Bit-2 clear, bit-0 set: Table D.9 schedule — the fourth cleanup
+    pass (Table D.9 row "bp4 cleanup: AC, terminate"), every MR raw
+    pass (Table D.9 row "MR raw, terminate"), and every Cleanup pass
+    from bit-plane 5 onward (Table D.9 row "Cleanup AC, terminate")
+    are terminated; the bit-plane 5+ SP raw passes are not, and
+    neither are the bit-plane 1/2/3 cleanups or any of the
+    pre-bypass SP/MR passes.
+* The sequencer itself still drives every pass against the
+  `MqDecoder` the caller supplies — termination is a
+  packet-reader-level concern (which decoder to feed each pass), not
+  a sequencer-internal one. The lower-level `decode_passes` entry
+  point exists so a §D.4.2-aware caller can construct one
+  `MqDecoder` per terminated segment and drive the sequencer one
+  pass at a time.
+
+12 new lib tests cover the addition (suite total: 440 lib tests, was
+428):
+
+* `sequencer_termination_default_off` — bit-2 toggle off on a fresh
+  sequencer.
+* `sequencer_with_termination_on_each_coding_pass_round_trips` —
+  builder monotonicity in both directions.
+* `next_pass_is_terminated_false_when_no_flags` — the default packet
+  returns `false` at every `(passes_decoded, pass)` state.
+* `next_pass_is_terminated_true_for_every_pass_when_bit2_set` —
+  bit-2 alone forces `true` at every `(passes_decoded, pass)` state.
+* `next_pass_is_terminated_bit2_wins_over_bypass` — bit-2 + bit-0 at
+  the bp5 SP boundary still returns `true` (overrides bypass's
+  "raw SP not terminated" row).
+* `next_pass_is_terminated_table_d9_schedule_under_bypass_only` —
+  walks the full Table D.9 row schedule under bit-0 alone for
+  `passes_decoded == 0..=12` (bp1 cleanup through bp5 cleanup).
+* `next_pass_is_terminated_repeats_per_bitplane_in_bypass_region` —
+  bit-planes 6 and 7 spot-check the SP/MR/Cleanup repeat pattern.
+* `next_pass_is_terminated_bit2_only_no_bypass_terminates_every_pass`
+  — bit-2 alone with bit-0 clear still terminates every AC pass.
+* `next_pass_is_terminated_bypass_only_bp4_cleanup_terminates` —
+  isolates the bp4 cleanup transition row (the gate into the
+  bypass region).
+* `next_pass_is_terminated_bypass_only_cleanups_outside_raw_region_unterminated`
+  — bp1/2/3 cleanups stay unterminated under bypass-only, consistent
+  with their being inside the surrounding AC-decoder run.
+* `next_pass_is_terminated_drives_off_passes_decoded_not_next_pass_alone`
+  — the predicate consults `passes_decoded`, not just `next_pass`;
+  early Cleanups stay unterminated and late ones terminate.
+* `next_pass_is_terminated_independent_of_other_toggles` — the §D.5
+  segmentation-symbol and §D.7 vertically-causal-context toggles do
+  not affect the §D.4.2 classification.
+
 ## Status — 2026-06-04 (clean-room round 227)
 
 Round 227 lands the T.800 **§D.6 selective arithmetic-coding bypass**

@@ -59,8 +59,18 @@
 //!   code-block — the three passes are individually callable; chaining
 //!   them per code-block from the packet reader's byte ranges is the next
 //!   step.
-//! * The §D.4.2 termination modes (per-pass / predictable). **§D.5
-//!   error-resilience segmentation symbols are wired** via
+//! * The §D.4.2 **predictable** termination flag (Scod bit-4). The
+//!   §D.4.2 **per-pass** termination flag (Scod bit-2) **is wired**
+//!   via the [`BitPlaneSequencer::with_termination_on_each_coding_pass`]
+//!   builder, the matching accessor, and the
+//!   [`BitPlaneSequencer::next_pass_is_terminated`] dispatch predicate
+//!   that combines bit-2 with the §D.6 / Table D.9 schedule (the
+//!   fourth cleanup pass and every pass in the bypass region from
+//!   bit-plane 5 onward terminate even with only bit-0 set). The
+//!   sequencer itself still drives every pass against the supplied
+//!   [`MqDecoder`]; the predicate is the packet-reader-level dispatch
+//!   contract for deciding whether to open a fresh decoder per pass.
+//!   **§D.5 error-resilience segmentation symbols are wired** via
 //!   [`decode_segmentation_symbol`] and the
 //!   [`BitPlaneSequencer::with_segmentation_symbols`] toggle that the
 //!   COD / COC Table A.19 flag (decoded into
@@ -1505,22 +1515,38 @@ pub enum Pass {
 /// The four UNIFORM decisions modify the UNIFORM context's state per
 /// Table C.2 NMPS / NLPS exactly like any other UNIFORM decode.
 ///
+/// ## §D.4.2 termination dispatch
+///
+/// The COD / COC Table A.19 bit-2 flag
+/// ([`crate::CodeBlockStyle::termination_on_each_coding_pass`]) and the
+/// bit-0 ([`crate::CodeBlockStyle::selective_arithmetic_coding_bypass`])
+/// flag together drive the §D.4.2 / Table D.9 dispatch — which passes
+/// own their own terminated codeword segment in the packet body and
+/// which share one. The sequencer exposes the COD bit-2 toggle via
+/// [`Self::with_termination_on_each_coding_pass`] /
+/// [`Self::termination_on_each_coding_pass`] and the combined
+/// classification via [`Self::next_pass_is_terminated`]. The
+/// classifier returns `true` when bit-2 is set (every pass terminated,
+/// including the §D.6 raw passes); when bit-0 alone is set it returns
+/// `true` for the fourth cleanup pass (the bypass-region gate) and
+/// thereafter for every MR raw pass and every Cleanup AC pass; with
+/// neither flag set the predicate returns `false` and one decoder
+/// covers the whole packet. The sequencer itself still drives every
+/// pass against the [`MqDecoder`] the caller supplies — termination
+/// is a packet-reader-level concern (which decoder to feed each pass),
+/// not a sequencer-internal one. The lower-level
+/// [`Self::decode_passes`] entry point exists exactly so a §D.4.2-aware
+/// caller can construct one [`MqDecoder`] per terminated segment and
+/// call the driver one pass at a time.
+///
 /// ## What this sequencer does NOT cover
 ///
-/// * **§D.4.2 termination** between coding passes. Each call to
-///   [`Self::decode_packet`] uses one [`MqDecoder`] across every pass in
-///   the call — the right behaviour when the COD `Scod` bit-2
-///   "code-block style: arithmetic coder bypass" and bit-4 "termination
-///   on each pass" flags are both clear (the common case). When per-pass
-///   termination is signalled, the caller must construct one
-///   [`MqDecoder`] per segment and call [`Self::decode_passes`] one pass
-///   at a time; that lower-level entry point is provided for exactly
-///   that reason.
-/// * **§D.6 selective arithmetic-coding bypass** (raw-bit mode). The
-///   §D.6 mode would route the significance / refinement / sign decisions
-///   for selected bit-planes to a raw-bit reader instead of the MQ
-///   decoder. A future round adds the raw-bit reader and a `bypass` flag
-///   on the sequencer to select it.
+/// * **§D.4.2 predictable-termination** (Scod bit-4). The
+///   bit-4-driven encoder-side termination procedure (a precise
+///   number-of-bits push-out through the byte buffer plus the
+///   `0xFF`-tail constraint) shapes the encoder, not the decoder; the
+///   decoder side is a length-counter check that lives on top of
+///   [`MqDecoder::byte_pointer`] and is a future round.
 /// ## §D.7 vertically-causal context formation
 ///
 /// When the COD / COC Table A.19
@@ -1579,6 +1605,27 @@ pub struct BitPlaneSequencer {
     /// [`CodeBlock::magnitude_refinement_pass_raw`]) when the
     /// sequencer indicates the next SP / MR pass should run raw.
     selective_arithmetic_coding_bypass: bool,
+    /// Whether the COD / COC Table A.19
+    /// `termination_on_each_coding_pass` flag (bit 2 of `Scod`) is set
+    /// for this code-block (T.800 §D.4.2).
+    ///
+    /// When `true`, **every** coding pass owns its own terminated
+    /// codeword segment — the packet-reader integration must construct
+    /// a fresh [`MqDecoder`] (and / or [`RawBitReader`] in the §D.6
+    /// raw region) for each pass and consult the packet header's
+    /// §B.10.7 per-pass byte allocations. When `false`, the §D.4.2
+    /// dispatch falls back to the §D.6 / Table D.9 default — only the
+    /// AC ↔ raw transitions (cleanup at bit-plane 4 and onward, plus
+    /// every MR / cleanup pass once raw kicks in) own their own
+    /// segments.
+    ///
+    /// The sequencer's surface in this round exposes the flag plus the
+    /// [`Self::next_pass_is_terminated`] dispatch predicate. The pass
+    /// driver itself ([`Self::decode_passes`] / [`Self::decode_packet`])
+    /// still walks every pass against the [`MqDecoder`] the caller
+    /// supplies — termination is a packet-reader-level concern (which
+    /// decoder to feed each pass), not a sequencer-internal one.
+    termination_on_each_coding_pass: bool,
 }
 
 impl BitPlaneSequencer {
@@ -1603,6 +1650,7 @@ impl BitPlaneSequencer {
             segmentation_symbols: false,
             vertically_causal_context: false,
             selective_arithmetic_coding_bypass: false,
+            termination_on_each_coding_pass: false,
         }
     }
 
@@ -1725,6 +1773,111 @@ impl BitPlaneSequencer {
         match self.next_pass {
             Pass::Sp | Pass::Mr => self.passes_decoded >= 10,
             Pass::Cleanup => false,
+        }
+    }
+
+    /// Builder — enable T.800 §D.4.2 termination on each coding pass
+    /// for this code-block.
+    ///
+    /// When enabled, [`Self::next_pass_is_terminated`] returns `true`
+    /// for every pass: the COD / COC Table A.19 bit-2 flag asks the
+    /// encoder to flush the arithmetic coder (or pad the raw stream)
+    /// at the end of every coding pass, so each pass owns its own
+    /// codeword segment in the packet body. The packet-reader
+    /// integration is then responsible for opening a fresh
+    /// [`MqDecoder`] (or [`RawBitReader`] in §D.6 raw mode) for each
+    /// pass against that pass's allocated byte slice.
+    ///
+    /// The flag is taken from the COD / COC Table A.19
+    /// [`crate::CodeBlockStyle::termination_on_each_coding_pass`] bit.
+    pub fn with_termination_on_each_coding_pass(mut self, enabled: bool) -> Self {
+        self.termination_on_each_coding_pass = enabled;
+        self
+    }
+
+    /// Whether T.800 §D.4.2 termination on each coding pass is on.
+    pub fn termination_on_each_coding_pass(&self) -> bool {
+        self.termination_on_each_coding_pass
+    }
+
+    /// Whether the **next** pass (per [`Self::next_pass`]) owns its
+    /// own terminated codeword segment in the packet body.
+    ///
+    /// This is the T.800 §D.4.2 / §D.6 dispatch contract a packet
+    /// reader consults to decide whether to construct a fresh
+    /// [`MqDecoder`] (or [`RawBitReader`] in §D.6 raw mode) for the
+    /// upcoming pass. The classification combines the COD / COC Table
+    /// A.19 bit-2 ([`Self::termination_on_each_coding_pass`]) flag and
+    /// the bit-0 ([`Self::selective_arithmetic_coding_bypass`]) flag
+    /// per the spec's Table D.9 + §D.6 prose:
+    ///
+    /// * **Bit-2 (termination on each coding pass) set** — every pass
+    ///   is terminated. The §D.6 prose explicitly confirms this:
+    ///   "If termination on each coding pass is selected, then every
+    ///   pass is terminated (including both raw passes)."
+    /// * **Bit-2 clear, bit-0 (AC bypass) clear** — the default
+    ///   single-segment packet of §D.4.1: only the end of the packet
+    ///   is terminated, which is outside this predicate's scope.
+    ///   Returns `false` for every pass.
+    /// * **Bit-2 clear, bit-0 set** — Table D.9 schedule. The first
+    ///   ten passes (bit-plane 1 cleanup + bit-planes 2/3/4 each
+    ///   running SP/MR/cleanup) are AC. The fourth cleanup pass
+    ///   (`passes_decoded == 9` ahead of running it) is the
+    ///   `AC, terminate` row of Table D.9 — it terminates so the
+    ///   following bit-plane 5 SP can start the raw region. From
+    ///   bit-plane 5 onward each set has `SP raw` (not terminated),
+    ///   `MR raw, terminate`, `cleanup AC, terminate`. The §D.6
+    ///   prose's "the cleanup coding passes ... are always
+    ///   terminated" applies once the bypass region kicks in — the
+    ///   earlier cleanups (bit-planes 1/2/3) sit inside a single
+    ///   AC-decoder run with the SP / MR passes that surround them
+    ///   and do **not** terminate on their own.
+    ///
+    /// The classification is independent of whether the sequencer has
+    /// already driven any passes — it reflects only the **state at
+    /// the boundary in front of the next pass**. After the pass runs
+    /// the sequencer advances `passes_decoded` and `next_pass` /
+    /// `current_bitplane`, so the predicate's answer for the
+    /// following call may change.
+    pub fn next_pass_is_terminated(&self) -> bool {
+        // Bit-2 wins outright — every pass terminated, including
+        // every raw pass in the §D.6 region.
+        if self.termination_on_each_coding_pass {
+            return true;
+        }
+        // Default packet (no AC bypass either): single segment, no
+        // intra-packet termination.
+        if !self.selective_arithmetic_coding_bypass {
+            return false;
+        }
+        // §D.6 bypass region per Table D.9. `passes_decoded` is the
+        // count of passes **completed**, so it equals the 0-based
+        // index of the pass about to run.
+        //
+        //   passes_decoded == 0  → bp1 cleanup           (AC, no term)
+        //   passes_decoded == 1  → bp2 SP                (AC, no term)
+        //   passes_decoded == 2  → bp2 MR                (AC, no term)
+        //   passes_decoded == 3  → bp2 cleanup           (AC, no term)
+        //   passes_decoded == 4  → bp3 SP                (AC, no term)
+        //   …
+        //   passes_decoded == 9  → bp4 cleanup           (AC, terminate)
+        //   passes_decoded == 10 → bp5 SP                (raw, no term)
+        //   passes_decoded == 11 → bp5 MR                (raw, terminate)
+        //   passes_decoded == 12 → bp5 cleanup           (AC, terminate)
+        //   passes_decoded == 13 → bp6 SP                (raw, no term)
+        //   …
+        match (self.next_pass, self.passes_decoded) {
+            // The fourth cleanup row of Table D.9 — terminate so the
+            // next SP can flip to raw without backtracking.
+            (Pass::Cleanup, 9) => true,
+            // Inside the raw region the cleanup pass is always
+            // terminated, and so is each MR pass; the SP pass is not.
+            (Pass::Cleanup, n) if n >= 10 => true,
+            (Pass::Mr, n) if n >= 10 => true,
+            (Pass::Sp, n) if n >= 10 => false,
+            // Pre-bypass-region (passes 0..=8 AC SP/MR/Cleanup) — the
+            // single AC-decoder run carries all of them.
+            _ => false,
         }
     }
 
@@ -3875,6 +4028,280 @@ mod tests {
                 assert_eq!(s.sign, o.sign);
                 assert_eq!(s.magnitude, o.magnitude);
             }
+        }
+    }
+
+    // -- §D.4.2 termination dispatch (Table D.9 + Scod bits 0 / 2) ----
+
+    #[test]
+    fn sequencer_termination_default_off() {
+        let seq = BitPlaneSequencer::new(7);
+        assert!(!seq.termination_on_each_coding_pass());
+    }
+
+    #[test]
+    fn sequencer_with_termination_on_each_coding_pass_round_trips() {
+        // Builder monotonicity in both directions, like the §D.5 / §D.7
+        // builders above.
+        let seq_off = BitPlaneSequencer::new(7);
+        assert!(!seq_off.termination_on_each_coding_pass());
+
+        let seq_on = seq_off.with_termination_on_each_coding_pass(true);
+        assert!(seq_on.termination_on_each_coding_pass());
+
+        let seq_back = seq_on.with_termination_on_each_coding_pass(false);
+        assert!(!seq_back.termination_on_each_coding_pass());
+    }
+
+    #[test]
+    fn next_pass_is_terminated_false_when_no_flags() {
+        // The default packet (Scod bit-0 / bit-2 both clear): single
+        // segment carries every pass. Walk a synthetic state through
+        // all three pass kinds at low and high pass counts and confirm
+        // the predicate stays false everywhere.
+        let mut seq = BitPlaneSequencer::new(7);
+        for passes in [0u32, 1, 2, 3, 9, 10, 11, 12, 25] {
+            for pass in [Pass::Cleanup, Pass::Sp, Pass::Mr] {
+                seq.passes_decoded = passes;
+                seq.next_pass = pass;
+                assert!(
+                    !seq.next_pass_is_terminated(),
+                    "passes_decoded={passes} pass={pass:?} must be unterminated"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn next_pass_is_terminated_true_for_every_pass_when_bit2_set() {
+        // Scod bit-2 (termination on each coding pass) set — §D.6
+        // explicitly says this wins outright, including over the §D.6
+        // raw passes. Cover every (pass kind, passes_decoded) the
+        // sequencer can land in, including the §D.6 raw region.
+        let mut seq = BitPlaneSequencer::new(7).with_termination_on_each_coding_pass(true);
+        for passes in [0u32, 1, 2, 3, 9, 10, 11, 12, 25] {
+            for pass in [Pass::Cleanup, Pass::Sp, Pass::Mr] {
+                seq.passes_decoded = passes;
+                seq.next_pass = pass;
+                assert!(
+                    seq.next_pass_is_terminated(),
+                    "passes_decoded={passes} pass={pass:?} must be terminated"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn next_pass_is_terminated_bit2_wins_over_bypass() {
+        // When both Scod bit-0 (AC bypass) and bit-2 (termination on
+        // each) are set, bit-2's "every pass terminated" wins — the
+        // SP raw pass terminates too, contrary to the bypass-only
+        // schedule below.
+        let mut seq = BitPlaneSequencer::new(7)
+            .with_selective_arithmetic_coding_bypass(true)
+            .with_termination_on_each_coding_pass(true);
+        // SP at passes_decoded == 10 — raw region. Under bypass-only
+        // this would be `false`; here it must be `true`.
+        seq.next_pass = Pass::Sp;
+        seq.passes_decoded = 10;
+        assert!(seq.next_pass_is_terminated());
+    }
+
+    #[test]
+    fn next_pass_is_terminated_table_d9_schedule_under_bypass_only() {
+        // Scod bit-0 (AC bypass) set, bit-2 clear — Table D.9 schedule.
+        // Walk passes_decoded across the entire pre-bypass + bypass
+        // regions and confirm the predicate matches each row.
+        let mut seq = BitPlaneSequencer::new(7).with_selective_arithmetic_coding_bypass(true);
+
+        // Pre-bypass region: passes 0..=8 (bp1 cleanup + bp2/3 full
+        // sets + bp4 SP/MR). None terminated.
+        // Walk the §D.3 pass cycle by hand from the sequencer's start
+        // state (next_pass=Cleanup, passes_decoded=0).
+        let cycle = [
+            Pass::Cleanup,
+            Pass::Sp,
+            Pass::Mr,
+            Pass::Cleanup,
+            Pass::Sp,
+            Pass::Mr,
+            Pass::Cleanup,
+            Pass::Sp,
+            Pass::Mr,
+            Pass::Cleanup,
+            Pass::Sp,
+            Pass::Mr,
+            Pass::Cleanup,
+        ];
+        let terminated_schedule = [
+            // passes_decoded=0: bp1 cleanup → AC, not term
+            false, // 1: bp2 SP, 2: bp2 MR, 3: bp2 cleanup — all AC, not term
+            false, false, false,
+            // 4: bp3 SP, 5: bp3 MR, 6: bp3 cleanup — all AC, not term
+            false, false, false, // 7: bp4 SP, 8: bp4 MR — AC, not term
+            false, false, // 9: bp4 cleanup — AC, terminate (Table D.9 row 10)
+            true,  // 10: bp5 SP — raw, not term
+            false, // 11: bp5 MR — raw, terminate
+            true,  // 12: bp5 cleanup — AC, terminate
+            true,
+        ];
+
+        for (i, (&pass, &want_term)) in cycle.iter().zip(terminated_schedule.iter()).enumerate() {
+            seq.passes_decoded = i as u32;
+            seq.next_pass = pass;
+            assert_eq!(
+                seq.next_pass_is_terminated(),
+                want_term,
+                "passes_decoded={i} pass={pass:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn next_pass_is_terminated_repeats_per_bitplane_in_bypass_region() {
+        // From bit-plane 5 onward the (SP raw not-term, MR raw term,
+        // Cleanup AC term) pattern repeats indefinitely. Spot-check
+        // bit-planes 6 and 7.
+        let mut seq = BitPlaneSequencer::new(7).with_selective_arithmetic_coding_bypass(true);
+
+        // bit-plane 6: passes_decoded = 13 (SP), 14 (MR), 15 (Cleanup)
+        for (passes, pass, want) in [
+            (13u32, Pass::Sp, false),
+            (14, Pass::Mr, true),
+            (15, Pass::Cleanup, true),
+            // bit-plane 7
+            (16, Pass::Sp, false),
+            (17, Pass::Mr, true),
+            (18, Pass::Cleanup, true),
+        ] {
+            seq.passes_decoded = passes;
+            seq.next_pass = pass;
+            assert_eq!(
+                seq.next_pass_is_terminated(),
+                want,
+                "passes_decoded={passes} pass={pass:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn next_pass_is_terminated_bit2_only_no_bypass_terminates_every_pass() {
+        // Scod bit-2 set, bit-0 clear — no bypass region, but every
+        // AC pass still terminates per §D.4.2. Confirm the predicate
+        // returns true regardless of pass-index.
+        let mut seq = BitPlaneSequencer::new(7).with_termination_on_each_coding_pass(true);
+        assert!(!seq.selective_arithmetic_coding_bypass());
+
+        // Walk the §D.3 cycle from a fresh state.
+        let cycle = [
+            Pass::Cleanup,
+            Pass::Sp,
+            Pass::Mr,
+            Pass::Cleanup,
+            Pass::Sp,
+            Pass::Mr,
+            Pass::Cleanup,
+        ];
+        for (i, &pass) in cycle.iter().enumerate() {
+            seq.passes_decoded = i as u32;
+            seq.next_pass = pass;
+            assert!(
+                seq.next_pass_is_terminated(),
+                "passes_decoded={i} pass={pass:?} must terminate when bit-2 only is set",
+            );
+        }
+    }
+
+    #[test]
+    fn next_pass_is_terminated_bypass_only_bp4_cleanup_terminates() {
+        // Spot-check the Table D.9 row 10 transition by itself: the
+        // bp4 cleanup is the gate into the raw region and must
+        // terminate even though the surrounding bp4 SP/MR did not.
+        let mut seq = BitPlaneSequencer::new(7).with_selective_arithmetic_coding_bypass(true);
+
+        seq.next_pass = Pass::Sp;
+        seq.passes_decoded = 7;
+        assert!(!seq.next_pass_is_terminated(), "bp4 SP not terminated");
+
+        seq.next_pass = Pass::Mr;
+        seq.passes_decoded = 8;
+        assert!(!seq.next_pass_is_terminated(), "bp4 MR not terminated");
+
+        seq.next_pass = Pass::Cleanup;
+        seq.passes_decoded = 9;
+        assert!(seq.next_pass_is_terminated(), "bp4 cleanup must terminate");
+    }
+
+    #[test]
+    fn next_pass_is_terminated_bypass_only_cleanups_outside_raw_region_unterminated() {
+        // The pre-bypass-region cleanups (bit-planes 1, 2, 3) live
+        // inside the one AC-decoder run with the surrounding SP / MR
+        // passes and do not terminate. Confirm bp1/2/3 cleanups
+        // remain unterminated under bypass-only.
+        let mut seq = BitPlaneSequencer::new(7).with_selective_arithmetic_coding_bypass(true);
+
+        for cleanup_pass_idx in [0u32, 3, 6] {
+            seq.next_pass = Pass::Cleanup;
+            seq.passes_decoded = cleanup_pass_idx;
+            assert!(
+                !seq.next_pass_is_terminated(),
+                "cleanup at passes_decoded={cleanup_pass_idx} must not terminate",
+            );
+        }
+    }
+
+    #[test]
+    fn next_pass_is_terminated_drives_off_passes_decoded_not_next_pass_alone() {
+        // The bp4 cleanup boundary depends on passes_decoded — a
+        // Pass::Cleanup with passes_decoded < 9 does NOT terminate
+        // under bypass-only. Sanity-check that the predicate reads
+        // both fields, not just `next_pass`.
+        let mut seq = BitPlaneSequencer::new(7).with_selective_arithmetic_coding_bypass(true);
+        seq.next_pass = Pass::Cleanup;
+
+        // passes_decoded < 9 → AC pre-bypass cleanup, not terminated.
+        for early in [0u32, 3, 6, 8] {
+            seq.passes_decoded = early;
+            assert!(
+                !seq.next_pass_is_terminated(),
+                "Cleanup at passes_decoded={early} must NOT terminate (pre-bypass)",
+            );
+        }
+        // passes_decoded == 9 → bp4 cleanup terminates.
+        seq.passes_decoded = 9;
+        assert!(seq.next_pass_is_terminated());
+        // passes_decoded >= 10 → bp5+ cleanup terminates.
+        for late in [12u32, 15, 25] {
+            seq.passes_decoded = late;
+            assert!(seq.next_pass_is_terminated());
+        }
+    }
+
+    #[test]
+    fn next_pass_is_terminated_independent_of_other_toggles() {
+        // The §D.4.2 / Table D.9 dispatch must be independent of the
+        // §D.5 segmentation-symbol toggle and the §D.7
+        // vertically-causal-context toggle — those are not termination
+        // flags. Toggle each on and confirm the predicate's output
+        // for the bp4 cleanup row matches the bare bypass-only case.
+        let baseline = BitPlaneSequencer::new(7).with_selective_arithmetic_coding_bypass(true);
+
+        let with_segsym = baseline.clone().with_segmentation_symbols(true);
+        let with_vcc = baseline.clone().with_vertically_causal_context(true);
+
+        for mut s in [baseline, with_segsym, with_vcc] {
+            s.next_pass = Pass::Cleanup;
+            s.passes_decoded = 9;
+            assert!(
+                s.next_pass_is_terminated(),
+                "bp4 cleanup must terminate regardless of seg-sym / VCC toggles",
+            );
+            s.passes_decoded = 10;
+            s.next_pass = Pass::Sp;
+            assert!(
+                !s.next_pass_is_terminated(),
+                "bp5 SP must remain unterminated under bypass-only",
+            );
         }
     }
 
