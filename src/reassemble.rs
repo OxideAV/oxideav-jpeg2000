@@ -79,7 +79,10 @@ use crate::dequant::{
     reconstruct_reversible, subband_gain_log2, StepSize,
 };
 use crate::dwt::{sr_2d_5x3, sr_2d_9x7, Interleaved2D};
-use crate::geometry::{PrecinctCodeBlock, ResolutionLevel, SubBand, SubBandOrientation};
+use crate::geometry::{
+    PrecinctCodeBlock, PrecinctCodeBlocks, PrecinctSubBand, ResolutionLevel, SubBand,
+    SubBandOrientation,
+};
 use crate::t1::CodeBlock;
 use crate::Error;
 
@@ -702,13 +705,255 @@ pub fn idwt_9x7<'a, S: BlockSource<'a>>(
 }
 
 // =====================================================================
+// §B.12 walker → BlockSource bridge.
+// =====================================================================
+
+/// One decoded `(sub-band, code-block)` entry contributed by the
+/// caller's tier-1 pass — paired with the per-block `Nb` count and a
+/// borrowed reference to the `(precinct, resolution, component)` the
+/// block belongs to.
+///
+/// The §B.12 packet-walker emits a sequence of `(precinct_index,
+/// PacketHeader)` tuples (see [`crate::packet::walk_packet_headers`]);
+/// each [`crate::packet::CodeBlockContribution`] inside one
+/// [`crate::packet::PacketHeader`] addresses a single code-block by
+/// `(sub_band, x, y)` triple — exactly the addressing
+/// [`crate::geometry::derive_precinct_code_blocks`] uses for its
+/// [`PrecinctCodeBlock`] entries inside each [`PrecinctSubBand`]. The
+/// caller drives tier-1 against the contribution's segment bytes,
+/// recovers a [`CodeBlock`] of the right `(width, height)`, computes the
+/// `Nb = Mb − P` (or the per-pass `Nb` for truncated decoding), and
+/// hands the result over via this struct.
+///
+/// `sub_band` is an index into [`PrecinctCodeBlocks::sub_bands`] — the
+/// §B.9 packet order at the matching resolution level. `cbx` / `cby`
+/// are 0-based code-block grid indices inside that sub-band's precinct,
+/// matching the [`PrecinctSubBand::code_blocks`] raster order
+/// (`code_blocks[cby * grid_wide + cbx]`).
+#[derive(Debug, Clone, Copy)]
+pub struct WalkerBlockEntry<'a> {
+    /// Index into the owning precinct's [`PrecinctCodeBlocks::sub_bands`].
+    pub sub_band: u32,
+    /// Code-block column within the precinct's sub-band grid.
+    pub cbx: u32,
+    /// Code-block row within the precinct's sub-band grid.
+    pub cby: u32,
+    /// Tier-1 decoded coefficients for this code-block.
+    pub coefficients: &'a CodeBlock,
+    /// Uniform per-coefficient `Nb(u, v)` (number of decoded magnitude
+    /// bits) — the §B.10.5 / §E.1.1.2 truncation model. The caller
+    /// computes `Mb − P` for fully-decoded code-blocks, or the per-pass
+    /// `Nb` when truncation cuts the packet short.
+    pub nb: u32,
+}
+
+/// One precinct's contribution to the [`WalkerBlockSource`] under
+/// construction — the geometry [`PrecinctCodeBlocks`] of the precinct
+/// paired with every decoded code-block the §B.12 walker has produced
+/// against that precinct's packets.
+///
+/// One [`PrecinctBlocks`] holds blocks across **every** layer of the
+/// precinct: §B.10.4 lets a code-block first appear in any layer of its
+/// precinct, after which subsequent layers refine the same coefficients
+/// without changing `(sub_band, cbx, cby)`. The caller therefore merges
+/// every layer's contributions into one [`WalkerBlockEntry`] per
+/// code-block — the entry's `coefficients` are the final accumulated
+/// tier-1 output across all consumed layers.
+///
+/// `entries` lists one [`WalkerBlockEntry`] per
+/// `(sub_band, cbx, cby)` triple the walker actually drew bytes for.
+/// Each entry must be **unique** across the slice (no duplicate
+/// `(sub_band, cbx, cby)`); duplicate entries raise
+/// [`Error::InvalidPacketHeader`] at
+/// [`WalkerBlockSource::from_precincts`] construction.
+#[derive(Debug, Clone)]
+pub struct PrecinctBlocks<'a> {
+    /// The geometry side — the precinct's `(sub_band, cbx, cby) →
+    /// PrecinctCodeBlock` lookup table built once per precinct by
+    /// [`crate::geometry::derive_precinct_code_blocks`].
+    pub geometry: &'a PrecinctCodeBlocks,
+    /// The tier-1 side — one entry per code-block the walker drew
+    /// bytes for inside this precinct, across every layer.
+    pub entries: &'a [WalkerBlockEntry<'a>],
+}
+
+/// A [`BlockSource`] populated from the §B.12 packet walker's output
+/// for one resolution level of one tile-component.
+///
+/// The bridge fans every [`WalkerBlockEntry`] across every input
+/// precinct into a per-orientation `Vec<CodedCodeBlock>` keyed by the
+/// §B.5 [`SubBandOrientation`]. [`Self::blocks_for`] then returns the
+/// matching slice in O(1) — the slice is built once at construction.
+///
+/// ## Why per-orientation
+///
+/// Inside one resolution level the §B.9 packet order is `LL` at `r =
+/// 0` and `[HL, LH, HH]` at `r ≥ 1` — every precinct's
+/// [`PrecinctCodeBlocks::sub_bands`] enumerates exactly those bands in
+/// that order. Sub-band lookup in the §F.3.1 cascade goes the other
+/// way: [`reassemble_resolution_5x3`] / [`reassemble_resolution_9x7`]
+/// fire one [`BlockSource::blocks_for`] call per [`SubBand`] of the
+/// resolution level — the orientation of that [`SubBand`] is exactly
+/// the §B.5 [`SubBandOrientation`] the bridge keys on. Indexing by
+/// orientation therefore makes the bridge dispatch zero-copy: collect
+/// once, return slice references thereafter.
+///
+/// ## Lifetime
+///
+/// `'a` is the borrow scope of the underlying [`CodeBlock`]s — every
+/// returned [`CodedCodeBlock`] re-borrows the same `&'a CodeBlock` the
+/// caller pinned via [`WalkerBlockEntry::coefficients`].
+#[derive(Debug, Clone)]
+pub struct WalkerBlockSource<'a> {
+    ll: Vec<CodedCodeBlock<'a>>,
+    hl: Vec<CodedCodeBlock<'a>>,
+    lh: Vec<CodedCodeBlock<'a>>,
+    hh: Vec<CodedCodeBlock<'a>>,
+}
+
+impl<'a> WalkerBlockSource<'a> {
+    /// Fan a slice of per-precinct walker outputs into the per-
+    /// orientation slot the [`BlockSource`] trait dispatches on.
+    ///
+    /// For each [`PrecinctBlocks`] entry the bridge:
+    ///
+    /// 1. Looks up every [`WalkerBlockEntry`]'s
+    ///    `(sub_band, cbx, cby)` against the precinct geometry to
+    ///    recover the clipped [`PrecinctCodeBlock`] placement.
+    /// 2. Cross-checks the [`CodeBlock`]'s `(width, height)` matches
+    ///    the placement's `(x1 − x0, y1 − y0)` — the §B.7 NOTE
+    ///    constraint.
+    /// 3. Cross-checks the [`CodeBlock`]'s orientation matches the
+    ///    [`PrecinctSubBand`]'s — Table B.1.
+    /// 4. Pushes a [`CodedCodeBlock`] into the per-orientation `Vec`.
+    ///
+    /// The output orientation slot is decided by the
+    /// [`PrecinctSubBand`]'s orientation; the [`CodeBlock`]'s
+    /// orientation must agree.
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::InvalidPacketHeader`] if any [`WalkerBlockEntry`]
+    ///   points at a `(sub_band, cbx, cby)` triple outside the
+    ///   precinct's geometry, if a [`WalkerBlockEntry`]'s
+    ///   [`CodeBlock`] orientation disagrees with its [`PrecinctSubBand`],
+    ///   or if two [`WalkerBlockEntry`]s (within or across precincts)
+    ///   share the same `(precinct_index, sub_band, cbx, cby)` triple.
+    /// * [`Error::InvalidMarkerLength`] if a [`WalkerBlockEntry`]'s
+    ///   [`CodeBlock`] dimensions do not match the precinct geometry's
+    ///   clipped placement.
+    pub fn from_precincts(precincts: &[PrecinctBlocks<'a>]) -> Result<Self, Error> {
+        let mut ll: Vec<CodedCodeBlock<'a>> = Vec::new();
+        let mut hl: Vec<CodedCodeBlock<'a>> = Vec::new();
+        let mut lh: Vec<CodedCodeBlock<'a>> = Vec::new();
+        let mut hh: Vec<CodedCodeBlock<'a>> = Vec::new();
+
+        // De-dup guard — one (precinct_index, sub_band, cbx, cby) may
+        // be supplied exactly once. Duplicate entries from a caller
+        // that accidentally merged layers twice surface here rather
+        // than as a silent double-scatter later in
+        // reassemble_subband_5x3 / 9x7.
+        let mut seen: std::collections::HashSet<(u32, u32, u32, u32)> =
+            std::collections::HashSet::new();
+
+        for precinct in precincts {
+            let pidx = precinct.geometry.precinct_index;
+            for entry in precinct.entries.iter() {
+                let sub_band_idx = entry.sub_band as usize;
+                let psb: &PrecinctSubBand = precinct
+                    .geometry
+                    .sub_bands
+                    .get(sub_band_idx)
+                    .ok_or(Error::InvalidPacketHeader)?;
+
+                if entry.cbx >= psb.grid_wide || entry.cby >= psb.grid_high {
+                    return Err(Error::InvalidPacketHeader);
+                }
+                let cb_index = (entry.cby as usize)
+                    .checked_mul(psb.grid_wide as usize)
+                    .and_then(|v| v.checked_add(entry.cbx as usize))
+                    .ok_or(Error::InvalidPacketHeader)?;
+                let placement: &PrecinctCodeBlock = psb
+                    .code_blocks
+                    .get(cb_index)
+                    .ok_or(Error::InvalidPacketHeader)?;
+
+                // §B.7 NOTE — the tier-1 output's (width, height)
+                // must equal the clipped placement extent.
+                let clipped_w = placement.width() as usize;
+                let clipped_h = placement.height() as usize;
+                if entry.coefficients.width() != clipped_w
+                    || entry.coefficients.height() != clipped_h
+                {
+                    return Err(Error::InvalidMarkerLength);
+                }
+
+                // Table B.1 — the tier-1 code-block's orientation must
+                // agree with its precinct sub-band's orientation. A
+                // mismatch here would feed an HL block into the LL
+                // accumulator and produce a silent miscolouring.
+                if entry.coefficients.orientation() != psb.orientation {
+                    return Err(Error::InvalidPacketHeader);
+                }
+
+                if !seen.insert((pidx, entry.sub_band, entry.cbx, entry.cby)) {
+                    return Err(Error::InvalidPacketHeader);
+                }
+
+                let coded = CodedCodeBlock {
+                    placement: *placement,
+                    coefficients: entry.coefficients,
+                    nb: entry.nb,
+                };
+                match psb.orientation {
+                    SubBandOrientation::LL => ll.push(coded),
+                    SubBandOrientation::HL => hl.push(coded),
+                    SubBandOrientation::LH => lh.push(coded),
+                    SubBandOrientation::HH => hh.push(coded),
+                }
+            }
+        }
+
+        Ok(Self { ll, hl, lh, hh })
+    }
+
+    /// Number of fanned-in code-blocks at the given orientation.
+    pub fn len(&self, orientation: SubBandOrientation) -> usize {
+        match orientation {
+            SubBandOrientation::LL => self.ll.len(),
+            SubBandOrientation::HL => self.hl.len(),
+            SubBandOrientation::LH => self.lh.len(),
+            SubBandOrientation::HH => self.hh.len(),
+        }
+    }
+
+    /// `true` iff no code-blocks were fanned in at any orientation.
+    pub fn is_empty(&self) -> bool {
+        self.ll.is_empty() && self.hl.is_empty() && self.lh.is_empty() && self.hh.is_empty()
+    }
+}
+
+impl<'a> BlockSource<'a> for WalkerBlockSource<'a> {
+    fn blocks_for(&self, band: &SubBand) -> &[CodedCodeBlock<'a>] {
+        match band.orientation {
+            SubBandOrientation::LL => &self.ll,
+            SubBandOrientation::HL => &self.hl,
+            SubBandOrientation::LH => &self.lh,
+            SubBandOrientation::HH => &self.hh,
+        }
+    }
+}
+
+// =====================================================================
 // Tests.
 // =====================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::geometry::{PrecinctCodeBlock, SubBand, SubBandOrientation};
+    use crate::geometry::{
+        PrecinctCodeBlock, PrecinctCodeBlocks, PrecinctSubBand, SubBand, SubBandOrientation,
+    };
     use crate::t1::{CodeBlock, Coefficient};
 
     /// Helper: build a CodeBlock pre-populated with given (mag, sign)
@@ -2085,5 +2330,729 @@ mod tests {
             "different (i0, j0) parities must produce different reconstructions \
              (proving idwt_5x3 forwards levels[k].trx0/try0 into sr_2d_5x3)",
         );
+    }
+
+    // ---------------------------------------------------------------
+    // §B.12 walker → BlockSource bridge.
+    // ---------------------------------------------------------------
+
+    /// Helper — build a [`PrecinctCodeBlocks`] for one resolution
+    /// level out of a per-sub-band `(orientation, grid_wide,
+    /// grid_high, placements)` description. The caller supplies the
+    /// raster code-block list (must have length `grid_wide *
+    /// grid_high`); we wrap it into a [`PrecinctSubBand`] inside a
+    /// [`PrecinctCodeBlocks`] with the given precinct index.
+    fn make_precinct_geometry(
+        r: u8,
+        precinct_index: u32,
+        px: u32,
+        py: u32,
+        sub_bands: &[(SubBandOrientation, u32, u32, Vec<PrecinctCodeBlock>)],
+    ) -> PrecinctCodeBlocks {
+        PrecinctCodeBlocks {
+            r,
+            precinct_index,
+            px,
+            py,
+            sub_bands: sub_bands
+                .iter()
+                .map(|(o, gw, gh, blocks)| {
+                    assert_eq!(blocks.len(), (*gw as usize) * (*gh as usize));
+                    PrecinctSubBand {
+                        orientation: *o,
+                        grid_wide: *gw,
+                        grid_high: *gh,
+                        code_blocks: blocks.clone(),
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn walker_bridge_empty_input_is_empty_source() {
+        let precincts: Vec<PrecinctBlocks<'_>> = Vec::new();
+        let source = WalkerBlockSource::from_precincts(&precincts).unwrap();
+        assert!(source.is_empty());
+        assert_eq!(source.len(SubBandOrientation::LL), 0);
+        assert_eq!(source.len(SubBandOrientation::HL), 0);
+        assert_eq!(source.len(SubBandOrientation::LH), 0);
+        assert_eq!(source.len(SubBandOrientation::HH), 0);
+    }
+
+    #[test]
+    fn walker_bridge_single_ll_block_routes_to_ll_slot() {
+        // 4×2 LL sub-band at r = 0 covered by one 4×2 code-block.
+        let placements = vec![PrecinctCodeBlock {
+            cbx: 0,
+            cby: 0,
+            x0: 0,
+            y0: 0,
+            x1: 4,
+            y1: 2,
+        }];
+        let geometry =
+            make_precinct_geometry(0, 0, 0, 0, &[(SubBandOrientation::LL, 1, 1, placements)]);
+        let block = make_block(
+            SubBandOrientation::LL,
+            4,
+            2,
+            &[
+                (1, false),
+                (0, false),
+                (3, false),
+                (2, true),
+                (0, false),
+                (5, false),
+                (7, true),
+                (1, false),
+            ],
+        );
+        let entries = [WalkerBlockEntry {
+            sub_band: 0,
+            cbx: 0,
+            cby: 0,
+            coefficients: &block,
+            nb: 8,
+        }];
+        let precincts = [PrecinctBlocks {
+            geometry: &geometry,
+            entries: &entries,
+        }];
+        let source = WalkerBlockSource::from_precincts(&precincts).unwrap();
+        assert_eq!(source.len(SubBandOrientation::LL), 1);
+        assert_eq!(source.len(SubBandOrientation::HL), 0);
+        assert!(!source.is_empty());
+
+        // BlockSource dispatch — pick by orientation, slice references
+        // re-borrow the same &CodeBlock.
+        let band = SubBand {
+            orientation: SubBandOrientation::LL,
+            nb: 1,
+            tbx0: 0,
+            tby0: 0,
+            tbx1: 4,
+            tby1: 2,
+        };
+        let slice = source.blocks_for(&band);
+        assert_eq!(slice.len(), 1);
+        assert_eq!(slice[0].placement.x1, 4);
+        assert_eq!(slice[0].placement.y1, 2);
+        assert_eq!(slice[0].nb, 8);
+        assert!(std::ptr::eq(slice[0].coefficients, &block));
+    }
+
+    #[test]
+    fn walker_bridge_hl_lh_hh_triple_routes_by_orientation() {
+        // r = 1 resolution: three 2×2 sub-bands, each with one 2×2
+        // code-block. The bridge must fan them into hl/lh/hh slots,
+        // and BlockSource::blocks_for must pick the right slot by
+        // orientation.
+        let placements_one = || {
+            vec![PrecinctCodeBlock {
+                cbx: 0,
+                cby: 0,
+                x0: 0,
+                y0: 0,
+                x1: 2,
+                y1: 2,
+            }]
+        };
+        let geometry = make_precinct_geometry(
+            1,
+            0,
+            0,
+            0,
+            &[
+                (SubBandOrientation::HL, 1, 1, placements_one()),
+                (SubBandOrientation::LH, 1, 1, placements_one()),
+                (SubBandOrientation::HH, 1, 1, placements_one()),
+            ],
+        );
+        let hl = make_block(
+            SubBandOrientation::HL,
+            2,
+            2,
+            &[(1, false), (2, false), (3, true), (4, false)],
+        );
+        let lh = make_block(
+            SubBandOrientation::LH,
+            2,
+            2,
+            &[(5, false), (6, false), (7, false), (8, false)],
+        );
+        let hh = make_block(
+            SubBandOrientation::HH,
+            2,
+            2,
+            &[(9, false), (10, false), (11, false), (12, true)],
+        );
+        let entries = [
+            WalkerBlockEntry {
+                sub_band: 0,
+                cbx: 0,
+                cby: 0,
+                coefficients: &hl,
+                nb: 6,
+            },
+            WalkerBlockEntry {
+                sub_band: 1,
+                cbx: 0,
+                cby: 0,
+                coefficients: &lh,
+                nb: 6,
+            },
+            WalkerBlockEntry {
+                sub_band: 2,
+                cbx: 0,
+                cby: 0,
+                coefficients: &hh,
+                nb: 6,
+            },
+        ];
+        let precincts = [PrecinctBlocks {
+            geometry: &geometry,
+            entries: &entries,
+        }];
+        let source = WalkerBlockSource::from_precincts(&precincts).unwrap();
+        assert_eq!(source.len(SubBandOrientation::HL), 1);
+        assert_eq!(source.len(SubBandOrientation::LH), 1);
+        assert_eq!(source.len(SubBandOrientation::HH), 1);
+        assert_eq!(source.len(SubBandOrientation::LL), 0);
+
+        let hl_band = SubBand {
+            orientation: SubBandOrientation::HL,
+            nb: 1,
+            tbx0: 0,
+            tby0: 0,
+            tbx1: 2,
+            tby1: 2,
+        };
+        let lh_band = SubBand {
+            orientation: SubBandOrientation::LH,
+            ..hl_band
+        };
+        let hh_band = SubBand {
+            orientation: SubBandOrientation::HH,
+            ..hl_band
+        };
+        assert!(std::ptr::eq(
+            source.blocks_for(&hl_band)[0].coefficients,
+            &hl
+        ));
+        assert!(std::ptr::eq(
+            source.blocks_for(&lh_band)[0].coefficients,
+            &lh
+        ));
+        assert!(std::ptr::eq(
+            source.blocks_for(&hh_band)[0].coefficients,
+            &hh
+        ));
+    }
+
+    #[test]
+    fn walker_bridge_two_precincts_same_orientation_concat_in_input_order() {
+        // Two precincts of the r = 1 LH sub-band, each contributing
+        // one 2×2 code-block at different sub-band corners. The
+        // bridge concatenates them in input order — the resolution-
+        // reassemble step is then responsible for the disjoint
+        // scatter.
+        let geometry_p0 = make_precinct_geometry(
+            1,
+            0,
+            0,
+            0,
+            &[(
+                SubBandOrientation::LH,
+                1,
+                1,
+                vec![PrecinctCodeBlock {
+                    cbx: 0,
+                    cby: 0,
+                    x0: 0,
+                    y0: 0,
+                    x1: 2,
+                    y1: 2,
+                }],
+            )],
+        );
+        let geometry_p1 = make_precinct_geometry(
+            1,
+            1,
+            1,
+            0,
+            &[(
+                SubBandOrientation::LH,
+                1,
+                1,
+                vec![PrecinctCodeBlock {
+                    cbx: 0,
+                    cby: 0,
+                    x0: 2,
+                    y0: 0,
+                    x1: 4,
+                    y1: 2,
+                }],
+            )],
+        );
+        let lh_left = make_block(
+            SubBandOrientation::LH,
+            2,
+            2,
+            &[(1, false), (2, false), (3, false), (4, false)],
+        );
+        let lh_right = make_block(
+            SubBandOrientation::LH,
+            2,
+            2,
+            &[(5, false), (6, false), (7, false), (8, false)],
+        );
+        let entries_p0 = [WalkerBlockEntry {
+            sub_band: 0,
+            cbx: 0,
+            cby: 0,
+            coefficients: &lh_left,
+            nb: 6,
+        }];
+        let entries_p1 = [WalkerBlockEntry {
+            sub_band: 0,
+            cbx: 0,
+            cby: 0,
+            coefficients: &lh_right,
+            nb: 6,
+        }];
+        let precincts = [
+            PrecinctBlocks {
+                geometry: &geometry_p0,
+                entries: &entries_p0,
+            },
+            PrecinctBlocks {
+                geometry: &geometry_p1,
+                entries: &entries_p1,
+            },
+        ];
+        let source = WalkerBlockSource::from_precincts(&precincts).unwrap();
+        assert_eq!(source.len(SubBandOrientation::LH), 2);
+        let band = SubBand {
+            orientation: SubBandOrientation::LH,
+            nb: 1,
+            tbx0: 0,
+            tby0: 0,
+            tbx1: 4,
+            tby1: 2,
+        };
+        let slice = source.blocks_for(&band);
+        // Input order — precinct 0 first, precinct 1 second.
+        assert_eq!(slice[0].placement.x0, 0);
+        assert_eq!(slice[1].placement.x0, 2);
+    }
+
+    #[test]
+    fn walker_bridge_rejects_out_of_range_sub_band_index() {
+        // Geometry has only one LL sub-band (index 0); entry points
+        // at sub_band = 1 — out of range.
+        let geometry = make_precinct_geometry(
+            0,
+            0,
+            0,
+            0,
+            &[(
+                SubBandOrientation::LL,
+                1,
+                1,
+                vec![PrecinctCodeBlock {
+                    cbx: 0,
+                    cby: 0,
+                    x0: 0,
+                    y0: 0,
+                    x1: 2,
+                    y1: 2,
+                }],
+            )],
+        );
+        let block = make_block(
+            SubBandOrientation::LL,
+            2,
+            2,
+            &[(1, false), (2, false), (3, false), (4, false)],
+        );
+        let entries = [WalkerBlockEntry {
+            sub_band: 1,
+            cbx: 0,
+            cby: 0,
+            coefficients: &block,
+            nb: 6,
+        }];
+        let precincts = [PrecinctBlocks {
+            geometry: &geometry,
+            entries: &entries,
+        }];
+        let res = WalkerBlockSource::from_precincts(&precincts);
+        assert_eq!(res.err(), Some(Error::InvalidPacketHeader));
+    }
+
+    #[test]
+    fn walker_bridge_rejects_out_of_range_cbx_cby() {
+        // Geometry's sub-band has a 1×1 grid; entry references
+        // (cbx = 1, cby = 0) — outside the grid.
+        let geometry = make_precinct_geometry(
+            0,
+            0,
+            0,
+            0,
+            &[(
+                SubBandOrientation::LL,
+                1,
+                1,
+                vec![PrecinctCodeBlock {
+                    cbx: 0,
+                    cby: 0,
+                    x0: 0,
+                    y0: 0,
+                    x1: 2,
+                    y1: 2,
+                }],
+            )],
+        );
+        let block = make_block(
+            SubBandOrientation::LL,
+            2,
+            2,
+            &[(1, false), (2, false), (3, false), (4, false)],
+        );
+        let entries = [WalkerBlockEntry {
+            sub_band: 0,
+            cbx: 1,
+            cby: 0,
+            coefficients: &block,
+            nb: 6,
+        }];
+        let precincts = [PrecinctBlocks {
+            geometry: &geometry,
+            entries: &entries,
+        }];
+        let res = WalkerBlockSource::from_precincts(&precincts);
+        assert_eq!(res.err(), Some(Error::InvalidPacketHeader));
+    }
+
+    #[test]
+    fn walker_bridge_rejects_codeblock_dimension_mismatch() {
+        // Placement is 2×2; supplied CodeBlock is 4×2. §B.7 NOTE
+        // requires width / height to equal the clipped placement.
+        let geometry = make_precinct_geometry(
+            0,
+            0,
+            0,
+            0,
+            &[(
+                SubBandOrientation::LL,
+                1,
+                1,
+                vec![PrecinctCodeBlock {
+                    cbx: 0,
+                    cby: 0,
+                    x0: 0,
+                    y0: 0,
+                    x1: 2,
+                    y1: 2,
+                }],
+            )],
+        );
+        let block = make_block(
+            SubBandOrientation::LL,
+            4,
+            2,
+            &[
+                (1, false),
+                (2, false),
+                (3, false),
+                (4, false),
+                (5, false),
+                (6, false),
+                (7, false),
+                (8, false),
+            ],
+        );
+        let entries = [WalkerBlockEntry {
+            sub_band: 0,
+            cbx: 0,
+            cby: 0,
+            coefficients: &block,
+            nb: 6,
+        }];
+        let precincts = [PrecinctBlocks {
+            geometry: &geometry,
+            entries: &entries,
+        }];
+        let res = WalkerBlockSource::from_precincts(&precincts);
+        assert_eq!(res.err(), Some(Error::InvalidMarkerLength));
+    }
+
+    #[test]
+    fn walker_bridge_rejects_orientation_mismatch() {
+        // Geometry's sub-band is LL; CodeBlock claims HL. Table B.1
+        // — the bridge rejects the cross-orientation supply rather
+        // than silently miscolour the LL accumulator.
+        let geometry = make_precinct_geometry(
+            0,
+            0,
+            0,
+            0,
+            &[(
+                SubBandOrientation::LL,
+                1,
+                1,
+                vec![PrecinctCodeBlock {
+                    cbx: 0,
+                    cby: 0,
+                    x0: 0,
+                    y0: 0,
+                    x1: 2,
+                    y1: 2,
+                }],
+            )],
+        );
+        let block = make_block(
+            SubBandOrientation::HL,
+            2,
+            2,
+            &[(1, false), (2, false), (3, false), (4, false)],
+        );
+        let entries = [WalkerBlockEntry {
+            sub_band: 0,
+            cbx: 0,
+            cby: 0,
+            coefficients: &block,
+            nb: 6,
+        }];
+        let precincts = [PrecinctBlocks {
+            geometry: &geometry,
+            entries: &entries,
+        }];
+        let res = WalkerBlockSource::from_precincts(&precincts);
+        assert_eq!(res.err(), Some(Error::InvalidPacketHeader));
+    }
+
+    #[test]
+    fn walker_bridge_rejects_duplicate_entry_within_one_precinct() {
+        // Two entries with identical (precinct_index, sub_band, cbx,
+        // cby). The de-dup guard surfaces this rather than letting
+        // the resolution-reassemble step double-scatter.
+        let geometry = make_precinct_geometry(
+            0,
+            0,
+            0,
+            0,
+            &[(
+                SubBandOrientation::LL,
+                1,
+                1,
+                vec![PrecinctCodeBlock {
+                    cbx: 0,
+                    cby: 0,
+                    x0: 0,
+                    y0: 0,
+                    x1: 2,
+                    y1: 2,
+                }],
+            )],
+        );
+        let block = make_block(
+            SubBandOrientation::LL,
+            2,
+            2,
+            &[(1, false), (2, false), (3, false), (4, false)],
+        );
+        let entries = [
+            WalkerBlockEntry {
+                sub_band: 0,
+                cbx: 0,
+                cby: 0,
+                coefficients: &block,
+                nb: 6,
+            },
+            WalkerBlockEntry {
+                sub_band: 0,
+                cbx: 0,
+                cby: 0,
+                coefficients: &block,
+                nb: 6,
+            },
+        ];
+        let precincts = [PrecinctBlocks {
+            geometry: &geometry,
+            entries: &entries,
+        }];
+        let res = WalkerBlockSource::from_precincts(&precincts);
+        assert_eq!(res.err(), Some(Error::InvalidPacketHeader));
+    }
+
+    #[test]
+    fn walker_bridge_accepts_same_triple_in_different_precincts() {
+        // Two precincts each contribute (sub_band = 0, cbx = 0, cby
+        // = 0). Same triple within each precinct, but different
+        // precinct_index → de-dup guard allows both.
+        let geometry_p0 = make_precinct_geometry(
+            1,
+            0,
+            0,
+            0,
+            &[(
+                SubBandOrientation::HL,
+                1,
+                1,
+                vec![PrecinctCodeBlock {
+                    cbx: 0,
+                    cby: 0,
+                    x0: 0,
+                    y0: 0,
+                    x1: 2,
+                    y1: 2,
+                }],
+            )],
+        );
+        let geometry_p1 = make_precinct_geometry(
+            1,
+            1,
+            1,
+            0,
+            &[(
+                SubBandOrientation::HL,
+                1,
+                1,
+                vec![PrecinctCodeBlock {
+                    cbx: 0,
+                    cby: 0,
+                    x0: 2,
+                    y0: 0,
+                    x1: 4,
+                    y1: 2,
+                }],
+            )],
+        );
+        let block_a = make_block(
+            SubBandOrientation::HL,
+            2,
+            2,
+            &[(1, false), (2, false), (3, false), (4, false)],
+        );
+        let block_b = make_block(
+            SubBandOrientation::HL,
+            2,
+            2,
+            &[(5, false), (6, false), (7, false), (8, false)],
+        );
+        let entries_p0 = [WalkerBlockEntry {
+            sub_band: 0,
+            cbx: 0,
+            cby: 0,
+            coefficients: &block_a,
+            nb: 6,
+        }];
+        let entries_p1 = [WalkerBlockEntry {
+            sub_band: 0,
+            cbx: 0,
+            cby: 0,
+            coefficients: &block_b,
+            nb: 6,
+        }];
+        let precincts = [
+            PrecinctBlocks {
+                geometry: &geometry_p0,
+                entries: &entries_p0,
+            },
+            PrecinctBlocks {
+                geometry: &geometry_p1,
+                entries: &entries_p1,
+            },
+        ];
+        let source = WalkerBlockSource::from_precincts(&precincts).unwrap();
+        assert_eq!(source.len(SubBandOrientation::HL), 2);
+    }
+
+    #[test]
+    fn walker_bridge_feeds_resolution_reassemble_5x3() {
+        // End-to-end: bridge populated from a single LL precinct,
+        // then handed to reassemble_resolution_5x3. The output
+        // must match the direct-input reassemble call byte-for-byte.
+        let band = SubBand {
+            orientation: SubBandOrientation::LL,
+            nb: 1,
+            tbx0: 0,
+            tby0: 0,
+            tbx1: 4,
+            tby1: 2,
+        };
+        let level = ResolutionLevel {
+            r: 0,
+            n_l: 0,
+            trx0: 0,
+            try0: 0,
+            trx1: 4,
+            try1: 2,
+            sub_bands: vec![band],
+        };
+        let placements = vec![PrecinctCodeBlock {
+            cbx: 0,
+            cby: 0,
+            x0: 0,
+            y0: 0,
+            x1: 4,
+            y1: 2,
+        }];
+        let geometry =
+            make_precinct_geometry(0, 0, 0, 0, &[(SubBandOrientation::LL, 1, 1, placements)]);
+        let block = make_block(
+            SubBandOrientation::LL,
+            4,
+            2,
+            &[
+                (1, false),
+                (0, false),
+                (3, false),
+                (2, true),
+                (0, false),
+                (5, false),
+                (7, true),
+                (1, false),
+            ],
+        );
+        let entries = [WalkerBlockEntry {
+            sub_band: 0,
+            cbx: 0,
+            cby: 0,
+            coefficients: &block,
+            nb: 8,
+        }];
+        let precincts = [PrecinctBlocks {
+            geometry: &geometry,
+            entries: &entries,
+        }];
+        let source = WalkerBlockSource::from_precincts(&precincts).unwrap();
+
+        // The bridge routes the LL block to source.blocks_for(LL band);
+        // sub-band reassembly via that slice must match the
+        // hand-built direct CodedCodeBlock slice byte-for-byte.
+        let via_bridge = reassemble_subband_5x3(
+            &level.sub_bands[0],
+            source.blocks_for(&level.sub_bands[0]),
+            8,
+            0.5,
+        )
+        .unwrap();
+        let direct_blocks = [CodedCodeBlock {
+            placement: PrecinctCodeBlock {
+                cbx: 0,
+                cby: 0,
+                x0: 0,
+                y0: 0,
+                x1: 4,
+                y1: 2,
+            },
+            coefficients: &block,
+            nb: 8,
+        }];
+        let direct = reassemble_subband_5x3(&level.sub_bands[0], &direct_blocks, 8, 0.5).unwrap();
+        assert_eq!(via_bridge, direct);
     }
 }

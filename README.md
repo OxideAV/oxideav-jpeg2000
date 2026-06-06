@@ -3,6 +3,96 @@
 Pure-Rust JPEG 2000 (J2K + JP2) and High-Throughput JPEG 2000 (HTJ2K)
 codec.
 
+## Status — 2026-06-07 (clean-room round 244)
+
+Round 244 lands the **§B.12 walker → `BlockSource` bridge** — the
+`reassemble::WalkerBlockSource<'a>` adapter that fans the §B.12
+packet-walker's per-precinct output into the per-orientation
+`Vec<CodedCodeBlock>` slots the §F.3.1 IDWT cascade
+(`reassemble_resolution_5x3` / `_9x7`) consumes:
+
+* `reassemble::WalkerBlockEntry<'a>` — one tier-1 decoded code-block
+  paired with its `(sub_band, cbx, cby)` precinct coordinate and
+  caller-computed uniform `Nb`. Sub-band index is into the
+  §B.9-ordered `PrecinctCodeBlocks::sub_bands` slice; `cbx` / `cby`
+  index the `PrecinctSubBand::code_blocks` raster grid (matching the
+  packet header's §B.10.8 walk order).
+* `reassemble::PrecinctBlocks<'a>` — one precinct's geometry
+  (`&PrecinctCodeBlocks`) paired with every tier-1 decoded
+  `WalkerBlockEntry` it produced across every layer (§B.10.4 lets a
+  block first appear in any layer; entries carry the merged final
+  coefficients).
+* `reassemble::WalkerBlockSource::from_precincts(precincts)` —
+  collects every `PrecinctBlocks` into per-orientation
+  `Vec<CodedCodeBlock>` slots keyed by §B.5 `SubBandOrientation`
+  (`LL` / `HL` / `LH` / `HH`). Cross-checks per entry: sub-band index
+  + `cbx` / `cby` in bounds against the precinct geometry; tier-1
+  `CodeBlock` dimensions match the precinct's clipped placement
+  (§B.7 NOTE); orientation matches Table B.1; no duplicate
+  `(precinct_index, sub_band, cbx, cby)` triple.
+* `WalkerBlockSource::len(orientation)` /
+  `WalkerBlockSource::is_empty()` — population accessors.
+* `impl BlockSource<'a> for WalkerBlockSource<'a>` — `blocks_for`
+  dispatches by `SubBand::orientation` into the matching
+  pre-collected slot in O(1), so the §F.3.1 cascade per-band
+  reassembly call sees a zero-copy slice of the same
+  `&'a CodeBlock`s the caller pinned.
+
+11 new lib tests cover the bridge (suite total: 467 lib tests, was
+456):
+
+* `walker_bridge_empty_input_is_empty_source` — zero-precinct input
+  produces an empty per-orientation source.
+* `walker_bridge_single_ll_block_routes_to_ll_slot` — one LL
+  precinct → `blocks_for(LL band)` returns a slice of length one
+  whose `coefficients` re-borrow the same `&CodeBlock`.
+* `walker_bridge_hl_lh_hh_triple_routes_by_orientation` — three
+  sub-bands at one precinct fan into the matching HL / LH / HH
+  slots; `blocks_for(HL band)` / `_(LH band)` / `_(HH band)` each
+  return their own entry.
+* `walker_bridge_two_precincts_same_orientation_concat_in_input_order`
+  — two LH precincts contributing one block each → concatenated in
+  input order (precinct 0 first, precinct 1 second).
+* `walker_bridge_rejects_out_of_range_sub_band_index` — entry
+  pointing at `sub_band = 1` against a 1-sub-band precinct →
+  `InvalidPacketHeader`.
+* `walker_bridge_rejects_out_of_range_cbx_cby` — entry pointing at
+  `(cbx = 1, cby = 0)` against a 1×1 grid → `InvalidPacketHeader`.
+* `walker_bridge_rejects_codeblock_dimension_mismatch` — tier-1
+  `CodeBlock` (4×2) does not match the precinct's clipped placement
+  (2×2) → `InvalidMarkerLength` (the §B.7 NOTE constraint).
+* `walker_bridge_rejects_orientation_mismatch` — tier-1
+  `CodeBlock::orientation() == HL` fed against an LL precinct
+  sub-band → `InvalidPacketHeader` (Table B.1).
+* `walker_bridge_rejects_duplicate_entry_within_one_precinct` — two
+  entries with the same `(sub_band, cbx, cby)` within one precinct
+  → `InvalidPacketHeader` (de-dup guard).
+* `walker_bridge_accepts_same_triple_in_different_precincts` —
+  identical `(sub_band, cbx, cby)` across two different precincts
+  → both accepted (the de-dup key includes `precinct_index`).
+* `walker_bridge_feeds_resolution_reassemble_5x3` — end-to-end
+  byte-identity: `reassemble_subband_5x3(band,
+  source.blocks_for(band), Mb = 8, r = 0.5)` matches a hand-built
+  direct `CodedCodeBlock` slice byte-for-byte, proving the bridge is
+  the zero-shift adapter the §F.3.1 cascade expects.
+
+Pending after r244:
+
+* Per-coefficient (not per-block) `Nb` — a code-block can mix
+  per-pass `Nb` values when the packet header's pass count stops
+  mid-bit-plane. The bridge inherits `CodedCodeBlock`'s uniform-`Nb`
+  contract.
+* Per-component MCT inverse + DC level-shift threading once the
+  per-tile-component cascade returns from `idwt_5x3` / `_9x7`. The
+  `mct::` primitives from r195 / r201 are the one-line switches the
+  threading layer will call.
+* Encoder MCT toggle in `encode_jpeg2000` (forward §G.2.1 / §G.3.1
+  + forward §G.1.1 primitives already exist; the missing piece is
+  the tile-reconstruction wiring picking between them based on
+  `Cod::mct`).
+
+Previous round status follows:
+
 ## Status — 2026-06-06 (clean-room round 241)
 
 Round 241 lands the T.800 **§D.4.2 predictable termination** check on

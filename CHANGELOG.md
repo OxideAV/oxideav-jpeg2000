@@ -6,6 +6,47 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 244 (2026-06-07).** T.800 **§B.12 walker →
+  `BlockSource` bridge** — the `reassemble::WalkerBlockSource<'a>`
+  adapter that fans the §B.12 packet-walker's per-precinct output
+  into the per-orientation `Vec<CodedCodeBlock>` slots the §F.3.1
+  IDWT cascade (`reassemble_resolution_5x3` / `_9x7`) consumes.
+  * `reassemble::WalkerBlockEntry<'a>` — one tier-1 decoded
+    code-block paired with its `(sub_band, cbx, cby)` precinct
+    coordinate and caller-computed uniform `Nb`. Sub-band index is
+    into the §B.9-ordered `PrecinctCodeBlocks::sub_bands` slice;
+    `cbx` / `cby` index the `PrecinctSubBand::code_blocks` raster
+    grid matching the packet header's §B.10.8 walk order.
+  * `reassemble::PrecinctBlocks<'a>` — one precinct's geometry
+    (`&PrecinctCodeBlocks`) paired with every tier-1 decoded
+    `WalkerBlockEntry` it produced across every layer (§B.10.4 lets
+    a block first appear in any layer; entries carry the merged
+    final coefficients).
+  * `reassemble::WalkerBlockSource::from_precincts(precincts)` —
+    collects every `PrecinctBlocks` into per-orientation
+    `Vec<CodedCodeBlock>` slots keyed by §B.5 `SubBandOrientation`
+    (`LL` / `HL` / `LH` / `HH`). Cross-checks per entry: sub-band
+    index + `cbx` / `cby` in bounds against the precinct geometry;
+    tier-1 `CodeBlock` dimensions match the precinct's clipped
+    placement (§B.7 NOTE); orientation matches Table B.1; no
+    duplicate `(precinct_index, sub_band, cbx, cby)` triple. Returns
+    `Error::InvalidPacketHeader` / `Error::InvalidMarkerLength` on
+    constraint violations.
+  * `WalkerBlockSource::len(orientation)` /
+    `WalkerBlockSource::is_empty()` — population accessors.
+  * `impl BlockSource<'a> for WalkerBlockSource<'a>` — `blocks_for`
+    dispatches by `SubBand::orientation` into the matching
+    pre-collected slot in O(1); the §F.3.1 cascade per-band
+    reassembly call therefore sees a zero-copy slice of the same
+    `&'a CodeBlock`s the caller pinned via `WalkerBlockEntry`.
+  * 11 new lib tests cover the bridge end-to-end, including the
+    rejection paths (out-of-range sub-band index, out-of-range
+    `cbx` / `cby`, dimension mismatch, orientation mismatch,
+    duplicate-triple), the multi-precinct concatenation order, and
+    a byte-identity check against a hand-built direct
+    `CodedCodeBlock` slice fed to `reassemble_subband_5x3`. Suite
+    total: 467 lib tests (was 456).
+
 * **Clean-room round 241 (2026-06-06).** T.800 §D.4.2 **predictable
   termination** check on `MqDecoder` plus the matching COD / COC
   Table A.19 bit-4 toggle on `BitPlaneSequencer`.
