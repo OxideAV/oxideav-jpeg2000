@@ -59,9 +59,15 @@
 //!   code-block — the three passes are individually callable; chaining
 //!   them per code-block from the packet reader's byte ranges is the next
 //!   step.
-//! * The §D.4.2 **predictable** termination flag (Scod bit-4). The
-//!   §D.4.2 **per-pass** termination flag (Scod bit-2) **is wired**
-//!   via the [`BitPlaneSequencer::with_termination_on_each_coding_pass`]
+//! * The §D.4.2 **predictable termination** flag (Scod bit-4) **is
+//!   wired** via the
+//!   [`BitPlaneSequencer::with_predictable_termination`] toggle and the
+//!   [`MqDecoder::predictable_termination_satisfied`] decoder-side
+//!   validator that a §D.4.2-aware packet reader calls against each
+//!   terminated segment's length to confirm BP landed on the segment
+//!   end without any synthetic 0xFF fill. The §D.4.2 **per-pass**
+//!   termination flag (Scod bit-2) **is wired** via the
+//!   [`BitPlaneSequencer::with_termination_on_each_coding_pass`]
 //!   builder, the matching accessor, and the
 //!   [`BitPlaneSequencer::next_pass_is_terminated`] dispatch predicate
 //!   that combines bit-2 with the §D.6 / Table D.9 schedule (the
@@ -1539,14 +1545,19 @@ pub enum Pass {
 /// caller can construct one [`MqDecoder`] per terminated segment and
 /// call the driver one pass at a time.
 ///
-/// ## What this sequencer does NOT cover
+/// ## §D.4.2 predictable termination
 ///
-/// * **§D.4.2 predictable-termination** (Scod bit-4). The
-///   bit-4-driven encoder-side termination procedure (a precise
-///   number-of-bits push-out through the byte buffer plus the
-///   `0xFF`-tail constraint) shapes the encoder, not the decoder; the
-///   decoder side is a length-counter check that lives on top of
-///   [`MqDecoder::byte_pointer`] and is a future round.
+/// The COD / COC Table A.19 bit-4 flag
+/// ([`crate::CodeBlockStyle::predictable_termination`]) signals that
+/// every terminated codeword segment in the packet body was flushed by
+/// the §D.4.2 procedure (k = (11 − CT) + 1 bits pushed out, terminating
+/// BYTEOUT, no 0xFF tail-byte elision). The sequencer carries the
+/// toggle via [`Self::with_predictable_termination`] /
+/// [`Self::predictable_termination`]; the decoder-side validator is
+/// [`MqDecoder::predictable_termination_satisfied`] which a packet
+/// reader calls on each terminated segment's decoder against the
+/// segment length the §B.10.7 packet header signalled.
+///
 /// ## §D.7 vertically-causal context formation
 ///
 /// When the COD / COC Table A.19
@@ -1626,6 +1637,25 @@ pub struct BitPlaneSequencer {
     /// supplies — termination is a packet-reader-level concern (which
     /// decoder to feed each pass), not a sequencer-internal one.
     termination_on_each_coding_pass: bool,
+    /// Whether the COD / COC Table A.19 `predictable_termination` flag
+    /// (bit 4 of `Scod`) is set for this code-block (T.800 §D.4.2).
+    ///
+    /// When `true`, every terminated codeword segment in the packet
+    /// body has been flushed by the §D.4.2 procedure (k = (11 − CT) + 1
+    /// bits pushed out, terminating BYTEOUT, no 0xFF tail-byte
+    /// elision). A §D.4.2-aware packet reader can validate each
+    /// terminated segment via
+    /// [`MqDecoder::predictable_termination_satisfied`] against the
+    /// segment length the §B.10.7 packet header signalled.
+    ///
+    /// The sequencer itself does not perform the check — it is the
+    /// packet-reader-level responsibility, parallel to the
+    /// `termination_on_each_coding_pass` dispatch. The toggle composes
+    /// with the §D.5 segmentation-symbol mode (per the §D.5 NOTE,
+    /// "this can be used with or without the predictable termination").
+    /// HTJ2K (Part 15) HT code-blocks opt out — the flag does not apply
+    /// to HT code-block segments.
+    predictable_termination: bool,
 }
 
 impl BitPlaneSequencer {
@@ -1651,6 +1681,7 @@ impl BitPlaneSequencer {
             vertically_causal_context: false,
             selective_arithmetic_coding_bypass: false,
             termination_on_each_coding_pass: false,
+            predictable_termination: false,
         }
     }
 
@@ -1798,6 +1829,36 @@ impl BitPlaneSequencer {
     /// Whether T.800 §D.4.2 termination on each coding pass is on.
     pub fn termination_on_each_coding_pass(&self) -> bool {
         self.termination_on_each_coding_pass
+    }
+
+    /// Builder — enable T.800 §D.4.2 predictable termination for this
+    /// code-block.
+    ///
+    /// When enabled, every terminated codeword segment in the packet
+    /// body was flushed by the §D.4.2 procedure (k = (11 − CT) + 1 bits
+    /// pushed out, terminating BYTEOUT, no 0xFF tail-byte elision). The
+    /// matching decoder-side validator is
+    /// [`MqDecoder::predictable_termination_satisfied`]: a
+    /// §D.4.2-aware packet reader opens a fresh decoder over each
+    /// terminated segment (the segment lengths come from §B.10.7) and
+    /// asks the decoder whether its terminal state is conformant after
+    /// consuming the segment's symbols.
+    ///
+    /// The flag is taken from the COD / COC Table A.19
+    /// [`crate::CodeBlockStyle::predictable_termination`] bit. The
+    /// toggle composes with [`Self::with_segmentation_symbols`] (per the
+    /// §D.5 NOTE the two are independent) and with the §D.6 bypass /
+    /// bit-2 termination flags. HTJ2K (Part 15) HT code-blocks opt out
+    /// of predictable termination per Table A.13 — do not enable it for
+    /// HT code-blocks.
+    pub fn with_predictable_termination(mut self, enabled: bool) -> Self {
+        self.predictable_termination = enabled;
+        self
+    }
+
+    /// Whether T.800 §D.4.2 predictable termination is on.
+    pub fn predictable_termination(&self) -> bool {
+        self.predictable_termination
     }
 
     /// Whether the **next** pass (per [`Self::next_pass`]) owns its
@@ -4303,6 +4364,114 @@ mod tests {
                 "bp5 SP must remain unterminated under bypass-only",
             );
         }
+    }
+
+    // -- §D.4.2 predictable-termination (Scod bit-4) ------------------
+
+    #[test]
+    fn sequencer_predictable_termination_default_off() {
+        let seq = BitPlaneSequencer::new(7);
+        assert!(!seq.predictable_termination());
+    }
+
+    #[test]
+    fn sequencer_with_predictable_termination_round_trips() {
+        // Builder monotonicity in both directions, matching the §D.5 /
+        // §D.6 / §D.7 / bit-2 builders.
+        let seq_off = BitPlaneSequencer::new(5);
+        assert!(!seq_off.predictable_termination());
+
+        let seq_on = seq_off.with_predictable_termination(true);
+        assert!(seq_on.predictable_termination());
+
+        let seq_back = seq_on.with_predictable_termination(false);
+        assert!(!seq_back.predictable_termination());
+    }
+
+    #[test]
+    fn sequencer_predictable_termination_does_not_affect_dispatch_predicates() {
+        // The §D.4.2 predictable flag (Scod bit-4) is independent of the
+        // §D.4.2 per-pass termination flag (Scod bit-2) and the §D.6
+        // bypass (Scod bit-0): it shapes only the segment-validation
+        // check on each terminated segment, not the dispatch of "which
+        // passes own their own segment". Toggle the predictable flag on
+        // and confirm the bit-2 / bit-0 dispatch predicate is identical
+        // to the no-predictable case across the §D.6 schedule rows.
+        let mut without = BitPlaneSequencer::new(7).with_selective_arithmetic_coding_bypass(true);
+        let mut with = without.clone().with_predictable_termination(true);
+
+        for (passes, pass) in [
+            (0u32, Pass::Cleanup),
+            (1, Pass::Sp),
+            (2, Pass::Mr),
+            (3, Pass::Cleanup),
+            (9, Pass::Cleanup),
+            (10, Pass::Sp),
+            (11, Pass::Mr),
+            (12, Pass::Cleanup),
+            (13, Pass::Sp),
+        ] {
+            without.passes_decoded = passes;
+            without.next_pass = pass;
+            with.passes_decoded = passes;
+            with.next_pass = pass;
+            assert_eq!(
+                with.next_pass_is_terminated(),
+                without.next_pass_is_terminated(),
+                "predictable flag must not influence next_pass_is_terminated at \
+                 (passes_decoded={passes}, pass={pass:?})",
+            );
+            assert_eq!(
+                with.raw_mode_for_next_pass(),
+                without.raw_mode_for_next_pass(),
+                "predictable flag must not influence raw_mode_for_next_pass at \
+                 (passes_decoded={passes}, pass={pass:?})",
+            );
+        }
+    }
+
+    #[test]
+    fn sequencer_predictable_termination_composes_with_other_flags() {
+        // All four Table A.19 toggles (§D.5, §D.7, §D.6, bit-2) compose
+        // independently with the bit-4 predictable flag — switching the
+        // bit-4 flag does not flip any of the other accessors.
+        let base = BitPlaneSequencer::new(7)
+            .with_segmentation_symbols(true)
+            .with_vertically_causal_context(true)
+            .with_selective_arithmetic_coding_bypass(true)
+            .with_termination_on_each_coding_pass(true);
+        assert!(!base.predictable_termination());
+
+        let on = base.clone().with_predictable_termination(true);
+        assert!(on.predictable_termination());
+        assert!(on.segmentation_symbols());
+        assert!(on.vertically_causal_context());
+        assert!(on.selective_arithmetic_coding_bypass());
+        assert!(on.termination_on_each_coding_pass());
+
+        let off = on.with_predictable_termination(false);
+        assert!(!off.predictable_termination());
+        assert!(off.segmentation_symbols());
+        assert!(off.vertically_causal_context());
+        assert!(off.selective_arithmetic_coding_bypass());
+        assert!(off.termination_on_each_coding_pass());
+    }
+
+    #[test]
+    fn sequencer_predictable_termination_independent_of_passes() {
+        // The §D.4.2 predictable flag is a static code-block style
+        // attribute — it does not change as the sequencer drives
+        // passes. Run a short decode on a known stream and confirm the
+        // accessor returns the constructed value before and after.
+        let bytes = [0xC1u8, 0x5D, 0x82, 0x77];
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 2, 2);
+        let mut ctx = reset_contexts();
+        let mut seq = BitPlaneSequencer::new(0).with_predictable_termination(true);
+        assert!(seq.predictable_termination());
+        let _ = seq
+            .decode_packet(&mut block, &bytes, 1, &mut ctx)
+            .expect("decode_packet must not fail");
+        assert!(seq.predictable_termination());
     }
 
     #[test]

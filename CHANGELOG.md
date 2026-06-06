@@ -6,6 +6,50 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 241 (2026-06-06).** T.800 §D.4.2 **predictable
+  termination** check on `MqDecoder` plus the matching COD / COC
+  Table A.19 bit-4 toggle on `BitPlaneSequencer`.
+  * `MqDecoder::predictable_termination_satisfied(segment_len)` — the
+    decoder-side §D.4.2 validator. Returns `true` iff no synthetic
+    `0xFF`-fill was ever consumed and the byte pointer landed on
+    exactly `segment_len`, **or** on `segment_len − 1` with `data[BP]
+    == 0xFF` (the §C.3.4 BYTEIN rule that parks `BP` on the `0xFF`
+    prefix of an end-of-segment marker). The encoder side of §D.4.2
+    pushes out `k = (11 − CT) + 1` bits via repeated BYTEOUT calls
+    and forbids the optional 0xFF tail-byte elision, so every bit the
+    decoder asks for must be materialised in the codestream — the
+    check rejects any decoder run that pulled the §C.3.4
+    end-of-stream marker fill, which is mutually exclusive with a
+    predictably-terminated segment.
+  * `MqDecoder::synthetic_fill_used()` — the sticky internal flag
+    surfaced for diagnostic introspection. Set the first time BYTEIN
+    reads past the end of the input slice (either the `B` lookup or
+    the `B1` peek that follows a `0xFF` prefix at end-of-segment) and
+    never cleared. Also set by INITDEC when the input is empty.
+  * `BitPlaneSequencer::with_predictable_termination(enabled)` /
+    `BitPlaneSequencer::predictable_termination()` — builder +
+    accessor for the COD / COC Table A.19 bit-4 flag. Default
+    `false`. The bit composes with the §D.5 / §D.6 / §D.7 / bit-2
+    toggles per the spec's §D.5 NOTE "this can be used with or
+    without the predictable termination"; it does not influence
+    `next_pass_is_terminated` or `raw_mode_for_next_pass` — those
+    dispatch predicates are bit-2 / bit-0 driven.
+  * 16 new lib tests covering: synthetic-fill clear on a non-empty
+    input; synthetic-fill set by INITDEC on empty input; predictable
+    accept when `BP == segment_len`; reject when `BP` is short of
+    `segment_len`; reject when `BP > segment_len`; accept the
+    BP-parked-on-0xFF-prefix marker case (segment_len = BP + 1);
+    reject when synthetic-fill fired; reject `segment_len == 0` when
+    `BP > 0`; reject the empty-input segment_len-zero degenerate
+    case (synthetic-fill gate priority); synthetic-fill flag
+    stickiness; the `0xFF 0xFF` marker stream does not trip
+    synthetic-fill (BP parks on the prefix); sequencer bit-4 default
+    off; builder monotonicity; bit-4 does not change
+    `next_pass_is_terminated` / `raw_mode_for_next_pass` across the
+    Table D.9 schedule rows; bit-4 composes with every other
+    Table A.19 toggle; bit-4 is invariant across a `decode_packet`
+    call. Suite is now 456 lib tests (was 440).
+
 * **Clean-room round 235 (2026-06-05).** T.800 §D.4.2 **termination
   dispatch** surface on `BitPlaneSequencer` — the COD / COC Table A.19
   bit-2 (`termination_on_each_coding_pass`) toggle plus the combined

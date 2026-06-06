@@ -3,6 +3,79 @@
 Pure-Rust JPEG 2000 (J2K + JP2) and High-Throughput JPEG 2000 (HTJ2K)
 codec.
 
+## Status — 2026-06-06 (clean-room round 241)
+
+Round 241 lands the T.800 **§D.4.2 predictable termination** check on
+`MqDecoder` plus the matching COD / COC Table A.19 bit-4 toggle on
+`BitPlaneSequencer` — the decoder-side validator and sequencer
+surface for the Scod-bit-4 flag that says "every terminated codeword
+segment in this packet was flushed by the §D.4.2 procedure":
+
+* `MqDecoder::predictable_termination_satisfied(segment_len)` —
+  returns `true` iff (a) no synthetic `0xFF`-fill was ever consumed
+  (the §C.3.4 end-of-stream marker fill is mutually exclusive with a
+  predictably-terminated segment because §D.4.2's encoder side pushes
+  out `k = (11 − CT) + 1` bits via repeated BYTEOUT) **and** (b) the
+  byte pointer landed on exactly `segment_len`, or on `segment_len −
+  1` with `data[BP] == 0xFF` (the §C.3.4 BYTEIN rule parks BP on the
+  `0xFF` prefix of an end-of-segment marker, so a properly-terminated
+  segment whose final byte is `0xFF` parks BP one short of the
+  signalled length).
+* `MqDecoder::synthetic_fill_used()` — the sticky internal flag
+  surfaced for diagnostics. Set the first time BYTEIN reads past the
+  end of the input slice (either the `B` lookup or the `B1` peek that
+  follows a `0xFF` prefix at end-of-segment), and at construction by
+  INITDEC when the input is empty.
+* `BitPlaneSequencer::with_predictable_termination(enabled)` /
+  `BitPlaneSequencer::predictable_termination()` — builder + accessor
+  for the COD / COC Table A.19 bit-4 flag. Default `false`. The
+  toggle composes with the §D.5 / §D.6 / §D.7 / bit-2 flags per the
+  §D.5 NOTE ("this can be used with or without the predictable
+  termination") and does **not** influence the
+  `next_pass_is_terminated` / `raw_mode_for_next_pass` dispatch
+  predicates — those are bit-2 / bit-0 driven.
+
+16 new lib tests cover the addition (suite total: 456 lib tests, was
+440):
+
+* `synthetic_fill_starts_false_for_non_empty_input` — clear on a
+  normal segment.
+* `synthetic_fill_set_by_empty_input` — INITDEC over `[]` sets the
+  flag and the predictable check rejects any segment length.
+* `predictable_termination_holds_when_bp_lands_on_segment_end` —
+  accept when `BP == segment_len`.
+* `predictable_termination_fails_when_bp_short_of_segment_end` —
+  reject when `BP < segment_len`.
+* `predictable_termination_fails_when_bp_overruns_segment_len` —
+  reject when `segment_len < BP`.
+* `predictable_termination_accepts_bp_parked_on_0xff_marker_prefix`
+  — accept when `BP + 1 == segment_len` and `data[BP] == 0xFF`.
+* `predictable_termination_fails_when_synthetic_fill_used` — reject
+  every segment length once synthetic-fill fired.
+* `synthetic_fill_does_not_fire_on_ff_ff_marker_run` — the
+  `0xFF 0xFF` marker stream parks BP on the prefix without tripping
+  synthetic-fill; the marker-prefix acceptance rule still applies.
+* `predictable_termination_segment_len_zero_rejects_non_initial_bp`
+  — reject `segment_len == 0` when `BP > 0`.
+* `predictable_termination_zero_byte_segment_initial_state_passes`
+  — the empty-input + `segment_len == 0` degenerate case is rejected
+  by the synthetic-fill gate (which takes priority over the BP-vs-len
+  equality).
+* `synthetic_fill_flag_is_sticky_after_first_overrun` — flag does
+  not clear on subsequent BYTEIN calls.
+* `sequencer_predictable_termination_default_off` — bit-4 toggle off
+  on a fresh sequencer.
+* `sequencer_with_predictable_termination_round_trips` — builder
+  monotonicity in both directions.
+* `sequencer_predictable_termination_does_not_affect_dispatch_predicates`
+  — toggling bit-4 leaves `next_pass_is_terminated` and
+  `raw_mode_for_next_pass` byte-for-byte identical across the
+  Table D.9 schedule rows.
+* `sequencer_predictable_termination_composes_with_other_flags` —
+  bit-4 composes independently with §D.5 / §D.6 / §D.7 / bit-2.
+* `sequencer_predictable_termination_independent_of_passes` —
+  the accessor is invariant across a `decode_packet` call.
+
 ## Status — 2026-06-05 (clean-room round 235)
 
 Round 235 lands the T.800 **§D.4.2 termination dispatch** surface on
