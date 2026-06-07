@@ -549,6 +549,299 @@ pub fn clamp_to_dynamic_range(
 }
 
 // ---------------------------------------------------------------------------
+// §G.1 + §G.2 / §G.3 — per-tile-component threading.
+// ---------------------------------------------------------------------------
+
+/// Three-component reconstruction parameters fed to the §G threading
+/// surface — one entry per component, in the same `(0, 1, 2)` order
+/// the SIZ marker lists them.
+///
+/// Mirrors the [`crate::SizComponent`] fields the inverse §G pipeline
+/// actually consumes (the §G.1 / §G.2 / §G.3 procedures only read the
+/// component's `Ssiz` byte: precision + signedness; the sub-sampling
+/// factors are a §B / §F concern that the caller has already honoured
+/// by handing in matched-length sample slices). This three-tuple is
+/// the smallest invariant the threading code needs to dispatch the
+/// inverse DC level-shift and the dynamic-range clamp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ComponentDescriptor {
+    /// Per-component sample precision in bits (1..=38), the
+    /// `precision_bits` field of [`crate::SizComponent`].
+    pub precision_bits: u8,
+    /// Per-component signedness (Ssiz MSB), the `is_signed` field of
+    /// [`crate::SizComponent`].
+    pub is_signed: bool,
+}
+
+impl ComponentDescriptor {
+    /// Build a [`ComponentDescriptor`] from a parsed
+    /// [`crate::SizComponent`]. The two extra `XRsiz / YRsiz`
+    /// sub-sampling fields the SIZ marker carries are deliberately
+    /// dropped: §G operates per `(x, y)` after the §F / §B layers
+    /// have already realised the per-component grid.
+    pub const fn from_siz_component(c: &crate::SizComponent) -> Self {
+        Self {
+            precision_bits: c.precision_bits,
+            is_signed: c.is_signed,
+        }
+    }
+}
+
+/// Inverse-MCT mode selected by the COD marker's `SGcod` MCT byte
+/// (T.800 Table A.17).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InverseMctMode {
+    /// `SGcod_MCT == 0` — no MCT applied at the encoder. Each
+    /// component is independently DC-level-shifted; no RCT / ICT
+    /// runs.
+    None,
+    /// `SGcod_MCT == 1` paired with the 5-3 reversible kernel —
+    /// inverse RCT (§G.2.2) on components `(0, 1, 2)`.
+    Rct,
+    /// `SGcod_MCT == 1` paired with the 9-7 irreversible kernel —
+    /// inverse ICT (§G.3.2) on components `(0, 1, 2)`.
+    Ict,
+}
+
+/// Thread the §G.2.2 inverse RCT + §G.1.2 per-component inverse DC
+/// level shift + §G.1.2-NOTE clamp across three reconstructed
+/// reversible-path tile-components — T.800 §G.1.2 prologue rule
+/// "performed after the computation of the inverse multiple component
+/// transformation".
+///
+/// This is the per-tile glue that sits between [`crate::dwt::idwt_5x3`]
+/// (which returns one [`crate::dwt::Interleaved2D<i32>`] per
+/// component) and the caller's per-tile pixel buffer. The three
+/// component slices are operated on in place; on return they hold
+/// the final clipped sample values for the three reconstructed
+/// components in `(0, 1, 2)` order.
+///
+/// Sequence executed per the §G.1 placement diagram (Figure G.1 when
+/// `mode == InverseMctMode::Rct`, Figure G.2 when `mode ==
+/// InverseMctMode::None`):
+///
+/// 1. If `mode == InverseMctMode::Rct`, run [`inverse_rct`] on
+///    `(c0, c1, c2)`. The Annex G.2 prologue requires that the three
+///    components share the same separation on the reference grid and
+///    the same bit-depth — this is enforced here by checking
+///    `descriptors[0..3]` carry equal `precision_bits` and equal
+///    `is_signed` flags when MCT is on.
+/// 2. For each component `i in 0..3`, call [`inverse_dc_level_shift`]
+///    with that component's `(precision_bits, is_signed)` from
+///    `descriptors[i]`. Signed components no-op per §G.1.2 prologue;
+///    unsigned components are shifted by `+2^(precision_bits - 1)`.
+/// 3. For each component `i in 0..3`, call
+///    [`clamp_to_dynamic_range`] with the same descriptor. This is
+///    the §G.1.2 NOTE's "typical solution" for the
+///    quantization-overflow case.
+///
+/// The threading is `O(3 N)` for `N` samples per component. The
+/// inverse RCT runs first and `O(N)` per component once each; the
+/// level-shift and clamp run `O(N)` per component once each.
+///
+/// `mode == InverseMctMode::Ict` is rejected: ICT operates on `f32`
+/// (T.800 §G.3.2 closing paragraph), so the 9-7 path uses a separate
+/// entry point — see [`reconstruct_tile_components_9x7`].
+///
+/// # Errors
+///
+/// * [`Error::InvalidMarkerLength`] if the three slices do not share
+///   a common length, or if `descriptors.len() != 3`.
+/// * [`Error::InvalidSamplePrecision`] if any descriptor's
+///   `precision_bits` is `0` or greater than `31` (the `i32`
+///   reversible-path surface bound; callers with `Ssiz ≥ 32` should
+///   stage the i64-widened path themselves).
+/// * [`Error::InvalidComponentCount`] if `mode ==
+///   InverseMctMode::Rct` and the three descriptors do not all share
+///   the same `(precision_bits, is_signed)` pair (the §G.2 prologue
+///   constraint).
+/// * [`Error::NotImplemented`] if `mode == InverseMctMode::Ict`
+///   (wrong entry point — see [`reconstruct_tile_components_9x7`]).
+pub fn reconstruct_tile_components_5x3(
+    c0: &mut [i32],
+    c1: &mut [i32],
+    c2: &mut [i32],
+    descriptors: &[ComponentDescriptor],
+    mode: InverseMctMode,
+) -> Result<(), Error> {
+    if c0.len() != c1.len() || c1.len() != c2.len() {
+        return Err(Error::InvalidMarkerLength);
+    }
+    if descriptors.len() != 3 {
+        return Err(Error::InvalidMarkerLength);
+    }
+    // Validate every descriptor's precision sits in the i32-path
+    // window before doing any work, so a bad descriptor[2] doesn't
+    // get caught only after RCT + level-shift on (0, 1) have run.
+    for d in descriptors {
+        if d.precision_bits == 0 || d.precision_bits > 31 {
+            return Err(Error::InvalidSamplePrecision);
+        }
+    }
+    match mode {
+        InverseMctMode::Ict => {
+            // ICT is the 9-7 irreversible path. The reversible-path
+            // entry point cannot honour it because ICT operates on
+            // f32; route the caller to the 9-7 entry point.
+            return Err(Error::NotImplemented);
+        }
+        InverseMctMode::Rct => {
+            // §G.2 prologue: "The three components input into the
+            // RCT shall have the same separation on the reference
+            // grid and the same bit-depth." The separation half is
+            // already honoured by the caller's matched-length
+            // slices; the bit-depth (and signedness) half is checked
+            // here.
+            let d0 = descriptors[0];
+            if descriptors[1] != d0 || descriptors[2] != d0 {
+                return Err(Error::InvalidComponentCount);
+            }
+            inverse_rct(c0, c1, c2)?;
+        }
+        InverseMctMode::None => {
+            // Figure G.2 path — components flow through the inverse
+            // DWT independently and the only §G work is the
+            // per-component level-shift + clamp.
+        }
+    }
+    // Per-component inverse DC level shift (§G.1.2 Eq. G-2) +
+    // §G.1.2 NOTE dynamic-range clamp. Both are signed-aware via
+    // the dispatchers in this module.
+    for (slice, d) in [
+        (c0 as &mut [i32], descriptors[0]),
+        (c1, descriptors[1]),
+        (c2, descriptors[2]),
+    ] {
+        inverse_dc_level_shift(slice, d.precision_bits, d.is_signed)?;
+        clamp_to_dynamic_range(slice, d.precision_bits, d.is_signed)?;
+    }
+    Ok(())
+}
+
+/// Thread the §G.3.2 inverse ICT + §G.1.2 per-component inverse DC
+/// level shift + §G.1.2-NOTE clamp across three reconstructed
+/// irreversible-path tile-components.
+///
+/// The 9-7 counterpart of [`reconstruct_tile_components_5x3`]: the
+/// three `f32` slices carry the §F.3 9-7 reconstructed coefficients
+/// (caller has already downcast the `f64` IDWT output if it ran the
+/// `f64` 9-7 path), the inverse ICT runs in `f32`, and the result is
+/// rounded to `i32` for the DC level-shift and clamp via
+/// `round-to-nearest-even` semantics (the §G.3.2 closing paragraph
+/// notes the spec does not pin the ICT coefficients' precision; a
+/// rounding step into `i32` after ICT is the conventional way of
+/// landing on a representable per-sample value).
+///
+/// `out0`, `out1`, `out2` receive the rounded, level-shifted,
+/// clipped samples. They must each be the same length as the
+/// matching input slice.
+///
+/// Sequence executed per the §G.1 placement diagram (Figure G.1 when
+/// `mode == InverseMctMode::Ict`, Figure G.2 when `mode ==
+/// InverseMctMode::None`):
+///
+/// 1. If `mode == InverseMctMode::Ict`, run [`inverse_ict`] on
+///    `(c0, c1, c2)`. The §G.3 prologue mirrors §G.2's "same
+///    separation and bit-depth" rule on the three components; this
+///    is enforced via the same `descriptors[0..3]` equality check.
+/// 2. Round each `f32` sample to its nearest integer (ties-to-even,
+///    matching Rust's `f32::round_ties_even` semantics) and write it
+///    into the matching `out*` slot.
+/// 3. For each component, run [`inverse_dc_level_shift`] then
+///    [`clamp_to_dynamic_range`] over the integerised slot.
+///
+/// `mode == InverseMctMode::Rct` is rejected: RCT operates on `i32`
+/// (T.800 §G.2.2), so the 5-3 path uses
+/// [`reconstruct_tile_components_5x3`] instead.
+///
+/// # Errors
+///
+/// * [`Error::InvalidMarkerLength`] if any of the six slices do not
+///   share a common length, or if `descriptors.len() != 3`.
+/// * [`Error::InvalidSamplePrecision`] if any descriptor's
+///   `precision_bits` is `0` or greater than `31`.
+/// * [`Error::InvalidComponentCount`] if `mode ==
+///   InverseMctMode::Ict` and the three descriptors do not all share
+///   the same `(precision_bits, is_signed)` pair (the §G.3 prologue
+///   constraint).
+/// * [`Error::NotImplemented`] if `mode == InverseMctMode::Rct`
+///   (wrong entry point — see [`reconstruct_tile_components_5x3`]).
+#[allow(clippy::too_many_arguments)]
+pub fn reconstruct_tile_components_9x7(
+    c0: &mut [f32],
+    c1: &mut [f32],
+    c2: &mut [f32],
+    out0: &mut [i32],
+    out1: &mut [i32],
+    out2: &mut [i32],
+    descriptors: &[ComponentDescriptor],
+    mode: InverseMctMode,
+) -> Result<(), Error> {
+    if c0.len() != c1.len() || c1.len() != c2.len() {
+        return Err(Error::InvalidMarkerLength);
+    }
+    if out0.len() != c0.len() || out1.len() != c1.len() || out2.len() != c2.len() {
+        return Err(Error::InvalidMarkerLength);
+    }
+    if descriptors.len() != 3 {
+        return Err(Error::InvalidMarkerLength);
+    }
+    for d in descriptors {
+        if d.precision_bits == 0 || d.precision_bits > 31 {
+            return Err(Error::InvalidSamplePrecision);
+        }
+    }
+    match mode {
+        InverseMctMode::Rct => {
+            return Err(Error::NotImplemented);
+        }
+        InverseMctMode::Ict => {
+            let d0 = descriptors[0];
+            if descriptors[1] != d0 || descriptors[2] != d0 {
+                return Err(Error::InvalidComponentCount);
+            }
+            inverse_ict(c0, c1, c2)?;
+        }
+        InverseMctMode::None => {
+            // Figure G.2 path on the 9-7 surface — no MCT applied.
+        }
+    }
+    // Round-to-nearest-even into the i32 output slots, then run the
+    // signed-aware inverse DC level shift + clamp on each component
+    // independently.
+    for (src, dst, d) in [
+        (&*c0, out0 as &mut [i32], descriptors[0]),
+        (&*c1, out1, descriptors[1]),
+        (&*c2, out2, descriptors[2]),
+    ] {
+        for (s, o) in src.iter().zip(dst.iter_mut()) {
+            // f32::round_ties_even is the IEEE-754 default
+            // rounding mode and matches the "no required precision"
+            // language of §G.3.2 closing paragraph: the rounding
+            // direction is a decoder choice, and ties-to-even is
+            // the only choice that is statistically unbiased on
+            // arbitrary fractional inputs.
+            let r = s.round_ties_even();
+            // Saturate before the cast — an ICT-amplified sample
+            // can wander outside the i32 range on a pathological
+            // input, and the subsequent §G.1.2 NOTE clamp will pull
+            // it back to the descriptor range anyway. Saturating
+            // here keeps the cast well-defined.
+            *o = if r >= i32::MAX as f32 {
+                i32::MAX
+            } else if r <= i32::MIN as f32 {
+                i32::MIN
+            } else {
+                r as i32
+            };
+        }
+        inverse_dc_level_shift(dst, d.precision_bits, d.is_signed)?;
+        clamp_to_dynamic_range(dst, d.precision_bits, d.is_signed)?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests.
 // ---------------------------------------------------------------------------
 
@@ -1081,5 +1374,419 @@ mod tests {
         );
         assert!(clamp_to_dynamic_range(&mut s, 1, false).is_ok());
         assert!(clamp_to_dynamic_range(&mut s, 31, true).is_ok());
+    }
+
+    // -------------------------------------------------------------------
+    // §G.1 + §G.2 / §G.3 — per-tile-component threading.
+    // -------------------------------------------------------------------
+
+    fn d_unsigned(p: u8) -> ComponentDescriptor {
+        ComponentDescriptor {
+            precision_bits: p,
+            is_signed: false,
+        }
+    }
+
+    fn d_signed(p: u8) -> ComponentDescriptor {
+        ComponentDescriptor {
+            precision_bits: p,
+            is_signed: true,
+        }
+    }
+
+    /// `ComponentDescriptor::from_siz_component` drops the SIZ
+    /// sub-sampling factors but copies the precision + signedness
+    /// verbatim.
+    #[test]
+    fn descriptor_from_siz_component_preserves_precision_and_signedness() {
+        let c = crate::SizComponent {
+            precision_bits: 12,
+            is_signed: true,
+            h_separation: 1,
+            v_separation: 2,
+        };
+        let d = ComponentDescriptor::from_siz_component(&c);
+        assert_eq!(d.precision_bits, 12);
+        assert!(d.is_signed);
+    }
+
+    /// 5-3 + RCT + unsigned 8-bit: §G.2.1 worked example fed into
+    /// the threading layer with the encoder having already DC-shifted
+    /// and forward-RCT'd the (200, 100, 50) triple. The threading
+    /// layer's job is to invert RCT, add back `+128`, and clamp —
+    /// recovering the original (200, 100, 50).
+    #[test]
+    fn thread_5x3_rct_unsigned_8bit_recovers_g_2_1_example() {
+        // Encoder: (R, G, B) = (200, 100, 50); subtract 128 each →
+        // (72, -28, -78); forward RCT (Eq. G-3/G-4/G-5):
+        //   Y0 = floor((72 + 2*(-28) + -78) / 4) = floor(-62/4) = -16
+        //   Y1 = -78 - (-28) = -50
+        //   Y2 = 72 - (-28) = 100
+        let mut c0 = [-16_i32];
+        let mut c1 = [-50_i32];
+        let mut c2 = [100_i32];
+        let descs = [d_unsigned(8), d_unsigned(8), d_unsigned(8)];
+        reconstruct_tile_components_5x3(&mut c0, &mut c1, &mut c2, &descs, InverseMctMode::Rct)
+            .unwrap();
+        assert_eq!(c0[0], 200);
+        assert_eq!(c1[0], 100);
+        assert_eq!(c2[0], 50);
+    }
+
+    /// 5-3 + RCT + 8-bit on a 256-entry diagonal — round-tripping the
+    /// `(R, G, B) = (k, k, k)` line. Encoder DC-shifts each value to
+    /// `k - 128`, then forward RCT collapses the diagonal into
+    /// `(Y0, Y1, Y2) = (k - 128, 0, 0)`. The threading layer should
+    /// recover `(k, k, k)` exactly for every `k ∈ 0..=255`.
+    #[test]
+    fn thread_5x3_rct_unsigned_8bit_recovers_grayscale_diagonal() {
+        for k in 0_i32..=255_i32 {
+            let mut c0 = [k - 128];
+            let mut c1 = [0_i32];
+            let mut c2 = [0_i32];
+            let descs = [d_unsigned(8), d_unsigned(8), d_unsigned(8)];
+            reconstruct_tile_components_5x3(&mut c0, &mut c1, &mut c2, &descs, InverseMctMode::Rct)
+                .unwrap();
+            assert_eq!(c0[0], k, "diagonal k={}: c0", k);
+            assert_eq!(c1[0], k, "diagonal k={}: c1", k);
+            assert_eq!(c2[0], k, "diagonal k={}: c2", k);
+        }
+    }
+
+    /// 5-3 + no MCT + unsigned 8-bit: components flow through the
+    /// inverse DWT independently. The threading layer just adds back
+    /// the per-component `+2^(p - 1)` and clamps. With `(p_i) = (8,
+    /// 10, 12)` and DWT-output samples `(0, 0, 0)` the level-shift
+    /// alone produces `(128, 512, 2048)` and the clamp leaves them
+    /// untouched.
+    #[test]
+    fn thread_5x3_none_mode_independent_per_component_level_shift() {
+        let mut c0 = [0_i32, 100, -50];
+        let mut c1 = [0_i32, 100, -50];
+        let mut c2 = [0_i32, 100, -50];
+        let descs = [d_unsigned(8), d_unsigned(10), d_unsigned(12)];
+        reconstruct_tile_components_5x3(&mut c0, &mut c1, &mut c2, &descs, InverseMctMode::None)
+            .unwrap();
+        assert_eq!(c0, [128_i32, 228, 78]);
+        assert_eq!(c1, [512_i32, 612, 462]);
+        assert_eq!(c2, [2048_i32, 2148, 1998]);
+    }
+
+    /// 5-3 + no MCT + signed 8-bit: signed components skip the
+    /// level shift but still get clamped to `[-128, 127]`.
+    #[test]
+    fn thread_5x3_none_mode_signed_component_clamps_only() {
+        let mut c0 = [-200_i32, -128, 0, 127, 200];
+        let mut c1 = c0;
+        let mut c2 = c0;
+        let descs = [d_signed(8), d_signed(8), d_signed(8)];
+        reconstruct_tile_components_5x3(&mut c0, &mut c1, &mut c2, &descs, InverseMctMode::None)
+            .unwrap();
+        assert_eq!(c0, [-128_i32, -128, 0, 127, 127]);
+        assert_eq!(c1, c0);
+        assert_eq!(c2, c0);
+    }
+
+    /// 5-3 + no MCT + clipping: an over-amplified reconstructed
+    /// sample lands outside the 8-bit unsigned range after the
+    /// `+128` level shift, and the clamp pulls it back to 255.
+    #[test]
+    fn thread_5x3_none_mode_clamps_overshoot() {
+        // DWT output 200 + level shift 128 = 328 → clamp to 255.
+        // DWT output -200 + level shift 128 = -72 → clamp to 0.
+        let mut c0 = [200_i32, -200, 0, 127];
+        let mut c1 = c0;
+        let mut c2 = c0;
+        let descs = [d_unsigned(8), d_unsigned(8), d_unsigned(8)];
+        reconstruct_tile_components_5x3(&mut c0, &mut c1, &mut c2, &descs, InverseMctMode::None)
+            .unwrap();
+        assert_eq!(c0, [255_i32, 0, 128, 255]);
+        assert_eq!(c1, c0);
+        assert_eq!(c2, c0);
+    }
+
+    /// 5-3 + RCT requires every component's `(precision, signedness)`
+    /// to match the §G.2 prologue "same separation and bit-depth"
+    /// rule; a mismatched second component is rejected.
+    #[test]
+    fn thread_5x3_rct_rejects_unequal_precision() {
+        let mut c0 = [0_i32];
+        let mut c1 = [0_i32];
+        let mut c2 = [0_i32];
+        let descs = [d_unsigned(8), d_unsigned(10), d_unsigned(8)];
+        assert_eq!(
+            reconstruct_tile_components_5x3(&mut c0, &mut c1, &mut c2, &descs, InverseMctMode::Rct,),
+            Err(Error::InvalidComponentCount)
+        );
+    }
+
+    /// 5-3 + RCT rejects mixed signedness across the three
+    /// components — the §G.2 prologue requires uniform bit-depth
+    /// AND uniform signedness.
+    #[test]
+    fn thread_5x3_rct_rejects_mixed_signedness() {
+        let mut c0 = [0_i32];
+        let mut c1 = [0_i32];
+        let mut c2 = [0_i32];
+        let descs = [d_unsigned(8), d_unsigned(8), d_signed(8)];
+        assert_eq!(
+            reconstruct_tile_components_5x3(&mut c0, &mut c1, &mut c2, &descs, InverseMctMode::Rct,),
+            Err(Error::InvalidComponentCount)
+        );
+    }
+
+    /// 5-3 entry point refuses ICT (wrong kernel pairing per the
+    /// §G.2 / §G.3 prologues; the 9-7 entry point owns ICT).
+    #[test]
+    fn thread_5x3_rejects_ict_mode() {
+        let mut c0 = [0_i32];
+        let mut c1 = [0_i32];
+        let mut c2 = [0_i32];
+        let descs = [d_unsigned(8), d_unsigned(8), d_unsigned(8)];
+        assert_eq!(
+            reconstruct_tile_components_5x3(&mut c0, &mut c1, &mut c2, &descs, InverseMctMode::Ict,),
+            Err(Error::NotImplemented)
+        );
+    }
+
+    /// 5-3 entry point rejects mismatched slice lengths up front.
+    #[test]
+    fn thread_5x3_rejects_mismatched_slice_lengths() {
+        let mut c0 = [0_i32; 4];
+        let mut c1 = [0_i32; 3];
+        let mut c2 = [0_i32; 4];
+        let descs = [d_unsigned(8); 3];
+        assert_eq!(
+            reconstruct_tile_components_5x3(
+                &mut c0,
+                &mut c1,
+                &mut c2,
+                &descs,
+                InverseMctMode::None,
+            ),
+            Err(Error::InvalidMarkerLength)
+        );
+    }
+
+    /// 5-3 entry point rejects a non-3 descriptor count.
+    #[test]
+    fn thread_5x3_rejects_non_three_descriptors() {
+        let mut c0 = [0_i32];
+        let mut c1 = [0_i32];
+        let mut c2 = [0_i32];
+        let descs = [d_unsigned(8); 2];
+        assert_eq!(
+            reconstruct_tile_components_5x3(
+                &mut c0,
+                &mut c1,
+                &mut c2,
+                &descs,
+                InverseMctMode::None,
+            ),
+            Err(Error::InvalidMarkerLength)
+        );
+    }
+
+    /// 5-3 entry point rejects out-of-range precision (any descriptor).
+    #[test]
+    fn thread_5x3_rejects_out_of_range_precision() {
+        let mut c0 = [0_i32];
+        let mut c1 = [0_i32];
+        let mut c2 = [0_i32];
+        let descs = [d_unsigned(8), d_unsigned(32), d_unsigned(8)];
+        assert_eq!(
+            reconstruct_tile_components_5x3(
+                &mut c0,
+                &mut c1,
+                &mut c2,
+                &descs,
+                InverseMctMode::None,
+            ),
+            Err(Error::InvalidSamplePrecision)
+        );
+    }
+
+    /// 9-7 + ICT + unsigned 8-bit: the §G.3.1 forward ICT on the
+    /// `(200 - 128, 100 - 128, 50 - 128) = (72, -28, -78)` shifted
+    /// triple round-trips through the threading layer back to
+    /// `(200, 100, 50)` within rounding error (the f32 ICT
+    /// coefficients are informative per §G.3.2 closing paragraph).
+    #[test]
+    fn thread_9x7_ict_unsigned_8bit_recovers_rgb_sample() {
+        // Encoder side: forward-shift then forward-ICT.
+        let mut c0 = [72.0_f32];
+        let mut c1 = [-28.0_f32];
+        let mut c2 = [-78.0_f32];
+        forward_ict(&mut c0, &mut c1, &mut c2).unwrap();
+        // Decoder side: thread it through.
+        let mut o0 = [0_i32];
+        let mut o1 = [0_i32];
+        let mut o2 = [0_i32];
+        let descs = [d_unsigned(8), d_unsigned(8), d_unsigned(8)];
+        reconstruct_tile_components_9x7(
+            &mut c0,
+            &mut c1,
+            &mut c2,
+            &mut o0,
+            &mut o1,
+            &mut o2,
+            &descs,
+            InverseMctMode::Ict,
+        )
+        .unwrap();
+        // The §G.3 coefficients are informative; allow ±1 LSB after
+        // round-to-nearest-even.
+        assert!((o0[0] - 200).abs() <= 1, "I0 = {} (want ~200)", o0[0]);
+        assert!((o1[0] - 100).abs() <= 1, "I1 = {} (want ~100)", o1[0]);
+        assert!((o2[0] - 50).abs() <= 1, "I2 = {} (want ~50)", o2[0]);
+    }
+
+    /// 9-7 + no MCT + unsigned 8-bit: per-component independent
+    /// round → level-shift → clamp, exactly like the 5-3 None
+    /// path but on the f32 surface.
+    #[test]
+    fn thread_9x7_none_mode_round_then_level_shift_then_clamp() {
+        let mut c0 = [0.0_f32, 0.4, -0.6, 100.0, -200.0];
+        let mut c1 = c0;
+        let mut c2 = c0;
+        let mut o0 = [0_i32; 5];
+        let mut o1 = [0_i32; 5];
+        let mut o2 = [0_i32; 5];
+        let descs = [d_unsigned(8), d_unsigned(8), d_unsigned(8)];
+        reconstruct_tile_components_9x7(
+            &mut c0,
+            &mut c1,
+            &mut c2,
+            &mut o0,
+            &mut o1,
+            &mut o2,
+            &descs,
+            InverseMctMode::None,
+        )
+        .unwrap();
+        // 0.0 → 0; +128 → 128.
+        // 0.4 → 0 (ties-to-even rounds half away from zero, but 0.4 is closer to 0); +128 → 128.
+        // -0.6 → -1; +128 → 127.
+        // 100.0 → 100; +128 → 228.
+        // -200.0 → -200; +128 → -72 → clamp 0.
+        assert_eq!(o0, [128_i32, 128, 127, 228, 0]);
+        assert_eq!(o1, o0);
+        assert_eq!(o2, o0);
+    }
+
+    /// 9-7 + ICT requires equal `(precision, signedness)` per the
+    /// §G.3 prologue (mirroring §G.2's rule).
+    #[test]
+    fn thread_9x7_ict_rejects_unequal_precision() {
+        let mut c0 = [0.0_f32];
+        let mut c1 = [0.0_f32];
+        let mut c2 = [0.0_f32];
+        let mut o0 = [0_i32];
+        let mut o1 = [0_i32];
+        let mut o2 = [0_i32];
+        let descs = [d_unsigned(8), d_unsigned(8), d_unsigned(10)];
+        assert_eq!(
+            reconstruct_tile_components_9x7(
+                &mut c0,
+                &mut c1,
+                &mut c2,
+                &mut o0,
+                &mut o1,
+                &mut o2,
+                &descs,
+                InverseMctMode::Ict,
+            ),
+            Err(Error::InvalidComponentCount)
+        );
+    }
+
+    /// 9-7 entry point refuses RCT (wrong kernel pairing).
+    #[test]
+    fn thread_9x7_rejects_rct_mode() {
+        let mut c0 = [0.0_f32];
+        let mut c1 = [0.0_f32];
+        let mut c2 = [0.0_f32];
+        let mut o0 = [0_i32];
+        let mut o1 = [0_i32];
+        let mut o2 = [0_i32];
+        let descs = [d_unsigned(8); 3];
+        assert_eq!(
+            reconstruct_tile_components_9x7(
+                &mut c0,
+                &mut c1,
+                &mut c2,
+                &mut o0,
+                &mut o1,
+                &mut o2,
+                &descs,
+                InverseMctMode::Rct,
+            ),
+            Err(Error::NotImplemented)
+        );
+    }
+
+    /// 9-7 entry point rejects out-of-range output slot length.
+    #[test]
+    fn thread_9x7_rejects_output_length_mismatch() {
+        let mut c0 = [0.0_f32; 4];
+        let mut c1 = [0.0_f32; 4];
+        let mut c2 = [0.0_f32; 4];
+        let mut o0 = [0_i32; 4];
+        let mut o1 = [0_i32; 3]; // wrong
+        let mut o2 = [0_i32; 4];
+        let descs = [d_unsigned(8); 3];
+        assert_eq!(
+            reconstruct_tile_components_9x7(
+                &mut c0,
+                &mut c1,
+                &mut c2,
+                &mut o0,
+                &mut o1,
+                &mut o2,
+                &descs,
+                InverseMctMode::None,
+            ),
+            Err(Error::InvalidMarkerLength)
+        );
+    }
+
+    /// 9-7 entry point saturates an ICT-amplified `f32` sample to
+    /// `i32::{MIN, MAX}` at the cast point, before the §G.1.2 NOTE
+    /// clamp runs. The cast saturation alone keeps the cast
+    /// well-defined; the §G.1.2 inverse level-shift then runs on
+    /// the saturated `i32` via the underlying `wrapping_add`
+    /// primitive, so an `i32::MAX + 128` lane wraps and the
+    /// subsequent clamp pulls it to `0` (not `255`). The lower
+    /// end is well-behaved: `i32::MIN + 128 = i32::MIN + 128` is
+    /// still negative, clamping to `0`.
+    #[test]
+    fn thread_9x7_saturates_pathological_f32_input() {
+        let mut c0 = [1e30_f32, -1e30, 0.0];
+        let mut c1 = [0.0_f32, 0.0, 0.0];
+        let mut c2 = [0.0_f32, 0.0, 0.0];
+        let mut o0 = [0_i32; 3];
+        let mut o1 = [0_i32; 3];
+        let mut o2 = [0_i32; 3];
+        let descs = [d_unsigned(8); 3];
+        reconstruct_tile_components_9x7(
+            &mut c0,
+            &mut c1,
+            &mut c2,
+            &mut o0,
+            &mut o1,
+            &mut o2,
+            &descs,
+            InverseMctMode::None,
+        )
+        .unwrap();
+        // 1e30 saturates to i32::MAX, then `wrapping_add(128)`
+        // wraps to a large-negative value, which the §G.1.2 NOTE
+        // clamp pulls to 0.
+        // -1e30 saturates to i32::MIN, `wrapping_add(128)` =
+        // i32::MIN + 128 (still hugely negative), clamps to 0.
+        // 0.0 → 0 → +128 → 128 (in-range, no clamp).
+        assert_eq!(o0, [0_i32, 0, 128]);
+        assert_eq!(o1, [128_i32, 128, 128]);
+        assert_eq!(o2, [128_i32, 128, 128]);
     }
 }

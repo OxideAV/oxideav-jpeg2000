@@ -3,6 +3,99 @@
 Pure-Rust JPEG 2000 (J2K + JP2) and High-Throughput JPEG 2000 (HTJ2K)
 codec.
 
+## Status — 2026-06-08 (clean-room round 252)
+
+Round 252 lands the T.800 Annex G **per-tile three-component
+reconstruction threading** — the per-tile glue that sits between the
+§F.3.1 IDWT cascade (`dwt::idwt_5x3` / `dwt::idwt_9x7`) and the
+caller's final per-tile pixel buffer:
+
+* `mct::ComponentDescriptor { precision_bits, is_signed }` — the
+  smallest per-component invariant the §G pipeline reads from the
+  SIZ marker. Constructed via
+  `ComponentDescriptor::from_siz_component(&siz_c)` directly from a
+  parsed [`SizComponent`].
+* `mct::InverseMctMode { None, Rct, Ict }` — the SGcod
+  multi-component-transform-byte dispatch enum (Table A.17). `None`
+  follows Figure G.2; `Rct` / `Ict` follow Figure G.1 against the
+  matching wavelet kernel.
+* `mct::reconstruct_tile_components_5x3(c0, c1, c2, descriptors, mode)`
+  — i32 5-3 / RCT threading entry point. When `mode == Rct`,
+  validates the §G.2 prologue "same separation and bit-depth" rule
+  (returns `InvalidComponentCount` if the three descriptors don't
+  agree), runs `inverse_rct`, then runs `inverse_dc_level_shift` +
+  `clamp_to_dynamic_range` per component. When `mode == None`, the
+  RCT step is skipped and each component independently runs the
+  level-shift + clamp pair (so a `(p, signedness)`-mixed tile is
+  supported). `mode == Ict` is rejected with `NotImplemented` (wrong
+  kernel pairing).
+* `mct::reconstruct_tile_components_9x7(c0, c1, c2, out0, out1, out2,
+  descriptors, mode)` — f32 9-7 / ICT threading entry point. Runs
+  `inverse_ict` under the §G.3 prologue equality check, then for
+  each component rounds the f32 sample ties-to-even into i32 with
+  saturation at the cast point (so a pathological ICT-amplified
+  value stays well-defined), runs the inverse DC level-shift, then
+  clamps. `mode == Rct` is rejected.
+
+17 new lib tests cover the threading layer (suite total: 485 lib
+tests, was 467):
+
+* `thread_5x3_rct_unsigned_8bit_recovers_g_2_1_example` — `(R, G, B)
+  = (200, 100, 50)` round-trips through the §G.2.1 forward-RCT
+  encoder side then the threading layer back to itself exactly.
+* `thread_5x3_rct_unsigned_8bit_recovers_grayscale_diagonal` — every
+  `(k, k, k)` for `k ∈ 0..=255` round-trips exactly.
+* `thread_5x3_none_mode_independent_per_component_level_shift` — a
+  `(8, 10, 12)`-bit unsigned tile flows through `mode == None` with
+  each component getting its own `+2^(p − 1)` shift.
+* `thread_5x3_none_mode_signed_component_clamps_only` — signed
+  components skip the level-shift but still get clamped.
+* `thread_5x3_none_mode_clamps_overshoot` — an out-of-range
+  reconstructed sample is pulled to the `[0, 255]` bound.
+* `thread_5x3_rct_rejects_unequal_precision` /
+  `thread_5x3_rct_rejects_mixed_signedness` — the §G.2 prologue
+  uniform-`(precision, signedness)` rule is enforced under MCT.
+* `thread_5x3_rejects_ict_mode` — cross-kernel misrouting returns
+  `NotImplemented`.
+* `thread_5x3_rejects_mismatched_slice_lengths` /
+  `thread_5x3_rejects_non_three_descriptors` /
+  `thread_5x3_rejects_out_of_range_precision` — shape preflight.
+* `thread_9x7_ict_unsigned_8bit_recovers_rgb_sample` — `(72, -28,
+  -78)` shifted triple, encoder-side forward ICT, decoder-side
+  threading layer recovers `(200, 100, 50)` within ±1 LSB.
+* `thread_9x7_none_mode_round_then_level_shift_then_clamp` — the
+  full f32 → round → +shift → clamp chain on a five-sample lane.
+* `thread_9x7_ict_rejects_unequal_precision` — §G.3 prologue
+  equality check.
+* `thread_9x7_rejects_rct_mode` — cross-kernel misrouting.
+* `thread_9x7_rejects_output_length_mismatch` — output slot
+  shape preflight.
+* `thread_9x7_saturates_pathological_f32_input` — `1e30 / -1e30`
+  inputs saturate at the cast point and the §G.1.2 NOTE clamp
+  produces the documented end-state without panicking.
+* `descriptor_from_siz_component_preserves_precision_and_signedness`
+  — the SIZ-to-descriptor adapter drops sub-sampling factors and
+  preserves the two §G fields verbatim.
+
+Pending after r252:
+
+* Per-coefficient (not per-block) `Nb` — a code-block can mix
+  per-pass `Nb` values when the packet header's pass count stops
+  mid-bit-plane. The §B.12 walker bridge still inherits
+  `CodedCodeBlock`'s uniform-`Nb` contract.
+* `i64`-widened reversible-path threading for tile-components with
+  `Ssiz` > 31. The `mct::*_i64` level-shift primitives from earlier
+  rounds are in place; the threading layer's `i64` mirror is the
+  one-line composition.
+* Encoder MCT toggle in `encode_jpeg2000` (forward §G.2.1 / §G.3.1
+  + forward §G.1.1 primitives already exist; the missing piece is
+  the tile-reconstruction wiring picking between them based on
+  `Cod::mct`).
+* Top-level wiring inside `decode_jpeg2000` connecting the §B.12
+  walker → §F.3.1 IDWT cascade → §G threading layer.
+
+Previous round status follows:
+
 ## Status — 2026-06-07 (clean-room round 244)
 
 Round 244 lands the **§B.12 walker → `BlockSource` bridge** — the

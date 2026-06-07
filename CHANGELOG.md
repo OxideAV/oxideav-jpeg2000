@@ -6,6 +6,67 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 252 (2026-06-08).** T.800 Annex G **per-tile
+  three-component reconstruction threading** — the per-tile glue that
+  sits between the §F.3.1 IDWT cascade (`dwt::idwt_5x3` /
+  `dwt::idwt_9x7`) and the caller's final per-tile pixel buffer.
+  Composes the inverse multi-component transform, the per-component
+  inverse DC level shift, and the §G.1.2 NOTE dynamic-range clamp
+  into one entry point per kernel.
+  * `mct::ComponentDescriptor { precision_bits, is_signed }` — the
+    smallest per-component invariant the §G pipeline reads from the
+    SIZ marker. Built directly from a parsed `SizComponent` via
+    `mct::ComponentDescriptor::from_siz_component(&siz_c)`. Drops the
+    two SIZ sub-sampling factors because §G operates per `(x, y)`
+    after §B / §F have realised the per-component grid.
+  * `mct::InverseMctMode { None, Rct, Ict }` — the SGcod
+    multi-component-transform-byte dispatch enum (Table A.17). `None`
+    is Figure G.2; `Rct` is Figure G.1 paired with the 5-3 kernel;
+    `Ict` is Figure G.1 paired with the 9-7 kernel.
+  * `mct::reconstruct_tile_components_5x3(c0, c1, c2, descriptors,
+    mode)` — the i32 5-3 / RCT threading entry point. When `mode ==
+    Rct`, validates the §G.2 prologue "same separation and bit-depth"
+    rule (uniform `(precision_bits, is_signed)` across all three
+    descriptors → `Error::InvalidComponentCount` on mismatch), runs
+    `inverse_rct`, then per-component runs `inverse_dc_level_shift`
+    + `clamp_to_dynamic_range`. When `mode == None`, the inverse RCT
+    is skipped and each component is independently level-shifted +
+    clamped per its own descriptor (so a `(p, signedness)`-mixed
+    tile is supported). `mode == Ict` is rejected with
+    `Error::NotImplemented` (wrong kernel pairing — the 9-7 entry
+    point owns ICT).
+  * `mct::reconstruct_tile_components_9x7(c0, c1, c2, out0, out1,
+    out2, descriptors, mode)` — the f32 9-7 / ICT threading entry
+    point. Runs the inverse ICT when `mode == Ict` under the same
+    "same separation and bit-depth" enforcement, then for each
+    component rounds the f32 samples ties-to-even into i32 (with
+    saturation at the cast point so a pathological ICT-amplified
+    value is well-defined), level-shifts, and clamps. `mode == Rct`
+    is rejected with `Error::NotImplemented`.
+  * 17 new lib tests cover the threading layer. Recovery checks:
+    `(R, G, B) = (200, 100, 50)` round-trips through the §G.2.1
+    forward-RCT encoder side then the 5-3 / RCT threading layer back
+    to `(200, 100, 50)`; the 256-entry grayscale diagonal `(k, k,
+    k)` round-trips exactly across the same path; the analogous
+    9-7 / ICT round-trip lands within ±1 LSB of the input (matching
+    the §G.3.2 closing-paragraph "no required precision" rule).
+    Per-component independence: a `(8, 10, 12)`-bit unsigned tile
+    flows through `mode == None` with each component getting its
+    own `+2^(p - 1)` shift. Clamp: an oversized DWT output is
+    pulled to the unsigned-`[0, 255]` bound; a signed component
+    skips the level-shift and gets clamped to `[-128, 127]`.
+    Rejection paths: mismatched precision under MCT
+    (`InvalidComponentCount`); mismatched signedness under MCT;
+    cross-mode misrouting (`Ict` against the 5-3 entry / `Rct`
+    against the 9-7 entry, `NotImplemented`); mismatched slice
+    lengths (`InvalidMarkerLength`); non-three descriptor count
+    (`InvalidMarkerLength`); out-of-range precision
+    (`InvalidSamplePrecision`); 9-7 output-slot length mismatch
+    (`InvalidMarkerLength`); 9-7 saturation of a 1e30 / -1e30
+    pathological f32 input through the cast-saturate then
+    wrapping-level-shift then NOTE-clamp chain. Suite total: 485
+    lib tests (was 467).
+
 * **Clean-room round 244 (2026-06-07).** T.800 **§B.12 walker →
   `BlockSource` bridge** — the `reassemble::WalkerBlockSource<'a>`
   adapter that fans the §B.12 packet-walker's per-precinct output
