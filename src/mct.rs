@@ -74,6 +74,12 @@
 //!   clipping reconstructed samples to the original
 //!   `[0, 2^Ssiz - 1]` (unsigned) or
 //!   `[-2^(Ssiz-1), 2^(Ssiz-1) - 1]` (signed) range.
+//! * [`clamp_to_dynamic_range_i64`] — the `i64`-widened mirror of
+//!   the clamp helper, covering `precision ∈ 1..=38` (the full
+//!   Table A.11 range). Pairs symmetrically with the
+//!   `*_dc_level_shift_unsigned_i64` primitives so a caller staging
+//!   the `Ssiz ≥ 32` reconstruction path can close §G.1.2 entirely
+//!   in `i64`.
 //!
 //! ## What this module does NOT cover
 //!
@@ -520,9 +526,9 @@ pub fn inverse_dc_level_shift(
 /// # Errors
 ///
 /// Returns [`Error::InvalidSamplePrecision`] if `precision` is `0`
-/// or greater than `31`. Callers handling `Ssiz ≥ 32` should clamp
-/// in their own `i64` surface (the formula is the same one bit
-/// wider).
+/// or greater than `31`. Callers handling `Ssiz ≥ 32` should reach
+/// for [`clamp_to_dynamic_range_i64`] instead — that variant covers
+/// the full `precision ∈ 1..=38` Table A.11 range on an `i64` slice.
 pub fn clamp_to_dynamic_range(
     samples: &mut [i32],
     precision: u8,
@@ -541,6 +547,54 @@ pub fn clamp_to_dynamic_range(
             (1_i32 << precision) - 1
         };
         (0, span)
+    };
+    for s in samples.iter_mut() {
+        *s = (*s).clamp(lo, hi);
+    }
+    Ok(())
+}
+
+/// `i64`-widened mirror of [`clamp_to_dynamic_range`] — the §G.1.2
+/// NOTE's "typical solution" extended to the `Ssiz ≥ 32` corner of
+/// T.800 Table A.11.
+///
+/// Use when the caller has staged the reconstruction pipeline on
+/// `i64` buffers — i.e. after a call to
+/// [`inverse_dc_level_shift_unsigned_i64`] — and needs the matching
+/// post-quantization clip. The clip endpoints are the §G.1.2 NOTE
+/// formula widened one bit:
+///
+/// * **Unsigned**: `[0, 2^precision - 1]`.
+/// * **Signed**:   `[-2^(precision - 1), 2^(precision - 1) - 1]`.
+///
+/// The `precision == 38` endpoints are both representable in `i64`
+/// (`2^38 - 1` ≪ `i64::MAX`, `-2^37` ≫ `i64::MIN`), so unlike the
+/// `i32` variant there is no edge case at the upper bound — the
+/// shift `1_i64 << precision` is always well-defined for
+/// `precision ∈ 1..=38`.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidSamplePrecision`] if `precision` is `0`
+/// or greater than `38` (the T.800 Table A.11 upper bound on
+/// `Ssiz`). The 1..=31 `i64` range is accepted: a caller with a
+/// modest-precision component that still wants to share an `i64`
+/// buffer with a wider sibling pays only the wider clamp arithmetic,
+/// not a separate code path.
+pub fn clamp_to_dynamic_range_i64(
+    samples: &mut [i64],
+    precision: u8,
+    is_signed: bool,
+) -> Result<(), Error> {
+    if precision == 0 || precision > 38 {
+        return Err(Error::InvalidSamplePrecision);
+    }
+    let (lo, hi) = if is_signed {
+        let half: i64 = 1_i64 << (precision - 1);
+        (-half, half - 1)
+    } else {
+        let span: i64 = (1_i64 << precision) - 1;
+        (0_i64, span)
     };
     for s in samples.iter_mut() {
         *s = (*s).clamp(lo, hi);
@@ -1374,6 +1428,160 @@ mod tests {
         );
         assert!(clamp_to_dynamic_range(&mut s, 1, false).is_ok());
         assert!(clamp_to_dynamic_range(&mut s, 31, true).is_ok());
+    }
+
+    // -------------------------------------------------------------------
+    // §G.1.2 NOTE — `i64`-widened dynamic-range clipping.
+    // -------------------------------------------------------------------
+
+    /// Unsigned 8-bit clip on the `i64` surface matches the `i32`
+    /// variant byte-for-byte — the formula is the same, just one
+    /// integer-width wider.
+    #[test]
+    fn clamp_dynamic_range_i64_unsigned_8bit_matches_i32() {
+        let mut s = [-10_i64, 0, 1, 254, 255, 256, 1_000_000];
+        clamp_to_dynamic_range_i64(&mut s, 8, false).unwrap();
+        assert_eq!(s, [0_i64, 0, 1, 254, 255, 255, 255]);
+    }
+
+    /// Signed 12-bit clip on the `i64` surface — the `[-2048, 2047]`
+    /// window is unchanged from the `i32` formula.
+    #[test]
+    fn clamp_dynamic_range_i64_signed_12bit() {
+        let mut s = [-3_000_i64, -2_048, -1, 0, 2_047, 2_048, 10_000];
+        clamp_to_dynamic_range_i64(&mut s, 12, true).unwrap();
+        assert_eq!(s, [-2_048_i64, -2_048, -1, 0, 2_047, 2_047, 2_047]);
+    }
+
+    /// Unsigned 32-bit clip — the headline reason the `i64` surface
+    /// exists. Range `[0, 2^32 - 1]`; `i32::MIN`-class underflows
+    /// pull to 0; samples above `2^32 - 1` pull to `2^32 - 1`.
+    #[test]
+    fn clamp_dynamic_range_i64_unsigned_32bit() {
+        let span: i64 = (1_i64 << 32) - 1;
+        let mut s = [
+            -1_i64,
+            0,
+            1,
+            (1_i64 << 31), // 2^31 — well inside the 32-bit window
+            span,
+            span + 1,
+            i64::MAX,
+        ];
+        clamp_to_dynamic_range_i64(&mut s, 32, false).unwrap();
+        assert_eq!(s, [0_i64, 0, 1, 1_i64 << 31, span, span, span]);
+    }
+
+    /// Signed 32-bit clip — range `[-2^31, 2^31 - 1]` on the `i64`
+    /// surface. The endpoints both stay in range (untouched); values
+    /// straddling each end pull to the nearest endpoint.
+    #[test]
+    fn clamp_dynamic_range_i64_signed_32bit() {
+        let lo: i64 = -(1_i64 << 31);
+        let hi: i64 = (1_i64 << 31) - 1;
+        let mut s = [lo - 1, lo, -1, 0, hi, hi + 1, i64::MAX];
+        clamp_to_dynamic_range_i64(&mut s, 32, true).unwrap();
+        assert_eq!(s, [lo, lo, -1, 0, hi, hi, hi]);
+    }
+
+    /// Unsigned 38-bit clip — Table A.11's upper bound. Range
+    /// `[0, 2^38 - 1]`.
+    #[test]
+    fn clamp_dynamic_range_i64_unsigned_38bit_upper_bound() {
+        let span: i64 = (1_i64 << 38) - 1;
+        let mut s = [-1_i64, 0, span, span + 1, i64::MAX];
+        clamp_to_dynamic_range_i64(&mut s, 38, false).unwrap();
+        assert_eq!(s, [0_i64, 0, span, span, span]);
+    }
+
+    /// Signed 38-bit clip — Table A.11's upper bound on the signed
+    /// side. Range `[-2^37, 2^37 - 1]`.
+    #[test]
+    fn clamp_dynamic_range_i64_signed_38bit_upper_bound() {
+        let lo: i64 = -(1_i64 << 37);
+        let hi: i64 = (1_i64 << 37) - 1;
+        let mut s = [i64::MIN, lo - 1, lo, 0, hi, hi + 1, i64::MAX];
+        clamp_to_dynamic_range_i64(&mut s, 38, true).unwrap();
+        assert_eq!(s, [lo, lo, lo, 0, hi, hi, hi]);
+    }
+
+    /// `precision = 1` on the unsigned side — range `[0, 1]`. The
+    /// `i64` surface accepts 1-bit components too, mirroring how the
+    /// `*_dc_level_shift_unsigned_i64` primitives behave.
+    #[test]
+    fn clamp_dynamic_range_i64_unsigned_1bit() {
+        let mut s = [-5_i64, 0, 1, 2, i64::MAX];
+        clamp_to_dynamic_range_i64(&mut s, 1, false).unwrap();
+        assert_eq!(s, [0_i64, 0, 1, 1, 1]);
+    }
+
+    /// In-range samples are not modified — the clip is a pure
+    /// `clamp(lo, hi)`, not a quantize.
+    #[test]
+    fn clamp_dynamic_range_i64_in_range_passthrough() {
+        let original = [0_i64, 1, 100, 1_000, 65_535, 1_i64 << 36];
+        let mut s = original;
+        clamp_to_dynamic_range_i64(&mut s, 38, false).unwrap();
+        assert_eq!(s, original);
+    }
+
+    /// Empty slice is a valid (and cheap) call — the clip helper
+    /// must not assume at least one sample.
+    #[test]
+    fn clamp_dynamic_range_i64_empty_slice_ok() {
+        let mut s: [i64; 0] = [];
+        assert!(clamp_to_dynamic_range_i64(&mut s, 32, false).is_ok());
+        assert!(clamp_to_dynamic_range_i64(&mut s, 38, true).is_ok());
+    }
+
+    /// Out-of-range `precision` is reported — `0`, `39`, and `255`
+    /// all error; `1` and `38` are accepted (the `i64` surface
+    /// inherits the Table A.11 1..=38 window from the
+    /// `*_dc_level_shift_unsigned_i64` primitives).
+    #[test]
+    fn clamp_dynamic_range_i64_rejects_invalid_precision() {
+        let mut s = [0_i64; 4];
+        assert_eq!(
+            clamp_to_dynamic_range_i64(&mut s, 0, false),
+            Err(Error::InvalidSamplePrecision)
+        );
+        assert_eq!(
+            clamp_to_dynamic_range_i64(&mut s, 39, false),
+            Err(Error::InvalidSamplePrecision)
+        );
+        assert_eq!(
+            clamp_to_dynamic_range_i64(&mut s, 255, true),
+            Err(Error::InvalidSamplePrecision)
+        );
+        assert!(clamp_to_dynamic_range_i64(&mut s, 1, false).is_ok());
+        assert!(clamp_to_dynamic_range_i64(&mut s, 38, true).is_ok());
+    }
+
+    /// Composes with the `i64` inverse DC level shift: after
+    /// `inverse_dc_level_shift_unsigned_i64`, the clip pulls any
+    /// post-quantization overshoot back into the `[0, 2^p - 1]`
+    /// unsigned window. Uses `precision = 32` so the chain exercises
+    /// the surface the `i32`-only primitives cannot reach.
+    #[test]
+    fn clamp_dynamic_range_i64_composes_with_inverse_level_shift_32bit() {
+        // Reconstructed centred samples — three in-range plus one
+        // overshoot above the encoded peak and one undershoot below.
+        let span: i64 = (1_i64 << 32) - 1;
+        let mut s: Vec<i64> = vec![
+            -(1_i64 << 31),       // post-IDWT lower endpoint (centred)
+            0,                    // middle of the centred window
+            (1_i64 << 31) - 1,    // post-IDWT upper endpoint (centred)
+            (1_i64 << 31),        // overshoot above the centred window
+            -(1_i64 << 31) - 100, // undershoot below the centred window
+        ];
+        inverse_dc_level_shift_unsigned_i64(&mut s, 32).unwrap();
+        // After the inverse shift the buffer is on the un-centred
+        // `[0, 2^32 - 1]` scale plus the two overshoot samples.
+        assert_eq!(s[0], 0);
+        assert_eq!(s[2], span);
+        clamp_to_dynamic_range_i64(&mut s, 32, false).unwrap();
+        // Overshoot pulls to the unsigned top; undershoot pulls to 0.
+        assert_eq!(s, vec![0_i64, 1_i64 << 31, span, span, 0]);
     }
 
     // -------------------------------------------------------------------

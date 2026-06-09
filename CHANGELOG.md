@@ -6,6 +6,26 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 265 (2026-06-09).** T.800 §G.1.2 NOTE
+  **`i64`-widened dynamic-range clip** — `Ssiz ≥ 32` mirror of
+  `clamp_to_dynamic_range`, completing the `i64` §G.1 primitive set
+  alongside the existing `*_dc_level_shift_unsigned_i64` pair.
+  * `mct::clamp_to_dynamic_range_i64(samples, precision, is_signed)`
+    — `precision ∈ 1..=38` (the full Table A.11 range); unsigned
+    clip is `[0, 2^precision - 1]`, signed clip is
+    `[-2^(precision - 1), 2^(precision - 1) - 1]`. Out-of-range
+    `precision` (`0`, `> 38`) reports
+    `Error::InvalidSamplePrecision`. Empty slices are accepted.
+  * 11 new lib tests: i32 / i64 endpoint parity at 8-bit unsigned;
+    12-bit signed; 32-bit unsigned + signed (the headline reason for
+    the `i64` surface — `1_i32 << 32` would overflow); 38-bit
+    unsigned + signed (Table A.11 upper bound); 1-bit unsigned
+    corner; in-range passthrough; empty-slice ok; out-of-range
+    `precision` rejection (`0`, `39`, `255`); composition with
+    `inverse_dc_level_shift_unsigned_i64(_, 32)` showing the chain
+    pulls overshoot back to `[0, 2^32 - 1]`. Suite total: 496 lib
+    tests (was 485).
+
 * **Clean-room round 252 (2026-06-08).** T.800 Annex G **per-tile
   three-component reconstruction threading** — the per-tile glue that
   sits between the §F.3.1 IDWT cascade (`dwt::idwt_5x3` /

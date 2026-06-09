@@ -3,6 +3,68 @@
 Pure-Rust JPEG 2000 (J2K + JP2) and High-Throughput JPEG 2000 (HTJ2K)
 codec.
 
+## Status — 2026-06-09 (clean-room round 265)
+
+Round 265 closes the **`i64`-widened §G.1.2 NOTE clip** — the
+`Ssiz ≥ 32` mirror of `clamp_to_dynamic_range` callers need to stage
+a full §G.1 inverse pipeline on `i64` buffers without paying the
+`i32` upper bound:
+
+* `mct::clamp_to_dynamic_range_i64(samples, precision, is_signed)` —
+  one-bit-wider clip helper. `precision ∈ 1..=38` (the full Table
+  A.11 range), unsigned clip is `[0, 2^precision - 1]`, signed clip
+  is `[-2^(precision - 1), 2^(precision - 1) - 1]`. Out-of-range
+  `precision` reports `Error::InvalidSamplePrecision`.
+
+Why the helper exists: the `i32`-only `clamp_to_dynamic_range` caps
+at `precision = 31` because `1_i32 << 31` overflows the signed
+type — Table A.11 lets `Ssiz` go up to `38`. The same algebra rolls
+out one bit wider on `i64`, and pairs symmetrically with the
+existing `*_dc_level_shift_unsigned_i64` primitives so a caller
+already staging the `Ssiz ≥ 32` reconstruction path on `i64` buffers
+can close §G.1.2 in one call without bridging back to `i32`.
+
+11 new lib tests cover the `i64` clip (suite total: 496 lib tests,
+was 485):
+
+* `clamp_dynamic_range_i64_unsigned_8bit_matches_i32` — same
+  endpoints as the `i32` variant on the modest-precision side.
+* `clamp_dynamic_range_i64_signed_12bit` — `[-2048, 2047]` window on
+  the `i64` surface.
+* `clamp_dynamic_range_i64_unsigned_32bit` /
+  `clamp_dynamic_range_i64_signed_32bit` — `Ssiz = 32` headline,
+  the precision the `i32` primitive cannot represent.
+* `clamp_dynamic_range_i64_unsigned_38bit_upper_bound` /
+  `clamp_dynamic_range_i64_signed_38bit_upper_bound` — Table A.11
+  upper endpoint, both signedness flavours.
+* `clamp_dynamic_range_i64_unsigned_1bit` — modest-precision corner.
+* `clamp_dynamic_range_i64_in_range_passthrough` — pure
+  `clamp(lo, hi)`, no quantize-style rounding.
+* `clamp_dynamic_range_i64_empty_slice_ok` — empty input is a valid
+  cheap call.
+* `clamp_dynamic_range_i64_rejects_invalid_precision` — `0` / `39` /
+  `255` rejected; `1` / `38` accepted.
+* `clamp_dynamic_range_i64_composes_with_inverse_level_shift_32bit`
+  — chains `inverse_dc_level_shift_unsigned_i64(_, 32)` with the new
+  clip and verifies the end-state pulls overshoot to the
+  `[0, 2^32 - 1]` window.
+
+Pending after r265:
+
+* `i64`-widened reversible-path threading entry point itself — the
+  three primitive `*_i64` pieces (forward + inverse DC level-shift,
+  clip) are all in place; the threading mirror of
+  `reconstruct_tile_components_5x3` on `i64` buffers is the
+  remaining composition.
+* Encoder MCT toggle in `encode_jpeg2000` (forward §G.2.1 / §G.3.1
+  + forward §G.1.1 primitives already exist; the missing piece is
+  the tile-reconstruction wiring picking between them based on
+  `Cod::mct`).
+* Top-level wiring inside `decode_jpeg2000` connecting the §B.12
+  walker → §F.3.1 IDWT cascade → §G threading layer.
+
+Previous round status follows:
+
 ## Status — 2026-06-08 (clean-room round 252)
 
 Round 252 lands the T.800 Annex G **per-tile three-component
