@@ -6,6 +6,41 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 273 (2026-06-10).** T.800 §G.2
+  **multi-component reversible reconstruction dispatcher** — the
+  §G.2 generalisation of the fixed-arity three-component threading.
+  §G.2 specifies that the RCT "is a decorrelating transformation
+  applied to the first three components of an image (indexed as 0, 1
+  and 2)"; an image may legally carry any component count `≥ 1`
+  (greyscale, two-plane, RGBA, multispectral), so the transform must
+  run on `(0, 1, 2)` while components with index `≥ 3` flow through
+  the Figure G.2 placement (level-shift + clamp only).
+  * `mct::reconstruct_tile_components_5x3_multi(components,
+    descriptors, mode)` — `components: &mut [&mut [i32]]` paired
+    `1:1` with `descriptors`. `mode == Rct` runs the §G.2.2 inverse
+    RCT on the first three components (enforcing the §G.2 prologue
+    "same separation and bit-depth" rule on those three inputs only)
+    then level-shifts + clamps every component per its own
+    descriptor; index-`≥ 3` components are never touched by the
+    transform and may each carry a distinct
+    `(precision_bits, is_signed)` pair. `mode == None` is the pure
+    Figure G.2 path at any count `≥ 1`. `Rct` is rejected for
+    `components.len() < 3` (a COD marker cannot legally signal an RCT
+    on fewer than three components). `Ict` is rejected
+    (`Error::NotImplemented` — wrong / `f32` surface). Empty
+    collection, count mismatch, ragged per-component lengths, and
+    out-of-range precision (any descriptor, including pass-through)
+    are rejected up front.
+  * 13 new lib tests: three-component parity with the fixed-arity
+    §G.2.1 worked example; four-component RGBA alpha pass-through
+    (10-bit alpha distinct from the 8-bit RCT triple); single-
+    and two-component `None`-mode level-shift; five-component
+    multispectral `None`-mode loop past the three-component
+    boundary; `Rct`-rejects-fewer-than-three; first-three unequal
+    precision rejection with a legal index-3 present; ICT-mode
+    rejection; empty / count-mismatch / ragged-length / out-of-range
+    precision rejections. Suite total: 508 lib tests (was 496).
+
 * **Clean-room round 265 (2026-06-09).** T.800 §G.1.2 NOTE
   **`i64`-widened dynamic-range clip** — `Ssiz ≥ 32` mirror of
   `clamp_to_dynamic_range`, completing the `i64` §G.1 primitive set

@@ -772,6 +772,126 @@ pub fn reconstruct_tile_components_5x3(
     Ok(())
 }
 
+/// Thread the §G.2.2 inverse RCT + §G.1.2 per-component inverse DC
+/// level shift + §G.1.2-NOTE clamp across an **arbitrary** number of
+/// reconstructed reversible-path tile-components — the multi-component
+/// generalisation of [`reconstruct_tile_components_5x3`].
+///
+/// T.800 §G.2 says the RCT "is a decorrelating transformation applied
+/// to the **first three** components of an image (indexed as 0, 1 and
+/// 2)". An image is not required to carry exactly three components: a
+/// single-component greyscale tile, a two-component pair, or a
+/// four-plus-component image (e.g. RGBA, or a multispectral scene) are
+/// all legal. This entry point realises that rule:
+///
+/// * `mode == InverseMctMode::Rct` runs [`inverse_rct`] on components
+///   `(0, 1, 2)` **only when at least three components are present**.
+///   Components with index `≥ 3` are never touched by the transform —
+///   they flow through the Figure G.2 placement (level-shift + clamp
+///   only), exactly as the §G.2 "first three" wording requires. When
+///   fewer than three components are present, no RCT can run: the
+///   `Rct` mode is rejected for `components.len() < 3` (a one- or
+///   two-component tile cannot legally signal an RCT in the COD
+///   marker — there is nothing for Equations G-6..G-8 to operate on).
+/// * `mode == InverseMctMode::None` is the pure Figure G.2 path for
+///   any component count `≥ 1`: every component is independently
+///   level-shifted + clamped per its own descriptor.
+///
+/// The §G.2 "same separation and bit-depth" prologue constraint is
+/// enforced on components `(0, 1, 2)` only (the transform inputs) when
+/// `mode == InverseMctMode::Rct`; the index-`≥ 3` pass-through
+/// components may each carry their own distinct
+/// `(precision_bits, is_signed)` pair.
+///
+/// `components[i]` is paired with `descriptors[i]`; the two slices must
+/// have the same length, and every component slice must share a common
+/// per-sample length (the §G "same separation on the reference grid"
+/// half of the prologue — already realised by the §B / §F layers).
+///
+/// # Errors
+///
+/// * [`Error::InvalidMarkerLength`] if `components.is_empty()`, if
+///   `components.len() != descriptors.len()`, or if the component
+///   slices do not all share a common length.
+/// * [`Error::InvalidSamplePrecision`] if any descriptor's
+///   `precision_bits` is `0` or greater than `31` (the `i32`
+///   reversible-path surface bound).
+/// * [`Error::InvalidComponentCount`] if `mode ==
+///   InverseMctMode::Rct` and either fewer than three components are
+///   present, or the first three descriptors do not all share the
+///   same `(precision_bits, is_signed)` pair (the §G.2 prologue
+///   constraint).
+/// * [`Error::NotImplemented`] if `mode == InverseMctMode::Ict`
+///   (wrong entry point — ICT is the 9-7 / `f32` surface, see
+///   [`reconstruct_tile_components_9x7`]).
+pub fn reconstruct_tile_components_5x3_multi(
+    components: &mut [&mut [i32]],
+    descriptors: &[ComponentDescriptor],
+    mode: InverseMctMode,
+) -> Result<(), Error> {
+    if components.is_empty() {
+        return Err(Error::InvalidMarkerLength);
+    }
+    if components.len() != descriptors.len() {
+        return Err(Error::InvalidMarkerLength);
+    }
+    // §G "same separation on the reference grid": every component
+    // realised onto the same per-tile grid carries the same sample
+    // count. Validate up-front so a length mismatch on a late
+    // component does not surface only after the RCT has mutated
+    // (0, 1, 2).
+    let len = components[0].len();
+    for c in components.iter() {
+        if c.len() != len {
+            return Err(Error::InvalidMarkerLength);
+        }
+    }
+    for d in descriptors {
+        if d.precision_bits == 0 || d.precision_bits > 31 {
+            return Err(Error::InvalidSamplePrecision);
+        }
+    }
+    match mode {
+        InverseMctMode::Ict => {
+            // ICT is the 9-7 irreversible / f32 path.
+            return Err(Error::NotImplemented);
+        }
+        InverseMctMode::Rct => {
+            // §G.2: the RCT operates on the first three components.
+            // A COD marker cannot legally signal an RCT for a tile
+            // with fewer than three components.
+            if components.len() < 3 {
+                return Err(Error::InvalidComponentCount);
+            }
+            // §G.2 prologue "same separation and bit-depth" — checked
+            // on the three transform inputs only. The index-≥3
+            // pass-through components are free to differ.
+            let d0 = descriptors[0];
+            if descriptors[1] != d0 || descriptors[2] != d0 {
+                return Err(Error::InvalidComponentCount);
+            }
+            // Split off the first three slices so the borrow checker
+            // accepts three simultaneous &mut into the component
+            // collection.
+            let (head, _tail) = components.split_at_mut(3);
+            if let [c0, c1, c2] = head {
+                inverse_rct(c0, c1, c2)?;
+            }
+        }
+        InverseMctMode::None => {
+            // Figure G.2 path — no MCT applied at any component count.
+        }
+    }
+    // Per-component inverse DC level shift (§G.1.2 Eq. G-2) +
+    // §G.1.2 NOTE dynamic-range clamp across every component, MCT'd or
+    // pass-through alike.
+    for (slice, d) in components.iter_mut().zip(descriptors.iter()) {
+        inverse_dc_level_shift(slice, d.precision_bits, d.is_signed)?;
+        clamp_to_dynamic_range(slice, d.precision_bits, d.is_signed)?;
+    }
+    Ok(())
+}
+
 /// Thread the §G.3.2 inverse ICT + §G.1.2 per-component inverse DC
 /// level shift + §G.1.2-NOTE clamp across three reconstructed
 /// irreversible-path tile-components.
@@ -1812,6 +1932,197 @@ mod tests {
             ),
             Err(Error::InvalidSamplePrecision)
         );
+    }
+
+    // -------------------------------------------------------------------
+    // §G.2 multi-component generalisation — RCT on the first three
+    // components, pass-through on index ≥ 3.
+    // -------------------------------------------------------------------
+
+    /// Multi-component RCT with exactly three components matches the
+    /// fixed-arity §G.2.1 worked example: the multi entry point is a
+    /// drop-in superset of `reconstruct_tile_components_5x3`.
+    #[test]
+    fn thread_5x3_multi_rct_three_components_matches_fixed_arity() {
+        let mut c0 = [-16_i32];
+        let mut c1 = [-50_i32];
+        let mut c2 = [100_i32];
+        let descs = [d_unsigned(8), d_unsigned(8), d_unsigned(8)];
+        let mut comps: [&mut [i32]; 3] = [&mut c0, &mut c1, &mut c2];
+        reconstruct_tile_components_5x3_multi(&mut comps, &descs, InverseMctMode::Rct).unwrap();
+        assert_eq!(c0[0], 200);
+        assert_eq!(c1[0], 100);
+        assert_eq!(c2[0], 50);
+    }
+
+    /// Four-component RCT image (e.g. RGBA): the §G.2 transform touches
+    /// only components `(0, 1, 2)`; the index-3 alpha plane flows
+    /// through the Figure G.2 placement (level-shift + clamp only) and
+    /// is recovered untransformed. The alpha plane carries its own
+    /// distinct descriptor (different precision) — legal because the
+    /// "same bit-depth" prologue binds only the three transform inputs.
+    #[test]
+    fn thread_5x3_multi_rct_four_components_alpha_passthrough() {
+        // (R, G, B) = (200, 100, 50) pre-RCT'd as in the §G.2.1
+        // example; alpha (index 3) is an independent 10-bit plane whose
+        // DWT output is 0 → level shift gives +512.
+        let mut c0 = [-16_i32];
+        let mut c1 = [-50_i32];
+        let mut c2 = [100_i32];
+        let mut c3 = [0_i32];
+        let descs = [d_unsigned(8), d_unsigned(8), d_unsigned(8), d_unsigned(10)];
+        let mut comps: [&mut [i32]; 4] = [&mut c0, &mut c1, &mut c2, &mut c3];
+        reconstruct_tile_components_5x3_multi(&mut comps, &descs, InverseMctMode::Rct).unwrap();
+        assert_eq!(c0[0], 200);
+        assert_eq!(c1[0], 100);
+        assert_eq!(c2[0], 50);
+        // Alpha plane: 0 + 2^(10-1) = 512, clamp no-op.
+        assert_eq!(c3[0], 512);
+    }
+
+    /// Single-component greyscale tile, no MCT: pure Figure G.2 path at
+    /// component count 1. The lone plane is level-shifted + clamped.
+    #[test]
+    fn thread_5x3_multi_none_single_component() {
+        let mut c0 = [0_i32, 100, -200, 200];
+        let descs = [d_unsigned(8)];
+        let mut comps: [&mut [i32]; 1] = [&mut c0];
+        reconstruct_tile_components_5x3_multi(&mut comps, &descs, InverseMctMode::None).unwrap();
+        // +128 then clamp to [0, 255].
+        assert_eq!(c0, [128_i32, 228, 0, 255]);
+    }
+
+    /// Two-component tile, no MCT: each plane independently
+    /// level-shifted + clamped per its own descriptor.
+    #[test]
+    fn thread_5x3_multi_none_two_components() {
+        let mut c0 = [0_i32, 100];
+        let mut c1 = [0_i32, 100];
+        let descs = [d_unsigned(8), d_unsigned(12)];
+        let mut comps: [&mut [i32]; 2] = [&mut c0, &mut c1];
+        reconstruct_tile_components_5x3_multi(&mut comps, &descs, InverseMctMode::None).unwrap();
+        assert_eq!(c0, [128_i32, 228]);
+        assert_eq!(c1, [2048_i32, 2148]);
+    }
+
+    /// RCT requires at least three components: a two-component tile
+    /// cannot legally signal an RCT in the COD marker.
+    #[test]
+    fn thread_5x3_multi_rct_rejects_fewer_than_three() {
+        let mut c0 = [0_i32];
+        let mut c1 = [0_i32];
+        let descs = [d_unsigned(8), d_unsigned(8)];
+        let mut comps: [&mut [i32]; 2] = [&mut c0, &mut c1];
+        assert_eq!(
+            reconstruct_tile_components_5x3_multi(&mut comps, &descs, InverseMctMode::Rct),
+            Err(Error::InvalidComponentCount)
+        );
+    }
+
+    /// The §G.2 "same bit-depth" prologue binds the three transform
+    /// inputs: an RCT with components `(0, 1, 2)` of mixed precision is
+    /// rejected even when a legal index-3 component is present.
+    #[test]
+    fn thread_5x3_multi_rct_rejects_unequal_precision_on_first_three() {
+        let mut c0 = [0_i32];
+        let mut c1 = [0_i32];
+        let mut c2 = [0_i32];
+        let mut c3 = [0_i32];
+        let descs = [d_unsigned(8), d_unsigned(10), d_unsigned(8), d_unsigned(8)];
+        let mut comps: [&mut [i32]; 4] = [&mut c0, &mut c1, &mut c2, &mut c3];
+        assert_eq!(
+            reconstruct_tile_components_5x3_multi(&mut comps, &descs, InverseMctMode::Rct),
+            Err(Error::InvalidComponentCount)
+        );
+    }
+
+    /// ICT mode is rejected on the reversible multi entry point (wrong
+    /// surface — ICT operates on `f32`).
+    #[test]
+    fn thread_5x3_multi_rejects_ict_mode() {
+        let mut c0 = [0_i32];
+        let mut c1 = [0_i32];
+        let mut c2 = [0_i32];
+        let descs = [d_unsigned(8); 3];
+        let mut comps: [&mut [i32]; 3] = [&mut c0, &mut c1, &mut c2];
+        assert_eq!(
+            reconstruct_tile_components_5x3_multi(&mut comps, &descs, InverseMctMode::Ict),
+            Err(Error::NotImplemented)
+        );
+    }
+
+    /// Empty component collection is rejected.
+    #[test]
+    fn thread_5x3_multi_rejects_empty() {
+        let descs: [ComponentDescriptor; 0] = [];
+        let mut comps: [&mut [i32]; 0] = [];
+        assert_eq!(
+            reconstruct_tile_components_5x3_multi(&mut comps, &descs, InverseMctMode::None),
+            Err(Error::InvalidMarkerLength)
+        );
+    }
+
+    /// Mismatched component / descriptor counts are rejected.
+    #[test]
+    fn thread_5x3_multi_rejects_count_mismatch() {
+        let mut c0 = [0_i32];
+        let mut c1 = [0_i32];
+        let descs = [d_unsigned(8); 3];
+        let mut comps: [&mut [i32]; 2] = [&mut c0, &mut c1];
+        assert_eq!(
+            reconstruct_tile_components_5x3_multi(&mut comps, &descs, InverseMctMode::None),
+            Err(Error::InvalidMarkerLength)
+        );
+    }
+
+    /// Component slices that do not share a common length are rejected
+    /// (the §G "same separation on the reference grid" rule).
+    #[test]
+    fn thread_5x3_multi_rejects_ragged_lengths() {
+        let mut c0 = [0_i32, 0];
+        let mut c1 = [0_i32];
+        let mut c2 = [0_i32, 0];
+        let descs = [d_unsigned(8); 3];
+        let mut comps: [&mut [i32]; 3] = [&mut c0, &mut c1, &mut c2];
+        assert_eq!(
+            reconstruct_tile_components_5x3_multi(&mut comps, &descs, InverseMctMode::Rct),
+            Err(Error::InvalidMarkerLength)
+        );
+    }
+
+    /// Out-of-range precision on any descriptor (including an index-≥3
+    /// pass-through component) is rejected up front.
+    #[test]
+    fn thread_5x3_multi_rejects_out_of_range_precision() {
+        let mut c0 = [0_i32];
+        let mut c1 = [0_i32];
+        let mut c2 = [0_i32];
+        let mut c3 = [0_i32];
+        let descs = [d_unsigned(8), d_unsigned(8), d_unsigned(8), d_unsigned(32)];
+        let mut comps: [&mut [i32]; 4] = [&mut c0, &mut c1, &mut c2, &mut c3];
+        assert_eq!(
+            reconstruct_tile_components_5x3_multi(&mut comps, &descs, InverseMctMode::Rct),
+            Err(Error::InvalidSamplePrecision)
+        );
+    }
+
+    /// Five-component multispectral tile, no MCT: every plane is
+    /// independently level-shifted + clamped. Exercises the loop past
+    /// the three-component boundary on the Figure G.2 path.
+    #[test]
+    fn thread_5x3_multi_none_five_components() {
+        let mut planes: Vec<Vec<i32>> = (0..5).map(|_| vec![0_i32, 300, -300]).collect();
+        let descs = [d_unsigned(8); 5];
+        {
+            let mut comps: Vec<&mut [i32]> = planes.iter_mut().map(|p| p.as_mut_slice()).collect();
+            reconstruct_tile_components_5x3_multi(&mut comps, &descs, InverseMctMode::None)
+                .unwrap();
+        }
+        for p in &planes {
+            // 0 + 128 = 128; 300 + 128 = 428 → clamp 255; -300 + 128 =
+            // -172 → clamp 0.
+            assert_eq!(p.as_slice(), [128_i32, 255, 0]);
+        }
     }
 
     /// 9-7 + ICT + unsigned 8-bit: the §G.3.1 forward ICT on the
