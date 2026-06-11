@@ -3,6 +3,64 @@
 Pure-Rust JPEG 2000 (J2K + JP2) and High-Throughput JPEG 2000 (HTJ2K)
 codec.
 
+## Status — 2026-06-11 (clean-room round 278)
+
+Round 278 closes the **§G.3 multi-component irreversible
+reconstruction dispatcher** — the 9-7 / `f32` mirror of round 273's
+`reconstruct_tile_components_5x3_multi`, completing the §G
+multi-component surface for both kernels:
+
+* `mct::reconstruct_tile_components_9x7_multi(components, outputs,
+  descriptors, mode)` — `components: &mut [&mut [f32]]` paired `1:1`
+  with `outputs: &mut [&mut [i32]]` and `descriptors`. §G.3 carries
+  the same "applied to the first three components of an image
+  (indexed as 0, 1 and 2)" wording as §G.2, so `mode == Ict` runs
+  the §G.3.2 inverse ICT on components `(0, 1, 2)` (enforcing the
+  §G.3 prologue "same separation and bit-depth" rule on those three
+  inputs only) while index-`≥ 3` components flow through the Figure
+  G.2 placement untransformed — each rounded ties-to-even into its
+  `i32` output slot (saturating at the cast point), level-shifted
+  and clamped per its own descriptor. `mode == None` is the pure
+  Figure G.2 path at any component count `≥ 1`. `Ict` is rejected
+  for fewer than three components; `Rct` is rejected
+  (`Error::NotImplemented` — wrong / `i32` surface). Empty
+  collection, count mismatches, ragged component lengths, short
+  output slots, and out-of-range precision are all rejected before
+  the ICT mutates anything.
+* Shared `round_f32_into_i32` helper factored out of the fixed-arity
+  9-7 entry point — both paths integerise through the same
+  ties-to-even + saturating code.
+
+14 new lib tests (suite total: 522, was 508): fixed-arity output
+parity on the §G.3.1 forward-ICT'd `(200, 100, 50)` sample (±1 LSB
+per the §G.3.2 "no required precision" rule); RGBA alpha
+pass-through with a distinct 10-bit descriptor; single- / two- /
+five-component `None`-mode; `Ict`-rejects-fewer-than-three;
+first-three unequal-precision + mixed-signedness rejections with a
+legal index-3 present; RCT-mode rejection; empty / count-mismatch /
+ragged-length / short-output / out-of-range-precision rejections;
+pathological `±1e30` saturation parity.
+
+(Round 273 landed the 5-3 / `i32` half of this pair:
+`reconstruct_tile_components_5x3_multi`, the §G.2 RCT dispatcher
+with the same first-three / pass-through split — see CHANGELOG.)
+
+Pending after r278:
+
+* `i64`-widened reversible-path threading entry point — the three
+  primitive `*_i64` pieces (forward + inverse DC level-shift, clip)
+  are all in place; the threading mirror of
+  `reconstruct_tile_components_5x3` on `i64` buffers is the
+  remaining composition.
+* Encoder MCT toggle in `encode_jpeg2000` (forward §G.2.1 / §G.3.1
+  + forward §G.1.1 primitives already exist; the missing piece is
+  the tile-reconstruction wiring picking between them based on
+  `Cod::mct`).
+* Top-level wiring inside `decode_jpeg2000` connecting the §B.12
+  walker → §F.3.1 IDWT cascade → §G threading layer.
+
+Previous round status follows:
+
 ## Status — 2026-06-09 (clean-room round 265)
 
 Round 265 closes the **`i64`-widened §G.1.2 NOTE clip** — the

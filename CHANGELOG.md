@@ -6,6 +6,50 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 278 (2026-06-11).** T.800 §G.3
+  **multi-component irreversible reconstruction dispatcher** — the
+  9-7 / `f32` mirror of round 273's
+  `reconstruct_tile_components_5x3_multi`, closing the §G multi
+  surface for both kernels. §G.3 carries the same "applied to the
+  first three components of an image (indexed as 0, 1 and 2)"
+  wording as §G.2, so the ICT runs on `(0, 1, 2)` while components
+  with index `≥ 3` flow through the Figure G.2 placement (round +
+  level-shift + clamp only).
+  * `mct::reconstruct_tile_components_9x7_multi(components, outputs,
+    descriptors, mode)` — `components: &mut [&mut [f32]]` paired
+    `1:1` with `outputs: &mut [&mut [i32]]` and `descriptors`.
+    `mode == Ict` runs the §G.3.2 inverse ICT on the first three
+    components (enforcing the §G.3 prologue "same separation and
+    bit-depth" rule on those three inputs only), then per component
+    rounds ties-to-even into the `i32` output slot (saturating at
+    the cast point), level-shifts and clamps per its own
+    descriptor; index-`≥ 3` components are never touched by the
+    transform. `mode == None` is the pure Figure G.2 path at any
+    count `≥ 1`. `Ict` is rejected for `components.len() < 3` (a
+    COD marker cannot legally signal an ICT on fewer than three
+    components); `Rct` is rejected (`Error::NotImplemented` —
+    `i32` / 5-3 surface). Empty collection, count mismatches
+    (components vs outputs vs descriptors), ragged component
+    lengths, short output slots, and out-of-range precision are all
+    rejected up front, before the ICT mutates anything.
+  * Shared `round_f32_into_i32` helper factored out of the
+    fixed-arity 9-7 entry point — both paths now integerise through
+    the same ties-to-even + saturating code.
+  * 14 new lib tests: three-component output parity with the
+    fixed-arity entry point on the §G.3.1 forward-ICT'd
+    `(200, 100, 50)` sample (±1 LSB recovery per the §G.3.2 "no
+    required precision" rule); four-component RGBA alpha
+    pass-through (10-bit alpha distinct from the 8-bit ICT triple);
+    single- / two-component `None`-mode round + level-shift;
+    five-component multispectral `None`-mode loop past the
+    three-component boundary; `Ict`-rejects-fewer-than-three;
+    first-three unequal-precision and mixed-signedness rejections
+    with a legal index-3 present; RCT-mode rejection; empty /
+    count-mismatch (both flavours) / ragged-length / short-output /
+    out-of-range-precision rejections; pathological `1e30` / `-1e30`
+    saturation parity with the fixed-arity test. Suite total: 522
+    lib tests (was 508).
+
 * **Clean-room round 273 (2026-06-10).** T.800 §G.2
   **multi-component reversible reconstruction dispatcher** — the
   §G.2 generalisation of the fixed-arity three-component threading.

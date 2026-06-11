@@ -988,27 +988,175 @@ pub fn reconstruct_tile_components_9x7(
         (&*c1, out1, descriptors[1]),
         (&*c2, out2, descriptors[2]),
     ] {
-        for (s, o) in src.iter().zip(dst.iter_mut()) {
-            // f32::round_ties_even is the IEEE-754 default
-            // rounding mode and matches the "no required precision"
-            // language of §G.3.2 closing paragraph: the rounding
-            // direction is a decoder choice, and ties-to-even is
-            // the only choice that is statistically unbiased on
-            // arbitrary fractional inputs.
-            let r = s.round_ties_even();
-            // Saturate before the cast — an ICT-amplified sample
-            // can wander outside the i32 range on a pathological
-            // input, and the subsequent §G.1.2 NOTE clamp will pull
-            // it back to the descriptor range anyway. Saturating
-            // here keeps the cast well-defined.
-            *o = if r >= i32::MAX as f32 {
-                i32::MAX
-            } else if r <= i32::MIN as f32 {
-                i32::MIN
-            } else {
-                r as i32
-            };
+        round_f32_into_i32(src, dst);
+        inverse_dc_level_shift(dst, d.precision_bits, d.is_signed)?;
+        clamp_to_dynamic_range(dst, d.precision_bits, d.is_signed)?;
+    }
+    Ok(())
+}
+
+/// Round one component's `f32` reconstructed samples to `i32`
+/// ties-to-even, saturating at the cast point.
+///
+/// `f32::round_ties_even` is the IEEE-754 default rounding mode and
+/// matches the "no required precision" language of the §G.3.2 closing
+/// paragraph: the rounding direction is a decoder choice, and
+/// ties-to-even is the only choice that is statistically unbiased on
+/// arbitrary fractional inputs. The saturation keeps the cast
+/// well-defined when an ICT-amplified sample wanders outside the
+/// `i32` range on a pathological input — the subsequent §G.1.2 NOTE
+/// clamp pulls it back to the descriptor range anyway.
+///
+/// Caller guarantees `src.len() == dst.len()`.
+fn round_f32_into_i32(src: &[f32], dst: &mut [i32]) {
+    for (s, o) in src.iter().zip(dst.iter_mut()) {
+        let r = s.round_ties_even();
+        *o = if r >= i32::MAX as f32 {
+            i32::MAX
+        } else if r <= i32::MIN as f32 {
+            i32::MIN
+        } else {
+            r as i32
+        };
+    }
+}
+
+/// Thread the §G.3.2 inverse ICT + §G.1.2 per-component inverse DC
+/// level shift + §G.1.2-NOTE clamp across an **arbitrary** number of
+/// reconstructed irreversible-path tile-components — the
+/// multi-component generalisation of
+/// [`reconstruct_tile_components_9x7`], and the 9-7 / `f32` mirror of
+/// [`reconstruct_tile_components_5x3_multi`].
+///
+/// T.800 §G.3 says the ICT "is a decorrelating transformation applied
+/// to the **first three** components of an image (indexed as 0, 1 and
+/// 2)" — the same "first three" wording as the §G.2 RCT. An image is
+/// not required to carry exactly three components, so this entry
+/// point realises that rule on the irreversible surface:
+///
+/// * `mode == InverseMctMode::Ict` runs [`inverse_ict`] on components
+///   `(0, 1, 2)` **only when at least three components are present**.
+///   Components with index `≥ 3` are never touched by the transform —
+///   they flow through the Figure G.2 placement (round, level-shift
+///   and clamp only). When fewer than three components are present,
+///   the `Ict` mode is rejected (a one- or two-component tile cannot
+///   legally signal an ICT in the COD marker — there is nothing for
+///   Equations G-12..G-14 to operate on).
+/// * `mode == InverseMctMode::None` is the pure Figure G.2 path for
+///   any component count `≥ 1`: every component is independently
+///   rounded, level-shifted and clamped per its own descriptor.
+///
+/// The §G.3 "same separation and bit-depth" prologue constraint is
+/// enforced on components `(0, 1, 2)` only (the transform inputs)
+/// when `mode == InverseMctMode::Ict`; the index-`≥ 3` pass-through
+/// components may each carry their own distinct
+/// `(precision_bits, is_signed)` pair.
+///
+/// `components[i]` is paired `1:1` with `outputs[i]` and
+/// `descriptors[i]`. Every component slice must share a common
+/// per-sample length (the §G "same separation on the reference grid"
+/// half of the prologue — already realised by the §B / §F layers),
+/// and every output slice must carry that same length. After the
+/// (optional) inverse ICT, each component's `f32` samples are rounded
+/// ties-to-even into the matching `outputs[i]` slot with saturation
+/// at the cast point, then level-shifted + clamped per
+/// `descriptors[i]` — the same integerisation contract as the
+/// fixed-arity 9-7 entry point.
+///
+/// `mode == InverseMctMode::Rct` is rejected: RCT operates on `i32`
+/// (T.800 §G.2.2), so the 5-3 path uses
+/// [`reconstruct_tile_components_5x3_multi`] instead.
+///
+/// # Errors
+///
+/// * [`Error::InvalidMarkerLength`] if `components.is_empty()`, if
+///   `components`, `outputs` and `descriptors` do not all share a
+///   common count, or if the component / output slices do not all
+///   share a common length.
+/// * [`Error::InvalidSamplePrecision`] if any descriptor's
+///   `precision_bits` is `0` or greater than `31` (the `i32` output
+///   surface bound).
+/// * [`Error::InvalidComponentCount`] if `mode ==
+///   InverseMctMode::Ict` and either fewer than three components are
+///   present, or the first three descriptors do not all share the
+///   same `(precision_bits, is_signed)` pair (the §G.3 prologue
+///   constraint).
+/// * [`Error::NotImplemented`] if `mode == InverseMctMode::Rct`
+///   (wrong entry point — RCT is the 5-3 / `i32` surface, see
+///   [`reconstruct_tile_components_5x3_multi`]).
+pub fn reconstruct_tile_components_9x7_multi(
+    components: &mut [&mut [f32]],
+    outputs: &mut [&mut [i32]],
+    descriptors: &[ComponentDescriptor],
+    mode: InverseMctMode,
+) -> Result<(), Error> {
+    if components.is_empty() {
+        return Err(Error::InvalidMarkerLength);
+    }
+    if components.len() != outputs.len() || components.len() != descriptors.len() {
+        return Err(Error::InvalidMarkerLength);
+    }
+    // §G "same separation on the reference grid": every component
+    // realised onto the same per-tile grid carries the same sample
+    // count, and each output slot must match. Validate up-front so a
+    // length mismatch on a late component does not surface only after
+    // the ICT has mutated (0, 1, 2).
+    let len = components[0].len();
+    for c in components.iter() {
+        if c.len() != len {
+            return Err(Error::InvalidMarkerLength);
         }
+    }
+    for o in outputs.iter() {
+        if o.len() != len {
+            return Err(Error::InvalidMarkerLength);
+        }
+    }
+    for d in descriptors {
+        if d.precision_bits == 0 || d.precision_bits > 31 {
+            return Err(Error::InvalidSamplePrecision);
+        }
+    }
+    match mode {
+        InverseMctMode::Rct => {
+            // RCT is the 5-3 reversible / i32 path.
+            return Err(Error::NotImplemented);
+        }
+        InverseMctMode::Ict => {
+            // §G.3: the ICT operates on the first three components.
+            // A COD marker cannot legally signal an ICT for a tile
+            // with fewer than three components.
+            if components.len() < 3 {
+                return Err(Error::InvalidComponentCount);
+            }
+            // §G.3 prologue "same separation and bit-depth" — checked
+            // on the three transform inputs only. The index-≥3
+            // pass-through components are free to differ.
+            let d0 = descriptors[0];
+            if descriptors[1] != d0 || descriptors[2] != d0 {
+                return Err(Error::InvalidComponentCount);
+            }
+            // Split off the first three slices so the borrow checker
+            // accepts three simultaneous &mut into the component
+            // collection.
+            let (head, _tail) = components.split_at_mut(3);
+            if let [c0, c1, c2] = head {
+                inverse_ict(c0, c1, c2)?;
+            }
+        }
+        InverseMctMode::None => {
+            // Figure G.2 path — no MCT applied at any component count.
+        }
+    }
+    // Per-component round-to-nearest-even integerisation + inverse DC
+    // level shift (§G.1.2 Eq. G-2) + §G.1.2 NOTE dynamic-range clamp
+    // across every component, MCT'd or pass-through alike.
+    for ((src, dst), d) in components
+        .iter()
+        .zip(outputs.iter_mut())
+        .zip(descriptors.iter())
+    {
+        round_f32_into_i32(src, dst);
         inverse_dc_level_shift(dst, d.precision_bits, d.is_signed)?;
         clamp_to_dynamic_range(dst, d.precision_bits, d.is_signed)?;
     }
@@ -2307,5 +2455,423 @@ mod tests {
         assert_eq!(o0, [0_i32, 0, 128]);
         assert_eq!(o1, [128_i32, 128, 128]);
         assert_eq!(o2, [128_i32, 128, 128]);
+    }
+
+    // -------------------------------------------------------------------
+    // reconstruct_tile_components_9x7_multi — §G.3 multi-component
+    // generalisation.
+    // -------------------------------------------------------------------
+
+    /// Multi-component ICT with exactly three components matches the
+    /// fixed-arity entry point on the §G.3.1 forward-ICT'd
+    /// `(200, 100, 50)` sample: the multi entry point is a drop-in
+    /// superset of `reconstruct_tile_components_9x7`.
+    #[test]
+    fn thread_9x7_multi_ict_three_components_matches_fixed_arity() {
+        // Encoder side: forward-shift then forward-ICT.
+        let mut a0 = [72.0_f32];
+        let mut a1 = [-28.0_f32];
+        let mut a2 = [-78.0_f32];
+        forward_ict(&mut a0, &mut a1, &mut a2).unwrap();
+        let descs = [d_unsigned(8), d_unsigned(8), d_unsigned(8)];
+
+        // Fixed-arity reference.
+        let (mut f0, mut f1, mut f2) = (a0, a1, a2);
+        let mut r0 = [0_i32];
+        let mut r1 = [0_i32];
+        let mut r2 = [0_i32];
+        reconstruct_tile_components_9x7(
+            &mut f0,
+            &mut f1,
+            &mut f2,
+            &mut r0,
+            &mut r1,
+            &mut r2,
+            &descs,
+            InverseMctMode::Ict,
+        )
+        .unwrap();
+
+        // Multi entry point on the same inputs.
+        let (mut m0, mut m1, mut m2) = (a0, a1, a2);
+        let mut o0 = [0_i32];
+        let mut o1 = [0_i32];
+        let mut o2 = [0_i32];
+        {
+            let mut comps: [&mut [f32]; 3] = [&mut m0, &mut m1, &mut m2];
+            let mut outs: [&mut [i32]; 3] = [&mut o0, &mut o1, &mut o2];
+            reconstruct_tile_components_9x7_multi(
+                &mut comps,
+                &mut outs,
+                &descs,
+                InverseMctMode::Ict,
+            )
+            .unwrap();
+        }
+        assert_eq!((o0[0], o1[0], o2[0]), (r0[0], r1[0], r2[0]));
+        // And the recovered triple lands within ±1 LSB of the source
+        // (the §G.3 coefficients are informative per §G.3.2 closing
+        // paragraph).
+        assert!((o0[0] - 200).abs() <= 1, "I0 = {} (want ~200)", o0[0]);
+        assert!((o1[0] - 100).abs() <= 1, "I1 = {} (want ~100)", o1[0]);
+        assert!((o2[0] - 50).abs() <= 1, "I2 = {} (want ~50)", o2[0]);
+    }
+
+    /// Four-component ICT image (e.g. RGBA): the §G.3 transform
+    /// touches only components `(0, 1, 2)`; the index-3 alpha plane
+    /// flows through the Figure G.2 placement (round + level-shift +
+    /// clamp only) and is recovered untransformed. The alpha plane
+    /// carries its own distinct descriptor (different precision) —
+    /// legal because the "same bit-depth" prologue binds only the
+    /// three transform inputs.
+    #[test]
+    fn thread_9x7_multi_ict_four_components_alpha_passthrough() {
+        let mut a0 = [72.0_f32];
+        let mut a1 = [-28.0_f32];
+        let mut a2 = [-78.0_f32];
+        forward_ict(&mut a0, &mut a1, &mut a2).unwrap();
+        // Alpha (index 3) is an independent 10-bit plane whose DWT
+        // output is 0.25 → rounds to 0 → level shift gives +512.
+        let mut a3 = [0.25_f32];
+        let descs = [d_unsigned(8), d_unsigned(8), d_unsigned(8), d_unsigned(10)];
+        let mut o0 = [0_i32];
+        let mut o1 = [0_i32];
+        let mut o2 = [0_i32];
+        let mut o3 = [0_i32];
+        {
+            let mut comps: [&mut [f32]; 4] = [&mut a0, &mut a1, &mut a2, &mut a3];
+            let mut outs: [&mut [i32]; 4] = [&mut o0, &mut o1, &mut o2, &mut o3];
+            reconstruct_tile_components_9x7_multi(
+                &mut comps,
+                &mut outs,
+                &descs,
+                InverseMctMode::Ict,
+            )
+            .unwrap();
+        }
+        assert!((o0[0] - 200).abs() <= 1, "I0 = {} (want ~200)", o0[0]);
+        assert!((o1[0] - 100).abs() <= 1, "I1 = {} (want ~100)", o1[0]);
+        assert!((o2[0] - 50).abs() <= 1, "I2 = {} (want ~50)", o2[0]);
+        // Alpha plane: round(0.25) = 0, then 0 + 2^(10-1) = 512.
+        assert_eq!(o3[0], 512);
+    }
+
+    /// Single-component greyscale tile, no MCT: pure Figure G.2 path
+    /// at component count 1 on the f32 surface — round, level-shift,
+    /// clamp.
+    #[test]
+    fn thread_9x7_multi_none_single_component() {
+        let mut c0 = [0.0_f32, 0.4, -0.6, 100.0, -200.0];
+        let mut o0 = [0_i32; 5];
+        let descs = [d_unsigned(8)];
+        {
+            let mut comps: [&mut [f32]; 1] = [&mut c0];
+            let mut outs: [&mut [i32]; 1] = [&mut o0];
+            reconstruct_tile_components_9x7_multi(
+                &mut comps,
+                &mut outs,
+                &descs,
+                InverseMctMode::None,
+            )
+            .unwrap();
+        }
+        // Same expectations as the fixed-arity None-mode test.
+        assert_eq!(o0, [128_i32, 128, 127, 228, 0]);
+    }
+
+    /// Two-component tile, no MCT: each plane independently rounded +
+    /// level-shifted + clamped per its own descriptor.
+    #[test]
+    fn thread_9x7_multi_none_two_components() {
+        let mut c0 = [0.0_f32, 100.0];
+        let mut c1 = [0.0_f32, 100.0];
+        let mut o0 = [0_i32; 2];
+        let mut o1 = [0_i32; 2];
+        let descs = [d_unsigned(8), d_unsigned(12)];
+        {
+            let mut comps: [&mut [f32]; 2] = [&mut c0, &mut c1];
+            let mut outs: [&mut [i32]; 2] = [&mut o0, &mut o1];
+            reconstruct_tile_components_9x7_multi(
+                &mut comps,
+                &mut outs,
+                &descs,
+                InverseMctMode::None,
+            )
+            .unwrap();
+        }
+        assert_eq!(o0, [128_i32, 228]);
+        assert_eq!(o1, [2048_i32, 2148]);
+    }
+
+    /// Five-component multispectral tile, no MCT: every plane is
+    /// independently rounded + level-shifted + clamped. Exercises the
+    /// loop past the three-component boundary on the Figure G.2 path.
+    #[test]
+    fn thread_9x7_multi_none_five_components() {
+        let mut planes: Vec<Vec<f32>> = (0..5).map(|_| vec![0.0_f32, 300.0, -300.0]).collect();
+        let mut outs_storage: Vec<Vec<i32>> = (0..5).map(|_| vec![0_i32; 3]).collect();
+        let descs = [d_unsigned(8); 5];
+        {
+            let mut comps: Vec<&mut [f32]> = planes.iter_mut().map(|p| p.as_mut_slice()).collect();
+            let mut outs: Vec<&mut [i32]> =
+                outs_storage.iter_mut().map(|p| p.as_mut_slice()).collect();
+            reconstruct_tile_components_9x7_multi(
+                &mut comps,
+                &mut outs,
+                &descs,
+                InverseMctMode::None,
+            )
+            .unwrap();
+        }
+        for o in &outs_storage {
+            // 0 + 128 = 128; 300 + 128 = 428 → clamp 255;
+            // -300 + 128 = -172 → clamp 0.
+            assert_eq!(o.as_slice(), [128_i32, 255, 0]);
+        }
+    }
+
+    /// ICT requires at least three components: a two-component tile
+    /// cannot legally signal an ICT in the COD marker.
+    #[test]
+    fn thread_9x7_multi_ict_rejects_fewer_than_three() {
+        let mut c0 = [0.0_f32];
+        let mut c1 = [0.0_f32];
+        let mut o0 = [0_i32];
+        let mut o1 = [0_i32];
+        let descs = [d_unsigned(8), d_unsigned(8)];
+        let mut comps: [&mut [f32]; 2] = [&mut c0, &mut c1];
+        let mut outs: [&mut [i32]; 2] = [&mut o0, &mut o1];
+        assert_eq!(
+            reconstruct_tile_components_9x7_multi(
+                &mut comps,
+                &mut outs,
+                &descs,
+                InverseMctMode::Ict
+            ),
+            Err(Error::InvalidComponentCount)
+        );
+    }
+
+    /// The §G.3 "same bit-depth" prologue binds the three transform
+    /// inputs: an ICT with components `(0, 1, 2)` of mixed precision
+    /// is rejected even when a legal index-3 component is present.
+    #[test]
+    fn thread_9x7_multi_ict_rejects_unequal_precision_on_first_three() {
+        let mut c0 = [0.0_f32];
+        let mut c1 = [0.0_f32];
+        let mut c2 = [0.0_f32];
+        let mut c3 = [0.0_f32];
+        let mut o0 = [0_i32];
+        let mut o1 = [0_i32];
+        let mut o2 = [0_i32];
+        let mut o3 = [0_i32];
+        let descs = [d_unsigned(8), d_unsigned(10), d_unsigned(8), d_unsigned(8)];
+        let mut comps: [&mut [f32]; 4] = [&mut c0, &mut c1, &mut c2, &mut c3];
+        let mut outs: [&mut [i32]; 4] = [&mut o0, &mut o1, &mut o2, &mut o3];
+        assert_eq!(
+            reconstruct_tile_components_9x7_multi(
+                &mut comps,
+                &mut outs,
+                &descs,
+                InverseMctMode::Ict
+            ),
+            Err(Error::InvalidComponentCount)
+        );
+    }
+
+    /// The §G.3 prologue also binds signedness — mixed signedness on
+    /// the three transform inputs is rejected.
+    #[test]
+    fn thread_9x7_multi_ict_rejects_mixed_signedness_on_first_three() {
+        let mut c0 = [0.0_f32];
+        let mut c1 = [0.0_f32];
+        let mut c2 = [0.0_f32];
+        let mut o0 = [0_i32];
+        let mut o1 = [0_i32];
+        let mut o2 = [0_i32];
+        let descs = [d_unsigned(8), d_signed(8), d_unsigned(8)];
+        let mut comps: [&mut [f32]; 3] = [&mut c0, &mut c1, &mut c2];
+        let mut outs: [&mut [i32]; 3] = [&mut o0, &mut o1, &mut o2];
+        assert_eq!(
+            reconstruct_tile_components_9x7_multi(
+                &mut comps,
+                &mut outs,
+                &descs,
+                InverseMctMode::Ict
+            ),
+            Err(Error::InvalidComponentCount)
+        );
+    }
+
+    /// RCT mode is rejected on the irreversible multi entry point
+    /// (wrong surface — RCT operates on `i32`).
+    #[test]
+    fn thread_9x7_multi_rejects_rct_mode() {
+        let mut c0 = [0.0_f32];
+        let mut c1 = [0.0_f32];
+        let mut c2 = [0.0_f32];
+        let mut o0 = [0_i32];
+        let mut o1 = [0_i32];
+        let mut o2 = [0_i32];
+        let descs = [d_unsigned(8); 3];
+        let mut comps: [&mut [f32]; 3] = [&mut c0, &mut c1, &mut c2];
+        let mut outs: [&mut [i32]; 3] = [&mut o0, &mut o1, &mut o2];
+        assert_eq!(
+            reconstruct_tile_components_9x7_multi(
+                &mut comps,
+                &mut outs,
+                &descs,
+                InverseMctMode::Rct
+            ),
+            Err(Error::NotImplemented)
+        );
+    }
+
+    /// Empty component collection is rejected.
+    #[test]
+    fn thread_9x7_multi_rejects_empty() {
+        let descs: [ComponentDescriptor; 0] = [];
+        let mut comps: [&mut [f32]; 0] = [];
+        let mut outs: [&mut [i32]; 0] = [];
+        assert_eq!(
+            reconstruct_tile_components_9x7_multi(
+                &mut comps,
+                &mut outs,
+                &descs,
+                InverseMctMode::None
+            ),
+            Err(Error::InvalidMarkerLength)
+        );
+    }
+
+    /// Mismatched component / output / descriptor counts are rejected.
+    #[test]
+    fn thread_9x7_multi_rejects_count_mismatch() {
+        let mut c0 = [0.0_f32];
+        let mut c1 = [0.0_f32];
+        let mut o0 = [0_i32];
+        let mut o1 = [0_i32];
+
+        // components vs descriptors mismatch.
+        let descs3 = [d_unsigned(8); 3];
+        let mut comps: [&mut [f32]; 2] = [&mut c0, &mut c1];
+        let mut outs: [&mut [i32]; 2] = [&mut o0, &mut o1];
+        assert_eq!(
+            reconstruct_tile_components_9x7_multi(
+                &mut comps,
+                &mut outs,
+                &descs3,
+                InverseMctMode::None
+            ),
+            Err(Error::InvalidMarkerLength)
+        );
+
+        // components vs outputs mismatch.
+        let descs2 = [d_unsigned(8); 2];
+        let mut comps: [&mut [f32]; 2] = [&mut c0, &mut c1];
+        let mut outs1: [&mut [i32]; 1] = [&mut o0];
+        assert_eq!(
+            reconstruct_tile_components_9x7_multi(
+                &mut comps,
+                &mut outs1,
+                &descs2,
+                InverseMctMode::None
+            ),
+            Err(Error::InvalidMarkerLength)
+        );
+    }
+
+    /// Component slices that do not share a common length are rejected
+    /// (the §G "same separation on the reference grid" rule), as are
+    /// output slots that do not match the component length.
+    #[test]
+    fn thread_9x7_multi_rejects_ragged_lengths() {
+        // Ragged component slices.
+        let mut c0 = [0.0_f32, 0.0];
+        let mut c1 = [0.0_f32];
+        let mut c2 = [0.0_f32, 0.0];
+        let mut o0 = [0_i32; 2];
+        let mut o1 = [0_i32];
+        let mut o2 = [0_i32; 2];
+        let descs = [d_unsigned(8); 3];
+        let mut comps: [&mut [f32]; 3] = [&mut c0, &mut c1, &mut c2];
+        let mut outs: [&mut [i32]; 3] = [&mut o0, &mut o1, &mut o2];
+        assert_eq!(
+            reconstruct_tile_components_9x7_multi(
+                &mut comps,
+                &mut outs,
+                &descs,
+                InverseMctMode::Ict
+            ),
+            Err(Error::InvalidMarkerLength)
+        );
+
+        // Uniform components but one short output slot.
+        let mut c0 = [0.0_f32, 0.0];
+        let mut c1 = [0.0_f32, 0.0];
+        let mut c2 = [0.0_f32, 0.0];
+        let mut o0 = [0_i32; 2];
+        let mut o1 = [0_i32];
+        let mut o2 = [0_i32; 2];
+        let mut comps: [&mut [f32]; 3] = [&mut c0, &mut c1, &mut c2];
+        let mut outs: [&mut [i32]; 3] = [&mut o0, &mut o1, &mut o2];
+        assert_eq!(
+            reconstruct_tile_components_9x7_multi(
+                &mut comps,
+                &mut outs,
+                &descs,
+                InverseMctMode::Ict
+            ),
+            Err(Error::InvalidMarkerLength)
+        );
+    }
+
+    /// Out-of-range precision on any descriptor (including an
+    /// index-≥3 pass-through component) is rejected up front.
+    #[test]
+    fn thread_9x7_multi_rejects_out_of_range_precision() {
+        let mut c0 = [0.0_f32];
+        let mut c1 = [0.0_f32];
+        let mut c2 = [0.0_f32];
+        let mut c3 = [0.0_f32];
+        let mut o0 = [0_i32];
+        let mut o1 = [0_i32];
+        let mut o2 = [0_i32];
+        let mut o3 = [0_i32];
+        let descs = [d_unsigned(8), d_unsigned(8), d_unsigned(8), d_unsigned(32)];
+        let mut comps: [&mut [f32]; 4] = [&mut c0, &mut c1, &mut c2, &mut c3];
+        let mut outs: [&mut [i32]; 4] = [&mut o0, &mut o1, &mut o2, &mut o3];
+        assert_eq!(
+            reconstruct_tile_components_9x7_multi(
+                &mut comps,
+                &mut outs,
+                &descs,
+                InverseMctMode::Ict
+            ),
+            Err(Error::InvalidSamplePrecision)
+        );
+    }
+
+    /// Pathological f32 inputs saturate at the cast point on the
+    /// multi surface exactly as on the fixed-arity entry point.
+    #[test]
+    fn thread_9x7_multi_saturates_pathological_f32_input() {
+        let mut c0 = [1e30_f32, -1e30, 0.0];
+        let mut o0 = [0_i32; 3];
+        let descs = [d_unsigned(8)];
+        {
+            let mut comps: [&mut [f32]; 1] = [&mut c0];
+            let mut outs: [&mut [i32]; 1] = [&mut o0];
+            reconstruct_tile_components_9x7_multi(
+                &mut comps,
+                &mut outs,
+                &descs,
+                InverseMctMode::None,
+            )
+            .unwrap();
+        }
+        // Same expectations as the fixed-arity saturation test:
+        // saturate → wrapping level shift → §G.1.2 NOTE clamp.
+        assert_eq!(o0, [0_i32, 0, 128]);
     }
 }
