@@ -231,6 +231,84 @@ pub fn forward_rct(c0: &mut [i32], c1: &mut [i32], c2: &mut [i32]) -> Result<(),
     Ok(())
 }
 
+/// `i64`-widened inverse Reversible Component Transform — T.800
+/// §G.2.2 for the full Table A.11 `Ssiz ≤ 38` range.
+///
+/// Same Equations G-6, G-7, G-8 as [`inverse_rct`], rolled out one
+/// word wider. Use when the SIZ-marker component precision exceeds
+/// 31 bits and the caller has staged the reversible reconstruction
+/// pipeline on `i64` buffers (paired with
+/// [`inverse_dc_level_shift_unsigned_i64`] and
+/// [`clamp_to_dynamic_range_i64`]). The §G.2.1 NOTE about `Y1` / `Y2`
+/// carrying one bit more precision than the original components means
+/// a 38-bit component's transform coefficients need 39 bits — far
+/// inside `i64`, so unlike the `i32` surface no wrapping can fire on
+/// any legal Table A.11 input.
+///
+/// The `⌊·/4⌋` floor-toward-minus-infinity convention is realised by
+/// the same arithmetic-right-shift-by-two as the `i32` variant.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidMarkerLength`] if the three slices do not
+/// share a common length.
+pub fn inverse_rct_i64(c0: &mut [i64], c1: &mut [i64], c2: &mut [i64]) -> Result<(), Error> {
+    if c0.len() != c1.len() || c1.len() != c2.len() {
+        return Err(Error::InvalidMarkerLength);
+    }
+    for i in 0..c0.len() {
+        let y0 = c0[i];
+        let y1 = c1[i];
+        let y2 = c2[i];
+        // I1 = Y0 - ⌊(Y2 + Y1) / 4⌋        (§G.2.2 Eq. G-6)
+        let sum = y2.wrapping_add(y1);
+        let floor_div4 = sum >> 2;
+        let i1 = y0.wrapping_sub(floor_div4);
+        // I0 = Y2 + I1                      (§G.2.2 Eq. G-7)
+        let i0 = y2.wrapping_add(i1);
+        // I2 = Y1 + I1                      (§G.2.2 Eq. G-8)
+        let i2 = y1.wrapping_add(i1);
+        c0[i] = i0;
+        c1[i] = i1;
+        c2[i] = i2;
+    }
+    Ok(())
+}
+
+/// `i64`-widened forward Reversible Component Transform — T.800
+/// §G.2.1 for the full Table A.11 `Ssiz ≤ 38` range.
+///
+/// Same Equations G-3, G-4, G-5 as [`forward_rct`], one word wider.
+/// Provided so the test battery (and the encoder MCT toggle round)
+/// can round-trip §G.2.1 → §G.2.2 on `Ssiz ≥ 32` sample values that
+/// the `i32` surface cannot represent.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidMarkerLength`] if the three slices do not
+/// share a common length.
+pub fn forward_rct_i64(c0: &mut [i64], c1: &mut [i64], c2: &mut [i64]) -> Result<(), Error> {
+    if c0.len() != c1.len() || c1.len() != c2.len() {
+        return Err(Error::InvalidMarkerLength);
+    }
+    for i in 0..c0.len() {
+        let r = c0[i];
+        let g = c1[i];
+        let b = c2[i];
+        // Y0 = ⌊(I0 + 2 I1 + I2) / 4⌋      (§G.2.1 Eq. G-3)
+        let sum = r.wrapping_add(g.wrapping_mul(2)).wrapping_add(b);
+        let y0 = sum >> 2;
+        // Y1 = I2 - I1                      (§G.2.1 Eq. G-4)
+        let y1 = b.wrapping_sub(g);
+        // Y2 = I0 - I1                      (§G.2.1 Eq. G-5)
+        let y2 = r.wrapping_sub(g);
+        c0[i] = y0;
+        c1[i] = y1;
+        c2[i] = y2;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // §G.3 — Irreversible Component Transform (linear / lossy).
 // ---------------------------------------------------------------------------
@@ -888,6 +966,112 @@ pub fn reconstruct_tile_components_5x3_multi(
     for (slice, d) in components.iter_mut().zip(descriptors.iter()) {
         inverse_dc_level_shift(slice, d.precision_bits, d.is_signed)?;
         clamp_to_dynamic_range(slice, d.precision_bits, d.is_signed)?;
+    }
+    Ok(())
+}
+
+/// `i64`-widened mirror of [`reconstruct_tile_components_5x3`] —
+/// the §G.2.2 inverse RCT + §G.1.2 inverse DC level shift +
+/// §G.1.2-NOTE clamp threading for tile-components whose SIZ-marker
+/// precision exceeds the `i32` surface's 31-bit bound.
+///
+/// T.800 Table A.11 admits `Ssiz` up to 38 bits; the `i32` threading
+/// entry point caps at 31 because the `1 << (Ssiz - 1)` level-shift
+/// constant and the `[0, 2^Ssiz - 1]` clamp endpoint stop being
+/// representable. This mirror composes the three `i64` primitives
+/// that landed for exactly this purpose —
+/// [`inverse_rct_i64`], [`inverse_dc_level_shift_unsigned_i64`], and
+/// [`clamp_to_dynamic_range_i64`] — into the same Figure G.1
+/// (`mode == InverseMctMode::Rct`) / Figure G.2
+/// (`mode == InverseMctMode::None`) sequence:
+///
+/// 1. If `mode == InverseMctMode::Rct`, enforce the §G.2 prologue
+///    "same separation and bit-depth" rule on `descriptors[0..3]`
+///    and run [`inverse_rct_i64`].
+/// 2. Per component: inverse DC level shift (§G.1.2 Eq. G-2) for
+///    unsigned descriptors — signed components are not shifted, per
+///    the §G.1.2 prologue "components that are unsigned only" rule.
+/// 3. Per component: [`clamp_to_dynamic_range_i64`], the §G.1.2 NOTE
+///    "typical solution" clip.
+///
+/// The accepted `precision_bits` window is the full Table A.11
+/// `1..=38` range — a modest-precision component sharing an `i64`
+/// staging buffer with a wide sibling flows through unchanged, so a
+/// caller does not have to split a mixed-precision tile across the
+/// two surfaces.
+///
+/// `mode == InverseMctMode::Ict` is rejected: ICT is the 9-7 / `f32`
+/// surface — see [`reconstruct_tile_components_9x7`].
+///
+/// # Errors
+///
+/// * [`Error::InvalidMarkerLength`] if the three slices do not share
+///   a common length, or if `descriptors.len() != 3`.
+/// * [`Error::InvalidSamplePrecision`] if any descriptor's
+///   `precision_bits` is `0` or greater than `38` (the Table A.11
+///   upper bound on `Ssiz`).
+/// * [`Error::InvalidComponentCount`] if `mode ==
+///   InverseMctMode::Rct` and the three descriptors do not all share
+///   the same `(precision_bits, is_signed)` pair (the §G.2 prologue
+///   constraint).
+/// * [`Error::NotImplemented`] if `mode == InverseMctMode::Ict`
+///   (wrong entry point — see [`reconstruct_tile_components_9x7`]).
+pub fn reconstruct_tile_components_5x3_i64(
+    c0: &mut [i64],
+    c1: &mut [i64],
+    c2: &mut [i64],
+    descriptors: &[ComponentDescriptor],
+    mode: InverseMctMode,
+) -> Result<(), Error> {
+    if c0.len() != c1.len() || c1.len() != c2.len() {
+        return Err(Error::InvalidMarkerLength);
+    }
+    if descriptors.len() != 3 {
+        return Err(Error::InvalidMarkerLength);
+    }
+    // Validate every descriptor's precision before doing any work, so
+    // a bad descriptor[2] doesn't get caught only after RCT +
+    // level-shift on (0, 1) have run. The bound is the Table A.11
+    // `Ssiz ≤ 38` ceiling, not the `i32` surface's 31.
+    for d in descriptors {
+        if d.precision_bits == 0 || d.precision_bits > 38 {
+            return Err(Error::InvalidSamplePrecision);
+        }
+    }
+    match mode {
+        InverseMctMode::Ict => {
+            // ICT is the 9-7 irreversible / f32 path.
+            return Err(Error::NotImplemented);
+        }
+        InverseMctMode::Rct => {
+            // §G.2 prologue: "The three components input into the RCT
+            // shall have the same separation on the reference grid and
+            // the same bit-depth." Separation is honoured by the
+            // caller's matched-length slices; bit-depth (and
+            // signedness) is checked here.
+            let d0 = descriptors[0];
+            if descriptors[1] != d0 || descriptors[2] != d0 {
+                return Err(Error::InvalidComponentCount);
+            }
+            inverse_rct_i64(c0, c1, c2)?;
+        }
+        InverseMctMode::None => {
+            // Figure G.2 path — per-component level-shift + clamp only.
+        }
+    }
+    // Per-component inverse DC level shift (§G.1.2 Eq. G-2) + §G.1.2
+    // NOTE dynamic-range clamp. The §G.1.2 prologue shifts unsigned
+    // components only; precision is already validated above, so the
+    // signed branch simply skips the shift.
+    for (slice, d) in [
+        (c0 as &mut [i64], descriptors[0]),
+        (c1, descriptors[1]),
+        (c2, descriptors[2]),
+    ] {
+        if !d.is_signed {
+            inverse_dc_level_shift_unsigned_i64(slice, d.precision_bits)?;
+        }
+        clamp_to_dynamic_range_i64(slice, d.precision_bits, d.is_signed)?;
     }
     Ok(())
 }
@@ -2270,6 +2454,315 @@ mod tests {
             // 0 + 128 = 128; 300 + 128 = 428 → clamp 255; -300 + 128 =
             // -172 → clamp 0.
             assert_eq!(p.as_slice(), [128_i32, 255, 0]);
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // §G.2 i64-widened surface — RCT primitives + threading mirror
+    // for the Table A.11 `Ssiz ≥ 32` corner.
+    // -------------------------------------------------------------------
+
+    /// `i64` forward RCT matches the §G.2.1 worked example —
+    /// `(200, 100, 50)` → `(112, -50, 100)` (same arithmetic as the
+    /// `i32` variant on narrow inputs).
+    #[test]
+    fn forward_rct_i64_matches_g_2_1_worked_example() {
+        let mut c0 = [200_i64];
+        let mut c1 = [100_i64];
+        let mut c2 = [50_i64];
+        forward_rct_i64(&mut c0, &mut c1, &mut c2).unwrap();
+        assert_eq!(c0[0], 112);
+        assert_eq!(c1[0], -50);
+        assert_eq!(c2[0], 100);
+    }
+
+    /// `i64` inverse RCT matches the §G.2.2 worked example —
+    /// `(112, -50, 100)` → `(200, 100, 50)`.
+    #[test]
+    fn inverse_rct_i64_matches_g_2_2_worked_example() {
+        let mut c0 = [112_i64];
+        let mut c1 = [-50_i64];
+        let mut c2 = [100_i64];
+        inverse_rct_i64(&mut c0, &mut c1, &mut c2).unwrap();
+        assert_eq!(c0[0], 200);
+        assert_eq!(c1[0], 100);
+        assert_eq!(c2[0], 50);
+    }
+
+    /// `i64` inverse RCT matches the `i32` variant sample-for-sample
+    /// across a probe set that exercises the negative-sum floor
+    /// (`(Y2 + Y1) >> 2` toward minus infinity) on both surfaces.
+    #[test]
+    fn inverse_rct_i64_matches_i32_on_narrow_inputs() {
+        let y0 = [-16_i32, 0, 7, -7, 100, -100, i16::MAX as i32];
+        let y1 = [-50_i32, 1, -1, 3, -3, 99, -99];
+        let y2 = [100_i32, -1, 1, -3, 3, -99, 99];
+        let mut a32 = y0;
+        let mut b32 = y1;
+        let mut c32 = y2;
+        inverse_rct(&mut a32, &mut b32, &mut c32).unwrap();
+        let mut a64: Vec<i64> = y0.iter().map(|&v| v as i64).collect();
+        let mut b64: Vec<i64> = y1.iter().map(|&v| v as i64).collect();
+        let mut c64: Vec<i64> = y2.iter().map(|&v| v as i64).collect();
+        inverse_rct_i64(&mut a64, &mut b64, &mut c64).unwrap();
+        for i in 0..y0.len() {
+            assert_eq!(a64[i], a32[i] as i64, "i={}: I0", i);
+            assert_eq!(b64[i], b32[i] as i64, "i={}: I1", i);
+            assert_eq!(c64[i], c32[i] as i64, "i={}: I2", i);
+        }
+    }
+
+    /// §G.2 reversibility on `Ssiz = 38`-scale magnitudes — forward
+    /// then inverse recovers DC-shifted probes spanning the
+    /// `[-2^37, 2^37 - 1]` window exactly. These values are
+    /// unrepresentable on the `i32` RCT surface; the §G.2.1 NOTE's
+    /// one-bit `Y1` / `Y2` growth (39 bits here) stays far inside
+    /// `i64`.
+    #[test]
+    fn rct_i64_roundtrips_wide_38bit_probes() {
+        let half = 1_i64 << 37;
+        let i0 = [half - 1, -half, 0, half - 1, -half, 123_456_789_012];
+        let i1 = [-half, half - 1, half - 1, 0, -1, -987_654_321_098];
+        let i2 = [half - 1, -half, -half, 1, half - 1, 5];
+        let (mut a, mut b, mut c) = (i0, i1, i2);
+        forward_rct_i64(&mut a, &mut b, &mut c).unwrap();
+        inverse_rct_i64(&mut a, &mut b, &mut c).unwrap();
+        assert_eq!(a, i0);
+        assert_eq!(b, i1);
+        assert_eq!(c, i2);
+    }
+
+    /// `i64` RCT pair rejects mismatched slice lengths.
+    #[test]
+    fn rct_i64_rejects_mismatched_lengths() {
+        let mut c0 = [0_i64; 2];
+        let mut c1 = [0_i64; 3];
+        let mut c2 = [0_i64; 2];
+        assert_eq!(
+            forward_rct_i64(&mut c0, &mut c1, &mut c2),
+            Err(Error::InvalidMarkerLength)
+        );
+        assert_eq!(
+            inverse_rct_i64(&mut c0, &mut c1, &mut c2),
+            Err(Error::InvalidMarkerLength)
+        );
+    }
+
+    /// i64 threading mirror + RCT + unsigned 8-bit: the same §G.2.1
+    /// worked-example input as the fixed-arity `i32` test recovers
+    /// `(200, 100, 50)` — the mirror is a drop-in widening on
+    /// narrow-precision tiles.
+    #[test]
+    fn thread_5x3_i64_rct_unsigned_8bit_matches_i32_fixed_arity() {
+        let mut c0 = [-16_i64];
+        let mut c1 = [-50_i64];
+        let mut c2 = [100_i64];
+        let descs = [d_unsigned(8), d_unsigned(8), d_unsigned(8)];
+        reconstruct_tile_components_5x3_i64(&mut c0, &mut c1, &mut c2, &descs, InverseMctMode::Rct)
+            .unwrap();
+        assert_eq!(c0[0], 200);
+        assert_eq!(c1[0], 100);
+        assert_eq!(c2[0], 50);
+    }
+
+    /// i64 threading + RCT + unsigned 36-bit — the headline case the
+    /// `i32` surface cannot represent. Encoder side: §G.1.1 forward
+    /// DC shift (`-2^35`) then §G.2.1 forward RCT on three wide
+    /// samples; the threading mirror inverts RCT, adds back `+2^35`,
+    /// and clamps — recovering the originals exactly.
+    #[test]
+    fn thread_5x3_i64_rct_unsigned_36bit_round_trip() {
+        let originals = [
+            [1_i64 << 35, (1 << 36) - 1, 0],
+            [(1_i64 << 34) + 7, 1, (1 << 36) - 1],
+            [12_345_678_901_i64, (1 << 35) - 1, 1 << 33],
+        ];
+        let mut c0 = originals[0];
+        let mut c1 = originals[1];
+        let mut c2 = originals[2];
+        forward_dc_level_shift_unsigned_i64(&mut c0, 36).unwrap();
+        forward_dc_level_shift_unsigned_i64(&mut c1, 36).unwrap();
+        forward_dc_level_shift_unsigned_i64(&mut c2, 36).unwrap();
+        forward_rct_i64(&mut c0, &mut c1, &mut c2).unwrap();
+        let descs = [d_unsigned(36), d_unsigned(36), d_unsigned(36)];
+        reconstruct_tile_components_5x3_i64(&mut c0, &mut c1, &mut c2, &descs, InverseMctMode::Rct)
+            .unwrap();
+        assert_eq!(c0, originals[0]);
+        assert_eq!(c1, originals[1]);
+        assert_eq!(c2, originals[2]);
+    }
+
+    /// i64 threading + no MCT + unsigned 38-bit (the Table A.11 upper
+    /// bound): level shift adds `2^37`; an overshoot clamps to
+    /// `2^38 - 1` and an undershoot clamps to `0`.
+    #[test]
+    fn thread_5x3_i64_none_mode_38bit_level_shift_and_clamp() {
+        let half = 1_i64 << 37;
+        let top = (1_i64 << 38) - 1;
+        // 0 + 2^37 = 2^37; (2^37) + 2^37 = 2^38 → clamp to 2^38 - 1;
+        // (-2^37 - 5) + 2^37 = -5 → clamp to 0.
+        let mut c0 = [0_i64, half, -half - 5];
+        let mut c1 = c0;
+        let mut c2 = c0;
+        let descs = [d_unsigned(38), d_unsigned(38), d_unsigned(38)];
+        reconstruct_tile_components_5x3_i64(
+            &mut c0,
+            &mut c1,
+            &mut c2,
+            &descs,
+            InverseMctMode::None,
+        )
+        .unwrap();
+        assert_eq!(c0, [half, top, 0]);
+        assert_eq!(c1, c0);
+        assert_eq!(c2, c0);
+    }
+
+    /// i64 threading + no MCT + signed 32-bit: signed components skip
+    /// the §G.1.2 shift but still get the NOTE clamp to
+    /// `[-2^31, 2^31 - 1]`.
+    #[test]
+    fn thread_5x3_i64_none_mode_signed_clamps_only() {
+        let half = 1_i64 << 31;
+        let mut c0 = [-half - 1, -half, 0, half - 1, half];
+        let mut c1 = c0;
+        let mut c2 = c0;
+        let descs = [d_signed(32), d_signed(32), d_signed(32)];
+        reconstruct_tile_components_5x3_i64(
+            &mut c0,
+            &mut c1,
+            &mut c2,
+            &descs,
+            InverseMctMode::None,
+        )
+        .unwrap();
+        assert_eq!(c0, [-half, -half, 0, half - 1, half - 1]);
+        assert_eq!(c1, c0);
+        assert_eq!(c2, c0);
+    }
+
+    /// i64 threading + RCT enforces the §G.2 prologue uniform
+    /// `(precision, signedness)` rule across the three components.
+    #[test]
+    fn thread_5x3_i64_rct_rejects_unequal_precision_and_signedness() {
+        let mut c0 = [0_i64];
+        let mut c1 = [0_i64];
+        let mut c2 = [0_i64];
+        let descs = [d_unsigned(36), d_unsigned(38), d_unsigned(36)];
+        assert_eq!(
+            reconstruct_tile_components_5x3_i64(
+                &mut c0,
+                &mut c1,
+                &mut c2,
+                &descs,
+                InverseMctMode::Rct,
+            ),
+            Err(Error::InvalidComponentCount)
+        );
+        let descs = [d_unsigned(36), d_unsigned(36), d_signed(36)];
+        assert_eq!(
+            reconstruct_tile_components_5x3_i64(
+                &mut c0,
+                &mut c1,
+                &mut c2,
+                &descs,
+                InverseMctMode::Rct,
+            ),
+            Err(Error::InvalidComponentCount)
+        );
+    }
+
+    /// i64 threading refuses ICT (wrong kernel pairing — the 9-7 /
+    /// `f32` entry point owns ICT).
+    #[test]
+    fn thread_5x3_i64_rejects_ict_mode() {
+        let mut c0 = [0_i64];
+        let mut c1 = [0_i64];
+        let mut c2 = [0_i64];
+        let descs = [d_unsigned(36), d_unsigned(36), d_unsigned(36)];
+        assert_eq!(
+            reconstruct_tile_components_5x3_i64(
+                &mut c0,
+                &mut c1,
+                &mut c2,
+                &descs,
+                InverseMctMode::Ict,
+            ),
+            Err(Error::NotImplemented)
+        );
+    }
+
+    /// i64 threading rejects mismatched slice lengths and a non-3
+    /// descriptor count up front.
+    #[test]
+    fn thread_5x3_i64_rejects_shape_mismatches() {
+        let mut c0 = [0_i64; 4];
+        let mut c1 = [0_i64; 3];
+        let mut c2 = [0_i64; 4];
+        let descs = [d_unsigned(36); 3];
+        assert_eq!(
+            reconstruct_tile_components_5x3_i64(
+                &mut c0,
+                &mut c1,
+                &mut c2,
+                &descs,
+                InverseMctMode::None,
+            ),
+            Err(Error::InvalidMarkerLength)
+        );
+        let mut c1 = [0_i64; 4];
+        let two = [d_unsigned(36); 2];
+        assert_eq!(
+            reconstruct_tile_components_5x3_i64(
+                &mut c0,
+                &mut c1,
+                &mut c2,
+                &two,
+                InverseMctMode::None,
+            ),
+            Err(Error::InvalidMarkerLength)
+        );
+    }
+
+    /// i64 threading accepts the full Table A.11 `1..=38` precision
+    /// window (a mixed-precision `None`-mode tile sharing an `i64`
+    /// staging buffer flows through) and rejects `0` / `39`.
+    #[test]
+    fn thread_5x3_i64_precision_window_is_table_a11() {
+        // Mixed (8, 32, 38) None-mode tile: per-component shift.
+        let mut c0 = [0_i64];
+        let mut c1 = [0_i64];
+        let mut c2 = [0_i64];
+        let descs = [d_unsigned(8), d_unsigned(32), d_unsigned(38)];
+        reconstruct_tile_components_5x3_i64(
+            &mut c0,
+            &mut c1,
+            &mut c2,
+            &descs,
+            InverseMctMode::None,
+        )
+        .unwrap();
+        assert_eq!(c0[0], 128);
+        assert_eq!(c1[0], 1_i64 << 31);
+        assert_eq!(c2[0], 1_i64 << 37);
+        // Out-of-range precisions reject before any mutation.
+        for bad in [0_u8, 39, 255] {
+            let mut c0 = [0_i64];
+            let mut c1 = [0_i64];
+            let mut c2 = [0_i64];
+            let descs = [d_unsigned(8), d_unsigned(bad), d_unsigned(8)];
+            assert_eq!(
+                reconstruct_tile_components_5x3_i64(
+                    &mut c0,
+                    &mut c1,
+                    &mut c2,
+                    &descs,
+                    InverseMctMode::None,
+                ),
+                Err(Error::InvalidSamplePrecision),
+                "precision {} must reject",
+                bad
+            );
         }
     }
 

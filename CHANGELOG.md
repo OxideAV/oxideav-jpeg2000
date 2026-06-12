@@ -6,6 +6,48 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 281 (2026-06-12).** T.800 §G.2 **`i64`-widened
+  reversible-path threading** — the `Ssiz ≥ 32` mirror of
+  `reconstruct_tile_components_5x3`, closing the "i64 threading
+  composition" followup. Table A.11 admits `Ssiz` up to 38 bits; the
+  `i32` threading surface caps at 31 because the
+  `1 << (Ssiz - 1)` level-shift constant and the `[0, 2^Ssiz - 1]`
+  clamp endpoint stop being representable. The widened entry point
+  composes the `*_i64` primitives that landed in earlier rounds into
+  the same Figure G.1 / G.2 sequence one word wider.
+  * `mct::inverse_rct_i64` / `mct::forward_rct_i64` — the §G.2.2 /
+    §G.2.1 equation triples (G-6..G-8 / G-3..G-5) on `i64` slices,
+    same arithmetic-right-shift `⌊·/4⌋` floor convention as the
+    `i32` pair. The §G.2.1 NOTE's one-bit `Y1` / `Y2` precision
+    growth means a 38-bit component needs 39-bit transform
+    coefficients — far inside `i64`, so no wrapping can fire on any
+    legal Table A.11 input.
+  * `mct::reconstruct_tile_components_5x3_i64(c0, c1, c2,
+    descriptors, mode)` — accepts the full Table A.11
+    `precision ∈ 1..=38` window (a modest-precision component
+    sharing an `i64` staging buffer flows through unchanged).
+    `mode == Rct` enforces the §G.2 prologue "same separation and
+    bit-depth" rule on the three descriptors then runs
+    `inverse_rct_i64`; `mode == None` is the Figure G.2 path. Each
+    component then takes the §G.1.2 Eq. G-2 inverse DC level shift
+    (unsigned only, per the prologue) and the §G.1.2-NOTE
+    `clamp_to_dynamic_range_i64` clip. `Ict` is rejected
+    (`Error::NotImplemented` — 9-7 / `f32` surface); shape and
+    precision preflight reject before anything mutates.
+  * 13 new lib tests: §G.2.1 / §G.2.2 worked-example parity for the
+    `i64` RCT pair; `i32`-vs-`i64` inverse-RCT sample parity across
+    negative-sum floor probes; forward→inverse reversibility on
+    `±2^37`-scale probes (unrepresentable on the `i32` surface);
+    threading parity with the fixed-arity `i32` entry point on the
+    8-bit worked example; full encoder-side round-trip at
+    `Ssiz = 36` (forward shift + forward RCT → threading recovers
+    exactly); 38-bit `None`-mode level-shift + clamp endpoints;
+    signed 32-bit clamp-only path; RCT prologue
+    unequal-precision / mixed-signedness rejections; ICT-mode
+    rejection; slice-length + descriptor-count rejections;
+    mixed `(8, 32, 38)` precision-window acceptance with `0` / `39`
+    / `255` rejection. Suite total: 535 lib tests (was 522).
+
 * **Clean-room round 278 (2026-06-11).** T.800 §G.3
   **multi-component irreversible reconstruction dispatcher** — the
   9-7 / `f32` mirror of round 273's

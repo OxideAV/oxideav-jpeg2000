@@ -3,6 +3,57 @@
 Pure-Rust JPEG 2000 (J2K + JP2) and High-Throughput JPEG 2000 (HTJ2K)
 codec.
 
+## Status — 2026-06-12 (clean-room round 281)
+
+Round 281 closes the **`i64`-widened §G.2 reversible-path threading**
+— the `Ssiz ≥ 32` mirror of `reconstruct_tile_components_5x3` that
+the followups have carried since r252. Table A.11 admits `Ssiz` up to
+38 bits, but the `i32` threading surface caps at 31 (the
+`1 << (Ssiz - 1)` shift constant and the `[0, 2^Ssiz - 1]` clamp
+endpoint stop being representable); the widened mirror composes the
+`*_i64` primitives from r195 / r265 with a new `i64` RCT pair:
+
+* `mct::inverse_rct_i64` / `mct::forward_rct_i64` — the §G.2.2 /
+  §G.2.1 equation triples (G-6..G-8 / G-3..G-5) on `i64` slices,
+  same arithmetic-right-shift `⌊·/4⌋` floor convention as the `i32`
+  pair. The §G.2.1 NOTE's one-bit `Y1` / `Y2` growth puts a 38-bit
+  component's transform coefficients at 39 bits — far inside `i64`,
+  so no wrapping fires on any legal Table A.11 input.
+* `mct::reconstruct_tile_components_5x3_i64(c0, c1, c2, descriptors,
+  mode)` — accepts the full Table A.11 `precision ∈ 1..=38` window
+  (a modest-precision component sharing an `i64` staging buffer
+  flows through unchanged, so mixed-precision `None`-mode tiles
+  don't split across the two surfaces). `mode == Rct` enforces the
+  §G.2 prologue "same separation and bit-depth" rule then runs
+  `inverse_rct_i64`; `mode == None` is the Figure G.2 path. Each
+  component then takes the §G.1.2 Eq. G-2 inverse DC level shift
+  (unsigned only) and the §G.1.2-NOTE `clamp_to_dynamic_range_i64`
+  clip. `Ict` is rejected (9-7 / `f32` surface); shape + precision
+  preflight reject before anything mutates.
+
+13 new lib tests (suite total: 535, was 522): §G.2.1 / §G.2.2
+worked-example parity for the `i64` RCT pair; `i32`-vs-`i64`
+inverse-RCT parity across negative-sum floor probes; reversibility
+on `±2^37`-scale probes; threading parity with the fixed-arity `i32`
+entry point; full encoder-side round-trip at `Ssiz = 36`; 38-bit
+`None`-mode shift + clamp endpoints; signed 32-bit clamp-only;
+prologue / mode / shape / precision-window rejections.
+
+Pending after r281:
+
+* `i64` multi-component dispatcher
+  (`reconstruct_tile_components_5x3_multi` mirror on `i64` buffers)
+  — the first-three / pass-through split is now a mechanical
+  widening of the r273 dispatcher over the new `inverse_rct_i64`.
+* Encoder MCT toggle in `encode_jpeg2000` (forward §G.2.1 / §G.3.1
+  + forward §G.1.1 primitives already exist — including the new
+  `forward_rct_i64`; the missing piece is the tile-reconstruction
+  wiring picking between them based on `Cod::mct`).
+* Top-level wiring inside `decode_jpeg2000` connecting the §B.12
+  walker → §F.3.1 IDWT cascade → §G threading layer.
+
+Previous round status follows:
+
 ## Status — 2026-06-11 (clean-room round 278)
 
 Round 278 closes the **§G.3 multi-component irreversible
