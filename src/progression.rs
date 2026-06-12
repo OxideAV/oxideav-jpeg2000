@@ -105,9 +105,7 @@
 //! and the NOTE permitting the efficient precinct-corner enumeration; the
 //! `Nmax = max_i(NL_i)` definition; the §B.12 NOTE on synchronising the
 //! resolution-level index across components with different NL; §B.6 / §B.9
-//! on empty precincts still producing packets). No external library
-//! source was consulted, quoted, paraphrased, or used as a cross-check
-//! oracle. No WebSearch / WebFetch was used for any reason.
+//! on empty precincts still producing packets).
 
 use crate::{Error, PocProgression, ProgressionOrder};
 

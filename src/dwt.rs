@@ -69,11 +69,7 @@
 //! HOR_SR; §F.3.5 VER_SR; §F.3.6 1D_SR + length-one parity rule;
 //! §F.3.7 1D_EXTR + Equations F-3 / F-4 + Tables F.2 / F.3; §F.3.8.1
 //! 1D_FILTR5-3R + Equations F-5 / F-6; §F.3.8.2 1D_FILTR9-7I +
-//! Equation F-7 + Table F.4 lifting parameters). No external
-//! library source — OpenJPEG, OpenJPH, Kakadu, FFmpeg, libavcodec,
-//! jpeg2000-rs, etc. — was consulted, quoted, paraphrased, or used
-//! as a cross-check oracle. No WebSearch / WebFetch was used for
-//! any reason.
+//! Equation F-7 + Table F.4 lifting parameters).
 //!
 //! ## Numerical model
 //!

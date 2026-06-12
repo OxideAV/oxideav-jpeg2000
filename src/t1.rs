@@ -108,10 +108,7 @@
 //! four-zero-column shortcut; §D.4 + Table D.7 — initial context states).
 //! The Figure D.2 layout is the in-PDF diagram transcribed to neighbour
 //! offsets; the Tables D.1 / D.2 / D.3 / D.4 / D.5 contents are
-//! transcribed verbatim from the PDF. No external library source — OpenJPEG, OpenJPH, Kakadu,
-//! Grok, FFmpeg, libavcodec, jpeg2000-rs, etc. — was consulted, quoted,
-//! paraphrased, or used as a cross-check oracle. No WebSearch /
-//! WebFetch was used for any reason.
+//! transcribed verbatim from the PDF.
 
 use crate::geometry::SubBandOrientation;
 use crate::mq::{MqContext, MqDecoder};

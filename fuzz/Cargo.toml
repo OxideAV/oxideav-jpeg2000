@@ -22,9 +22,8 @@ cargo-fuzz = true
 # tier-1 coding-pass surface drives.
 #
 # Each byte along every one of those paths is attacker-controlled when a
-# third party hands us a `.j2k` / `.jp2` sample. There is no external
-# library oracle we can pull in (OpenJPEG / OpenJPH / Kakadu are off the
-# clean-room wall), so this fuzz crate is parse-only: feed arbitrary
+# third party hands us a `.j2k` / `.jp2` sample. This fuzz crate is
+# oracle-free and parse-only: feed arbitrary
 # bytes to the four public parsing entry points AND drive a fixed number
 # of MQ decisions over arbitrary bytes, asserting every call returns a
 # `Result` (or completes infallibly) rather than panicking,

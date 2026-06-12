@@ -35,9 +35,6 @@
 //!   Specification box, Figure I.10 / Tables I.9 / I.10 / I.11),
 //!   §I.5.4 (Contiguous Codestream box).
 //!
-//! No external library source (OpenJPEG, OpenJPH, Kakadu, FFmpeg,
-//! libavformat, etc.) was consulted, quoted, paraphrased, or used
-//! as a cross-check oracle.
 
 use crate::Error;
 

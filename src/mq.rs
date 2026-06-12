@@ -72,11 +72,7 @@
 //! Implemented solely from `docs/image/jpeg2000/T-REC-T.800-201906-S.pdf`
 //! (Annex C §C.1–§C.3 prose + Table C.2; Annex D §D.4 Table D.7). The
 //! §C.3.2 / §C.3.3 / §C.3.4 / §C.3.5 register operations are the prose
-//! descriptions of Figures C.15–C.20 transcribed to integer ops. No
-//! external library source — OpenJPEG, OpenJPH, Kakadu, Grok, FFmpeg,
-//! libavcodec, jpeg2000-rs, etc. — was consulted, quoted, paraphrased,
-//! or used as a cross-check oracle. No WebSearch / WebFetch was used
-//! for any reason.
+//! descriptions of Figures C.15–C.20 transcribed to integer ops.
 
 /// One row of T.800 Table C.2: `(Qe, NMPS, NLPS, SWITCH)`.
 ///

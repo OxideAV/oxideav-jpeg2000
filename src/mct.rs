@@ -105,11 +105,7 @@
 //! forward RCT [used only as the forward reference for the
 //! self-inverse round-trip tests] + §G.2.2 inverse RCT + Equations
 //! G-6 / G-7 / G-8; §G.3 prologue + §G.3.2 inverse ICT + Equations
-//! G-12 / G-13 / G-14). No external library source — OpenJPEG,
-//! OpenJPH, Kakadu, FFmpeg, libavcodec, jpeg2000-rs, grok-jpeg2000,
-//! etc. — was consulted, quoted, paraphrased, or used as a
-//! cross-check oracle. No WebSearch / WebFetch was used for any
-//! reason.
+//! G-12 / G-13 / G-14).
 //!
 //! ## Numerical model
 //!

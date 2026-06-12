@@ -69,10 +69,7 @@
 //! E-5 + Table E.1; §E.1.1.2 + Equation E-6; §E.1.2.1; §E.1.2.2 +
 //! Equations E-7 / E-8; §E.2 + Equation E-9) and §A.6.4 + Tables A.28
 //! / A.29 / A.30 (the SPqcd byte / 16-bit-word layouts the parser at
-//! `crate::lib.rs` already consumes raw). No external library source
-//! — OpenJPEG, OpenJPH, Kakadu, FFmpeg, libavcodec, jpeg2000-rs, etc.
-//! — was consulted, quoted, paraphrased, or used as a cross-check
-//! oracle. No WebSearch / WebFetch was used for any reason.
+//! `crate::lib.rs` already consumes raw).
 
 use crate::geometry::SubBandOrientation;
 use crate::t1::Coefficient;

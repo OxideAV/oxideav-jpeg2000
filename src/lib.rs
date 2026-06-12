@@ -109,9 +109,6 @@
 //!   (COC), A.24 / A.25 / A.26 (RGN), A.27 / A.28 / A.29 / A.30
 //!   (QCD), A.31 (QCC), A.32 (POC), A.36 / A.37 (PLT), A.39 (PPT).
 //!
-//! No external library source (OpenJPEG, OpenJPH, Kakadu, FFmpeg,
-//! libavcodec, etc.) was consulted, quoted, paraphrased, or used as
-//! a cross-check oracle.
 
 #![warn(missing_debug_implementations)]
 

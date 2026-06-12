@@ -54,9 +54,6 @@
 //!   and multiple codeword-segment cases).
 //! * §B.10.8 — Order of information within a packet header.
 //!
-//! No external library source — OpenJPEG, OpenJPH, Kakadu, FFmpeg,
-//! etc. — was consulted, quoted, paraphrased, or used as a
-//! cross-check oracle when writing this module.
 
 use crate::Error;
 

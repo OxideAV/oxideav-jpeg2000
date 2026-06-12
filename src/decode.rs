@@ -43,7 +43,7 @@
 //! termination on each coding pass).
 //!
 //! All behaviour is derived from the staged T.800 specification
-//! text; no external implementation source was consulted. The
+//! text. The
 //! committed test fixtures were produced and cross-checked with an
 //! encoder/decoder binary invoked strictly as an opaque black box.
 

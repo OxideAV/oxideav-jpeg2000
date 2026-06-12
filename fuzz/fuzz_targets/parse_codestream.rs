@@ -25,9 +25,8 @@
 //!   `COM`.
 //!
 //! Every byte along that path is attacker-controlled when a third party
-//! hands us a `.j2k` sample. There is no external library oracle worth
-//! pulling in (and the clean-room wall bars the C references anyway),
-//! so this harness is parse-only: feed arbitrary bytes and assert the
+//! hands us a `.j2k` sample. This harness is oracle-free and
+//! parse-only: feed arbitrary bytes and assert the
 //! call returns a `Result` rather than panicking, integer-overflowing
 //! (debug), indexing out of bounds, or allocating an attacker-controlled
 //! buffer.

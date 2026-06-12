@@ -23,8 +23,8 @@
 //! Each byte along that path is attacker-controlled when a third party
 //! hands us a `.jp2` sample, and any one of the box-length fields can
 //! be malformed (zero-length, length shorter than the 8-byte header,
-//! length overflowing the file). There is no external library oracle
-//! worth pulling in, so this harness is parse-only: feed arbitrary
+//! length overflowing the file). This harness is oracle-free and
+//! parse-only: feed arbitrary
 //! bytes and assert the call returns a `Result` rather than panicking,
 //! integer-overflowing (debug), or indexing out of bounds.
 //!

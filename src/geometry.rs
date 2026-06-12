@@ -57,8 +57,7 @@
 //! bounds established by the relevant precinct" ordering; and the
 //! Equation B-20 `2^(PP + NL - r)` reference-grid precinct step that
 //! projects to `2^PP` on the `r = 0` LL band and `2^(PP - 1)` on the
-//! `r ≥ 1` high-pass sub-bands). No external library source was
-//! consulted.
+//! `r ≥ 1` high-pass sub-bands).
 
 use crate::{Error, Siz};
 

@@ -1886,24 +1886,3 @@ consulted:
   count / grid handed to the drivers). Not yet covered: §B.12.2
   progression-order volumes (the Equation B-21 `POC`-bounded
   sub-ranges) and §B.12.3 POC order changes.
-
-No external library source — OpenJPEG, OpenJPH, Kakadu, FFmpeg, etc.
-— was consulted, quoted, paraphrased, or used as a cross-check
-oracle. Black-box `opj_compress` / `opj_decompress` / `ojph_compress`
-/ `ojph_expand` invocations remain on the allow-list for future
-round body-decode validation, but were not invoked in round 1
-(synthetic-byte-buffer tests cover the marker-parser surface).
-
-## Planned future rounds
-
-The clean-room rebuild will continue against:
-
-* ITU-T Rec. T.800 | ISO/IEC 15444-1 — JPEG 2000 Part 1 (core).
-* ITU-T Rec. T.801 | ISO/IEC 15444-2 — Part 2 (extensions).
-* ISO/IEC 15444-15 — High-Throughput JPEG 2000 (HTJ2K).
-* ITU-T Rec. T.814 | ISO/IEC 15444-15 supporting material.
-* Black-box invocations of the validator binaries above.
-
-## License
-
-MIT. See `LICENSE`.

@@ -777,10 +777,7 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
   (§E.1 prologue + Equations E-1 / E-2; §E.1.1.1 + Equations E-3 /
   E-4 / E-5 + Table E.1; §E.1.1.2 + Equation E-6; §E.1.2.1; §E.1.2.2
   + Equations E-7 / E-8; §E.2 + Equation E-9) and §A.6.4 + Tables
-  A.28 / A.29 / A.30 (SPqcd byte / 16-bit-word layouts). No external
-  library source was consulted, quoted, paraphrased, or used as a
-  cross-check oracle. No WebSearch / WebFetch was used for any
-  reason.
+  A.28 / A.29 / A.30 (SPqcd byte / 16-bit-word layouts).
 
 * **Clean-room round 143 (2026-05-26).** Tier-2 **§B.12.2 POC
   progression-order volume iteration** layered on the five §B.12.1
@@ -832,10 +829,7 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
   `docs/image/jpeg2000/T-REC-T.800-201906-S.pdf` §B.12.2 (Equation
   B-21 + the no-repeat / next-layer invariants + the
   more-volumes-than-codestream allowance) and §A.6.6 / Table A.32
-  (POC marker, layout already parsed in lib.rs). No external library
-  source was consulted, quoted, paraphrased, or used as a
-  cross-check oracle. No WebSearch / WebFetch was used for any
-  reason.
+  (POC marker, layout already parsed in lib.rs).
 
 * **Clean-room round 133 (2026-05-25).** The three remaining
   **position-keyed §B.12.1 progression orders** — §B.12.1.3 **RPCL**,
@@ -982,10 +976,7 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
   synchronising the resolution-level index across components with
   different decomposition depth; §B.6 / §B.9 on empty precincts still
   producing packets so they remain counted in the driver's
-  `precincts_per_resolution`). No external library source — OpenJPEG,
-  OpenJPH, Kakadu, Grok, FFmpeg, libavcodec, jpeg2000-rs, etc. — was
-  consulted, quoted, paraphrased, or used as a cross-check oracle. No
-  WebSearch / WebFetch was used for any reason.
+  `precincts_per_resolution`).
 
   The next tier-2 rounds: the remaining four progression orders
   (RLCP / RPCL / PCRL / CPRL) share the §B.12.1.3 / Equation B-20
@@ -1074,10 +1065,7 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
   and Annex B (§B.10.5 — the `Mb − 1 − P` starting bit-plane from
   the zero-bit-plane tag tree; §B.10.6 — the §B.10.6 / Table B.4
   Huffman that produces the per-packet pass count `coding_passes` the
-  sequencer consumes). No external library source — OpenJPEG, OpenJPH,
-  Kakadu, Grok, FFmpeg, libavcodec, jpeg2000-rs, etc. — was consulted,
-  quoted, paraphrased, or used as a cross-check oracle. No WebSearch
-  / WebFetch was used for any reason.
+  sequencer consumes).
 
   The next tier-1 rounds: §D.4.2 predictable-termination + §D.5
   segmentation-symbol + §D.6 selective arithmetic-coding bypass (raw
@@ -1149,10 +1137,7 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
   Annex D (§D.3.4 + Table D.5 the cleanup-pass run-length / UNIFORM logic;
   §D.3.1 + Table D.1 re-applied for ineligible columns; §D.3.2 sign
   subroutine; §D.1 scan pattern; §D.4 + Table D.7 initial states). Table
-  D.5 is transcribed verbatim. No external library source — OpenJPEG,
-  OpenJPH, Kakadu, Grok, FFmpeg, libavcodec, jpeg2000-rs, etc. — was
-  consulted, quoted, paraphrased, or used as a cross-check oracle. No
-  WebSearch / WebFetch was used for any reason.
+  D.5 is transcribed verbatim.
 
   The bit-plane **sequencer** that drives the §D.3 three-pass order
   (cleanup-only first bit-plane, then SP → MR → cleanup) per code-block
@@ -1198,10 +1183,7 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
   Built solely against `docs/image/jpeg2000/T-REC-T.800-201906-S.pdf`
   Annex D (§D.3.3 + Table D.4 the 3 magnitude-refinement contexts; §D.1
   the scan pattern; §D.3 the σ-significance state + Figure D.2 neighbour
-  layout). Table D.4 is transcribed verbatim. No external library source —
-  OpenJPEG, OpenJPH, Kakadu, Grok, FFmpeg, libavcodec, jpeg2000-rs, etc. —
-  was consulted, quoted, paraphrased, or used as a cross-check oracle. No
-  WebSearch / WebFetch was used for any reason.
+  layout). Table D.4 is transcribed verbatim.
 
 * **Clean-room round 11 (2026-05-24).** First Annex D Tier-1 coding pass —
   the **significance propagation pass** (T.800 §D.3.1) plus the §D.3.2
@@ -1263,10 +1245,7 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
   contexts per orientation; §D.3.2 + Table D.2 + Table D.3 + Equation D-1 the
   sign contexts + XORbit; §D.4 / Table D.7 the initial context states).
   Tables D.1 / D.2 / D.3 are transcribed verbatim; Figures D.1 / D.2 are
-  transcribed to scan order + neighbour offsets. No external library source
-  — OpenJPEG, OpenJPH, Kakadu, Grok, FFmpeg, libavcodec, jpeg2000-rs, etc. —
-  was consulted, quoted, paraphrased, or used as a cross-check oracle. No
-  WebSearch / WebFetch was used for any reason.
+  transcribed to scan order + neighbour offsets.
 
   The §D.3.3 magnitude refinement pass (Table D.4 contexts 14–16) and the
   §D.3.4 cleanup pass (Table D.1 re-applied + run-length context + UNIFORM
@@ -1331,10 +1310,7 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
   and Annex D (§D.4 / Table D.7 the initial context states; §D.4.1 the
   decoder's `0xFF`-fill extension of the input bit stream). The
   figures are images in the PDF; the register operations are the
-  Figures' prose descriptions transcribed to integer ops. No external
-  library source — OpenJPEG, OpenJPH, Kakadu, Grok, FFmpeg, libavcodec,
-  jpeg2000-rs, etc. — was consulted, quoted, paraphrased, or used as a
-  cross-check oracle. No WebSearch / WebFetch was used for any reason.
+  Figures' prose descriptions transcribed to integer ops.
 
   The Annex D context formation (significance / sign / magnitude / run-
   length / UNIFORM context labelling that decides which `MqContext` each
@@ -1421,10 +1397,7 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
   the per-precinct code-blocks in; §B.12.1.3 / Equation B-20 — the
   `2^(PP + NL - r)` reference-grid precinct step that establishes the
   projected precinct exponent on each sub-band when divided by the
-  sub-band scale `2^(NL - r + 1)`). No external library source —
-  OpenJPEG, OpenJPH, Kakadu, FFmpeg, libavcodec, jpeg2000-rs, etc. —
-  was consulted, quoted, paraphrased, or used as a cross-check oracle.
-  No WebSearch / WebFetch was used for any reason.
+  sub-band scale `2^(NL - r + 1)`).
 
   §B.12 progression-order packet iteration (Equation B-20 / B-21
   across all five orders LRCP / RLCP / RPCL / PCRL / CPRL) and §B.8
@@ -1480,10 +1453,7 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
   / B-18 effective code-block exponents, code-block partition anchored
   at `(0, 0)`, §B.7 NOTE on code-blocks extending past the sub-band
   edge; Table A.18 — `xcb = value + 2`; Table A.21 — precinct nibble
-  layout; Table A.13 — maximum-precinct `PPx = PPy = 15` default). No
-  external library source — OpenJPEG, OpenJPH, Kakadu, FFmpeg,
-  libavcodec, jpeg2000-rs, etc. — was consulted, quoted, paraphrased,
-  or used as a cross-check oracle.
+  layout; Table A.13 — maximum-precinct `PPx = PPy = 15` default).
 
   §B.8 layer formation, §B.9 packet assembly, and the §B.12
   progression-order packet iterator (Equation B-20 / B-21) land in
@@ -1542,9 +1512,7 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
   resolution-level corners; Equation B-15 sub-band corners; Table B.1
   sub-band orientation displacements `(xob, yob)`; §B.5 closing
   paragraph on sub-band width = `tbx1 - tbx0` and height =
-  `tby1 - tby0`). No external library source — OpenJPEG, OpenJPH,
-  Kakadu, FFmpeg, libavcodec, jpeg2000-rs, etc. — was consulted,
-  quoted, paraphrased, or used as a cross-check oracle.
+  `tby1 - tby0`).
 
   §B.6 precinct partitioning (Equation B-16 `numprecinctswide` /
   `numprecinctshigh` from the `COD` / `COC` `PPx` / `PPy` bytes),
@@ -1602,10 +1570,7 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
   — Equations B-3 / B-4 invariants, B-5 tile-grid extent, B-6 tile
   index to `(p, q)`, B-7 / B-8 / B-9 / B-10 per-tile reference-grid
   bounds, B-11 dimensions; §B.4 worked example for test corpus; §B.5
-  — Equation B-12 / B-13 per-component tile mapping). No external
-  library source — OpenJPEG, OpenJPH, Kakadu, FFmpeg, libavcodec,
-  jpeg2000-rs, etc. — was consulted, quoted, paraphrased, or used
-  as a cross-check oracle.
+  — Equation B-12 / B-13 per-component tile mapping).
 
   Resolution-level + sub-band + precinct partitioning (T.800 §B.5
   Equation B-14 / Table B.1 for sub-band corners, §B.6 Equation B-16
@@ -1679,10 +1644,7 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
   §B.10.5 — zero bit-plane information, §B.10.6 + Table B.4 —
   coding-passes Huffman, §B.10.7.1 — single codeword-segment
   length, §B.10.8 — master order, §A.8.1 — SOP marker, §A.8.2 —
-  EPH marker). No external library source — OpenJPEG, OpenJPH,
-  Kakadu, FFmpeg, libavcodec, jpeg2000-rs, etc. — was consulted,
-  quoted, paraphrased, or used as a cross-check oracle when writing
-  this module.
+  EPH marker).
 
   Geometry computation (T.800 §B.6 precinct partitioning, §B.7
   sub-band → code-block partitioning, §B.12 progression-order
@@ -1727,8 +1689,7 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
   Built solely against `docs/image/jpeg2000/T-REC-T.800-201906-S.pdf`
   (T.800 Annex I §I.4, §I.5.1, §I.5.2 + Tables I.3 / I.4, §I.5.3 +
   Figure I.7, §I.5.3.1 + Tables I.5 / I.6, §I.5.3.2 + Tables I.7 /
-  I.8, §I.5.3.3 + Tables I.9 / I.10 / I.11, §I.5.4). No external
-  library source consulted.
+  I.8, §I.5.3.3 + Tables I.9 / I.10 / I.11, §I.5.4).
 
 * **Clean-room round 3 (2026-05-21).** Typed tile-part marker parsers.
   Six new typed marker structs — `Coc` (T.800 §A.6.2), `Qcc`
@@ -1757,8 +1718,7 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
   (T.800 §A.6.2 / Table A.22 / A.23 / A.15 (COC), §A.6.3 / Table
   A.24 / A.25 / A.26 (RGN), §A.6.5 / Table A.31 (QCC), §A.6.6 /
   Table A.32 (POC), §A.7.3 / Table A.37 / Table A.36 (PLT), §A.7.5 /
-  Table A.39 (PPT), §A.9.2 (COM)). No external library source
-  consulted.
+  Table A.39 (PPT), §A.9.2 (COM)).
 
 * **Clean-room round 2 (2026-05-21).** SOT / SOD tile-part walker.
   New `Sot` / `TilePart` / `J2kCodestream` types and
@@ -1780,8 +1740,7 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
   Built solely against `docs/image/jpeg2000/T-REC-T.800-201906-S.pdf`
   (T.800 §A.2 / Table A.2 / §A.4.2 / Table A.5 / Table A.6 /
-  §A.4.3 / Table A.7 / §A.4.4 / Table A.8). No external library
-  source consulted.
+  §A.4.3 / Table A.7 / §A.4.4 / Table A.8).
 
 * **Clean-room round 1 (2026-05-20).** Initial JPEG 2000 Part-1
   main-header parser: `SOC`, `SIZ`, `COD`, `QCD` marker segments are
@@ -1797,8 +1756,7 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
   Built solely against `docs/image/jpeg2000/T-REC-T.800-201906-S.pdf`
   (ITU-T T.800 / ISO/IEC 15444-1, §A.4 / §A.5 / §A.6 — Tables A.4,
-  A.9–A.11, A.12–A.21, A.27–A.30). No external library source
-  consulted.
+  A.9–A.11, A.12–A.21, A.27–A.30).
 
   `decode_jpeg2000` and `encode_jpeg2000` still return
   `Error::NotImplemented`; body-decode (tier-1, tier-2, wavelet,
@@ -1809,10 +1767,4 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 * **Orphan rebuild (2026-05-20).** The crate was reset to a clean-room
   scaffold. The prior implementation contained module-level docstrings
   and inline comments whose provenance could not be defended against
-  the workspace clean-room rule (no external library source as
-  reference, not even as a sanity check). Per the workspace's
-  Implementer-Round procedure, such audit failures are unrecoverable
-  via incremental cleanup and require an orphan rebuild.
-
-  No `old` branch is retained; long-standing audit failures forfeit
-  the archive per workspace policy.
+  the workspace clean-room rule (

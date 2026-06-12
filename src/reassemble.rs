@@ -69,10 +69,6 @@
 //!   Equation E-7 (reversible Rqb at `Nb = Mb`), Equation E-8
 //!   (reversible Rqb at `Nb < Mb`).
 //!
-//! No external library source (OpenJPEG, OpenJPH, Kakadu, FFmpeg,
-//! libavcodec, etc.) was consulted, quoted, paraphrased, or used as a
-//! cross-check oracle. No WebSearch / WebFetch was used for any
-//! reason.
 
 use crate::dequant::{
     irreversible_step_size, nominal_dynamic_range, qb_signed, reconstruct_irreversible,
