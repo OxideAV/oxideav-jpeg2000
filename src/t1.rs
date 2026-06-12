@@ -400,6 +400,15 @@ pub struct CodeBlock {
     /// the immediately preceding significance propagation pass". Cleared
     /// at the start of every SP pass.
     newly_significant: Vec<bool>,
+    /// Per-coefficient "this coefficient's significance bit was coded
+    /// (decoded) by the current bit-plane's SP pass" flag — the π
+    /// pass-membership of T.800 §D.3.4 / Table D.10 decision D9: the
+    /// cleanup pass codes only "the remaining coefficients", i.e. those
+    /// neither significant nor already coded during the same plane's
+    /// significance propagation pass (even when that coding decoded a
+    /// 0 and the coefficient stayed insignificant). Cleared at the
+    /// start of every SP pass.
+    sp_visited: Vec<bool>,
     /// Whether the COD / COC Table A.19 `vertically_causal_context`
     /// flag is set for this code-block (T.800 §D.7).
     ///
@@ -431,6 +440,7 @@ impl CodeBlock {
             height,
             coefficients: vec![Coefficient::default(); width * height],
             newly_significant: vec![false; width * height],
+            sp_visited: vec![false; width * height],
             vertically_causal: false,
         }
     }
@@ -461,6 +471,7 @@ impl CodeBlock {
             height,
             coefficients,
             newly_significant: vec![false; width * height],
+            sp_visited: vec![false; width * height],
             vertically_causal: false,
         }
     }
@@ -554,8 +565,12 @@ impl CodeBlock {
         // §D.3.3: clear the "just became significant in the last SP
         // pass" carry at the start of every new SP pass; bits set during
         // *this* pass will be visible to the *next* magnitude refinement
-        // pass.
+        // pass. The §D.3.4 π pass-membership flags reset on the same
+        // boundary: a new bit-plane's SP pass owns a fresh membership.
         for flag in &mut self.newly_significant {
+            *flag = false;
+        }
+        for flag in &mut self.sp_visited {
             *flag = false;
         }
 
@@ -588,6 +603,10 @@ impl CodeBlock {
 
                     let cx = &mut ctx[SP_CTX_OFFSET + label as usize];
                     let bit = decoder.decode(cx);
+                    // §D.3.4 / Table D.10 D9: this coefficient's bit was
+                    // coded in the SP pass — the same plane's cleanup
+                    // pass must skip it whatever the outcome.
+                    self.sp_visited[u + v * self.width] = true;
                     if bit == 1 {
                         // Newly significant — set σ, accumulate the
                         // bit-plane's positional value into magnitude,
@@ -781,7 +800,15 @@ impl CodeBlock {
                 // run-length mode did not apply).
                 for dv in start_dv..stripe_h {
                     let v = v0 + dv;
-                    if self.coefficients[u + v * self.width].sigma {
+                    // Table D.10 decision D9: skip coefficients that are
+                    // already significant — or whose bit was already
+                    // coded during this bit-plane's significance
+                    // propagation pass (§D.3.4 "the remaining
+                    // coefficients … not handled by the significance
+                    // propagation pass").
+                    if self.coefficients[u + v * self.width].sigma
+                        || self.sp_visited[u + v * self.width]
+                    {
                         continue;
                     }
                     let label = significance_context_label(
@@ -835,8 +862,12 @@ impl CodeBlock {
     ) -> Result<usize, Error> {
         // §D.3.3: clear the "just became significant in the last SP
         // pass" carry at the start of every new SP pass; the §D.6 raw
-        // path keeps the same MR-skip semantics as the AC path.
+        // path keeps the same MR-skip semantics as the AC path. The
+        // §D.3.4 π pass-membership flags reset on the same boundary.
         for flag in &mut self.newly_significant {
+            *flag = false;
+        }
+        for flag in &mut self.sp_visited {
             *flag = false;
         }
 
@@ -863,6 +894,9 @@ impl CodeBlock {
                         continue;
                     }
                     let bit = raw.read_bit()?;
+                    // §D.3.4 / Table D.10 D9: coded in the SP pass —
+                    // skipped by the same plane's cleanup pass.
+                    self.sp_visited[u + v * self.width] = true;
                     if bit == 1 {
                         // §D.6 Equation D-2: signbit = raw_value (no
                         // XOR-with-XORbit redirection).
@@ -949,7 +983,12 @@ impl CodeBlock {
         for dv in 0..4 {
             let v = v0 + dv;
             let c = self.coefficients[u + v * self.width];
-            if c.sigma {
+            // Table D.10 decision D8: the four coefficients must be
+            // *undecoded* in this bit-plane — insignificant and not
+            // already coded by the SP pass. (A zero context implies the
+            // SP pass skipped the coefficient, so the π check is
+            // defensive; significance is monotonic within a plane.)
+            if c.sigma || self.sp_visited[u + v * self.width] {
                 return false;
             }
             if significance_context_label(self.orientation, self.neighbours_in_stripe(u, v, v0, 4))
@@ -4497,5 +4536,88 @@ mod tests {
         // untouched.
         assert!(!block.was_newly_significant(0, 0));
         assert!(block.coefficient(0, 0).sigma);
+    }
+
+    // -- §D.3.4 π pass-membership (Table D.10 decisions D8 / D9) ------
+
+    #[test]
+    fn sp_pass_marks_pass_membership_for_coded_zero_bits() {
+        // 2×1 LL block, (0, 0) significant from a previous bit-plane:
+        // the SP pass codes (1, 0) (non-zero Table D.1 context) and
+        // must record the π membership whatever the decoded outcome;
+        // (0, 0) is already significant and is not coded by SP.
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 2, 1);
+        block.mark_significant_for_test(0, 0, false, 2);
+        let bytes = [0u8; 4];
+        let mut dec = MqDecoder::new(&bytes);
+        let mut ctx = reset_contexts();
+        block
+            .significance_propagation_pass(1, &mut dec, &mut ctx)
+            .unwrap();
+        assert!(
+            block.sp_visited[1],
+            "(1, 0) was coded by the SP pass — π must be set"
+        );
+        assert!(
+            !block.sp_visited[0],
+            "(0, 0) is significant — SP does not code it"
+        );
+    }
+
+    #[test]
+    fn cleanup_skips_coefficients_coded_by_same_plane_sp_pass() {
+        // Table D.10 decision D9: a coefficient whose bit was already
+        // coded during this bit-plane's SP pass is skipped by the
+        // cleanup pass even when it stayed insignificant. Mark every
+        // insignificant coefficient as SP-coded; the cleanup pass must
+        // then code nothing at all — no coefficient state changes no
+        // matter what the decoder would have produced.
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 3, 2);
+        block.mark_significant_for_test(1, 0, true, 2);
+        for idx in 0..6 {
+            if !block.coefficients[idx].sigma {
+                block.sp_visited[idx] = true;
+            }
+        }
+        let before = block.coefficients.clone();
+        // 0xFF-heavy bytes decode plenty of 1-decisions if anything is
+        // coded, so an unchanged block proves nothing was coded.
+        let bytes = [0x5A, 0xFF, 0x00, 0xFF, 0x00, 0xFF];
+        let mut dec = MqDecoder::new(&bytes);
+        let mut ctx = reset_contexts();
+        let newly = block.cleanup_pass(1, &mut dec, &mut ctx).unwrap();
+        assert_eq!(newly, 0);
+        assert_eq!(block.coefficients, before);
+    }
+
+    #[test]
+    fn run_length_eligibility_requires_undecoded_column() {
+        // Table D.10 decision D8: the four column coefficients must be
+        // *undecoded* in this bit-plane. An all-insignificant,
+        // zero-context column is eligible; flagging any entry as
+        // SP-coded revokes it.
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 1, 4);
+        assert!(block.column_run_length_eligible(0, 0));
+        block.sp_visited[2] = true;
+        assert!(!block.column_run_length_eligible(0, 0));
+    }
+
+    #[test]
+    fn new_sp_pass_resets_pass_membership() {
+        // π membership belongs to one bit-plane's SP pass; the next SP
+        // pass starts from a clean slate.
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 2, 1);
+        block.sp_visited[0] = true;
+        block.sp_visited[1] = true;
+        // No significant coefficient anywhere → every context is zero
+        // and the SP pass codes nothing; the flags must still clear.
+        let bytes = [0u8; 2];
+        let mut dec = MqDecoder::new(&bytes);
+        let mut ctx = reset_contexts();
+        block
+            .significance_propagation_pass(0, &mut dec, &mut ctx)
+            .unwrap();
+        assert!(!block.sp_visited[0]);
+        assert!(!block.sp_visited[1]);
     }
 }

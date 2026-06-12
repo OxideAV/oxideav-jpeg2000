@@ -3,6 +3,69 @@
 Pure-Rust JPEG 2000 (J2K + JP2) and High-Throughput JPEG 2000 (HTJ2K)
 codec.
 
+## Status — 2026-06-12 (clean-room round 284)
+
+Round 284 lands the **top-level decode wiring**: `decode_j2k(bytes)
+-> DecodedImage` (plus `decode_codestream` for pre-parsed input and
+the historical interleaved-bytes `decode_jpeg2000`) composes every
+stage the crate has grown into one end-to-end path — §A codestream
+parse → §B.12 progression-order packet enumeration (LRCP / RLCP) →
+§B.10 packet-header walk → §C/§D tier-1 MQ coefficient decode →
+Annex E reassembly → §F.3.1 inverse-DWT cascade → Annex G inverse
+MCT + DC level shift / clamp → per-component image-area planes
+(Equation B-12 placement, per-tile, multiple tile-parts in `TPsot`
+order).
+
+The composition surfaced (and fixed) a real tier-1 conformance bug
+no synthetic self-test had caught: the §D.3.4 cleanup pass must skip
+coefficients whose bit was already **coded** by the same bit-plane's
+significance-propagation pass even when it decoded as 0 (Table D.10
+decision D9 — π pass-membership), not just those that became
+significant. `CodeBlock` now tracks the π flags; the Table D.10 D8
+run-length eligibility check honours them too.
+
+End-to-end pinning against committed fixtures (encoded /
+cross-decoded with an opaque CLI codec used strictly as a black
+box, COM markers scrubbed):
+
+* `gray-17x13-53.j2k` — 8-bit gray, 5-3 reversible, NL = 2:
+  **pixel-exact**.
+* `gray-17x13-tiled-8x8-53.j2k` — same raster on an 8×8 tile grid
+  (6 tiles): **pixel-exact**.
+* `rgb-16x16-rct-53.j2k` — 3-component lossless with §G.2.2 inverse
+  RCT: **pixel-exact** on all three planes.
+* `gray-32x32-97full.j2k` — 9-7 irreversible, scalar-expounded,
+  NL = 5, all passes present: within **±1** of the black-box
+  reference decode (Annex F floating-point latitude).
+* `gray-32x32-97.j2k` — same source rate-truncated 4:1 (passes cut
+  mid-bit-plane): pinned at max ≤ 16 / mean ≤ 4 — the wiring models
+  the §B.10.5 / E.1.1.2 `Nb` per *block* (fully-completed planes),
+  while the spec's per-coefficient `Nb(u, v)` would tighten the
+  Equation E-6 reconstruction lift; per-coefficient `Nb` is the main
+  follow-up.
+
+The `registry` feature now installs a real `Decoder` ( `jpeg2000`
+codec id, `.j2k` / `.j2c` extension hints): one raw codestream per
+packet, packed Gray8 / Rgb24 / Rgba output for unsigned ≤8-bit
+1:1-sampled components.
+
+Geometry classes covered: any tile grid, `NL ∈ 0..=32`, any §B.6 /
+§B.7 precinct + code-block partition, LRCP / RLCP at any layer
+count, both kernels (5-3 + style-none, 9-7 + scalar
+derived/expounded), MCT on/off (RCT / ICT with index-≥3
+pass-through), per-component `XRsiz` / `YRsiz` planes, SOP / EPH
+framing, multiple tile-parts per tile. Rejected cleanly with
+`NotImplemented` rather than mis-decoded: `COC` / `QCC`, tile-part
+`COD` / `QCD` overrides, `RGN`, `POC`, `PPM` / `PPT`, RPCL / PCRL /
+CPRL, and the segmentation-changing Table A.19 style bits (bypass /
+reset / termall — the §D.6 / §D.4.2 pass primitives exist; the
+per-segment driver wiring is a follow-up).
+
+11 new tests (suite total: 550, was 535): 7 fixture-driven
+end-to-end tests + 4 §D.3.4 π-membership unit tests.
+
+Previous round status follows:
+
 ## Status — 2026-06-12 (clean-room round 281)
 
 Round 281 closes the **`i64`-widened §G.2 reversible-path threading**

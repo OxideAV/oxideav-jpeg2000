@@ -6,6 +6,30 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 284 (2026-06-12).** **Top-level decode wiring**
+  — `decode::decode_j2k(bytes) -> DecodedImage` (and
+  `decode_codestream` for pre-parsed input) composes the §A parse,
+  §B.12 LRCP / RLCP packet enumeration, §B.10 packet-header walk,
+  §C/§D tier-1 decode, Annex E reassembly, §F.3.1 inverse-DWT
+  cascade, and Annex G inverse MCT + DC level shift into one
+  end-to-end raw-codestream decode: per-tile (any tile grid,
+  multiple tile-parts in `TPsot` order), both kernels (5-3 +
+  no-quant, 9-7 + scalar derived/expounded), MCT on/off,
+  per-component `XRsiz` / `YRsiz` planes, SOP / EPH framing.
+  Unsupported tools (`COC` / `QCC`, tile-part `COD` / `QCD`
+  overrides, `RGN`, `POC`, `PPM` / `PPT`, RPCL / PCRL / CPRL,
+  segmentation-changing Table A.19 style bits) are rejected with
+  `NotImplemented` instead of mis-decoding. The historical
+  `decode_jpeg2000` byte-vector entry point now decodes (interleaved
+  8-bit output). The `registry` feature installs a real framework
+  `Decoder` (`jpeg2000` id, `.j2k` / `.j2c` extension hints,
+  Gray8 / Rgb24 / Rgba packed output) plus a `make_decoder` factory.
+  Committed end-to-end fixtures pin the path: 5-3 lossless gray /
+  multi-tile gray / RGB-with-RCT are pixel-exact against the
+  deterministic sources; full-quality 9-7 is within ±1 of a
+  black-box reference decode; a rate-truncated 9-7 stream is pinned
+  at max ≤ 16 / mean ≤ 4 pending per-coefficient `Nb(u, v)`.
+
 * **Clean-room round 281 (2026-06-12).** T.800 §G.2 **`i64`-widened
   reversible-path threading** — the `Ssiz ≥ 32` mirror of
   `reconstruct_tile_components_5x3`, closing the "i64 threading
@@ -535,6 +559,20 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
     `(255, 0, 0) → (76.245, -43.031, 127.5)` Y'CbCr-601 red check,
     length-mismatch / out-of-range-precision rejection, empty-slice
     no-op.
+
+### Fixed
+
+* **§D.3.4 cleanup-pass membership (Table D.10 decision D9).** The
+  cleanup pass skipped only *significant* coefficients; it must also
+  skip coefficients whose bit was already coded by the same
+  bit-plane's significance-propagation pass even when that bit
+  decoded as 0. `t1::CodeBlock` now carries per-coefficient π
+  pass-membership flags, set by both the MQ and the §D.6 raw SP
+  passes, cleared at each SP pass start, honoured by the cleanup
+  pass and by the Table D.10 D8 run-length eligibility check. Every
+  real encoder stream with more than one coding pass per code-block
+  desynchronised without this; the new fixture suite decodes
+  bit-exactly with it.
 
 ## [0.0.13](https://github.com/OxideAV/oxideav-jpeg2000/compare/v0.0.12...v0.0.13) - 2026-05-30
 

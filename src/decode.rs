@@ -1,0 +1,855 @@
+//! End-to-end T.800 codestream decode wiring.
+//!
+//! This module composes the per-Annex stages the crate has grown —
+//! §A main-header + tile-part parsing ([`crate::parse_codestream`]),
+//! §B.12 progression-order packet enumeration
+//! ([`crate::progression`]), §B.10 packet-header decoding
+//! ([`crate::packet::walk_packet_headers`]), §C/§D tier-1 MQ
+//! coefficient decoding ([`crate::t1`]), Annex E sub-band reassembly
+//! with the §F.3.1 inverse-DWT cascade ([`crate::reassemble`]), and
+//! the Annex G inverse multiple-component transform with DC level
+//! shift ([`crate::mct`]) — into one public entry point:
+//! [`decode_j2k`].
+//!
+//! ## Coverage
+//!
+//! The wiring handles the T.800 baseline geometry classes:
+//!
+//! * any tile grid (each tile decoded independently per §B.3, with
+//!   multiple tile-parts per tile concatenated in `TPsot` order),
+//! * any decomposition-level count `NL ∈ 0..=32` and any precinct /
+//!   code-block partition the §B.6 / §B.7 derivations admit,
+//! * `LRCP` and `RLCP` progression orders (§B.12.1.1 / §B.12.1.2),
+//!   single or multiple layers,
+//! * both wavelet kernels: 5-3 reversible (quantisation style
+//!   "none", Table A.28) and 9-7 irreversible (scalar-derived or
+//!   scalar-expounded step sizes),
+//! * `SGcod` MCT on/off — inverse RCT (§G.2.2) with the 5-3 kernel,
+//!   inverse ICT (§G.3.2) with the 9-7 kernel, both with index-`≥ 3`
+//!   component pass-through,
+//! * per-component sub-sampling via `XRsiz` / `YRsiz` (each
+//!   component plane is reconstructed on its own §B.2 component
+//!   grid; no upsampling is performed),
+//! * SOP / EPH packet framing per the COD `Scod` bits.
+//!
+//! Streams that need machinery this round does not wire are
+//! **rejected** with [`Error::NotImplemented`] rather than
+//! mis-decoded: `COC` / `QCC` per-component overrides, tile-part
+//! header overrides (`COD` / `QCD` inside a tile-part), `RGN` ROI
+//! shifts, `POC` progression-order changes, `PPM` / `PPT` packed
+//! packet headers, the `RPCL` / `PCRL` / `CPRL` progression orders,
+//! and the Table A.19 code-block-style bits that change codeword
+//! segmentation (selective arithmetic-coding bypass, context reset,
+//! termination on each coding pass).
+//!
+//! All behaviour is derived from the staged T.800 specification
+//! text; no external implementation source was consulted. The
+//! committed test fixtures were produced and cross-checked with an
+//! encoder/decoder binary invoked strictly as an opaque black box.
+
+use std::collections::BTreeMap;
+
+use crate::dequant::{self, StepSize};
+use crate::geometry::{
+    derive_precinct_code_blocks, derive_precinct_partition, derive_resolution_levels,
+    derive_tile_geometry, image_area, precinct_exponents_at, tile_grid_extent, PrecinctCodeBlocks,
+    ResolutionLevel, SubBand, SubBandOrientation,
+};
+use crate::mct::{
+    reconstruct_tile_components_5x3_multi, reconstruct_tile_components_9x7_multi,
+    ComponentDescriptor, InverseMctMode,
+};
+use crate::packet::{PacketGeometry, SopEphMode, SubBandGeometry};
+use crate::progression::{lrcp_packet_order, rlcp_packet_order, ComponentProgressionInfo};
+use crate::reassemble::{
+    idwt_5x3, idwt_9x7, BlockSource, CodedCodeBlock, PrecinctBlocks, SubBandQuantization,
+    WalkerBlockEntry, WalkerBlockSource,
+};
+use crate::t1::{reset_contexts, BitPlaneSequencer, CodeBlock};
+use crate::{
+    Error, J2kCodestream, ProgressionOrder, QuantizationStyle, Siz, TilePartMarker,
+    WaveletTransform, MARKER_CAP, MARKER_COC, MARKER_POC, MARKER_QCC, MARKER_RGN, MARKER_SIZ,
+    MARKER_SOC,
+};
+
+/// `PPM` marker code (T.800 §A.7.4, `0xFF60`) — packed packet
+/// headers in the main header. Not a [`crate`]-level constant because
+/// the main-header parser only length-skips it; the decode wiring
+/// needs to recognise (and reject) it.
+const MARKER_PPM: u16 = 0xFF60;
+
+// ---------------------------------------------------------------------------
+// Public output types.
+// ---------------------------------------------------------------------------
+
+/// One reconstructed component plane of a decoded image.
+///
+/// `samples` is row-major `width × height` on the component's own
+/// §B.2 grid (Equation B-1 / B-2) — i.e. already divided by the
+/// `XRsiz` / `YRsiz` sub-sampling factors. Values are the final
+/// §G.1.2 level-shifted samples, clamped to the component's dynamic
+/// range: `[0, 2^precision − 1]` for unsigned components,
+/// `[−2^(precision−1), 2^(precision−1) − 1]` for signed ones.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedComponent {
+    /// Plane width in samples (component-grid, Equation B-2).
+    pub width: u32,
+    /// Plane height in samples.
+    pub height: u32,
+    /// Sample precision in bits (`Ssiz` low 7 bits + 1).
+    pub precision_bits: u8,
+    /// Whether samples are signed (`Ssiz` MSB).
+    pub is_signed: bool,
+    /// `XRsiz` — horizontal sub-sampling factor relative to the
+    /// reference grid.
+    pub h_separation: u8,
+    /// `YRsiz` — vertical sub-sampling factor.
+    pub v_separation: u8,
+    /// Row-major samples, `width * height` entries.
+    pub samples: Vec<i32>,
+}
+
+/// A fully decoded JPEG 2000 image — one [`DecodedComponent`] per SIZ
+/// component, each on its own component grid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedImage {
+    /// Image-area width on the reference grid (`Xsiz − XOsiz`).
+    pub width: u32,
+    /// Image-area height on the reference grid (`Ysiz − YOsiz`).
+    pub height: u32,
+    /// Component planes in `Csiz` declaration order.
+    pub components: Vec<DecodedComponent>,
+}
+
+// ---------------------------------------------------------------------------
+// Unsupported-feature detection.
+// ---------------------------------------------------------------------------
+
+/// Re-scan the main-header byte span for marker segments the wiring
+/// cannot honour yet. [`crate::parse_j2k_header`] length-skips
+/// optional markers; silently ignoring `COC` / `QCC` / `RGN` / `POC`
+/// / `PPM` / `CAP` would mis-decode the stream, so their presence is
+/// surfaced as [`Error::NotImplemented`] here.
+fn reject_unsupported_main_header_markers(bytes: &[u8], header_end: usize) -> Result<(), Error> {
+    // SOC is 2 bytes with no length field; every other main-header
+    // marker segment is `marker(2) + length(2) + payload(length-2)`.
+    let mut pos = 2usize; // skip SOC (already validated by the parser)
+    while pos + 4 <= header_end {
+        let marker = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]);
+        match marker {
+            MARKER_COC | MARKER_QCC | MARKER_RGN | MARKER_POC | MARKER_PPM | MARKER_CAP => {
+                return Err(Error::NotImplemented);
+            }
+            MARKER_SOC | MARKER_SIZ => {}
+            _ => {}
+        }
+        let len = u16::from_be_bytes([bytes[pos + 2], bytes[pos + 3]]) as usize;
+        if len < 2 {
+            return Err(Error::InvalidMarkerLength);
+        }
+        pos += 2 + len;
+    }
+    Ok(())
+}
+
+/// Reject tile-part-header marker segments that would alter the
+/// main-header coding parameters (not wired this round). `PLT` and
+/// `COM` are informational and pass through.
+fn reject_unsupported_tile_part_markers(markers: &[TilePartMarker]) -> Result<(), Error> {
+    for m in markers {
+        match m {
+            TilePartMarker::Plt(_) | TilePartMarker::Com(_) => {}
+            TilePartMarker::Cod(_)
+            | TilePartMarker::Coc(_)
+            | TilePartMarker::Qcd(_)
+            | TilePartMarker::Qcc(_)
+            | TilePartMarker::Rgn(_)
+            | TilePartMarker::Poc(_)
+            | TilePartMarker::Ppt(_) => return Err(Error::NotImplemented),
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Per-sub-band quantisation resolution (§A.6.4 / Annex E).
+// ---------------------------------------------------------------------------
+
+/// SPqcd / SPqcc index for the sub-band at resolution level `r` with
+/// the given orientation, per the F.3.1 order Table A.28 references:
+/// index 0 is the `NLLL` band; resolution level `r ≥ 1` contributes
+/// `[HL, LH, HH]` at indices `3(r−1)+1 .. 3(r−1)+3`.
+fn spqcd_index(r: u8, orientation: SubBandOrientation) -> usize {
+    match orientation {
+        SubBandOrientation::LL => 0,
+        SubBandOrientation::HL => 3 * (r as usize - 1) + 1,
+        SubBandOrientation::LH => 3 * (r as usize - 1) + 2,
+        SubBandOrientation::HH => 3 * (r as usize - 1) + 3,
+    }
+}
+
+/// Resolved per-sub-band quantisation for one component: the
+/// Equation E-2 `Mb` (always needed — it anchors the tier-1 starting
+/// bit-plane) and, on the 9-7 path, the full [`SubBandQuantization`].
+struct BandQuant {
+    mb: u32,
+    quant: SubBandQuantization,
+}
+
+/// Resolve `(εb, µb) → (Mb, Rb)` for every sub-band of one component.
+///
+/// Returns one `Vec<BandQuant>` per resolution level, in the same
+/// per-level band order as [`ResolutionLevel::sub_bands`] (`[LL]` at
+/// `r = 0`, `[HL, LH, HH]` at `r ≥ 1`).
+fn resolve_band_quant(
+    levels: &[ResolutionLevel],
+    style: QuantizationStyle,
+    spqcd: &[u8],
+    guard_bits: u8,
+    precision: u32,
+    n_l: u8,
+) -> Result<Vec<Vec<BandQuant>>, Error> {
+    // Pre-parse the step-size list once per style.
+    let expounded: Vec<StepSize> = match style {
+        QuantizationStyle::None => StepSize::parse_reversible_payload(spqcd),
+        QuantizationStyle::ScalarExpounded => StepSize::parse_irreversible_payload(spqcd)?,
+        QuantizationStyle::ScalarDerived => Vec::new(),
+        QuantizationStyle::Reserved(_) => return Err(Error::NotImplemented),
+    };
+    let derived_base: Option<StepSize> = match style {
+        QuantizationStyle::ScalarDerived => Some(StepSize::parse_derived_payload(spqcd)?),
+        _ => None,
+    };
+
+    let mut out = Vec::with_capacity(levels.len());
+    for level in levels {
+        let mut per_band = Vec::with_capacity(level.sub_bands.len());
+        for band in &level.sub_bands {
+            let step = if let Some(base) = derived_base {
+                // Scalar derived: Equation E-5 from the NLLL pair.
+                dequant::derive_from_nlll(base, n_l, band.nb)?
+            } else {
+                let idx = spqcd_index(level.r, band.orientation);
+                *expounded.get(idx).ok_or(Error::InvalidMarkerLength)?
+            };
+            let quant =
+                SubBandQuantization::resolve(precision, guard_bits, band.orientation, step)?;
+            per_band.push(BandQuant {
+                mb: quant.mb,
+                quant,
+            });
+        }
+        out.push(per_band);
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// §B.12 walk → tier-1 accumulation.
+// ---------------------------------------------------------------------------
+
+/// Per-code-block accumulator across every layer's packets: total
+/// signalled coding passes, the §B.10.5 missing-bit-plane count `P`
+/// (first inclusion only), and the concatenated codeword-segment
+/// bytes. With the segmentation-changing Table A.19 style bits
+/// rejected up front, all of a code-block's packet contributions form
+/// a single §C.3 codeword segment, so plain concatenation is exact.
+#[derive(Default)]
+struct BlockAccum {
+    passes: u32,
+    p: Option<u32>,
+    bytes: Vec<u8>,
+}
+
+/// Key addressing one code-block inside one tile:
+/// `(component, resolution, precinct, sub_band, cbx, cby)`.
+type BlockKey = (u16, u8, u32, u32, u32, u32);
+
+/// One tier-1-decoded code-block, owned, ready to be bridged into a
+/// [`WalkerBlockSource`].
+struct DecodedBlock {
+    component: u16,
+    r: u8,
+    precinct: u32,
+    sub_band: u32,
+    cbx: u32,
+    cby: u32,
+    nb: u32,
+    block: CodeBlock,
+}
+
+/// Per-resolution-level [`BlockSource`] dispatch for one
+/// tile-component: [`WalkerBlockSource`] keys blocks by orientation
+/// only, so one source per resolution level keeps the `HL` blocks of
+/// different levels apart. The owning level is recovered from the
+/// band's decomposition level `nb` (`r = NL − nb + 1` for high-pass
+/// bands, `r = 0` for `LL`, per §B.5).
+struct LevelKeyedSource<'a> {
+    n_l: u8,
+    per_level: Vec<WalkerBlockSource<'a>>,
+}
+
+impl<'a> BlockSource<'a> for LevelKeyedSource<'a> {
+    fn blocks_for(&self, band: &SubBand) -> &[CodedCodeBlock<'a>] {
+        let r = match band.orientation {
+            SubBandOrientation::LL => 0usize,
+            _ => (self.n_l as usize) + 1 - (band.nb as usize),
+        };
+        match self.per_level.get(r) {
+            Some(src) => src.blocks_for(band),
+            None => &[],
+        }
+    }
+}
+
+/// Number of fully-decoded bit-planes implied by `passes` coding
+/// passes per the §D.3 schedule (cleanup on the first plane, then
+/// `SP / MR / CL` triples): plane `k` completes on its cleanup pass.
+fn completed_bitplanes(passes: u32) -> u32 {
+    if passes == 0 {
+        0
+    } else {
+        1 + (passes - 1) / 3
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tile decode.
+// ---------------------------------------------------------------------------
+
+/// All COD-level knobs the per-tile decode consumes, resolved once.
+struct CodingParams {
+    n_l: u8,
+    xcb: u8,
+    ycb: u8,
+    precincts: Vec<u8>,
+    layers: u16,
+    progression: ProgressionOrder,
+    transform: WaveletTransform,
+    mct: u8,
+    sop_eph: SopEphMode,
+    segmentation_symbols: bool,
+    vertically_causal: bool,
+}
+
+/// Decode every component of one tile from the concatenated tile-part
+/// body bytes. Returns one row-major `i32` grid per component
+/// (tile-component extent), already §G-level-shifted and clamped.
+fn decode_tile(
+    siz: &Siz,
+    params: &CodingParams,
+    quant_style: QuantizationStyle,
+    spqcd: &[u8],
+    guard_bits: u8,
+    tile_index: u32,
+    body: &[u8],
+) -> Result<Vec<Vec<i32>>, Error> {
+    let tile = derive_tile_geometry(siz, tile_index)?;
+    let num_components = siz.components.len();
+
+    // -- Per-component resolution-level geometry + precinct layouts --
+    let mut levels_per_comp: Vec<Vec<ResolutionLevel>> = Vec::with_capacity(num_components);
+    let mut infos: Vec<ComponentProgressionInfo> = Vec::with_capacity(num_components);
+    // (component, resolution, precinct) → precinct code-block geometry.
+    let mut precinct_geom: BTreeMap<(u16, u8, u32), PrecinctCodeBlocks> = BTreeMap::new();
+
+    for (c, tc) in tile.components.iter().enumerate() {
+        let levels = derive_resolution_levels(*tc, params.n_l);
+        let mut per_res = Vec::with_capacity(levels.len());
+        for level in &levels {
+            let pp = precinct_exponents_at(&params.precincts, level.r);
+            let partition = derive_precinct_partition(level, pp);
+            let num = partition.num_precincts();
+            let num = u32::try_from(num).map_err(|_| Error::InvalidMarkerLength)?;
+            per_res.push(num);
+            for k in 0..num {
+                let geom = derive_precinct_code_blocks(level, pp, params.xcb, params.ycb, k)?;
+                precinct_geom.insert((c as u16, level.r, k), geom);
+            }
+        }
+        infos.push(ComponentProgressionInfo {
+            num_decomposition_levels: params.n_l,
+            precincts_per_resolution: per_res,
+        });
+        levels_per_comp.push(levels);
+    }
+
+    // -- §B.12 packet enumeration --
+    let descriptors = match params.progression {
+        ProgressionOrder::Lrcp => lrcp_packet_order(params.layers, &infos)?,
+        ProgressionOrder::Rlcp => rlcp_packet_order(params.layers, &infos)?,
+        _ => return Err(Error::NotImplemented),
+    };
+
+    // -- §B.10 packet-header walk --
+    // Assign one stable precinct-state id per (component, resolution,
+    // precinct) triple; build one PacketGeometry per packet.
+    let mut state_ids: BTreeMap<(u16, u8, u32), usize> = BTreeMap::new();
+    let mut packets: Vec<(usize, PacketGeometry)> = Vec::with_capacity(descriptors.len());
+    for desc in &descriptors {
+        let key = (desc.component, desc.resolution, desc.precinct);
+        let next_id = state_ids.len();
+        let id = *state_ids.entry(key).or_insert(next_id);
+        let geom = precinct_geom.get(&key).ok_or(Error::InvalidPacketHeader)?;
+        let sub_bands = geom
+            .sub_bands
+            .iter()
+            .map(|sb| SubBandGeometry {
+                width: sb.grid_wide,
+                height: sb.grid_high,
+            })
+            .collect();
+        packets.push((
+            id,
+            PacketGeometry {
+                sub_bands,
+                layer: desc.layer,
+            },
+        ));
+    }
+    let headers = crate::packet::walk_packet_headers(body, &packets, params.sop_eph)?;
+
+    // -- Replay body offsets; accumulate per-code-block segments --
+    let mut accum: BTreeMap<BlockKey, BlockAccum> = BTreeMap::new();
+    let mut pos = 0usize;
+    for (desc, header) in descriptors.iter().zip(headers.iter()) {
+        let mut seg_pos = pos
+            .checked_add(header.bytes_consumed)
+            .ok_or(Error::PacketHeaderOverrun)?;
+        for contrib in &header.contributions {
+            if !contrib.included {
+                continue;
+            }
+            let total: u64 = contrib.segment_lengths.iter().map(|&l| l as u64).sum();
+            let total = usize::try_from(total).map_err(|_| Error::PacketHeaderOverrun)?;
+            let end = seg_pos
+                .checked_add(total)
+                .ok_or(Error::PacketHeaderOverrun)?;
+            let bytes = body.get(seg_pos..end).ok_or(Error::PacketHeaderOverrun)?;
+            let key: BlockKey = (
+                desc.component,
+                desc.resolution,
+                desc.precinct,
+                contrib.sub_band,
+                contrib.x,
+                contrib.y,
+            );
+            let entry = accum.entry(key).or_default();
+            entry.passes = entry
+                .passes
+                .checked_add(contrib.coding_passes)
+                .ok_or(Error::InvalidPacketHeader)?;
+            if let Some(p) = contrib.zero_bit_planes {
+                if entry.p.is_some() {
+                    return Err(Error::InvalidPacketHeader);
+                }
+                entry.p = Some(p);
+            }
+            entry.bytes.extend_from_slice(bytes);
+            seg_pos = end;
+        }
+        pos = seg_pos;
+    }
+
+    // -- Per-component quantisation tables --
+    let mut quant_per_comp: Vec<Vec<Vec<BandQuant>>> = Vec::with_capacity(num_components);
+    for (c, levels) in levels_per_comp.iter().enumerate() {
+        let precision = siz.components[c].precision_bits as u32;
+        quant_per_comp.push(resolve_band_quant(
+            levels,
+            quant_style,
+            spqcd,
+            guard_bits,
+            precision,
+            params.n_l,
+        )?);
+    }
+
+    // -- Tier-1: decode every included code-block --
+    let mut decoded: Vec<DecodedBlock> = Vec::with_capacity(accum.len());
+    for ((c, r, k, sb, cbx, cby), acc) in accum.iter() {
+        if acc.passes == 0 {
+            continue;
+        }
+        let geom = precinct_geom
+            .get(&(*c, *r, *k))
+            .ok_or(Error::InvalidPacketHeader)?;
+        let psb = geom
+            .sub_bands
+            .get(*sb as usize)
+            .ok_or(Error::InvalidPacketHeader)?;
+        if *cbx >= psb.grid_wide || *cby >= psb.grid_high {
+            return Err(Error::InvalidPacketHeader);
+        }
+        let placement = psb.code_blocks[(*cby as usize) * (psb.grid_wide as usize) + *cbx as usize];
+        // Per-level band order matches the §B.9 packet sub-band order
+        // ([LL] at r = 0, [HL, LH, HH] at r ≥ 1), so the packet's
+        // sub-band index addresses the quant table directly.
+        let mb = quant_per_comp[*c as usize][*r as usize]
+            .get(*sb as usize)
+            .ok_or(Error::InvalidPacketHeader)?
+            .mb;
+        let p = acc.p.ok_or(Error::InvalidPacketHeader)?;
+        if p >= mb {
+            return Err(Error::InvalidPacketHeader);
+        }
+        // §D.3: at most 3 (Mb − P) − 2 passes fit above bit-plane 0.
+        if acc.passes > 3 * (mb - p) - 2 {
+            return Err(Error::InvalidPacketHeader);
+        }
+        let mut block = CodeBlock::new(
+            psb.orientation,
+            placement.width() as usize,
+            placement.height() as usize,
+        );
+        let mut ctx = reset_contexts();
+        let mut seq = BitPlaneSequencer::new(mb - 1 - p)
+            .with_segmentation_symbols(params.segmentation_symbols)
+            .with_vertically_causal_context(params.vertically_causal);
+        seq.decode_packet(&mut block, &acc.bytes, acc.passes, &mut ctx)?;
+        let nb = p + completed_bitplanes(acc.passes);
+        decoded.push(DecodedBlock {
+            component: *c,
+            r: *r,
+            precinct: *k,
+            sub_band: *sb,
+            cbx: *cbx,
+            cby: *cby,
+            nb,
+            block,
+        });
+    }
+
+    // -- Per-component: bridge → reassemble → §F.3.1 IDWT cascade --
+    let mut planes_5x3: Vec<Vec<i32>> = Vec::new();
+    let mut planes_9x7: Vec<Vec<f64>> = Vec::new();
+    for (c, levels) in levels_per_comp.iter().enumerate() {
+        let tc = &tile.components[c];
+        let (tw, th) = (tc.width() as usize, tc.height() as usize);
+        if tw == 0 || th == 0 {
+            match params.transform {
+                WaveletTransform::Reversible5x3 => planes_5x3.push(Vec::new()),
+                WaveletTransform::Irreversible9x7 => planes_9x7.push(Vec::new()),
+                WaveletTransform::Reserved(_) => return Err(Error::NotImplemented),
+            }
+            continue;
+        }
+
+        // Group this component's decoded blocks by (level, precinct).
+        // The entry maps are kept alive alongside the per-level
+        // sources because the bridge's lifetime parameter unifies the
+        // entry-slice borrow with the CodeBlock borrow.
+        let entries_store: Vec<BTreeMap<u32, Vec<WalkerBlockEntry<'_>>>> = levels
+            .iter()
+            .map(|level| {
+                let mut by_precinct: BTreeMap<u32, Vec<WalkerBlockEntry<'_>>> = BTreeMap::new();
+                for b in decoded
+                    .iter()
+                    .filter(|b| b.component == c as u16 && b.r == level.r)
+                {
+                    by_precinct
+                        .entry(b.precinct)
+                        .or_default()
+                        .push(WalkerBlockEntry {
+                            sub_band: b.sub_band,
+                            cbx: b.cbx,
+                            cby: b.cby,
+                            coefficients: &b.block,
+                            nb: b.nb,
+                        });
+                }
+                by_precinct
+            })
+            .collect();
+        let mut per_level_sources = Vec::with_capacity(levels.len());
+        for (level, entries_by_precinct) in levels.iter().zip(entries_store.iter()) {
+            let precinct_blocks: Vec<PrecinctBlocks<'_>> = entries_by_precinct
+                .iter()
+                .map(|(k, entries)| {
+                    precinct_geom
+                        .get(&(c as u16, level.r, *k))
+                        .map(|geometry| PrecinctBlocks {
+                            geometry,
+                            entries: entries.as_slice(),
+                        })
+                        .ok_or(Error::InvalidPacketHeader)
+                })
+                .collect::<Result<_, _>>()?;
+            per_level_sources.push(WalkerBlockSource::from_precincts(&precinct_blocks)?);
+        }
+        let source = LevelKeyedSource {
+            n_l: params.n_l,
+            per_level: per_level_sources,
+        };
+
+        match params.transform {
+            WaveletTransform::Reversible5x3 => {
+                if quant_style != QuantizationStyle::None {
+                    // Table A.28: the reversible kernel pairs with the
+                    // "no quantisation" style only.
+                    return Err(Error::NotImplemented);
+                }
+                let mb_per_level: Vec<Vec<u32>> = quant_per_comp[c]
+                    .iter()
+                    .map(|bands| bands.iter().map(|b| b.mb).collect())
+                    .collect();
+                let grid = idwt_5x3(levels, &source, &mb_per_level, 0.5)?;
+                if grid.width != tw || grid.height != th {
+                    return Err(Error::InvalidMarkerLength);
+                }
+                planes_5x3.push(grid.data);
+            }
+            WaveletTransform::Irreversible9x7 => {
+                if quant_style == QuantizationStyle::None {
+                    // Table A.28 pairs the 9-7 kernel with scalar
+                    // quantisation (derived or expounded).
+                    return Err(Error::NotImplemented);
+                }
+                let quant_per_level: Vec<Vec<SubBandQuantization>> = quant_per_comp[c]
+                    .iter()
+                    .map(|bands| bands.iter().map(|b| b.quant).collect())
+                    .collect();
+                let grid = idwt_9x7(levels, &source, &quant_per_level, 0.5)?;
+                if grid.width != tw || grid.height != th {
+                    return Err(Error::InvalidMarkerLength);
+                }
+                planes_9x7.push(grid.data);
+            }
+            WaveletTransform::Reserved(_) => return Err(Error::NotImplemented),
+        }
+    }
+
+    // -- Annex G: inverse MCT + DC level shift + clamp, per tile --
+    let descriptors: Vec<ComponentDescriptor> = siz
+        .components
+        .iter()
+        .map(ComponentDescriptor::from_siz_component)
+        .collect();
+    match params.transform {
+        WaveletTransform::Reversible5x3 => {
+            let mode = match params.mct {
+                0 => InverseMctMode::None,
+                1 => InverseMctMode::Rct,
+                _ => return Err(Error::NotImplemented),
+            };
+            let mut refs: Vec<&mut [i32]> =
+                planes_5x3.iter_mut().map(|v| v.as_mut_slice()).collect();
+            reconstruct_tile_components_5x3_multi(&mut refs, &descriptors, mode)?;
+            Ok(planes_5x3)
+        }
+        WaveletTransform::Irreversible9x7 => {
+            let mode = match params.mct {
+                0 => InverseMctMode::None,
+                1 => InverseMctMode::Ict,
+                _ => return Err(Error::NotImplemented),
+            };
+            let mut comps_f32: Vec<Vec<f32>> = planes_9x7
+                .iter()
+                .map(|p| p.iter().map(|&v| v as f32).collect())
+                .collect();
+            let mut outputs: Vec<Vec<i32>> =
+                planes_9x7.iter().map(|p| vec![0i32; p.len()]).collect();
+            let mut comp_refs: Vec<&mut [f32]> =
+                comps_f32.iter_mut().map(|v| v.as_mut_slice()).collect();
+            let mut out_refs: Vec<&mut [i32]> =
+                outputs.iter_mut().map(|v| v.as_mut_slice()).collect();
+            reconstruct_tile_components_9x7_multi(
+                &mut comp_refs,
+                &mut out_refs,
+                &descriptors,
+                mode,
+            )?;
+            Ok(outputs)
+        }
+        WaveletTransform::Reserved(_) => Err(Error::NotImplemented),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Image-level decode.
+// ---------------------------------------------------------------------------
+
+/// Decode a raw JPEG 2000 Part-1 codestream (`.j2k` / `.j2c`) into
+/// per-component sample planes.
+///
+/// This is the end-to-end composition of the crate's T.800 stages —
+/// see the [module documentation](self) for the geometry classes
+/// covered and the features that are cleanly rejected with
+/// [`Error::NotImplemented`].
+///
+/// Every tile of the §B.3 tile grid is decoded independently (its
+/// tile-parts concatenated in `TPsot` order) and placed into the
+/// per-component image-area planes at the Equation B-12 offsets.
+pub fn decode_j2k(bytes: &[u8]) -> Result<DecodedImage, Error> {
+    let cs: J2kCodestream = crate::parse_codestream(bytes)?;
+    decode_codestream(bytes, &cs)
+}
+
+/// [`decode_j2k`] against an already-parsed [`J2kCodestream`] (the
+/// `bytes` must be the same buffer the codestream was parsed from).
+pub fn decode_codestream(bytes: &[u8], cs: &J2kCodestream) -> Result<DecodedImage, Error> {
+    reject_unsupported_main_header_markers(bytes, cs.header.bytes_consumed)?;
+
+    let siz = &cs.header.siz;
+    let cod = &cs.header.cod;
+    let qcd = &cs.header.qcd;
+
+    let style_flags = cod.code_block_style_flags();
+    if style_flags.selective_arithmetic_coding_bypass()
+        || style_flags.reset_context_probabilities()
+        || style_flags.termination_on_each_coding_pass()
+    {
+        // These three Table A.19 bits change the §C.3 codeword
+        // segmentation; the single-segment tier-1 driver below would
+        // mis-decode them.
+        return Err(Error::NotImplemented);
+    }
+
+    let params = CodingParams {
+        n_l: cod.decomposition_levels,
+        xcb: cod
+            .code_block_width_exp
+            .checked_add(2)
+            .ok_or(Error::InvalidMarkerLength)?,
+        ycb: cod
+            .code_block_height_exp
+            .checked_add(2)
+            .ok_or(Error::InvalidMarkerLength)?,
+        precincts: cod.precincts.clone(),
+        layers: cod.layers,
+        progression: cod.progression,
+        transform: cod.transform,
+        mct: cod.multi_component_transform,
+        sop_eph: match (cod.sop_marker_allowed, cod.eph_marker_used) {
+            (false, false) => SopEphMode::None,
+            (true, false) => SopEphMode::SopOnly,
+            (false, true) => SopEphMode::EphOnly,
+            (true, true) => SopEphMode::SopAndEph,
+        },
+        segmentation_symbols: style_flags.segmentation_symbols(),
+        vertically_causal: style_flags.vertically_causal_context(),
+    };
+
+    // -- Image-area planes --
+    let areas = image_area(siz)?;
+    let (num_x, num_y) = tile_grid_extent(siz)?;
+    let num_tiles = (num_x as u64) * (num_y as u64);
+
+    let mut components: Vec<DecodedComponent> = Vec::with_capacity(siz.components.len());
+    for (sc, area) in siz.components.iter().zip(areas.iter()) {
+        let len = (area.width() as usize)
+            .checked_mul(area.height() as usize)
+            .ok_or(Error::InvalidMarkerLength)?;
+        components.push(DecodedComponent {
+            width: area.width(),
+            height: area.height(),
+            precision_bits: sc.precision_bits,
+            is_signed: sc.is_signed,
+            h_separation: sc.h_separation,
+            v_separation: sc.v_separation,
+            samples: vec![0i32; len],
+        });
+    }
+
+    // -- Group tile-parts by tile, ordered by TPsot --
+    let mut parts_by_tile: BTreeMap<u16, Vec<&crate::TilePart>> = BTreeMap::new();
+    for tp in &cs.tile_parts {
+        reject_unsupported_tile_part_markers(&tp.markers)?;
+        parts_by_tile.entry(tp.sot.tile_index).or_default().push(tp);
+    }
+
+    for (tile_index, mut parts) in parts_by_tile {
+        if (tile_index as u64) >= num_tiles {
+            return Err(Error::InvalidTilePartIndex);
+        }
+        parts.sort_by_key(|tp| tp.sot.tile_part_index);
+        let mut body = Vec::new();
+        for tp in &parts {
+            let end = tp
+                .body_offset
+                .checked_add(tp.body_len)
+                .ok_or(Error::PsotOverflow)?;
+            let slice = bytes.get(tp.body_offset..end).ok_or(Error::PsotOverflow)?;
+            body.extend_from_slice(slice);
+        }
+
+        let tile_planes = decode_tile(
+            siz,
+            &params,
+            qcd.style,
+            &qcd.spqcd,
+            qcd.guard_bits,
+            tile_index as u32,
+            &body,
+        )?;
+
+        // Place each tile-component plane into its image-area plane at
+        // the Equation B-12 offset.
+        let tile = derive_tile_geometry(siz, tile_index as u32)?;
+        for (c, plane) in tile_planes.iter().enumerate() {
+            let tc = &tile.components[c];
+            let (tw, th) = (tc.width() as usize, tc.height() as usize);
+            if tw == 0 || th == 0 {
+                continue;
+            }
+            if plane.len() != tw * th {
+                return Err(Error::InvalidMarkerLength);
+            }
+            let comp = &mut components[c];
+            let area = &areas[c];
+            let dx = tc
+                .tcx0
+                .checked_sub(area.x0)
+                .ok_or(Error::InvalidMarkerLength)? as usize;
+            let dy = tc
+                .tcy0
+                .checked_sub(area.y0)
+                .ok_or(Error::InvalidMarkerLength)? as usize;
+            let cw = comp.width as usize;
+            if dx + tw > cw || dy + th > comp.height as usize {
+                return Err(Error::InvalidMarkerLength);
+            }
+            for row in 0..th {
+                let src = &plane[row * tw..(row + 1) * tw];
+                let dst_start = (dy + row) * cw + dx;
+                comp.samples[dst_start..dst_start + tw].copy_from_slice(src);
+            }
+        }
+    }
+
+    Ok(DecodedImage {
+        width: siz.x_size.saturating_sub(siz.x_offset),
+        height: siz.y_size.saturating_sub(siz.y_offset),
+        components,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spqcd_index_follows_f31_order() {
+        assert_eq!(spqcd_index(0, SubBandOrientation::LL), 0);
+        assert_eq!(spqcd_index(1, SubBandOrientation::HL), 1);
+        assert_eq!(spqcd_index(1, SubBandOrientation::LH), 2);
+        assert_eq!(spqcd_index(1, SubBandOrientation::HH), 3);
+        assert_eq!(spqcd_index(2, SubBandOrientation::HL), 4);
+        assert_eq!(spqcd_index(3, SubBandOrientation::HH), 9);
+    }
+
+    #[test]
+    fn completed_bitplanes_follows_d3_schedule() {
+        assert_eq!(completed_bitplanes(0), 0);
+        assert_eq!(completed_bitplanes(1), 1); // CL
+        assert_eq!(completed_bitplanes(2), 1); // CL SP
+        assert_eq!(completed_bitplanes(3), 1); // CL SP MR
+        assert_eq!(completed_bitplanes(4), 2); // CL SP MR CL
+        assert_eq!(completed_bitplanes(7), 3);
+    }
+
+    #[test]
+    fn empty_input_is_rejected() {
+        assert!(decode_j2k(&[]).is_err());
+    }
+}

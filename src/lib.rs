@@ -115,6 +115,7 @@
 
 #![warn(missing_debug_implementations)]
 
+pub mod decode;
 pub mod dequant;
 pub mod dwt;
 pub mod geometry;
@@ -124,7 +125,14 @@ pub mod mq;
 pub mod packet;
 pub mod progression;
 pub mod reassemble;
+#[cfg(feature = "registry")]
+pub mod registry;
 pub mod t1;
+
+pub use decode::{decode_codestream, decode_j2k, DecodedComponent, DecodedImage};
+
+#[cfg(feature = "registry")]
+pub use registry::{make_decoder, Jpeg2000Decoder};
 
 #[cfg(feature = "registry")]
 use oxideav_core::RuntimeContext;
@@ -178,8 +186,13 @@ pub const MARKER_COM: u16 = 0xFF64;
 /// non-header entry points.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
-    /// Decoder/encoder body decode/encode paths are not yet wired up.
-    /// Header parsing IS implemented — see [`parse_j2k_header`].
+    /// The codestream needs a coding tool the decode wiring does not
+    /// handle yet (e.g. `COC` / `QCC` overrides, `RGN` ROI, `POC`,
+    /// packed packet headers, the `RPCL` / `PCRL` / `CPRL`
+    /// progression orders, or the segmentation-changing Table A.19
+    /// code-block-style bits) — or the encoder entry point, which is
+    /// not implemented at all. See [`decode`] for the supported
+    /// surface.
     NotImplemented,
     /// The codestream did not start with the SOC marker (T.800 §A.4.1).
     MissingSoc,
@@ -235,7 +248,7 @@ impl core::fmt::Display for Error {
         match self {
             Error::NotImplemented => write!(
                 f,
-                "oxideav-jpeg2000: codestream body decode not yet implemented"
+                "oxideav-jpeg2000: codestream uses a coding tool not yet wired (or encoder entry point)"
             ),
             Error::MissingSoc => write!(f, "JPEG 2000: missing SOC (0xFF4F) marker"),
             Error::MissingSiz => write!(f, "JPEG 2000: missing SIZ marker after SOC"),
@@ -1598,15 +1611,38 @@ fn scan_until_sot_or_eoc(bytes: &[u8], start: usize) -> Result<usize, Error> {
 }
 
 // ---------------------------------------------------------------------------
-// Decoder / encoder stubs.
+// Decoder / encoder entry points.
 // ---------------------------------------------------------------------------
 
-/// Decode a JPEG 2000 codestream (J2K) into raw component samples.
+/// Decode a JPEG 2000 codestream (J2K) into interleaved raw 8-bit
+/// component samples (row-major, `Csiz` components per pixel).
 ///
-/// **Not yet implemented.** Round 1 lands only the main-header parser
-/// ([`parse_j2k_header`]). Returns [`Error::NotImplemented`].
-pub fn decode_jpeg2000(_bytes: &[u8]) -> Result<Vec<u8>, Error> {
-    Err(Error::NotImplemented)
+/// Convenience wrapper around [`decode_j2k`] preserving the
+/// historical byte-vector signature. Requires every component to be
+/// 8-bit-or-less unsigned at `1:1` sub-sampling (so all planes share
+/// one geometry); other layouts return [`Error::NotImplemented`] —
+/// use [`decode_j2k`] to access the per-component planes directly.
+pub fn decode_jpeg2000(bytes: &[u8]) -> Result<Vec<u8>, Error> {
+    let image = decode_j2k(bytes)?;
+    let ncomp = image.components.len();
+    let first = image.components.first().ok_or(Error::NotImplemented)?;
+    let (w, h) = (first.width, first.height);
+    for c in &image.components {
+        if c.precision_bits > 8 || c.is_signed || c.width != w || c.height != h {
+            return Err(Error::NotImplemented);
+        }
+    }
+    let len = (w as usize)
+        .checked_mul(h as usize)
+        .and_then(|v| v.checked_mul(ncomp))
+        .ok_or(Error::InvalidMarkerLength)?;
+    let mut out = vec![0u8; len];
+    for (ci, comp) in image.components.iter().enumerate() {
+        for (i, &s) in comp.samples.iter().enumerate() {
+            out[i * ncomp + ci] = s.clamp(0, 255) as u8;
+        }
+    }
+    Ok(out)
 }
 
 /// Encode raw samples into a JPEG 2000 codestream (J2K).
@@ -1616,10 +1652,13 @@ pub fn encode_jpeg2000(_pixels: &[u8], _width: u32, _height: u32) -> Result<Vec<
     Err(Error::NotImplemented)
 }
 
-/// No-op codec registration — header-parser-only build registers
-/// nothing into the runtime context yet.
+/// Codec registration — installs the J2K codestream decoder factory
+/// and the `.j2k` / `.j2c` extension hints into the runtime context.
+/// See [`registry`] for the `Decoder` trait surface.
 #[cfg(feature = "registry")]
-pub fn register(_ctx: &mut RuntimeContext) {}
+pub fn register(ctx: &mut RuntimeContext) {
+    registry::register(ctx);
+}
 
 #[cfg(feature = "registry")]
 oxideav_core::register!("jpeg2000", register);
@@ -1890,8 +1929,12 @@ mod tests {
     }
 
     #[test]
-    fn decode_and_encode_are_still_unimplemented() {
-        assert_eq!(decode_jpeg2000(&[0xFF, 0x4F]), Err(Error::NotImplemented));
+    fn decode_rejects_truncated_input_and_encode_is_unimplemented() {
+        // A bare SOC with no SIZ behind it is a malformed codestream —
+        // the end-to-end decode path must surface a parse error (the
+        // happy path is exercised in tests/decode_e2e.rs against the
+        // committed fixtures).
+        assert_eq!(decode_jpeg2000(&[0xFF, 0x4F]), Err(Error::MissingSiz));
         assert_eq!(encode_jpeg2000(&[0u8; 4], 2, 2), Err(Error::NotImplemented));
     }
 
