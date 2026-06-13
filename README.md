@@ -3,6 +3,42 @@
 Pure-Rust JPEG 2000 (J2K + JP2) and High-Throughput JPEG 2000 (HTJ2K)
 codec.
 
+## Status — 2026-06-13 (clean-room round 288)
+
+Round 288 wires the three **position-keyed §B.12.1.3–5 progression
+orders** into the top-level decode. `decode_j2k` now dispatches
+**RPCL** (resolution level-position-component-layer), **PCRL**
+(position-component-resolution level-layer) and **CPRL**
+(component-position-resolution level-layer) through the
+`progression::{rpcl,pcrl,cprl}_packet_order` drivers — already
+present and unit-tested in isolation, now reachable end-to-end. The
+per-tile decode builds one `ComponentPositionInfo` per component
+(the precinct grid plus the §B.6 reference-grid corner mapping the
+position orders sort visits by, and the SIZ `XRsiz` / `YRsiz`
+sub-sampling) alongside the existing LRCP / RLCP path. Per the
+§B.12.1.3–5 power-of-two requirement on `XRsiz` / `YRsiz`, a
+non-power-of-two sub-sampling factor with a position-keyed order is
+rejected with `NotImplemented` rather than mis-ordered.
+
+Three new end-to-end fixtures pin the wiring (suite total 553):
+48×32 **three-component** lossless 5-3, MCT off (independent
+planes), 3 resolution levels, one each in **RPCL / PCRL / CPRL** —
+all **pixel-exact** on every plane. With three components and three
+resolution levels the three orders' packet interleaves genuinely
+differ (RPCL resolution-major, PCRL position-major, CPRL
+component-major), so any component- or resolution-ordering slip
+would corrupt a plane. Fixtures were encoded / COM-scrubbed with an
+opaque CLI codec used strictly as a black box.
+
+All five of LRCP / RLCP / RPCL / PCRL / CPRL now decode end-to-end
+on the single-precinct-per-resolution path. Multi-precinct decode
+(more than one precinct at a resolution level) remains a known
+follow-up — the packet-header walk / reassembly mis-orders
+code-block contributions across precincts; it is independent of the
+progression-order wiring and reproduces under LRCP too.
+
+Previous round status follows:
+
 ## Status — 2026-06-12 (clean-room round 284)
 
 Round 284 lands the **top-level decode wiring**: `decode_j2k(bytes)

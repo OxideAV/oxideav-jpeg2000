@@ -6,6 +6,30 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 288 (2026-06-13).** **Position-keyed progression
+  orders wired into the top-level decode.** `decode::decode_j2k` now
+  dispatches the three §B.12.1.3–5 position-keyed orders — **RPCL**
+  (resolution level-position-component-layer), **PCRL**
+  (position-component-resolution level-layer) and **CPRL**
+  (component-position-resolution level-layer) — through the
+  `progression::{rpcl,pcrl,cprl}_packet_order` drivers (already
+  present, now reachable end-to-end) by building one
+  `ComponentPositionInfo` per component alongside the existing
+  LRCP / RLCP `ComponentProgressionInfo`. The per-resolution
+  `ResolutionPrecinctLayout` is derived from the tile-component
+  geometry (`num_wide` / `num_high` from the §B.6 precinct partition;
+  the §B.6 anchor `floor(trx0 / 2^PPx)` = `trx0 >> ppx`; `trx0` /
+  `try0` / `ppx` / `ppy`), and the component sub-sampling
+  `XRsiz` / `YRsiz` comes from SIZ. Per the §B.12.1.3–5 requirement
+  that `XRsiz` / `YRsiz` be powers of two for these orders, a
+  non-power-of-two factor with a position-keyed order is rejected
+  with `Error::NotImplemented` rather than mis-ordered. Three new
+  fixture-driven end-to-end tests (suite total 553, was 550):
+  48×32 three-component lossless 5-3, MCT off, 3 resolution levels,
+  one each in RPCL / PCRL / CPRL — all **pixel-exact** on every plane
+  (encoded / COM-scrubbed via an opaque CLI codec used strictly as a
+  black box). Only LRCP / RLCP were wired before; RPCL / PCRL / CPRL
+  previously returned `NotImplemented`.
 * **Clean-room round 284 (2026-06-12).** **Top-level decode wiring**
   — `decode::decode_j2k(bytes) -> DecodedImage` (and
   `decode_codestream` for pre-parsed input) composes the §A parse,

@@ -60,7 +60,10 @@ use crate::mct::{
     ComponentDescriptor, InverseMctMode,
 };
 use crate::packet::{PacketGeometry, SopEphMode, SubBandGeometry};
-use crate::progression::{lrcp_packet_order, rlcp_packet_order, ComponentProgressionInfo};
+use crate::progression::{
+    cprl_packet_order, lrcp_packet_order, pcrl_packet_order, rlcp_packet_order, rpcl_packet_order,
+    ComponentPositionInfo, ComponentProgressionInfo, ResolutionPrecinctLayout,
+};
 use crate::reassemble::{
     idwt_5x3, idwt_9x7, BlockSource, CodedCodeBlock, PrecinctBlocks, SubBandQuantization,
     WalkerBlockEntry, WalkerBlockSource,
@@ -350,18 +353,37 @@ fn decode_tile(
     // -- Per-component resolution-level geometry + precinct layouts --
     let mut levels_per_comp: Vec<Vec<ResolutionLevel>> = Vec::with_capacity(num_components);
     let mut infos: Vec<ComponentProgressionInfo> = Vec::with_capacity(num_components);
+    // Parallel per-component input for the position-keyed (RPCL / PCRL /
+    // CPRL) §B.12.1.3–5 orders: same precinct grids, plus the
+    // reference-grid corner mapping those orders sort visits by.
+    let mut position_infos: Vec<ComponentPositionInfo> = Vec::with_capacity(num_components);
     // (component, resolution, precinct) → precinct code-block geometry.
     let mut precinct_geom: BTreeMap<(u16, u8, u32), PrecinctCodeBlocks> = BTreeMap::new();
 
     for (c, tc) in tile.components.iter().enumerate() {
         let levels = derive_resolution_levels(*tc, params.n_l);
         let mut per_res = Vec::with_capacity(levels.len());
+        let mut res_layouts = Vec::with_capacity(levels.len());
         for level in &levels {
             let pp = precinct_exponents_at(&params.precincts, level.r);
             let partition = derive_precinct_partition(level, pp);
             let num = partition.num_precincts();
             let num = u32::try_from(num).map_err(|_| Error::InvalidMarkerLength)?;
             per_res.push(num);
+            // §B.6: the precinct partition is anchored at (0, 0) on the
+            // reduced-resolution domain with step 2^PP; the resolution
+            // level's left/top edge (trx0/try0) falls in anchor cell
+            // floor(trx0 / 2^PPx) — exactly `trx0 >> ppx` for u32.
+            res_layouts.push(ResolutionPrecinctLayout {
+                num_wide: partition.num_wide,
+                num_high: partition.num_high,
+                anchor_x: level.trx0 >> pp.ppx,
+                anchor_y: level.try0 >> pp.ppy,
+                trx0: level.trx0,
+                try0: level.try0,
+                ppx: pp.ppx,
+                ppy: pp.ppy,
+            });
             for k in 0..num {
                 let geom = derive_precinct_code_blocks(level, pp, params.xcb, params.ycb, k)?;
                 precinct_geom.insert((c as u16, level.r, k), geom);
@@ -371,6 +393,12 @@ fn decode_tile(
             num_decomposition_levels: params.n_l,
             precincts_per_resolution: per_res,
         });
+        position_infos.push(ComponentPositionInfo {
+            num_decomposition_levels: params.n_l,
+            xrsiz: siz.components[c].h_separation,
+            yrsiz: siz.components[c].v_separation,
+            resolutions: res_layouts,
+        });
         levels_per_comp.push(levels);
     }
 
@@ -378,6 +406,22 @@ fn decode_tile(
     let descriptors = match params.progression {
         ProgressionOrder::Lrcp => lrcp_packet_order(params.layers, &infos)?,
         ProgressionOrder::Rlcp => rlcp_packet_order(params.layers, &infos)?,
+        // §B.12.1.3–5 require XRsiz / YRsiz to be powers of two for every
+        // component (the reference-grid corner divisibility tests only
+        // hold then). A non-power-of-two sub-sampling factor with one of
+        // these orders is malformed; reject rather than mis-order.
+        ProgressionOrder::Rpcl | ProgressionOrder::Pcrl | ProgressionOrder::Cprl => {
+            for pi in &position_infos {
+                if !pi.xrsiz.is_power_of_two() || !pi.yrsiz.is_power_of_two() {
+                    return Err(Error::NotImplemented);
+                }
+            }
+            match params.progression {
+                ProgressionOrder::Rpcl => rpcl_packet_order(params.layers, &position_infos)?,
+                ProgressionOrder::Pcrl => pcrl_packet_order(params.layers, &position_infos)?,
+                _ => cprl_packet_order(params.layers, &position_infos)?,
+            }
+        }
         _ => return Err(Error::NotImplemented),
     };
 

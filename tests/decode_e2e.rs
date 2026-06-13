@@ -10,7 +10,7 @@
 //! small tolerance for the floating-point inverse-DWT differences
 //! T.800 Annex F permits between conforming decoders.
 
-use oxideav_jpeg2000::{decode_j2k, decode_jpeg2000, parse_codestream};
+use oxideav_jpeg2000::{decode_j2k, decode_jpeg2000, parse_codestream, ProgressionOrder};
 
 const GRAY_53: &[u8] = include_bytes!("data/gray-17x13-53.j2k");
 const GRAY_53_TILED: &[u8] = include_bytes!("data/gray-17x13-tiled-8x8-53.j2k");
@@ -19,6 +19,18 @@ const GRAY_97: &[u8] = include_bytes!("data/gray-32x32-97.j2k");
 const GRAY_97_REF_PGM: &[u8] = include_bytes!("data/gray-32x32-97-ref.pgm");
 const GRAY_97_FULL: &[u8] = include_bytes!("data/gray-32x32-97full.j2k");
 const GRAY_97_FULL_REF_PGM: &[u8] = include_bytes!("data/gray-32x32-97full-ref.pgm");
+
+// Position-keyed §B.12.1.3–5 progression-order fixtures: the same
+// 48×32 three-component raster, lossless 5-3, MCT off (each plane
+// independent), 3 resolution levels, one precinct per level — one
+// each in RPCL / PCRL / CPRL order. With three components and three
+// resolution levels the three orders' packet interleaves genuinely
+// differ (RPCL is resolution-major, PCRL position-major, CPRL
+// component-major), so any component- or resolution-ordering slip in
+// the wiring would corrupt at least one plane. COM markers scrubbed.
+const RGB_RPCL_53: &[u8] = include_bytes!("data/rgb-48x32-rpcl-53.j2k");
+const RGB_PCRL_53: &[u8] = include_bytes!("data/rgb-48x32-pcrl-53.j2k");
+const RGB_CPRL_53: &[u8] = include_bytes!("data/rgb-48x32-cprl-53.j2k");
 
 /// Deterministic 17×13 gray source pattern (the raster the lossless
 /// gray fixtures were encoded from).
@@ -180,6 +192,64 @@ fn gray_97_irreversible_truncated_tracks_black_box_reference() {
         mean <= 4.0,
         "truncated 9-7 decode mean deviation {mean} (> 4.0)"
     );
+}
+
+/// Deterministic 48×32 three-component source pattern (the raster the
+/// position-keyed §B.12.1.3–5 fixtures were encoded from), MCT off so
+/// each plane is independent.
+fn rgb_48x32_pattern() -> [Vec<i32>; 3] {
+    let (w, h) = (48i32, 32i32);
+    let mut r = Vec::new();
+    let mut g = Vec::new();
+    let mut b = Vec::new();
+    for y in 0..h {
+        for x in 0..w {
+            r.push((x * 5 + y * 11 + (x * y) % 37) % 256);
+            g.push((x * 9 + y * 3 + (x + y) % 29) % 256);
+            b.push((x * 2 + y * 7 + (x * y) % 23) % 256);
+        }
+    }
+    [r, g, b]
+}
+
+/// Shared body for the three position-keyed fixtures: assert the COD
+/// carries the expected §B.12 progression order, then assert the
+/// reversible 5-3 decode reproduces the source raster exactly on
+/// every plane.
+fn assert_position_keyed_pixel_exact(j2k: &[u8], expected: ProgressionOrder) {
+    let cs = parse_codestream(j2k).expect("parse");
+    assert_eq!(
+        cs.header.cod.progression, expected,
+        "fixture COD progression order"
+    );
+    let img = decode_j2k(j2k).expect("decode");
+    assert_eq!((img.width, img.height), (48, 32));
+    assert_eq!(img.components.len(), 3);
+    let expected_planes = rgb_48x32_pattern();
+    for (c, exp) in img.components.iter().zip(expected_planes.iter()) {
+        assert_eq!((c.width, c.height), (48, 32));
+        assert_eq!(c.precision_bits, 8);
+        assert!(!c.is_signed);
+        assert_eq!(&c.samples, exp);
+    }
+}
+
+#[test]
+fn rgb_rpcl_53_lossless_is_pixel_exact() {
+    // §B.12.1.3 resolution level-position-component-layer order.
+    assert_position_keyed_pixel_exact(RGB_RPCL_53, ProgressionOrder::Rpcl);
+}
+
+#[test]
+fn rgb_pcrl_53_lossless_is_pixel_exact() {
+    // §B.12.1.4 position-component-resolution level-layer order.
+    assert_position_keyed_pixel_exact(RGB_PCRL_53, ProgressionOrder::Pcrl);
+}
+
+#[test]
+fn rgb_cprl_53_lossless_is_pixel_exact() {
+    // §B.12.1.5 component-position-resolution level-layer order.
+    assert_position_keyed_pixel_exact(RGB_CPRL_53, ProgressionOrder::Cprl);
 }
 
 #[test]
