@@ -3,6 +3,36 @@
 Pure-Rust JPEG 2000 (J2K + JP2) and High-Throughput JPEG 2000 (HTJ2K)
 codec.
 
+## Status — 2026-06-14 (clean-room round 302)
+
+Round 302 closes the **per-coefficient `Nb(u, v)`** follow-up that has
+been the named gap for rate-truncated decode since round 284. The §D.2.1
+number of decoded magnitude bits is per *coefficient*, not per
+code-block: when a packet header truncates the decode mid-bit-plane, the
+coefficients the final partial pass reached carry one more decoded bit
+than the ones it did not (the §E.1.1.2 NOTE). The tier-1 decoder now
+tracks this — every §D.3 coding pass (significance propagation,
+magnitude refinement, cleanup; AC and §D.6 raw alike) increments a
+per-coefficient counter at each magnitude-bit decode site, including the
+zero bits a zero-context cleanup or a run-length-escape column codes. A
+fully-decoded bit-plane gives every coefficient exactly one bit (so a
+non-truncated block keeps the uniform `Nb = Mb`); a truncated plane lets
+the counts diverge. `CodeBlock::effective_nb` returns
+`P + decoded_bits(u, v)` and `reassemble_subband_5x3` / `_9x7` lift each
+coefficient by its own `r · 2^(Mb − Nb(u, v))` midpoint (Equation E-6 /
+E-8).
+
+Measured delta: the committed rate-truncated 9-7 fixture
+(`gray-32x32-97.j2k`, 4:1, passes cut mid-bit-plane) now decodes within
+the same **±1** floating-point latitude as the full-quality decode — its
+end-to-end bound tightens from max ≤ 16 / mean ≤ 4 (the per-block-`Nb`
+approximation through round 295) to **max ≤ 1 / mean ≤ 0.05**. 6 new
+tier-1 unit tests pin the decoded-bit counting (suite total 560: 549
+lib + 11 e2e). The fully-decoded `Nb = Mb` path is unchanged (every
+existing fixture stays pixel-exact / within its prior bound).
+
+Previous round status follows:
+
 ## Status — 2026-06-14 (clean-room round 295)
 
 Round 295 fixes the **multi-precinct decode** known follow-up: the

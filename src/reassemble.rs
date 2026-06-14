@@ -206,7 +206,14 @@ pub fn reassemble_subband_5x3(
             for u in 0..block_w {
                 let coef = cb.coefficients.coefficient(u, v);
                 let qb = qb_signed(coef);
-                let r_qb = reconstruct_reversible(qb, mb, cb.nb, r);
+                // §E.1.2.1 Equation E-7 / E-8 take the **per-coefficient**
+                // Nb(u, v) (§D.2.1): under mid-bit-plane truncation the
+                // coefficients the final partial pass reached carry one
+                // more decoded magnitude bit than those it did not. The
+                // block tracks these counts; a test-constructed block
+                // (no passes run) falls back to the uniform `cb.nb`.
+                let nb = cb.coefficients.effective_nb(u, v, cb.nb);
+                let r_qb = reconstruct_reversible(qb, mb, nb, r);
                 let target = (dy + v) * width + (dx + u);
                 if written[target] {
                     return Err(Error::InvalidMarkerLength);
@@ -268,7 +275,11 @@ pub fn reassemble_subband_9x7(
             for u in 0..block_w {
                 let coef = cb.coefficients.coefficient(u, v);
                 let qb = qb_signed(coef);
-                let r_qb = reconstruct_irreversible(qb, quant.mb, cb.nb, step_size, r);
+                // §E.1.1.2 Equation E-6 takes the **per-coefficient**
+                // Nb(u, v) (§D.2.1) so mid-bit-plane truncation lifts each
+                // coefficient by its own `r · 2^(Mb − Nb(u, v))` midpoint.
+                let nb = cb.coefficients.effective_nb(u, v, cb.nb);
+                let r_qb = reconstruct_irreversible(qb, quant.mb, nb, step_size, r);
                 let target = (dy + v) * width + (dx + u);
                 if written[target] {
                     return Err(Error::InvalidMarkerLength);

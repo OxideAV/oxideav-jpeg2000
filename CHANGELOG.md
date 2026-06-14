@@ -6,6 +6,32 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Fixed
 
+* **Clean-room round 302 (2026-06-14).** **Per-coefficient `Nb(u, v)`**
+  for rate-truncated reconstruction. The tier-1 decoder now tracks the
+  §D.2.1 per-coefficient decoded-magnitude-bit count: every §D.3 coding
+  pass (significance propagation, magnitude refinement, cleanup — AC
+  and §D.6 raw variants) increments a per-coefficient counter whenever a
+  magnitude MSB is drawn for that coefficient (including the zero bits a
+  zero-context cleanup or a run-length-escape column decodes). Under a
+  **completed** bit-plane every coefficient gains exactly one bit, so a
+  non-truncated block keeps a uniform `Nb = Mb`; when a packet header
+  cuts the decode mid-bit-plane the counts diverge — the coefficients
+  the final partial pass reached carry one more decoded bit than those
+  it did not, which is precisely the per-coefficient `Nb(u, v)` of the
+  §E.1.1.2 NOTE. `CodeBlock::set_zero_bit_planes` records the §B.10.5
+  `P`; `CodeBlock::effective_nb(u, v, fallback)` returns
+  `P + decoded_bits(u, v)` (or the uniform fallback for a
+  test-constructed block with no passes run). `reassemble_subband_5x3`
+  / `_9x7` lift each coefficient by its own `r · 2^(Mb − Nb(u, v))`
+  midpoint (Equation E-6 / E-8) instead of one per-block value. Effect:
+  the committed rate-truncated 9-7 fixture (`gray-32x32-97.j2k`, 4:1
+  truncation, passes cut mid-bit-plane) now decodes within the same
+  ±1 floating-point latitude as the full-quality decode — its
+  end-to-end test bound tightens from max ≤ 16 / mean ≤ 4 (the
+  per-block-`Nb` approximation pinned through round 295) to
+  max ≤ 1 / mean ≤ 0.05. 6 new tier-1 unit tests pin the decoded-bit
+  counting (suite total 560: 549 lib + 11 e2e).
+
 * **Clean-room round 295 (2026-06-14).** **Multi-precinct decode** —
   the §B.7 Equation B-17 / B-18 effective code-block exponent had its
   `r = 0` and `r > 0` branches inverted. Per the spec, `xcb' =

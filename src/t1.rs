@@ -406,6 +406,28 @@ pub struct CodeBlock {
     /// 0 and the coefficient stayed insignificant). Cleared at the
     /// start of every SP pass.
     sp_visited: Vec<bool>,
+    /// Per-coefficient count of decoded magnitude bits drawn by the
+    /// §D.3 coding passes — the actually-iterated half of the §D.2.1
+    /// `Nb(u, v)` (the §B.10.5 zero-MSB count `P` is recorded
+    /// separately in [`Self::zero_bit_planes`] and added by
+    /// [`Self::effective_nb`]). Every coefficient gets exactly one
+    /// increment per **completed** bit-plane: the SP pass for an
+    /// insignificant coefficient with a non-zero Table D.1 context, the
+    /// MR pass for an already-significant coefficient, or the cleanup
+    /// pass for a coefficient left over (zero-context insignificant).
+    /// When a packet header truncates the decode mid-bit-plane the
+    /// counts diverge — the coefficients the truncated final pass
+    /// reached carry one more decoded bit than those it did not — which
+    /// is exactly the per-coefficient `Nb(u, v)` of §E.1.1.2 /
+    /// §E.1.2.1 Equation E-6 / E-8.
+    decoded_bits: Vec<u32>,
+    /// The §B.10.5 zero-most-significant-bit-plane count `P` for this
+    /// code-block, recorded by the decode driver via
+    /// [`Self::set_zero_bit_planes`]. `Nb(u, v) = P + decoded_bits(u, v)`
+    /// per §D.2.1 ("the number `Nb(u, v)` … includes the number of all
+    /// zero most significant bit-planes signalled in the packet
+    /// header"). Default `0`.
+    zero_bit_planes: u32,
     /// Whether the COD / COC Table A.19 `vertically_causal_context`
     /// flag is set for this code-block (T.800 §D.7).
     ///
@@ -438,6 +460,8 @@ impl CodeBlock {
             coefficients: vec![Coefficient::default(); width * height],
             newly_significant: vec![false; width * height],
             sp_visited: vec![false; width * height],
+            decoded_bits: vec![0u32; width * height],
+            zero_bit_planes: 0,
             vertically_causal: false,
         }
     }
@@ -469,6 +493,8 @@ impl CodeBlock {
             coefficients,
             newly_significant: vec![false; width * height],
             sp_visited: vec![false; width * height],
+            decoded_bits: vec![0u32; width * height],
+            zero_bit_planes: 0,
             vertically_causal: false,
         }
     }
@@ -530,6 +556,53 @@ impl CodeBlock {
     pub fn was_newly_significant(&self, u: usize, v: usize) -> bool {
         debug_assert!(u < self.width && v < self.height);
         self.newly_significant[u + v * self.width]
+    }
+
+    /// The number of decoded magnitude bits the §D.3 passes have drawn
+    /// for coefficient `(u, v)` — the actually-iterated half of
+    /// §D.2.1's `Nb(u, v)`. Does **not** include the §B.10.5 zero-MSB
+    /// count `P`; use [`Self::effective_nb`] for the full `Nb(u, v)`.
+    pub fn decoded_bits(&self, u: usize, v: usize) -> u32 {
+        debug_assert!(u < self.width && v < self.height);
+        self.decoded_bits[u + v * self.width]
+    }
+
+    /// The largest per-coefficient decoded-bit count in the block. Zero
+    /// for a block whose coding passes never ran (e.g. one built via
+    /// [`Self::from_coefficients`] for a reassembly test) — callers use
+    /// this to decide whether per-coefficient `Nb(u, v)` data is
+    /// available or whether to fall back to a uniform `Nb`.
+    pub fn max_decoded_bits(&self) -> u32 {
+        self.decoded_bits.iter().copied().max().unwrap_or(0)
+    }
+
+    /// Record the §B.10.5 zero-most-significant-bit-plane count `P` so
+    /// [`Self::effective_nb`] can return the full §D.2.1 `Nb(u, v)`.
+    /// The decode driver sets this after the §B.10 packet-header walk
+    /// (the first-inclusion `zero_bit_planes` field) and before
+    /// handing the block to the reassembly bridge.
+    pub fn set_zero_bit_planes(&mut self, p: u32) {
+        self.zero_bit_planes = p;
+    }
+
+    /// The §B.10.5 zero-MSB count `P` recorded on this block.
+    pub fn zero_bit_planes(&self) -> u32 {
+        self.zero_bit_planes
+    }
+
+    /// The full per-coefficient §D.2.1 `Nb(u, v)` for reconstruction:
+    /// `P + decoded_bits(u, v)` when the §D.3 passes were tracked on
+    /// this block, or the supplied `uniform_fallback` when they were
+    /// not (a test-constructed block via [`Self::from_coefficients`]
+    /// carries no per-coefficient bit counts). Used by the §E.1.1.2 /
+    /// §E.1.2.1 reconstruction in [`crate::reassemble`].
+    pub fn effective_nb(&self, u: usize, v: usize, uniform_fallback: u32) -> u32 {
+        debug_assert!(u < self.width && v < self.height);
+        if self.max_decoded_bits() == 0 {
+            uniform_fallback
+        } else {
+            self.zero_bit_planes + self.decoded_bits[u + v * self.width]
+        }
     }
 
     /// Run one §D.3.1 significance-propagation pass over the bit-plane
@@ -604,6 +677,10 @@ impl CodeBlock {
                     // coded in the SP pass — the same plane's cleanup
                     // pass must skip it whatever the outcome.
                     self.sp_visited[u + v * self.width] = true;
+                    // §D.2.1: a magnitude MSB was decoded for this
+                    // coefficient on this bit-plane (whether it read 0
+                    // or 1) — count it toward Nb(u, v).
+                    self.decoded_bits[u + v * self.width] += 1;
                     if bit == 1 {
                         // Newly significant — set σ, accumulate the
                         // bit-plane's positional value into magnitude,
@@ -701,6 +778,9 @@ impl CodeBlock {
                     }
                     updated.already_refined = true;
                     self.coefficients[idx] = updated;
+                    // §D.2.1: one refinement (magnitude) bit decoded for
+                    // this already-significant coefficient on this plane.
+                    self.decoded_bits[idx] += 1;
                     refined += 1;
                 }
             }
@@ -774,7 +854,13 @@ impl CodeBlock {
                 if stripe_h == 4 && self.column_run_length_eligible(u, v0) {
                     let rl_cx = &mut ctx[RUN_LENGTH_CTX];
                     if decoder.decode(rl_cx) == 0 {
-                        // All four remain insignificant; skip the column.
+                        // All four remain insignificant; the run-length
+                        // escape decoded a 0 magnitude bit for every one
+                        // of the column's four coefficients on this
+                        // bit-plane (§D.2.1: count each toward Nb).
+                        for dv in 0..4 {
+                            self.decoded_bits[u + (v0 + dv) * self.width] += 1;
+                        }
                         continue;
                     }
                     // At least one significant: two UNIFORM bits (MSB
@@ -789,6 +875,14 @@ impl CodeBlock {
                     let v = v0 + first;
                     self.make_significant_with_sign(u, v, weight, v0, stripe_h, decoder, ctx);
                     newly += 1;
+                    // §D.2.1: the coefficients above `first` were decoded
+                    // as 0 by the run-length escape; `first` itself was
+                    // decoded as a 1. Each gets one magnitude bit this
+                    // bit-plane. (Coefficients below `first` are coded by
+                    // the normal loop below, which counts them there.)
+                    for dv in 0..=first {
+                        self.decoded_bits[u + (v0 + dv) * self.width] += 1;
+                    }
                     start_dv = first + 1;
                 }
 
@@ -813,6 +907,9 @@ impl CodeBlock {
                         self.neighbours_in_stripe(u, v, v0, stripe_h),
                     );
                     let cx = &mut ctx[SP_CTX_OFFSET + label as usize];
+                    // §D.2.1: this leftover coefficient is coded (a 0 or
+                    // 1 magnitude bit) by the cleanup pass on this plane.
+                    self.decoded_bits[u + v * self.width] += 1;
                     if decoder.decode(cx) == 1 {
                         self.make_significant_with_sign(u, v, weight, v0, stripe_h, decoder, ctx);
                         newly += 1;
@@ -894,6 +991,10 @@ impl CodeBlock {
                     // §D.3.4 / Table D.10 D9: coded in the SP pass —
                     // skipped by the same plane's cleanup pass.
                     self.sp_visited[u + v * self.width] = true;
+                    // §D.2.1: one magnitude MSB decoded for this
+                    // coefficient on this bit-plane — count toward
+                    // Nb(u, v).
+                    self.decoded_bits[u + v * self.width] += 1;
                     if bit == 1 {
                         // §D.6 Equation D-2: signbit = raw_value (no
                         // XOR-with-XORbit redirection).
@@ -957,6 +1058,9 @@ impl CodeBlock {
                     }
                     updated.already_refined = true;
                     self.coefficients[idx] = updated;
+                    // §D.2.1: one refinement (magnitude) bit decoded for
+                    // this already-significant coefficient on this plane.
+                    self.decoded_bits[idx] += 1;
                     refined += 1;
                 }
             }
@@ -2641,6 +2745,136 @@ mod tests {
         }
         // No MQ decision means no byte consumption.
         assert_eq!(dec.byte_pointer(), bp_start);
+    }
+
+    // -- §D.2.1 per-coefficient decoded-bit (Nb) tracking -------------
+
+    #[test]
+    fn decoded_bits_start_zero_and_effective_nb_falls_back() {
+        // A test-constructed block (no passes run) carries zero
+        // decoded-bit counts; effective_nb must return the uniform
+        // fallback so the historical reassembly test path is unchanged.
+        let block = CodeBlock::new(SubBandOrientation::LL, 3, 5);
+        for v in 0..5 {
+            for u in 0..3 {
+                assert_eq!(block.decoded_bits(u, v), 0);
+            }
+        }
+        assert_eq!(block.max_decoded_bits(), 0);
+        assert_eq!(block.zero_bit_planes(), 0);
+        // Fallback returned verbatim when no per-coefficient data.
+        assert_eq!(block.effective_nb(1, 2, 7), 7);
+        assert_eq!(block.effective_nb(0, 0, 12), 12);
+    }
+
+    #[test]
+    fn set_zero_bit_planes_round_trips() {
+        let mut block = CodeBlock::new(SubBandOrientation::HL, 2, 2);
+        block.set_zero_bit_planes(3);
+        assert_eq!(block.zero_bit_planes(), 3);
+    }
+
+    #[test]
+    fn sp_pass_increments_decoded_bits_for_visited_coefficients() {
+        // (0, 0) pre-significant → its right neighbour (1, 0) has a
+        // non-zero context (label 5) and is visited by the SP pass,
+        // gaining one decoded bit whatever the decision. (2, 0) / (3, 0)
+        // have zero context and are deferred to cleanup — no bit yet.
+        let bytes = [0x84u8, 0xC7, 0x3B, 0xFC];
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 4, 1);
+        block.mark_significant_for_test(0, 0, false, 1);
+        let mut dec = MqDecoder::new(&bytes);
+        let mut ctx = reset_contexts();
+        block
+            .significance_propagation_pass(0, &mut dec, &mut ctx)
+            .unwrap();
+        // (0, 0) was pre-marked (not via a pass) → no decoded bit.
+        assert_eq!(block.decoded_bits(0, 0), 0);
+        // (1, 0) had a non-zero context → exactly one decoded bit.
+        assert_eq!(block.decoded_bits(1, 0), 1);
+        // Zero-context coefficients are untouched by SP.
+        assert_eq!(block.decoded_bits(2, 0), 0);
+        assert_eq!(block.decoded_bits(3, 0), 0);
+    }
+
+    #[test]
+    fn cleanup_run_length_zero_counts_one_bit_per_column_coefficient() {
+        // Run-length escape decodes a single 0 for the whole column but
+        // §D.2.1 counts a decoded magnitude bit for every one of the
+        // four coefficients on this bit-plane.
+        let candidates: [[u8; 4]; 4] = [
+            [0x00, 0x00, 0x00, 0x00],
+            [0xFF, 0xFF, 0xFF, 0xFF],
+            [0x84, 0xC7, 0x3B, 0xFC],
+            [0x42, 0x91, 0x6A, 0x0D],
+        ];
+        let bytes = candidates
+            .iter()
+            .find(|b| replay_eligible_column_1x4(*b, 1 << 7).0 == 0)
+            .expect("a run-length-0 candidate must exist");
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 1, 4);
+        let mut dec = MqDecoder::new(bytes);
+        let mut ctx = reset_contexts();
+        block.cleanup_pass(7, &mut dec, &mut ctx).unwrap();
+        for v in 0..4 {
+            assert_eq!(
+                block.decoded_bits(0, v),
+                1,
+                "({v}) should have one decoded bit after the run-length-0 column"
+            );
+        }
+    }
+
+    #[test]
+    fn full_bitplane_gives_every_coefficient_exactly_one_bit() {
+        // A complete bit-plane (SP, MR, CL) on an all-insignificant LL
+        // block: every coefficient is reached exactly once — the
+        // zero-context coefficients via the cleanup pass, none via SP.
+        // After the cleanup pass every coefficient has exactly one
+        // decoded bit, so under full decode Nb is uniform.
+        let bytes = [0x84u8, 0xC7, 0x3B, 0xFC, 0x11, 0x22, 0x33, 0x44];
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 4, 4);
+        let mut dec = MqDecoder::new(&bytes);
+        let mut ctx = reset_contexts();
+        block
+            .significance_propagation_pass(7, &mut dec, &mut ctx)
+            .unwrap();
+        block
+            .magnitude_refinement_pass(7, &mut dec, &mut ctx)
+            .unwrap();
+        block.cleanup_pass(7, &mut dec, &mut ctx).unwrap();
+        for v in 0..4 {
+            for u in 0..4 {
+                assert_eq!(
+                    block.decoded_bits(u, v),
+                    1,
+                    "({u}, {v}) should have exactly one decoded bit after a full plane"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn effective_nb_diverges_across_coefficients_on_truncated_plane() {
+        // SP pass only (no cleanup) on a block with one pre-significant
+        // seed: the SP-visited coefficient carries one decoded bit while
+        // the zero-context coefficients carry none → effective_nb
+        // diverges by exactly one once P is recorded.
+        let bytes = [0x84u8, 0xC7, 0x3B, 0xFC];
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 4, 1);
+        block.mark_significant_for_test(0, 0, false, 1);
+        let mut dec = MqDecoder::new(&bytes);
+        let mut ctx = reset_contexts();
+        block
+            .significance_propagation_pass(0, &mut dec, &mut ctx)
+            .unwrap();
+        block.set_zero_bit_planes(2);
+        // The SP-visited (1, 0) has Nb = P + 1; the deferred (2, 0) /
+        // (3, 0) have Nb = P + 0. The fallback is ignored because the
+        // block now carries per-coefficient data.
+        assert_eq!(block.effective_nb(1, 0, 99), 3);
+        assert_eq!(block.effective_nb(2, 0, 99), 2);
+        assert_eq!(block.effective_nb(3, 0, 99), 2);
     }
 
     // -- Single-coefficient SP decode end-to-end ----------------------

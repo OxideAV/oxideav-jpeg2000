@@ -551,6 +551,14 @@ fn decode_tile(
             .with_segmentation_symbols(params.segmentation_symbols)
             .with_vertically_causal_context(params.vertically_causal);
         seq.decode_packet(&mut block, &acc.bytes, acc.passes, &mut ctx)?;
+        // Record the §B.10.5 zero-MSB count so the reassembly bridge can
+        // recover the full per-coefficient §D.2.1 Nb(u, v) =
+        // P + decoded_bits(u, v). The tier-1 passes have already tracked
+        // each coefficient's decoded-bit count; under mid-bit-plane
+        // truncation those counts diverge (the §E.1.1.2 / E.1.2.1
+        // per-coefficient Nb), tightening the Equation E-6 / E-8 lift
+        // versus the per-block `nb` fallback below.
+        block.set_zero_bit_planes(p);
         let nb = p + completed_bitplanes(acc.passes);
         decoded.push(DecodedBlock {
             component: *c,

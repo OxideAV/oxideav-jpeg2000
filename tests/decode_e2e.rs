@@ -225,20 +225,24 @@ fn gray_97_irreversible_full_quality_matches_black_box_reference() {
 #[test]
 fn gray_97_irreversible_truncated_tracks_black_box_reference() {
     // Same source rate-limited 4:1 — coding passes are truncated
-    // mid-bit-plane, so per E.1.1.2 NOTE Nb(u, v) differs across one
-    // code-block. The wiring currently models Nb per *block* (the
-    // fully-completed bit-plane count), which costs up to one
-    // bit-plane of Equation E-6 reconstruction-lift accuracy on the
-    // coefficients the partial passes did reach; the deviation bound
-    // here pins that approximation until per-coefficient Nb lands.
+    // mid-bit-plane, so per the §E.1.1.2 NOTE Nb(u, v) differs across
+    // one code-block: the coefficients the final partial pass reached
+    // carry one more decoded magnitude bit than those it did not. The
+    // tier-1 decoder now tracks the §D.2.1 per-coefficient decoded-bit
+    // count and the §E.1.1.2 reconstruction lifts each coefficient by
+    // its own `r · 2^(Mb − Nb(u, v))` midpoint (round 302). With the
+    // per-coefficient Nb the truncated decode tracks the black-box
+    // reference within the same ±1 floating-point latitude as the
+    // full-quality decode — a step down from the max ≤ 16 / mean ≤ 4
+    // the per-block-Nb approximation pinned through round 295.
     let (max_diff, mean) = gray_97_deviation(GRAY_97, GRAY_97_REF_PGM);
     assert!(
-        max_diff <= 16,
-        "truncated 9-7 decode deviates from the reference by {max_diff} (> 16)"
+        max_diff <= 1,
+        "truncated 9-7 decode deviates from the reference by {max_diff} (> 1)"
     );
     assert!(
-        mean <= 4.0,
-        "truncated 9-7 decode mean deviation {mean} (> 4.0)"
+        mean <= 0.05,
+        "truncated 9-7 decode mean deviation {mean} (> 0.05)"
     );
 }
 
