@@ -32,10 +32,37 @@ const RGB_RPCL_53: &[u8] = include_bytes!("data/rgb-48x32-rpcl-53.j2k");
 const RGB_PCRL_53: &[u8] = include_bytes!("data/rgb-48x32-pcrl-53.j2k");
 const RGB_CPRL_53: &[u8] = include_bytes!("data/rgb-48x32-cprl-53.j2k");
 
+// Multi-precinct §B.6 / §B.7 fixture: 40×40 gray, lossless 5-3, NL = 2,
+// 8×8 code-blocks (xcb = ycb = 3), precinct exponents PPx = PPy = 4
+// (16×16 precinct cells) at every resolution. The precinct cell (16) is
+// larger than a code-block (8), so each precinct holds a 2×2 grid of
+// code-blocks, and the sub-bands span several precincts — the LRCP walk
+// must visit every (precinct, code-block) in §B.10.8 raster order and
+// scatter each block at its absolute §B.7 sub-band corner. This pins the
+// §B.7 Eq B-17 / B-18 effective code-block exponent (`min(xcb, PPx)` at
+// r = 0, `min(xcb, PPx - 1)` at r > 0): an off-by-one in the r = 0 / r > 0
+// branch mis-counts the LL-band code-blocks and desyncs the packet walk.
+// COM markers scrubbed; encoded with an opaque CLI codec as a black box.
+const GRAY_MULTIPRECINCT_53: &[u8] = include_bytes!("data/gray-40x40-multiprecinct-53.j2k");
+
 /// Deterministic 17×13 gray source pattern (the raster the lossless
 /// gray fixtures were encoded from).
 fn gray_17x13_pattern() -> Vec<i32> {
     let (w, h) = (17i32, 13i32);
+    let mut out = Vec::with_capacity((w * h) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            out.push((x * 7 + y * 13 + (x * y) % 31) % 256);
+        }
+    }
+    out
+}
+
+/// Deterministic 40×40 gray source pattern (the raster the
+/// multi-precinct fixture was encoded from); same arithmetic family as
+/// [`gray_17x13_pattern`].
+fn gray_40x40_pattern() -> Vec<i32> {
+    let (w, h) = (40i32, 40i32);
     let mut out = Vec::with_capacity((w * h) as usize);
     for y in 0..h {
         for x in 0..w {
@@ -111,6 +138,27 @@ fn gray_53_multi_tile_is_pixel_exact() {
     let img = decode_j2k(GRAY_53_TILED).expect("decode");
     assert_eq!(img.components.len(), 1);
     assert_eq!(img.components[0].samples, gray_17x13_pattern());
+}
+
+#[test]
+fn gray_53_multi_precinct_is_pixel_exact() {
+    // 40×40 gray, lossless 5-3, NL = 2, 8×8 code-blocks, 16×16 precinct
+    // cells: every sub-band spans several precincts and each precinct
+    // holds a 2×2 code-block grid. Exercises the §B.6 precinct partition
+    // and the §B.7 Eq B-17 / B-18 effective-exponent branch end-to-end.
+    let cs = parse_codestream(GRAY_MULTIPRECINCT_53).expect("parse");
+    // Confirm the fixture genuinely carries more than one precinct at
+    // some resolution (PPx = PPy = 4 with NL = 2): the COD must define
+    // precincts (Scod bit 0).
+    assert!(
+        cs.header.cod.scod & 0x01 != 0,
+        "fixture must define precincts (Scod bit 0)"
+    );
+    let img = decode_j2k(GRAY_MULTIPRECINCT_53).expect("decode");
+    assert_eq!(img.width, 40);
+    assert_eq!(img.height, 40);
+    assert_eq!(img.components.len(), 1);
+    assert_eq!(img.components[0].samples, gray_40x40_pattern());
 }
 
 #[test]

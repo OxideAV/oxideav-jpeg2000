@@ -4,6 +4,27 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ## [Unreleased]
 
+### Fixed
+
+* **Clean-room round 295 (2026-06-14).** **Multi-precinct decode** —
+  the §B.7 Equation B-17 / B-18 effective code-block exponent had its
+  `r = 0` and `r > 0` branches inverted. Per the spec, `xcb' =
+  min(xcb, PPx)` at the `NLLL` band (`r = 0`) and `xcb' =
+  min(xcb, PPx - 1)` at every higher resolution level (`r > 0`); the
+  implementation applied `PPx - 1` at `r = 0` and `PPx` at `r > 0`.
+  Harmless while precincts stayed at the default maximum (`PPx = 15`),
+  but with small user-defined precincts the `r = 0` LL band was split
+  into the wrong number of code-blocks, desynchronising the §B.10.8
+  packet-header walk and corrupting the image. `geometry::
+  derive_code_block_dimensions` now matches the equation; the
+  redundant second clamp in `derive_precinct_code_blocks` is documented
+  as a defensive no-op. A new end-to-end fixture (40×40 gray, lossless
+  5-3, NL = 2, 8×8 code-blocks, 16×16 precinct cells — multiple
+  precincts per sub-band, 2×2 code-blocks per precinct) decodes
+  pixel-exact; five inverted geometry unit tests were corrected to the
+  spec branch (suite total 554). Multi-**layer** reassembly across
+  precincts remains a separate known follow-up.
+
 ### Added
 
 * **Clean-room round 288 (2026-06-13).** **Position-keyed progression

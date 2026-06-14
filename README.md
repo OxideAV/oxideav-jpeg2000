@@ -3,6 +3,36 @@
 Pure-Rust JPEG 2000 (J2K + JP2) and High-Throughput JPEG 2000 (HTJ2K)
 codec.
 
+## Status — 2026-06-14 (clean-room round 295)
+
+Round 295 fixes the **multi-precinct decode** known follow-up: the
+§B.7 Equation B-17 / B-18 effective code-block exponent had its `r = 0`
+and `r > 0` branches **inverted**. The spec uses the full precinct
+exponent at the `NLLL` band (`xcb' = min(xcb, PPx)` at `r = 0`) and
+shaves one off at every higher resolution level
+(`xcb' = min(xcb, PPx - 1)` at `r > 0`); the implementation had these
+the other way round. The error was invisible while precincts stayed at
+the default maximum (`PPx = 15`, so both `min(xcb, 15)` and
+`min(xcb, 14)` reduce to `xcb`), but as soon as a stream defined small
+precincts the `r = 0` LL band was partitioned into the wrong number of
+code-blocks, desynchronising the §B.10.8 packet-header walk and
+corrupting the image. `derive_code_block_dimensions` now matches the
+equation; the redundant second clamp in
+`derive_precinct_code_blocks` is documented as a defensive no-op.
+
+A new end-to-end fixture pins the path (suite total 554): 40×40 gray,
+lossless 5-3, NL = 2, 8×8 code-blocks, 16×16 precinct cells — so every
+sub-band spans several precincts and each precinct holds a 2×2
+code-block grid — decoding **pixel-exact**. Five inverted geometry
+unit tests were corrected to the spec branch. Multi-precinct decode
+now works for any precinct size at single layer; **multi-layer**
+reassembly (a code-block first appearing in a later layer and refining
+across layers) remains a separate known follow-up, reproducing under a
+single precinct. The fixture was encoded / COM-scrubbed with an opaque
+CLI codec used strictly as a black box.
+
+Previous round status follows:
+
 ## Status — 2026-06-13 (clean-room round 288)
 
 Round 288 wires the three **position-keyed §B.12.1.3–5 progression

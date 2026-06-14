@@ -872,14 +872,18 @@ pub fn derive_precinct_partition(
 /// level and `exponents` is the `(PPx, PPy)` in force at that level.
 ///
 /// ```text
-/// xcb' = min(xcb, PPx - 1)  at r = 0,   min(xcb, PPx)  at r > 0
-/// ycb' = min(ycb, PPy - 1)  at r = 0,   min(ycb, PPy)  at r > 0
+/// xcb' = min(xcb, PPx)  at r = 0,   min(xcb, PPx - 1)  at r > 0
+/// ycb' = min(ycb, PPy)  at r = 0,   min(ycb, PPy - 1)  at r > 0
 /// ```
 ///
-/// `PPx - 1` / `PPy - 1` at `r = 0` use a saturating subtraction so a
-/// `PP = 0` (legal only at `r = 0`, Table A.21) clamps the effective
-/// exponent to zero (a `1×n` / `n×1` code-block partition) rather than
-/// underflowing.
+/// Equation B-17 / B-18 use the **full** precinct exponent at the
+/// `NLLL` band (`r = 0`) and shave one off (`PPx - 1` / `PPy - 1`) at
+/// every higher resolution level (`r > 0`), where the precinct's
+/// projection onto the sub-band domain sits one wavelet level finer.
+///
+/// `PPx - 1` / `PPy - 1` at `r > 0` use a saturating subtraction so a
+/// `PP = 0` clamps the effective exponent to zero (a `1×n` / `n×1`
+/// code-block partition) rather than underflowing.
 pub fn derive_code_block_dimensions(
     r: u8,
     xcb: u8,
@@ -887,12 +891,12 @@ pub fn derive_code_block_dimensions(
     exponents: PrecinctExponents,
 ) -> CodeBlockDimensions {
     let (px_bound, py_bound) = if r == 0 {
+        (exponents.ppx, exponents.ppy)
+    } else {
         (
             exponents.ppx.saturating_sub(1),
             exponents.ppy.saturating_sub(1),
         )
-    } else {
-        (exponents.ppx, exponents.ppy)
     };
     CodeBlockDimensions {
         xcb: xcb.min(px_bound),
@@ -1142,15 +1146,13 @@ pub fn derive_precinct_code_blocks(
 
     // §B.9 requires each code-block be "confined to the relevant
     // precinct", so a code-block can never exceed a precinct cell. On the
-    // sub-band domain the precinct cell is `2^pcbx × 2^pcby`. In a
-    // conformant stream the §B.7 clamp already keeps `xcb' ≤ pcbx`
-    // (default `PPx = 15` → footprint `2^14`, real code-blocks ≤ `2^6`),
-    // but at `r ≥ 1` the literal §B.7 `min(xcb, PPx)` can equal `PPx`
-    // while the projected footprint exponent is `PPx - 1`. We clamp the
-    // enumeration exponent to the footprint so the precinct partition
-    // stays a tiling (no code-block claimed by two precincts), which is
-    // the only reading of §B.9 under which "confined to the precinct" is
-    // well-defined.
+    // sub-band domain the precinct cell is `2^pcbx × 2^pcby`, and the §B.7
+    // effective exponents (Eq B-17 / B-18) are already clamped to exactly
+    // that footprint (`PPx` at `r = 0`, `PPx - 1` at `r ≥ 1`), so
+    // `cb.xcb ≤ pcbx` / `cb.ycb ≤ pcby` always holds. The `min` is a
+    // defensive no-op keeping the enumeration exponent ≤ the footprint so
+    // the precinct partition stays a tiling (no code-block claimed by two
+    // precincts) even if the two derivations ever drift apart.
     let cbx_eff = cb.xcb.min(pcbx);
     let cby_eff = cb.ycb.min(pcby);
 
@@ -1992,9 +1994,10 @@ mod tests {
 
     #[test]
     fn code_block_dims_unclamped_when_precinct_is_large() {
-        // Eq B-17 / B-18 at r > 0: xcb' = min(xcb, PPx). When PPx > xcb
-        // the code-block keeps its nominal exponent. xcb = ycb = 6
-        // (64×64 code-block), PPx = PPy = 15 → xcb' = ycb' = 6.
+        // Eq B-17 / B-18 at r > 0: xcb' = min(xcb, PPx - 1). When
+        // PPx - 1 > xcb the code-block keeps its nominal exponent.
+        // xcb = ycb = 6 (64×64 code-block), PPx = PPy = 15 →
+        // xcb' = ycb' = min(6, 14) = 6.
         let pp = PrecinctExponents { ppx: 15, ppy: 15 };
         let cb = derive_code_block_dimensions(2, 6, 6, pp);
         assert_eq!(cb.xcb, 6);
@@ -2005,23 +2008,12 @@ mod tests {
 
     #[test]
     fn code_block_dims_clamped_to_precinct_above_r_zero() {
-        // Eq B-17 / B-18 at r > 0: xcb' = min(xcb, PPx). PPx = PPy = 4,
-        // nominal xcb = ycb = 6 → xcb' = ycb' = min(6, 4) = 4 (16×16).
+        // Eq B-17 / B-18 at r > 0: xcb' = min(xcb, PPx - 1). PPx =
+        // PPy = 4, nominal xcb = ycb = 6 → xcb' = ycb' = min(6, 3) = 3
+        // (8×8). At r > 0 the precinct projection sits one wavelet level
+        // finer, so the bound is PPx - 1, not PPx.
         let pp = PrecinctExponents { ppx: 4, ppy: 4 };
         let cb = derive_code_block_dimensions(1, 6, 6, pp);
-        assert_eq!(cb.xcb, 4);
-        assert_eq!(cb.ycb, 4);
-        assert_eq!(cb.width(), 16);
-        assert_eq!(cb.height(), 16);
-    }
-
-    #[test]
-    fn code_block_dims_use_pp_minus_one_at_r_zero() {
-        // Eq B-17 / B-18 at r = 0: xcb' = min(xcb, PPx - 1). PPx =
-        // PPy = 4, nominal xcb = ycb = 6 → xcb' = ycb' = min(6, 3) = 3
-        // (8×8). The r = 0 case shaves one off PPx/PPy.
-        let pp = PrecinctExponents { ppx: 4, ppy: 4 };
-        let cb = derive_code_block_dimensions(0, 6, 6, pp);
         assert_eq!(cb.xcb, 3);
         assert_eq!(cb.ycb, 3);
         assert_eq!(cb.width(), 8);
@@ -2029,13 +2021,25 @@ mod tests {
     }
 
     #[test]
-    fn code_block_dims_pp_zero_at_r_zero_saturates() {
-        // Table A.21 allows PPx = PPy = 0 only at the NLLL band (r = 0).
-        // Eq B-17 then gives xcb' = min(xcb, PPx - 1) = min(xcb, 0)
-        // under saturating subtraction → 0 (a 1×1 code-block partition),
-        // not a wraparound to a giant block.
-        let pp = PrecinctExponents { ppx: 0, ppy: 0 };
+    fn code_block_dims_use_full_pp_at_r_zero() {
+        // Eq B-17 / B-18 at r = 0 (the NLLL band): xcb' = min(xcb, PPx).
+        // PPx = PPy = 4, nominal xcb = ycb = 6 → xcb' = ycb' =
+        // min(6, 4) = 4 (16×16). The r = 0 case uses the full PPx/PPy.
+        let pp = PrecinctExponents { ppx: 4, ppy: 4 };
         let cb = derive_code_block_dimensions(0, 6, 6, pp);
+        assert_eq!(cb.xcb, 4);
+        assert_eq!(cb.ycb, 4);
+        assert_eq!(cb.width(), 16);
+        assert_eq!(cb.height(), 16);
+    }
+
+    #[test]
+    fn code_block_dims_pp_zero_at_r_above_zero_saturates() {
+        // At r > 0 Eq B-17 gives xcb' = min(xcb, PPx - 1). With PPx = 0
+        // the saturating subtraction yields min(xcb, 0) = 0 (a 1×1
+        // code-block partition), not a wraparound to a giant block.
+        let pp = PrecinctExponents { ppx: 0, ppy: 0 };
+        let cb = derive_code_block_dimensions(1, 6, 6, pp);
         assert_eq!(cb.xcb, 0);
         assert_eq!(cb.ycb, 0);
         assert_eq!(cb.width(), 1);
@@ -2046,14 +2050,14 @@ mod tests {
     fn code_block_dims_asymmetric_exponents() {
         // xcb and ycb need not be equal, and the clamp is applied
         // independently per axis. xcb = 7, ycb = 4, PPx = 5, PPy = 6,
-        // r = 2 (r > 0 branch):
-        //   xcb' = min(7, 5) = 5 (32 wide)
-        //   ycb' = min(4, 6) = 4 (16 high)
+        // r = 2 (r > 0 branch → bound is PP - 1):
+        //   xcb' = min(7, 4) = 4 (16 wide)
+        //   ycb' = min(4, 5) = 4 (16 high)
         let pp = PrecinctExponents { ppx: 5, ppy: 6 };
         let cb = derive_code_block_dimensions(2, 7, 4, pp);
-        assert_eq!(cb.xcb, 5);
+        assert_eq!(cb.xcb, 4);
         assert_eq!(cb.ycb, 4);
-        assert_eq!(cb.width(), 32);
+        assert_eq!(cb.width(), 16);
         assert_eq!(cb.height(), 16);
     }
 
@@ -2074,14 +2078,14 @@ mod tests {
         // NL = 1, r = 0: the LL band spans [0, 32)×[0, 32). PPx = PPy = 4
         // → precinct step 2^4 = 16 on the resolution-level domain → 2×2 =
         // 4 precincts. r = 0 projects PP directly (footprint 16). xcb =
-        // ycb = 6, xcb' = min(6, PPx - 1) = min(6, 3) = 3 → 8×8 code-
-        // blocks. Each 16×16 precinct holds a 2×2 grid of 8×8 blocks.
+        // ycb = 3 (nominal 8), xcb' = min(3, PPx) = min(3, 4) = 3 → 8×8
+        // code-blocks. Each 16×16 precinct holds a 2×2 grid of 8×8 blocks.
         let levels = derive_resolution_levels(tc_aligned_64(), 1);
         let pp = PrecinctExponents { ppx: 4, ppy: 4 };
         let part = derive_precinct_partition(&levels[0], pp);
         assert_eq!((part.num_wide, part.num_high), (2, 2));
 
-        let p = derive_precinct_code_blocks(&levels[0], pp, 6, 6, 0).unwrap();
+        let p = derive_precinct_code_blocks(&levels[0], pp, 3, 3, 0).unwrap();
         assert_eq!((p.px, p.py), (0, 0));
         assert_eq!(p.sub_bands.len(), 1);
         let ll = &p.sub_bands[0];
@@ -2127,11 +2131,12 @@ mod tests {
 
     #[test]
     fn enumerate_r0_last_precinct_anchored() {
-        // Same setup, precinct index 3 → (px, py) = (1, 1): cell
-        // [16, 32)×[16, 32), 2×2 blocks of 8×8 anchored at (0, 0).
+        // Same setup (xcb = ycb = 3 → 8×8 blocks), precinct index 3 →
+        // (px, py) = (1, 1): cell [16, 32)×[16, 32), 2×2 blocks of 8×8
+        // anchored at (0, 0).
         let levels = derive_resolution_levels(tc_aligned_64(), 1);
         let pp = PrecinctExponents { ppx: 4, ppy: 4 };
-        let p = derive_precinct_code_blocks(&levels[0], pp, 6, 6, 3).unwrap();
+        let p = derive_precinct_code_blocks(&levels[0], pp, 3, 3, 3).unwrap();
         assert_eq!((p.px, p.py), (1, 1));
         let ll = &p.sub_bands[0];
         assert_eq!((ll.grid_wide, ll.grid_high), (2, 2));
@@ -2165,9 +2170,8 @@ mod tests {
         // The precinct count is taken on the resolution-level rectangle
         // [0, 64) (r = 1 → trx1 = 64): step 16 → 4×4 = 16 precincts.
         // r ≥ 1 projects PP - 1 = 3 onto the sub-band (footprint 8). xcb =
-        // ycb = 6 → xcb' = min(6, PPx) = 4, clamped to the footprint
-        // exponent 3 → 8×8 blocks. So every precinct holds exactly one
-        // 8×8 code-block per sub-band.
+        // ycb = 6 → xcb' = min(6, PPx - 1) = min(6, 3) = 3 → 8×8 blocks.
+        // So every precinct holds exactly one 8×8 code-block per sub-band.
         let levels = derive_resolution_levels(tc_aligned_64(), 1);
         let pp = PrecinctExponents { ppx: 4, ppy: 4 };
         let part = derive_precinct_partition(&levels[1], pp);
@@ -2244,7 +2248,7 @@ mod tests {
         // Offset tile-component [5, 37)×[5, 37), NL = 0 (single LL band =
         // the tile-component itself). PPx = PPy = 4 (step 16). Precinct
         // count on [5, 37): ceil(37/16) - floor(5/16) = 3 - 0 = 3 wide.
-        // xcb = ycb = 3 → xcb' = min(3, PPx - 1) = 3 (8). Precinct 0
+        // r = 0 → xcb' = min(xcb, PPx) = min(3, 4) = 3 (8). Precinct 0
         // (px = 0): cell anchored at floor(5/16)·16 = 0, cell [0, 16)
         // clipped to the sub-band [5, 37) → [5, 16). Code-block 0 spans
         // [0, 8) clipped to [5, 8) (a 3-wide block — §B.7 NOTE: blocks may
@@ -2317,14 +2321,15 @@ mod tests {
         // The per-sub-band (grid_wide, grid_high) is the exact
         // SubBandGeometry { width, height } the packet reader consumes.
         // For the aligned 64×64 NL = 1 component with PPx = PPy = 4, the
-        // r = 0 LL band has a 2×2 grid per precinct (4 precincts → 16
-        // total = (32/8)²), confirming the count bridges cleanly.
+        // r = 0 LL band (xcb = ycb = 3 → 8×8 blocks) has a 2×2 grid per
+        // precinct (4 precincts → 16 total = (32/8)²), confirming the
+        // count bridges cleanly.
         let levels = derive_resolution_levels(tc_aligned_64(), 1);
         let pp = PrecinctExponents { ppx: 4, ppy: 4 };
         let part = derive_precinct_partition(&levels[0], pp);
         let mut total = 0u32;
         for k in 0..part.num_precincts() as u32 {
-            let p = derive_precinct_code_blocks(&levels[0], pp, 6, 6, k).unwrap();
+            let p = derive_precinct_code_blocks(&levels[0], pp, 3, 3, k).unwrap();
             let g = &p.sub_bands[0];
             total += g.grid_wide * g.grid_high;
             assert_eq!(g.code_blocks.len() as u32, g.grid_wide * g.grid_high);
@@ -2336,8 +2341,8 @@ mod tests {
     fn enumerate_max_precinct_single_precinct_holds_all() {
         // Max-precinct default (PPx = PPy = 15) → one precinct per
         // resolution level holding the entire LL grid. NL = 0, tc
-        // [0, 64)×[0, 64), xcb = ycb = 6 → xcb' = min(6, 14) = 6 (64).
-        // The single LL band is one 64×64 code-block.
+        // [0, 64)×[0, 64), r = 0 → xcb' = min(6, PPx) = min(6, 15) = 6
+        // (64). The single LL band is one 64×64 code-block.
         let levels = derive_resolution_levels(tc_aligned_64(), 0);
         let pp = PrecinctExponents { ppx: 15, ppy: 15 };
         let part = derive_precinct_partition(&levels[0], pp);
