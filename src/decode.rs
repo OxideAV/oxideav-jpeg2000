@@ -71,8 +71,7 @@ use crate::reassemble::{
 use crate::t1::{reset_contexts, BitPlaneSequencer, CodeBlock};
 use crate::{
     Error, J2kCodestream, ProgressionOrder, QuantizationStyle, Siz, TilePartMarker,
-    WaveletTransform, MARKER_CAP, MARKER_COC, MARKER_POC, MARKER_QCC, MARKER_RGN, MARKER_SIZ,
-    MARKER_SOC,
+    WaveletTransform, MARKER_CAP, MARKER_COC, MARKER_POC, MARKER_RGN, MARKER_SIZ, MARKER_SOC,
 };
 
 /// `PPM` marker code (T.800 §A.7.4, `0xFF60`) — packed packet
@@ -130,9 +129,14 @@ pub struct DecodedImage {
 
 /// Re-scan the main-header byte span for marker segments the wiring
 /// cannot honour yet. [`crate::parse_j2k_header`] length-skips
-/// optional markers; silently ignoring `COC` / `QCC` / `RGN` / `POC`
-/// / `PPM` / `CAP` would mis-decode the stream, so their presence is
-/// surfaced as [`Error::NotImplemented`] here.
+/// optional markers; silently ignoring `COC` / `RGN` / `POC` / `PPM`
+/// / `CAP` would mis-decode the stream, so their presence is surfaced
+/// as [`Error::NotImplemented`] here.
+///
+/// `QCC` is **not** rejected: the main-header per-component
+/// quantization override (T.800 §A.6.5, `Main QCC > Main QCD`) is
+/// honoured — see [`crate::collect_main_header_qcc`] and
+/// [`resolve_component_quant`].
 fn reject_unsupported_main_header_markers(bytes: &[u8], header_end: usize) -> Result<(), Error> {
     // SOC is 2 bytes with no length field; every other main-header
     // marker segment is `marker(2) + length(2) + payload(length-2)`.
@@ -140,7 +144,7 @@ fn reject_unsupported_main_header_markers(bytes: &[u8], header_end: usize) -> Re
     while pos + 4 <= header_end {
         let marker = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]);
         match marker {
-            MARKER_COC | MARKER_QCC | MARKER_RGN | MARKER_POC | MARKER_PPM | MARKER_CAP => {
+            MARKER_COC | MARKER_RGN | MARKER_POC | MARKER_PPM | MARKER_CAP => {
                 return Err(Error::NotImplemented);
             }
             MARKER_SOC | MARKER_SIZ => {}
@@ -197,6 +201,54 @@ fn spqcd_index(r: u8, orientation: SubBandOrientation) -> usize {
 struct BandQuant {
     mb: u32,
     quant: SubBandQuantization,
+}
+
+/// The quantisation parameters that apply to one component, after the
+/// T.800 §A.6.5 `Main QCC > Main QCD` precedence has been resolved.
+/// Borrows the `SPqcd` / `SPqcc` payload from the owning marker.
+#[derive(Clone, Copy)]
+struct ComponentQuant<'a> {
+    style: QuantizationStyle,
+    spqcd: &'a [u8],
+    guard_bits: u8,
+}
+
+/// Resolve the per-component quantisation for every component, applying
+/// any main-header `QCC` override over the main `QCD` (T.800 §A.6.5).
+///
+/// At most one `QCC` may target a given component in the main header
+/// (§A.6.5); a duplicate is rejected as malformed. A `QCC` whose
+/// `Cqcc` is out of range is likewise rejected.
+fn resolve_component_quant<'a>(
+    num_components: usize,
+    qcd: &'a crate::Qcd,
+    qccs: &'a [crate::Qcc],
+) -> Result<Vec<ComponentQuant<'a>>, Error> {
+    let mut out: Vec<ComponentQuant<'a>> = (0..num_components)
+        .map(|_| ComponentQuant {
+            style: qcd.style,
+            spqcd: &qcd.spqcd,
+            guard_bits: qcd.guard_bits,
+        })
+        .collect();
+    let mut seen = vec![false; num_components];
+    for qcc in qccs {
+        let c = qcc.component_index as usize;
+        if c >= num_components {
+            return Err(Error::InvalidMarkerLength);
+        }
+        if seen[c] {
+            // §A.6.5: no more than one QCC per component per header.
+            return Err(Error::InvalidMarkerLength);
+        }
+        seen[c] = true;
+        out[c] = ComponentQuant {
+            style: qcc.style,
+            spqcd: &qcc.spqcc,
+            guard_bits: qcc.guard_bits,
+        };
+    }
+    Ok(out)
 }
 
 /// Resolve `(εb, µb) → (Mb, Rb)` for every sub-band of one component.
@@ -341,9 +393,7 @@ struct CodingParams {
 fn decode_tile(
     siz: &Siz,
     params: &CodingParams,
-    quant_style: QuantizationStyle,
-    spqcd: &[u8],
-    guard_bits: u8,
+    comp_quant: &[ComponentQuant<'_>],
     tile_index: u32,
     body: &[u8],
 ) -> Result<Vec<Vec<i32>>, Error> {
@@ -495,15 +545,16 @@ fn decode_tile(
         pos = seg_pos;
     }
 
-    // -- Per-component quantisation tables --
+    // -- Per-component quantisation tables (§A.6.5 QCC override) --
     let mut quant_per_comp: Vec<Vec<Vec<BandQuant>>> = Vec::with_capacity(num_components);
     for (c, levels) in levels_per_comp.iter().enumerate() {
         let precision = siz.components[c].precision_bits as u32;
+        let cq = comp_quant.get(c).ok_or(Error::InvalidMarkerLength)?;
         quant_per_comp.push(resolve_band_quant(
             levels,
-            quant_style,
-            spqcd,
-            guard_bits,
+            cq.style,
+            cq.spqcd,
+            cq.guard_bits,
             precision,
             params.n_l,
         )?);
@@ -634,9 +685,14 @@ fn decode_tile(
             per_level: per_level_sources,
         };
 
+        // §A.6.5: a QCC may override the quantisation style per
+        // component, but the COD/COC transform is global to this code;
+        // Table A.28 still requires each component's style to match the
+        // kernel it is reconstructed with.
+        let comp_style = comp_quant[c].style;
         match params.transform {
             WaveletTransform::Reversible5x3 => {
-                if quant_style != QuantizationStyle::None {
+                if comp_style != QuantizationStyle::None {
                     // Table A.28: the reversible kernel pairs with the
                     // "no quantisation" style only.
                     return Err(Error::NotImplemented);
@@ -652,7 +708,7 @@ fn decode_tile(
                 planes_5x3.push(grid.data);
             }
             WaveletTransform::Irreversible9x7 => {
-                if quant_style == QuantizationStyle::None {
+                if comp_style == QuantizationStyle::None {
                     // Table A.28 pairs the 9-7 kernel with scalar
                     // quantisation (derived or expounded).
                     return Err(Error::NotImplemented);
@@ -746,6 +802,12 @@ pub fn decode_codestream(bytes: &[u8], cs: &J2kCodestream) -> Result<DecodedImag
     let cod = &cs.header.cod;
     let qcd = &cs.header.qcd;
 
+    // §A.6.5: resolve per-component quantisation, applying any
+    // main-header QCC over the main QCD for the components it targets.
+    let csiz = siz.components.len() as u16;
+    let main_qccs = crate::collect_main_header_qcc(bytes, cs.header.bytes_consumed, csiz)?;
+    let comp_quant = resolve_component_quant(siz.components.len(), qcd, &main_qccs)?;
+
     let style_flags = cod.code_block_style_flags();
     if style_flags.selective_arithmetic_coding_bypass()
         || style_flags.reset_context_probabilities()
@@ -825,15 +887,7 @@ pub fn decode_codestream(bytes: &[u8], cs: &J2kCodestream) -> Result<DecodedImag
             body.extend_from_slice(slice);
         }
 
-        let tile_planes = decode_tile(
-            siz,
-            &params,
-            qcd.style,
-            &qcd.spqcd,
-            qcd.guard_bits,
-            tile_index as u32,
-            &body,
-        )?;
+        let tile_planes = decode_tile(siz, &params, &comp_quant, tile_index as u32, &body)?;
 
         // Place each tile-component plane into its image-area plane at
         // the Equation B-12 offset.
@@ -903,5 +957,71 @@ mod tests {
     #[test]
     fn empty_input_is_rejected() {
         assert!(decode_j2k(&[]).is_err());
+    }
+
+    // `style_code` is the low-5-bit Table A.28 style; `None` = 0, so the
+    // Sqcd/Sqcc byte is just `guard << 5` for the `None` cases below.
+    fn qcd(style: QuantizationStyle, guard: u8, spqcd: &[u8]) -> crate::Qcd {
+        crate::Qcd {
+            sqcd: guard << 5,
+            style,
+            guard_bits: guard,
+            spqcd: spqcd.to_vec(),
+        }
+    }
+
+    fn qcc(c: u16, style: QuantizationStyle, guard: u8, spqcc: &[u8]) -> crate::Qcc {
+        crate::Qcc {
+            component_index: c,
+            sqcc: guard << 5,
+            style,
+            guard_bits: guard,
+            spqcc: spqcc.to_vec(),
+        }
+    }
+
+    #[test]
+    fn resolve_component_quant_defaults_to_qcd() {
+        // §A.6.5: with no QCC, every component inherits the QCD.
+        let d = qcd(QuantizationStyle::None, 2, &[0x40, 0x41]);
+        let resolved = resolve_component_quant(3, &d, &[]).expect("resolve");
+        assert_eq!(resolved.len(), 3);
+        for cq in &resolved {
+            assert_eq!(cq.style, QuantizationStyle::None);
+            assert_eq!(cq.guard_bits, 2);
+            assert_eq!(cq.spqcd, &[0x40, 0x41]);
+        }
+    }
+
+    #[test]
+    fn resolve_component_quant_applies_override() {
+        // §A.6.5: a QCC for component 1 overrides the QCD only there.
+        let d = qcd(QuantizationStyle::None, 2, &[0x40]);
+        let c1 = qcc(1, QuantizationStyle::ScalarExpounded, 4, &[0x12, 0x34]);
+        let resolved = resolve_component_quant(3, &d, std::slice::from_ref(&c1)).expect("resolve");
+        // Components 0 and 2 keep the default.
+        assert_eq!(resolved[0].style, QuantizationStyle::None);
+        assert_eq!(resolved[0].guard_bits, 2);
+        assert_eq!(resolved[2].spqcd, &[0x40]);
+        // Component 1 takes the QCC values.
+        assert_eq!(resolved[1].style, QuantizationStyle::ScalarExpounded);
+        assert_eq!(resolved[1].guard_bits, 4);
+        assert_eq!(resolved[1].spqcd, &[0x12, 0x34]);
+    }
+
+    #[test]
+    fn resolve_component_quant_rejects_out_of_range_index() {
+        let d = qcd(QuantizationStyle::None, 1, &[0x40]);
+        let bad = qcc(5, QuantizationStyle::None, 1, &[0x40]);
+        assert!(resolve_component_quant(3, &d, std::slice::from_ref(&bad)).is_err());
+    }
+
+    #[test]
+    fn resolve_component_quant_rejects_duplicate_component() {
+        // §A.6.5: no more than one QCC per component per header.
+        let d = qcd(QuantizationStyle::None, 1, &[0x40]);
+        let a = qcc(0, QuantizationStyle::None, 1, &[0x40]);
+        let b = qcc(0, QuantizationStyle::ScalarExpounded, 2, &[0x10, 0x20]);
+        assert!(resolve_component_quant(2, &d, &[a, b]).is_err());
     }
 }

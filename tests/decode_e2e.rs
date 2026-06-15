@@ -159,6 +159,60 @@ fn gray_53_lossless_is_pixel_exact() {
     assert_eq!(c.samples, gray_17x13_pattern());
 }
 
+/// §A.6.5 main-header `QCC` override. Inject a `QCC` segment for
+/// component 0 into the gray 5-3 fixture's main header that mirrors the
+/// fixture's `QCD` byte-for-byte (same style, guard bits, step sizes).
+///
+/// Because the override is identical to the default it replaces, the
+/// decode must remain **pixel-exact** versus the un-injected stream —
+/// which proves the wiring (a) no longer rejects a main-header `QCC`
+/// with `Error::NotImplemented`, and (b) parses `Cqcc` / `Sqcc` /
+/// `SPqcc` and routes them into the per-component quantisation
+/// resolution `resolve_band_quant` consumes. A wrong `Cqcc` width, a
+/// mis-read style byte, or a dropped step-size payload would change the
+/// reconstructed coefficients and break the equality.
+#[test]
+fn gray_53_redundant_main_header_qcc_is_pixel_exact() {
+    use oxideav_jpeg2000::MARKER_QCC;
+
+    let cs = parse_codestream(GRAY_53).expect("parse");
+    let qcd = &cs.header.qcd;
+    let insert_at = cs.header.bytes_consumed;
+
+    // Sanity: the un-injected fixture has no QCC (so this test really
+    // exercises the new path), and the insertion point is the SOT.
+    assert!(!GRAY_53[2..insert_at]
+        .windows(2)
+        .any(|w| w == MARKER_QCC.to_be_bytes()));
+    assert_eq!(
+        u16::from_be_bytes([GRAY_53[insert_at], GRAY_53[insert_at + 1]]),
+        0xFF90, // SOT
+    );
+
+    // Build a QCC for component 0 mirroring the QCD. Csiz = 1 < 257 so
+    // Cqcc is 8-bit. Lqcc = 2 (length) + 1 (Cqcc) + 1 (Sqcc) + SPqcc.
+    let lqcc = 2 + 1 + 1 + qcd.spqcd.len();
+    let mut qcc = Vec::new();
+    qcc.extend_from_slice(&MARKER_QCC.to_be_bytes());
+    qcc.extend_from_slice(&(lqcc as u16).to_be_bytes());
+    qcc.push(0u8); // Cqcc = component 0
+    qcc.push(qcd.sqcd); // Sqcc mirrors Sqcd (style + guard bits)
+    qcc.extend_from_slice(&qcd.spqcd); // SPqcc mirrors SPqcd
+
+    let mut injected = Vec::with_capacity(GRAY_53.len() + qcc.len());
+    injected.extend_from_slice(&GRAY_53[..insert_at]);
+    injected.extend_from_slice(&qcc);
+    injected.extend_from_slice(&GRAY_53[insert_at..]);
+
+    // The injected QCC must now be parsed (not skipped-then-rejected).
+    let parsed = parse_codestream(&injected).expect("parse with main-header QCC");
+    assert_eq!(parsed.header.siz.components.len(), 1);
+
+    let img = decode_j2k(&injected).expect("decode with main-header QCC");
+    assert_eq!(img.components.len(), 1);
+    assert_eq!(img.components[0].samples, gray_17x13_pattern());
+}
+
 #[test]
 fn gray_53_multi_tile_is_pixel_exact() {
     // Same raster, 8×8 tile grid → 3×2 = 6 tiles, exercising the

@@ -38,6 +38,10 @@ What is implemented:
 - **Reassembly** — per-coefficient `Nb(u, v)` magnitude-bit tracking for
   rate-truncated streams, dequantisation, the 5-3 and 9-7 inverse DWT,
   and the inverse multi-component transform.
+- **Per-component quantisation** — main-header `QCC` overrides of the
+  `QCD` default (T.800 §A.6.5, `Main QCC > Main QCD`): each component's
+  quantisation style, guard bits and step sizes are resolved
+  independently.
 - **Progression** — all five §B.12.1 orders (LRCP, RLCP, RPCL, PCRL,
   CPRL), §B.12.2 POC volume iteration, and **multi-layer** /
   **multi-precinct** reassembly.
@@ -46,8 +50,8 @@ What is implemented:
 
 These surface a clean `Error::NotImplemented` rather than mis-decoding:
 
-- `COC` / `QCC` per-component overrides and tile-part `COD` / `QCD`
-  overrides.
+- `COC` per-component coding-style overrides, and tile-part `COD` /
+  `COC` / `QCD` / `QCC` overrides (main-header `QCC` *is* honoured).
 - `RGN` region-of-interest, `POC` order changes mid-decode, and
   `PPM` / `PPT` packed-header markers.
 - The Table A.19 segmentation-changing style bits (bypass / reset /

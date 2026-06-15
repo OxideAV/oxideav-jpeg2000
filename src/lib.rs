@@ -1409,6 +1409,43 @@ pub fn parse_j2k_header(bytes: &[u8]) -> Result<J2kHeader, Error> {
     })
 }
 
+/// Collect every `QCC` (Quantization component, T.800 §A.6.5) marker
+/// segment in the main header.
+///
+/// [`parse_j2k_header`] length-skips `QCC` without retaining it; the
+/// decode wiring re-parses the main-header span to honour the
+/// per-component override (`Main QCC > Main QCD`, T.800 §A.6.5). The
+/// 8- vs 16-bit `Cqcc` width is selected from `Csiz`, exactly as in
+/// the tile-part-header path. `header_end` is the
+/// [`J2kHeader::bytes_consumed`] offset (start of the first `SOT`).
+pub(crate) fn collect_main_header_qcc(
+    bytes: &[u8],
+    header_end: usize,
+    csiz: u16,
+) -> Result<Vec<Qcc>, Error> {
+    let mut out = Vec::new();
+    // SOC has no length field; SIZ/COD/QCD/QCC/... are
+    // `marker(2) + length(2) + payload(length-2)`. Walk the span by
+    // length, parsing only QCC.
+    let mut pos = 2usize; // skip SOC (no length field)
+    while pos + 4 <= header_end {
+        let marker = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]);
+        if marker == MARKER_QCC {
+            // Re-parse from just after the marker code via the shared
+            // QCC parser, which validates Lqcc and the style/payload.
+            let mut reader = Reader::new(bytes);
+            reader.pos = pos + 2;
+            out.push(parse_qcc(&mut reader, csiz)?);
+        }
+        let len = u16::from_be_bytes([bytes[pos + 2], bytes[pos + 3]]) as usize;
+        if len < 2 {
+            return Err(Error::InvalidMarkerLength);
+        }
+        pos += 2 + len;
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // Tile-part walker (T.800 §A.4.2 / §A.4.3 — SOT + SOD).
 // ---------------------------------------------------------------------------

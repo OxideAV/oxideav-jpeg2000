@@ -4,6 +4,28 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+* **Clean-room round 315 (2026-06-15).** **Main-header `QCC`
+  per-component quantization override** (T.800 §A.6.5). A main-header
+  `QCC` segment is now honoured instead of being rejected with
+  `Error::NotImplemented`: `decode_codestream` re-scans the main-header
+  span (`collect_main_header_qcc`) and resolves each component's
+  quantisation under the §A.6.5 `Main QCC > Main QCD` precedence
+  (`resolve_component_quant`), so a stream that quantises one component
+  differently from the rest decodes correctly. The per-component
+  `(style, guard bits, step sizes)` triple drives `resolve_band_quant`,
+  and the Table A.28 transform/style pairing check
+  (reversible 5-3 ↔ no-quantisation, irreversible 9-7 ↔ scalar) now
+  runs against each component's resolved style rather than one global
+  value. A duplicate `QCC` for the same component or an out-of-range
+  `Cqcc` is rejected as malformed (§A.6.5). `COC`, `RGN`, `POC`, `PPM`,
+  `CAP` remain rejected. A new end-to-end test injects a `QCC` mirroring
+  the gray 5-3 fixture's `QCD` byte-for-byte and confirms the decode
+  stays pixel-exact; four unit tests pin the override / default /
+  duplicate / out-of-range resolution. Suite total 566 (553 lib + 13
+  e2e, was 561).
+
 ## [0.0.14](https://github.com/OxideAV/oxideav-jpeg2000/compare/v0.0.13...v0.0.14) - 2026-06-15
 
 ### Other
