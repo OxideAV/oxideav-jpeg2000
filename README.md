@@ -3,6 +3,43 @@
 Pure-Rust JPEG 2000 (J2K + JP2) and High-Throughput JPEG 2000 (HTJ2K)
 codec.
 
+## Status — 2026-06-15 (clean-room round 309)
+
+Round 309 closes the **multi-layer decode** follow-up named since round
+295. The §B.10.4 inclusion tag tree, the §B.10.7.1 `Lblock` state, and
+the per-code-block already-included flag are all carried per precinct
+across the §B.12 layer passes by `packet::walk_packet_headers`, and the
+top-level decode accumulates each code-block's coding passes (and the
+§B.10.5 zero-bit-plane count on first inclusion) across every layer it
+contributes to, concatenating the codeword-segment bytes into the single
+§C.3 segment the tier-1 driver decodes. A code-block that first becomes
+included in a later layer and then refines across the layers above it is
+therefore reconstructed exactly — there was no break to fix; the path
+was correct but unpinned, and the follow-up's "remains broken" note was
+stale.
+
+A new committed end-to-end fixture pins it: **64×64 gray, lossless 5-3,
+NL = 2, 16×16 code-blocks, single precinct, LRCP, FIVE quality layers**.
+The deterministic source raster carries an extra high-frequency `(x ^ y)`
+term so the rate allocator genuinely spreads each code-block's passes
+across the five layers (instrumentation confirmed 22 cross-layer
+refinement events and 16 blocks first-included in a layer above 0 on
+this exact stream). The decode is **pixel-exact**. The fixture was
+encoded / COM-scrubbed with an opaque CLI codec used strictly as a black
+box.
+
+Suite total 561 (549 lib + 12 e2e, was 560). Multi-layer reassembly now
+works at single precinct under LRCP; the same accumulation already
+covers RLCP and multi-precinct (verified during the round, not
+separately pinned). The remaining decode follow-ups are unchanged:
+`COC` / `QCC` per-component overrides, tile-part `COD` / `QCD`
+overrides, `RGN`, `POC`, `PPM` / `PPT`, the segmentation-changing
+Table A.19 style bits (bypass / reset / termall), and the position-keyed
+orders under non-power-of-two sub-sampling — all still rejected cleanly
+with `NotImplemented`.
+
+Previous round status follows:
+
 ## Status — 2026-06-14 (clean-room round 302)
 
 Round 302 closes the **per-coefficient `Nb(u, v)`** follow-up that has

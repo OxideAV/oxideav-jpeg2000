@@ -4,6 +4,29 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+* **Clean-room round 309 (2026-06-15).** **Multi-layer decode pinned**
+  — closes the follow-up named since round 295. The §B.10.4 inclusion
+  tag tree, §B.10.7.1 `Lblock` state and per-code-block already-included
+  flag are carried per precinct across the §B.12 layer passes by
+  `packet::walk_packet_headers`; the top-level `decode::decode_tile`
+  accumulates each code-block's coding passes (and the §B.10.5
+  zero-bit-plane count on first inclusion) across every layer it
+  contributes to, concatenating the codeword-segment bytes into the
+  single §C.3 segment the tier-1 driver decodes. A code-block that first
+  becomes included in a later layer and refines across the layers above
+  it is therefore reconstructed exactly. No code change was needed — the
+  path was already correct; the follow-up's "remains broken" note was
+  stale. A new committed end-to-end fixture (`gray-64x64-multilayer-53`:
+  64×64 gray, lossless 5-3, NL = 2, 16×16 code-blocks, single precinct,
+  LRCP, five quality layers, deterministic source with a high-frequency
+  `(x ^ y)` term that spreads each block's passes across all five layers
+  — 22 cross-layer refinement events and 16 first-inclusions above layer
+  0 observed on the stream) decodes **pixel-exact**. The fixture was
+  encoded / COM-scrubbed with an opaque CLI codec used strictly as a
+  black box. Suite total 561 (549 lib + 12 e2e, was 560).
+
 ### Fixed
 
 * **Clean-room round 302 (2026-06-14).** **Per-coefficient `Nb(u, v)`**

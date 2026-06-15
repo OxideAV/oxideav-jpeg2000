@@ -45,6 +45,36 @@ const RGB_CPRL_53: &[u8] = include_bytes!("data/rgb-48x32-cprl-53.j2k");
 // COM markers scrubbed; encoded with an opaque CLI codec as a black box.
 const GRAY_MULTIPRECINCT_53: &[u8] = include_bytes!("data/gray-40x40-multiprecinct-53.j2k");
 
+// Multi-layer §B.10.4 / §B.12 fixture: 64×64 gray, lossless 5-3, NL = 2,
+// 16×16 code-blocks, single precinct per resolution, LRCP, FIVE quality
+// layers. The rate allocator spreads each code-block's coding passes
+// across the five layers, so a block first becomes included in one layer
+// (§B.10.4 inclusion tag tree) and is then refined by further coding
+// passes in every later layer it contributes to. The per-precinct
+// inclusion + Lblock state must persist across the five LRCP layer passes
+// and the §C.3 codeword segments concatenate (no segmentation-changing
+// Table A.19 bit is set), so the tier-1 decoder sees one segment per
+// code-block built from every layer's contribution in order. A
+// layer-ordering or per-layer-state slip would corrupt the reconstruction.
+// COM markers scrubbed; encoded with an opaque CLI codec as a black box.
+const GRAY_MULTILAYER_53: &[u8] = include_bytes!("data/gray-64x64-multilayer-53.j2k");
+
+/// Deterministic 64×64 gray source pattern (the raster the multi-layer
+/// fixture was encoded from); same arithmetic family as
+/// [`gray_17x13_pattern`] with an extra high-frequency `(x ^ y)` term so
+/// the sub-bands carry energy the rate allocator distributes across the
+/// quality layers (forcing genuine cross-layer code-block refinement).
+fn gray_64x64_pattern() -> Vec<i32> {
+    let (w, h) = (64i32, 64i32);
+    let mut out = Vec::with_capacity((w * h) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            out.push((x * 7 + y * 13 + (x * y) % 31 + (x ^ y) * 5) % 256);
+        }
+    }
+    out
+}
+
 /// Deterministic 17×13 gray source pattern (the raster the lossless
 /// gray fixtures were encoded from).
 fn gray_17x13_pattern() -> Vec<i32> {
@@ -159,6 +189,33 @@ fn gray_53_multi_precinct_is_pixel_exact() {
     assert_eq!(img.height, 40);
     assert_eq!(img.components.len(), 1);
     assert_eq!(img.components[0].samples, gray_40x40_pattern());
+}
+
+#[test]
+fn gray_53_multi_layer_is_pixel_exact() {
+    // 64×64 gray, lossless 5-3, NL = 2, 16×16 code-blocks, single
+    // precinct, LRCP with five quality layers. Each code-block's coding
+    // passes are distributed across the five layers, so blocks first
+    // become included in one layer (§B.10.4) and refine in every later
+    // layer they contribute to — the §B.12 walk visits all five layers
+    // and the per-code-block contributions accumulate into one §C.3
+    // codeword segment. This pins the multi-layer reassembly path under a
+    // single precinct.
+    let cs = parse_codestream(GRAY_MULTILAYER_53).expect("parse");
+    // Confirm the fixture genuinely carries more than one quality layer.
+    assert!(
+        cs.header.cod.layers >= 2,
+        "fixture must define multiple quality layers (got {})",
+        cs.header.cod.layers
+    );
+    assert_eq!(cs.header.cod.progression, ProgressionOrder::Lrcp);
+    let img = decode_j2k(GRAY_MULTILAYER_53).expect("decode");
+    assert_eq!(img.width, 64);
+    assert_eq!(img.height, 64);
+    assert_eq!(img.components.len(), 1);
+    assert_eq!(img.components[0].precision_bits, 8);
+    assert!(!img.components[0].is_signed);
+    assert_eq!(img.components[0].samples, gray_64x64_pattern());
 }
 
 #[test]
