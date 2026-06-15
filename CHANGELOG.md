@@ -4,6 +4,32 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ## [Unreleased]
 
+## [0.0.14](https://github.com/OxideAV/oxideav-jpeg2000/compare/v0.0.13...v0.0.14) - 2026-06-15
+
+### Other
+
+- pin multi-layer reassembly end-to-end (5-layer LRCP fixture)
+- per-coefficient §D.2.1 Nb(u,v) for rate-truncated reconstruction
+- fix inverted §B.7 Eq B-17/B-18 code-block-exponent branch (multi-precinct decode)
+- wire §B.12.1.3–5 RPCL / PCRL / CPRL position-keyed progression orders
+- state provenance positively across module heads, CHANGELOG, and fuzz harness
+- top-level T.800 end-to-end wiring (decode_j2k) + §D.3.4 cleanup-pass π membership fix
+- i64-widened §G.2 reversible-path threading (round 281)
+- §G.3 multi-component irreversible reconstruction dispatcher
+- §G.2 multi-component reversible reconstruction dispatcher
+- §G.1.2 NOTE i64-widened dynamic-range clip (Ssiz ≥ 32)
+- §G per-tile three-component reconstruction threading (Annex G)
+- drop release-plz.toml — use release-plz defaults across the workspace
+- §B.12 walker → BlockSource bridge (WalkerBlockSource)
+- §D.4.2 predictable-termination check + Scod bit-4 toggle
+- §D.4.2 termination dispatch + Table D.9 schedule classifier
+- §D.6 selective arithmetic-coding bypass raw-bit reader + raw-mode SP/MR
+- §D.7 vertically-causal context formation toggle
+- §D.5 segmentation symbol + Table A.19 code-block-style flags
+- §F.3.1 IDWT cascade across resolution levels
+- complete §G.1 DC level-shifting surface (forward + i64 + signed-aware + clip)
+- T.800 Annex G multi-component transform (inverse RCT + inverse ICT)
+
 ### Added
 
 * **Clean-room round 309 (2026-06-15).** **Multi-layer decode pinned**
