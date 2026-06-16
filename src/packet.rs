@@ -517,6 +517,25 @@ pub fn decode_segment_length(
     reader: &mut PacketBitReader<'_>,
 ) -> Result<u32, Error> {
     read_lblock_increment(state, reader)?;
+    read_segment_length_value(state.lblock, passes_in_segment, reader)
+}
+
+/// Reads one §B.10.7.1 codeword-segment length **value** from the bit
+/// stream, given an already-resolved `lblock` (no leading
+/// increase-Lblock prefix is consumed). The field is
+/// `(lblock + floor(log2 passes_in_segment))` bits, big-endian.
+///
+/// This is the inner half of [`decode_segment_length`]. It is also the
+/// per-length read for the §B.10.7.2 multiple-codeword-segment case,
+/// where the increase-Lblock prefix is signalled **only once** before
+/// the first length (per the §B.10.7.2 worked example: "the value of
+/// Lblock is incremented only at the start of the sequence") and the
+/// remaining `K − 1` lengths are read directly with the same `Lblock`.
+fn read_segment_length_value(
+    lblock: u32,
+    passes_in_segment: u32,
+    reader: &mut PacketBitReader<'_>,
+) -> Result<u32, Error> {
     let extra = if passes_in_segment <= 1 {
         0
     } else {
@@ -525,8 +544,7 @@ pub fn decode_segment_length(
         // value fits comfortably in a u32 ilog2.
         passes_in_segment.ilog2()
     };
-    let bits = state
-        .lblock
+    let bits = lblock
         .checked_add(extra)
         .ok_or(Error::InvalidPacketHeader)?;
     if bits == 0 || bits > 32 {
@@ -772,11 +790,19 @@ impl Default for PrecinctState {
 /// `EPH` markers — see [`SopEphMode`]. The default ([`SopEphMode::None`])
 /// is correct for a stream encoded with the COD `Scod` SOP/EPH bits
 /// both clear.
+///
+/// `split` selects the §B.10.7 codeword-segment-length layout per the
+/// COD / COC Table A.19 code-block-style bits — see [`SegmentSplit`].
+/// [`SegmentSplit::Single`] (the default) reads one length per
+/// included contribution; [`SegmentSplit::PerPass`] reads one length
+/// per coding pass for the §D.4.2 "termination on each coding pass"
+/// style.
 pub fn decode_packet_header(
     bytes: &[u8],
     geometry: &PacketGeometry,
     precinct_state: &mut PrecinctState,
     sop_eph: SopEphMode,
+    split: SegmentSplit,
 ) -> Result<PacketHeader, Error> {
     precinct_state.ensure_layout(geometry)?;
 
@@ -819,6 +845,7 @@ pub fn decode_packet_header(
                     y,
                     geometry.layer,
                     &mut reader,
+                    split,
                 )?;
                 contributions.push(contribution);
             }
@@ -848,6 +875,7 @@ fn decode_one_code_block(
     y: u32,
     layer: u16,
     reader: &mut PacketBitReader<'_>,
+    split: SegmentSplit,
 ) -> Result<CodeBlockContribution, Error> {
     let idx = sub_band.idx(x, y);
     let already_in = sub_band.already_included[idx];
@@ -891,13 +919,37 @@ fn decode_one_code_block(
     // §B.10.6 — number of coding passes.
     let passes = decode_coding_passes(reader)?;
 
-    // §B.10.7.1 — one codeword segment per included contribution
-    // (the §B.10.7.2 multi-segment case requires the caller to slice
-    // the pass count between termination boundaries, which isn't
-    // visible at the packet-header layer; round 5 emits the single-
-    // segment length as a `Vec<u32>` of size 1).
+    // §B.10.7 — codeword-segment lengths. `split` decides how the
+    // contribution's `passes` map onto §C.3 codeword segments:
+    //
+    // * `Single` (§B.10.7.1) — all passes form one codeword segment;
+    //   read one length sized for the whole pass count.
+    // * `PerPass` (§B.10.7.2 with the COD / COC Table A.19 bit-2
+    //   "termination on each coding pass" flag) — every included pass
+    //   is terminated, so `T` is the full pass-index set and `K =
+    //   passes`. Read `passes` lengths, each covering exactly one pass
+    //   (Equation B-19 widening `floor(log2 1) = 0`). The §B.10.7.1
+    //   Lblock signalling prefix is read once per length (the worked
+    //   §B.10.7.2 example increments Lblock only on the first length,
+    //   but the spec permits a zero increment on the rest, which
+    //   `read_lblock_increment` handles transparently).
     let lblock = &mut sub_band.lblock[idx];
-    let len = decode_segment_length(lblock, passes, reader)?;
+    let segment_lengths = match split {
+        SegmentSplit::Single => vec![decode_segment_length(lblock, passes, reader)?],
+        SegmentSplit::PerPass => {
+            // §B.10.7.2: the increase-Lblock prefix is signalled **once**
+            // before the first length; the remaining K − 1 lengths reuse
+            // the same Lblock. Every terminated pass carries exactly one
+            // coding pass, so each width's Equation B-19 widening is
+            // `floor(log2 1) = 0` (`passes_in_segment = 1`).
+            read_lblock_increment(lblock, reader)?;
+            let mut lens = Vec::with_capacity(passes as usize);
+            for _ in 0..passes {
+                lens.push(read_segment_length_value(lblock.lblock, 1, reader)?);
+            }
+            lens
+        }
+    };
 
     Ok(CodeBlockContribution {
         sub_band: band_idx,
@@ -906,7 +958,7 @@ fn decode_one_code_block(
         included: true,
         zero_bit_planes,
         coding_passes: passes,
-        segment_lengths: vec![len],
+        segment_lengths,
     })
 }
 
@@ -927,6 +979,31 @@ pub enum SopEphMode {
     EphOnly,
     /// Both SOP (preceding) and EPH (following) markers present.
     SopAndEph,
+}
+
+/// How a code-block contribution to one packet splits into codeword
+/// segments (T.800 §B.10.7).
+///
+/// The COD / COC Table A.19 code-block-style bits decide whether the
+/// passes contributed in a packet form a single §C.3 codeword segment
+/// or several. The packet-header reader needs this to know how many
+/// §B.10.7.1 lengths to read for each included contribution and how to
+/// size each one (Equation B-19 widens by `floor(log2 passes)` of the
+/// passes in *that* segment).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SegmentSplit {
+    /// §B.10.7.1 — all of a contribution's passes form one codeword
+    /// segment. One length is signalled, sized for the whole pass
+    /// count. This is the default (no termination / no AC bypass).
+    #[default]
+    Single,
+    /// §B.10.7.2 with the COD / COC Table A.19 bit-2
+    /// "termination on each coding pass" flag set (§D.4.2): **every**
+    /// included pass is terminated, so `T` is the full set of pass
+    /// indices and `K` equals the contribution's pass count. Each of
+    /// the `K` lengths covers exactly one pass (Equation B-19 widening
+    /// is `floor(log2 1) = 0`).
+    PerPass,
 }
 
 /// Marker code — SOP (Start of packet, T.800 §A.8.1, `0xFF91`).
@@ -997,6 +1074,7 @@ pub fn walk_packet_headers(
     body: &[u8],
     packets: &[(usize, PacketGeometry)],
     sop_eph: SopEphMode,
+    split: SegmentSplit,
 ) -> Result<Vec<PacketHeader>, Error> {
     // We don't know up-front how many distinct precinct_index values
     // appear; collect into a sparse map.
@@ -1009,7 +1087,7 @@ pub fn walk_packet_headers(
             return Err(Error::PacketHeaderOverrun);
         }
         let state = precincts.entry(*precinct_index).or_default();
-        let header = decode_packet_header(&body[pos..], geometry, state, sop_eph)?;
+        let header = decode_packet_header(&body[pos..], geometry, state, sop_eph, split)?;
         pos = pos
             .checked_add(header.bytes_consumed)
             .ok_or(Error::PacketHeaderOverrun)?;
@@ -1298,7 +1376,14 @@ mod tests {
             }],
             layer: 0,
         };
-        let h = decode_packet_header(&packed, &geom, &mut state, SopEphMode::None).unwrap();
+        let h = decode_packet_header(
+            &packed,
+            &geom,
+            &mut state,
+            SopEphMode::None,
+            SegmentSplit::Single,
+        )
+        .unwrap();
         assert!(!h.non_zero_length);
         assert!(h.contributions.is_empty());
         assert_eq!(h.bytes_consumed, packed.len());
@@ -1329,7 +1414,14 @@ mod tests {
             layer: 0,
         };
         let mut state = PrecinctState::new();
-        let h = decode_packet_header(&packed, &geom, &mut state, SopEphMode::None).unwrap();
+        let h = decode_packet_header(
+            &packed,
+            &geom,
+            &mut state,
+            SopEphMode::None,
+            SegmentSplit::Single,
+        )
+        .unwrap();
         assert!(h.non_zero_length);
         assert_eq!(h.contributions.len(), 1);
         let c = &h.contributions[0];
@@ -1341,6 +1433,107 @@ mod tests {
         // Should have flagged this code-block as already included for
         // subsequent layers.
         assert!(state.sub_bands[0].already_included[0]);
+    }
+
+    #[test]
+    fn per_pass_split_reads_one_length_per_pass() {
+        // §B.10.7.2 termination-on-each-pass: a contribution with K
+        // coding passes signals K codeword-segment lengths, with the
+        // increase-Lblock prefix appearing **once** before the first
+        // length (per the §B.10.7.2 worked example "the value of Lblock
+        // is incremented only at the start of the sequence"). Each
+        // length is `lblock` bits (passes_in_segment = 1 → no widening).
+        //
+        // Bits (T.800 §B.10.8 order):
+        //   1        — non-zero packet
+        //   1        — inclusion tag tree (leaf 0 < 1 → included)
+        //   1        — zero-bitplane tree value = 0
+        //   1100     — coding passes = 3 (Table B.4 codeword)
+        //   0        — Lblock increment prefix: no increment (once)
+        //   101      — length[0] = 5 (3 bits, lblock = 3)
+        //   011      — length[1] = 3
+        //   100      — length[2] = 4
+        let bits = vec![
+            1u8, // non-zero
+            1,   // inclusion
+            1,   // zero-bitplane = 0
+            1, 1, 0, 0, // coding passes = 3
+            0, // no Lblock increment (only here, not per length)
+            1, 0, 1, // len 5
+            0, 1, 1, // len 3
+            1, 0, 0, // len 4
+        ];
+        let packed = pack_bits(&bits);
+        let geom = PacketGeometry {
+            sub_bands: vec![SubBandGeometry {
+                width: 1,
+                height: 1,
+            }],
+            layer: 0,
+        };
+        let mut state = PrecinctState::new();
+        let h = decode_packet_header(
+            &packed,
+            &geom,
+            &mut state,
+            SopEphMode::None,
+            SegmentSplit::PerPass,
+        )
+        .unwrap();
+        assert!(h.non_zero_length);
+        let c = &h.contributions[0];
+        assert!(c.included);
+        assert_eq!(c.coding_passes, 3);
+        // K = 3 lengths, one per terminated pass.
+        assert_eq!(c.segment_lengths, vec![5, 3, 4]);
+        assert_eq!(c.zero_bit_planes, Some(0));
+        assert_eq!(h.total_body_bytes(), 12);
+        // Lblock unchanged (the single prefix asked for no increment).
+        assert_eq!(state.sub_bands[0].lblock[0].lblock, 3);
+    }
+
+    #[test]
+    fn per_pass_split_single_prefix_then_widened_lblock() {
+        // Same as above but the single increase-Lblock prefix bumps
+        // Lblock from 3 to 4 (`10`), so every one of the K = 2 lengths
+        // is read with 4 bits — exercising that the prefix applies to
+        // all subsequent lengths, not just the first.
+        //
+        //   1        — non-zero
+        //   1        — inclusion
+        //   1        — zero-bitplane = 0
+        //   1,0      — coding passes = 2
+        //   1,0      — Lblock increment: +1 → lblock = 4 (once)
+        //   0110     — length[0] = 6 (4 bits)
+        //   1001     — length[1] = 9
+        let bits = vec![
+            1u8, 1, 1, // non-zero, inclusion, zero-bitplane
+            1, 0, // coding passes = 2
+            1, 0, // Lblock += 1 → 4
+            0, 1, 1, 0, // len 6
+            1, 0, 0, 1, // len 9
+        ];
+        let packed = pack_bits(&bits);
+        let geom = PacketGeometry {
+            sub_bands: vec![SubBandGeometry {
+                width: 1,
+                height: 1,
+            }],
+            layer: 0,
+        };
+        let mut state = PrecinctState::new();
+        let h = decode_packet_header(
+            &packed,
+            &geom,
+            &mut state,
+            SopEphMode::None,
+            SegmentSplit::PerPass,
+        )
+        .unwrap();
+        let c = &h.contributions[0];
+        assert_eq!(c.coding_passes, 2);
+        assert_eq!(c.segment_lengths, vec![6, 9]);
+        assert_eq!(state.sub_bands[0].lblock[0].lblock, 4);
     }
 
     #[test]
@@ -1367,7 +1560,14 @@ mod tests {
         //   011     — 3-bit length = 3
         let bits = vec![1u8, 1, 0, 0, 0, 1, 1];
         let packed = pack_bits(&bits);
-        let h = decode_packet_header(&packed, &geom, &mut state, SopEphMode::None).unwrap();
+        let h = decode_packet_header(
+            &packed,
+            &geom,
+            &mut state,
+            SopEphMode::None,
+            SegmentSplit::Single,
+        )
+        .unwrap();
         assert!(h.non_zero_length);
         let c = &h.contributions[0];
         assert!(c.included);
@@ -1394,7 +1594,14 @@ mod tests {
             layer: 0,
         };
         let mut state = PrecinctState::new();
-        let h = decode_packet_header(&packed, &geom, &mut state, SopEphMode::None).unwrap();
+        let h = decode_packet_header(
+            &packed,
+            &geom,
+            &mut state,
+            SopEphMode::None,
+            SegmentSplit::Single,
+        )
+        .unwrap();
         assert!(h.non_zero_length);
         let c = &h.contributions[0];
         assert!(!c.included);
@@ -1437,6 +1644,7 @@ mod tests {
             &all,
             &[(0usize, g0.clone()), (0usize, g1.clone())],
             SopEphMode::None,
+            SegmentSplit::Single,
         )
         .unwrap();
         assert_eq!(headers.len(), 2);
@@ -1464,7 +1672,13 @@ mod tests {
             }],
             layer: 0,
         };
-        let err = walk_packet_headers(&all, &[(0usize, geom)], SopEphMode::None).unwrap_err();
+        let err = walk_packet_headers(
+            &all,
+            &[(0usize, geom)],
+            SopEphMode::None,
+            SegmentSplit::Single,
+        )
+        .unwrap_err();
         assert_eq!(err, Error::PacketHeaderOverrun);
     }
 
@@ -1505,7 +1719,14 @@ mod tests {
             layer: 0,
         };
         let mut state = PrecinctState::new();
-        let h = decode_packet_header(&packed, &geom, &mut state, SopEphMode::None).unwrap();
+        let h = decode_packet_header(
+            &packed,
+            &geom,
+            &mut state,
+            SopEphMode::None,
+            SegmentSplit::Single,
+        )
+        .unwrap();
         assert!(h.non_zero_length);
         assert_eq!(h.contributions.len(), 3);
         assert!(!h.contributions[0].included);
@@ -1528,7 +1749,14 @@ mod tests {
             layer: 0,
         };
         let mut state = PrecinctState::new();
-        let h = decode_packet_header(&packed, &geom, &mut state, SopEphMode::SopOnly).unwrap();
+        let h = decode_packet_header(
+            &packed,
+            &geom,
+            &mut state,
+            SopEphMode::SopOnly,
+            SegmentSplit::Single,
+        )
+        .unwrap();
         assert!(!h.non_zero_length);
         assert_eq!(h.bytes_consumed, packed.len());
     }
@@ -1546,7 +1774,14 @@ mod tests {
             layer: 0,
         };
         let mut state = PrecinctState::new();
-        let h = decode_packet_header(&packed, &geom, &mut state, SopEphMode::EphOnly).unwrap();
+        let h = decode_packet_header(
+            &packed,
+            &geom,
+            &mut state,
+            SopEphMode::EphOnly,
+            SegmentSplit::Single,
+        )
+        .unwrap();
         assert!(!h.non_zero_length);
         assert_eq!(h.bytes_consumed, packed.len());
     }
@@ -1571,9 +1806,23 @@ mod tests {
         let mut state = PrecinctState::new();
         // First call seeds the layout.
         let bits = pack_bits(&[0]);
-        decode_packet_header(&bits, &geom1, &mut state, SopEphMode::None).unwrap();
+        decode_packet_header(
+            &bits,
+            &geom1,
+            &mut state,
+            SopEphMode::None,
+            SegmentSplit::Single,
+        )
+        .unwrap();
         // Second call with mismatching geometry must be rejected.
-        let err = decode_packet_header(&bits, &geom2, &mut state, SopEphMode::None).unwrap_err();
+        let err = decode_packet_header(
+            &bits,
+            &geom2,
+            &mut state,
+            SopEphMode::None,
+            SegmentSplit::Single,
+        )
+        .unwrap_err();
         assert_eq!(err, Error::InvalidPacketHeader);
     }
 }

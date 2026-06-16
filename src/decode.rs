@@ -59,7 +59,7 @@ use crate::mct::{
     reconstruct_tile_components_5x3_multi, reconstruct_tile_components_9x7_multi,
     ComponentDescriptor, InverseMctMode,
 };
-use crate::packet::{PacketGeometry, SopEphMode, SubBandGeometry};
+use crate::packet::{PacketGeometry, SegmentSplit, SopEphMode, SubBandGeometry};
 use crate::progression::{
     cprl_packet_order, lrcp_packet_order, pcrl_packet_order, rlcp_packet_order, rpcl_packet_order,
     ComponentPositionInfo, ComponentProgressionInfo, ResolutionPrecinctLayout,
@@ -305,15 +305,24 @@ fn resolve_band_quant(
 
 /// Per-code-block accumulator across every layer's packets: total
 /// signalled coding passes, the §B.10.5 missing-bit-plane count `P`
-/// (first inclusion only), and the concatenated codeword-segment
-/// bytes. With the segmentation-changing Table A.19 style bits
-/// rejected up front, all of a code-block's packet contributions form
-/// a single §C.3 codeword segment, so plain concatenation is exact.
+/// (first inclusion only), and the per-codeword-segment bytes.
+///
+/// With the default single-segment style (and the §C.3.6
+/// context-reset style, which does **not** split the stream) all of a
+/// code-block's packet contributions form one continuous §C.3 codeword
+/// segment, so `segments` holds a single entry carrying every pass.
+///
+/// Under the §D.4.2 "termination on each coding pass" style each
+/// included pass owns its own terminated §C.3 segment (§B.10.7.2), so
+/// `segments` holds one entry per pass — each a fresh MQ run that the
+/// tier-1 driver decodes against its own [`crate::mq::MqDecoder`].
 #[derive(Default)]
 struct BlockAccum {
     passes: u32,
     p: Option<u32>,
-    bytes: Vec<u8>,
+    /// One `(segment bytes, passes carried by this segment)` per §C.3
+    /// codeword segment, in coding-pass order.
+    segments: Vec<(Vec<u8>, u32)>,
 }
 
 /// Key addressing one code-block inside one tile:
@@ -386,6 +395,12 @@ struct CodingParams {
     segmentation_symbols: bool,
     vertically_causal: bool,
     reset_context_probabilities: bool,
+    /// §D.4.2 "termination on each coding pass" (Table A.19 bit 2):
+    /// every coding pass owns its own terminated §C.3 codeword segment
+    /// (§B.10.7.2). When set the packet reader uses
+    /// [`SegmentSplit::PerPass`] and the tier-1 driver opens a fresh
+    /// [`crate::mq::MqDecoder`] per pass.
+    termination_on_each_coding_pass: bool,
 }
 
 /// Decode every component of one tile from the concatenated tile-part
@@ -502,7 +517,12 @@ fn decode_tile(
             },
         ));
     }
-    let headers = crate::packet::walk_packet_headers(body, &packets, params.sop_eph)?;
+    let split = if params.termination_on_each_coding_pass {
+        SegmentSplit::PerPass
+    } else {
+        SegmentSplit::Single
+    };
+    let headers = crate::packet::walk_packet_headers(body, &packets, params.sop_eph, split)?;
 
     // -- Replay body offsets; accumulate per-code-block segments --
     let mut accum: BTreeMap<BlockKey, BlockAccum> = BTreeMap::new();
@@ -515,12 +535,6 @@ fn decode_tile(
             if !contrib.included {
                 continue;
             }
-            let total: u64 = contrib.segment_lengths.iter().map(|&l| l as u64).sum();
-            let total = usize::try_from(total).map_err(|_| Error::PacketHeaderOverrun)?;
-            let end = seg_pos
-                .checked_add(total)
-                .ok_or(Error::PacketHeaderOverrun)?;
-            let bytes = body.get(seg_pos..end).ok_or(Error::PacketHeaderOverrun)?;
             let key: BlockKey = (
                 desc.component,
                 desc.resolution,
@@ -540,8 +554,58 @@ fn decode_tile(
                 }
                 entry.p = Some(p);
             }
-            entry.bytes.extend_from_slice(bytes);
-            seg_pos = end;
+            // Slice each §B.10.7 codeword segment out of the packet body
+            // and record it with the number of coding passes it carries.
+            //
+            // * Single segment (§B.10.7.1, default / §C.3.6 context-reset
+            //   style) — the code-block's contributions form **one**
+            //   continuous §C.3 codeword segment across every layer.
+            //   Concatenate this packet's bytes onto a single shared
+            //   `segments[0]` entry and add its pass count, so the
+            //   multi-layer / multi-packet stream stays one MQ run.
+            // * Per-pass segments (§B.10.7.2, §D.4.2 termination) — the
+            //   packet reader signalled one length per pass, so each
+            //   length carries exactly one terminated pass and the
+            //   tier-1 driver opens a fresh MQ decoder per entry. Push
+            //   one entry per pass (no cross-layer concatenation: each
+            //   terminated pass is independent).
+            let num_segs = contrib.segment_lengths.len();
+            if num_segs <= 1 {
+                let len = contrib.segment_lengths.first().copied().unwrap_or(0) as usize;
+                let end = seg_pos.checked_add(len).ok_or(Error::PacketHeaderOverrun)?;
+                let bytes = body.get(seg_pos..end).ok_or(Error::PacketHeaderOverrun)?;
+                // Append onto the single shared segment for this block.
+                if entry.segments.is_empty() {
+                    entry.segments.push((Vec::new(), 0));
+                }
+                let seg = &mut entry.segments[0];
+                seg.0.extend_from_slice(bytes);
+                seg.1 = seg
+                    .1
+                    .checked_add(contrib.coding_passes)
+                    .ok_or(Error::InvalidPacketHeader)?;
+                seg_pos = end;
+            } else {
+                for (si, &len) in contrib.segment_lengths.iter().enumerate() {
+                    let len = len as usize;
+                    let end = seg_pos.checked_add(len).ok_or(Error::PacketHeaderOverrun)?;
+                    let bytes = body.get(seg_pos..end).ok_or(Error::PacketHeaderOverrun)?;
+                    // §B.10.7.2 per-pass split: every length but the last
+                    // carries exactly one pass; the residue lands on the
+                    // final segment so the sum always equals the
+                    // contribution's pass count.
+                    let seg_passes = if si + 1 < num_segs {
+                        1
+                    } else {
+                        contrib
+                            .coding_passes
+                            .checked_sub(si as u32)
+                            .ok_or(Error::InvalidPacketHeader)?
+                    };
+                    entry.segments.push((bytes.to_vec(), seg_passes));
+                    seg_pos = end;
+                }
+            }
         }
         pos = seg_pos;
     }
@@ -602,8 +666,24 @@ fn decode_tile(
         let mut seq = BitPlaneSequencer::new(mb - 1 - p)
             .with_segmentation_symbols(params.segmentation_symbols)
             .with_vertically_causal_context(params.vertically_causal)
-            .with_reset_context_probabilities(params.reset_context_probabilities);
-        seq.decode_packet(&mut block, &acc.bytes, acc.passes, &mut ctx)?;
+            .with_reset_context_probabilities(params.reset_context_probabilities)
+            .with_termination_on_each_coding_pass(params.termination_on_each_coding_pass);
+        // Drive the §D.3 pass schedule across this code-block's §C.3
+        // codeword segments. Each segment opens a fresh MqDecoder (the
+        // MQ engine restarts per §C.3 at every termination boundary —
+        // §D.4.1 0xFF-fill is synthesised by `MqDecoder::new`), while
+        // the Annex D context array (`ctx`) persists across segments per
+        // §D.4 (unless the §C.3.6 reset bit is set, which the sequencer
+        // applies internally). The single-segment case is one iteration
+        // carrying every pass; the §D.4.2 per-pass case is one iteration
+        // per terminated pass.
+        for (seg_bytes, seg_passes) in &acc.segments {
+            if *seg_passes == 0 {
+                continue;
+            }
+            let mut decoder = crate::mq::MqDecoder::new(seg_bytes);
+            seq.decode_passes(&mut block, &mut decoder, &mut ctx, *seg_passes)?;
+        }
         // Record the §B.10.5 zero-MSB count so the reassembly bridge can
         // recover the full per-coefficient §D.2.1 Nb(u, v) =
         // P + decoded_bits(u, v). The tier-1 passes have already tracked
@@ -811,19 +891,25 @@ pub fn decode_codestream(bytes: &[u8], cs: &J2kCodestream) -> Result<DecodedImag
     let comp_quant = resolve_component_quant(siz.components.len(), qcd, &main_qccs)?;
 
     let style_flags = cod.code_block_style_flags();
-    if style_flags.selective_arithmetic_coding_bypass()
-        || style_flags.termination_on_each_coding_pass()
-    {
-        // These two Table A.19 bits split the code-block contribution
-        // into multiple §C.3 codeword segments (§B.10.7.2); the
-        // single-segment tier-1 driver below would mis-decode them.
-        //
-        // The §C.3.6 reset-context-probabilities bit (0x02) does NOT
-        // split the stream — it only re-initialises the Annex D contexts
-        // to their Table D.7 states at each pass boundary — so it is
-        // honoured directly (threaded into the BitPlaneSequencer below).
+    if style_flags.selective_arithmetic_coding_bypass() {
+        // §D.6 selective arithmetic-coding bypass splits the code-block
+        // into AC + raw (lazy) codeword segments and reads the SP / MR
+        // passes from bit-plane 5 onward directly from a bit-stuffed
+        // stream. That raw-mode dispatch is not wired into the tier-1
+        // driver below yet, so reject it cleanly.
         return Err(Error::NotImplemented);
     }
+    // §D.4.2 "termination on each coding pass" (Table A.19 bit 2) splits
+    // the contribution into one terminated §C.3 codeword segment per
+    // coding pass (§B.10.7.2). The packet reader reads the per-pass
+    // §B.10.7 lengths and the tier-1 driver opens a fresh MqDecoder per
+    // segment — so it is honoured here.
+    //
+    // The §C.3.6 reset-context-probabilities bit (0x02) does NOT split
+    // the stream — it only re-initialises the Annex D contexts to their
+    // Table D.7 states at each pass boundary — and is honoured directly
+    // (threaded into the BitPlaneSequencer below).
+    let termination_on_each_coding_pass = style_flags.termination_on_each_coding_pass();
 
     let params = CodingParams {
         n_l: cod.decomposition_levels,
@@ -849,6 +935,7 @@ pub fn decode_codestream(bytes: &[u8], cs: &J2kCodestream) -> Result<DecodedImag
         segmentation_symbols: style_flags.segmentation_symbols(),
         vertically_causal: style_flags.vertically_causal_context(),
         reset_context_probabilities: style_flags.reset_context_probabilities(),
+        termination_on_each_coding_pass,
     };
 
     // -- Image-area planes --

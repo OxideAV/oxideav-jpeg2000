@@ -59,6 +59,17 @@ const GRAY_MULTIPRECINCT_53: &[u8] = include_bytes!("data/gray-40x40-multiprecin
 // COM markers scrubbed; encoded with an opaque CLI codec as a black box.
 const GRAY_MULTILAYER_53: &[u8] = include_bytes!("data/gray-64x64-multilayer-53.j2k");
 
+// §D.4.2 "termination on each coding pass" fixture: 40×40 gray,
+// lossless 5-3, NL = 3, 8×8 code-blocks, with the COD Table A.19
+// code-block-style bit 2 set. Every coding pass owns its own
+// terminated §C.3 codeword segment, so the §B.10.7.2 multi-segment
+// length signalling is exercised (one §B.10.7.1 length per pass) and
+// the tier-1 driver must open a fresh MQ decoder per pass while the
+// Annex D contexts persist across the per-pass segment boundaries. The
+// reconstruction must remain pixel-exact versus the source raster. COM
+// markers scrubbed; encoded with an opaque CLI codec as a black box.
+const GRAY_TERMALL_53: &[u8] = include_bytes!("data/gray-40x40-termall-53.j2k");
+
 /// Deterministic 64×64 gray source pattern (the raster the multi-layer
 /// fixture was encoded from); same arithmetic family as
 /// [`gray_17x13_pattern`] with an extra high-frequency `(x ^ y)` term so
@@ -270,6 +281,47 @@ fn gray_53_multi_layer_is_pixel_exact() {
     assert_eq!(img.components[0].precision_bits, 8);
     assert!(!img.components[0].is_signed);
     assert_eq!(img.components[0].samples, gray_64x64_pattern());
+}
+
+#[test]
+fn gray_53_termination_on_each_pass_is_pixel_exact() {
+    // 40×40 gray, lossless 5-3, NL = 3, 8×8 code-blocks, COD Table A.19
+    // code-block-style bit 2 ("termination on each coding pass", §D.4.2)
+    // set. Each coding pass is flushed into its own terminated §C.3
+    // codeword segment, so:
+    //
+    //   * the packet header signals one §B.10.7.1 length per pass
+    //     (§B.10.7.2 multi-segment case, K = passes), and
+    //   * the tier-1 driver opens a fresh MQ decoder over each pass's
+    //     segment (§D.4.1 0xFF-fill synthesised per segment) while the
+    //     Annex D contexts persist across the per-pass boundaries.
+    //
+    // A single-segment driver (concatenating every pass into one MQ run)
+    // would desync at the first termination boundary, so pixel-exactness
+    // here pins the whole §D.4.2 path.
+    let cs = parse_codestream(GRAY_TERMALL_53).expect("parse");
+    assert!(
+        cs.header
+            .cod
+            .code_block_style_flags()
+            .termination_on_each_coding_pass(),
+        "fixture must set the termination-on-each-coding-pass style bit"
+    );
+    // And it must NOT set the AC-bypass bit (that path is still rejected).
+    assert!(
+        !cs.header
+            .cod
+            .code_block_style_flags()
+            .selective_arithmetic_coding_bypass(),
+        "fixture must not set the selective-arithmetic-coding-bypass bit"
+    );
+    let img = decode_j2k(GRAY_TERMALL_53).expect("decode termination-on-each-pass");
+    assert_eq!(img.width, 40);
+    assert_eq!(img.height, 40);
+    assert_eq!(img.components.len(), 1);
+    assert_eq!(img.components[0].precision_bits, 8);
+    assert!(!img.components[0].is_signed);
+    assert_eq!(img.components[0].samples, gray_40x40_pattern());
 }
 
 #[test]

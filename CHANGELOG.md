@@ -6,6 +6,30 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 324 (2026-06-16).** **Table A.19 `termination on
+  each coding pass` style bit** (Scod bit 2, `0x04`; T.800 §D.4.2). A
+  code-block whose `COD.SPcod` code-block-style byte sets this bit is
+  now decoded instead of being rejected with `Error::NotImplemented`.
+  Every coding pass is flushed into its own terminated §C.3 codeword
+  segment, so the §B.10.7.2 multiple-codeword-segment length signalling
+  is honoured: the packet reader reads `K = passes` lengths per included
+  contribution, with the increase-`Lblock` prefix signalled **once**
+  before the first length and each width set to `Lblock`
+  (`floor(log2 1) = 0` widening). A new `SegmentSplit` enum
+  (`Single` / `PerPass`) threads the COD style decision through
+  `walk_packet_headers` / `decode_packet_header`. The tier-1 driver now
+  decodes each code-block across its per-segment byte slices, opening a
+  fresh `MqDecoder` per terminated pass (§D.4.1 `0xFF`-fill synthesised
+  per segment) while the Annex D context array persists across the
+  per-pass boundaries; the default single-segment / context-reset path
+  still concatenates a code-block's cross-layer contributions into one
+  continuous MQ run. `decode_codestream` threads the flag through
+  `CodingParams` and drops it from the rejected set; §D.6 selective
+  arithmetic-coding bypass remains rejected (its raw-bit / lazy SP-MR
+  region is not wired yet). One pixel-exact e2e fixture
+  (`gray-40x40-termall-53.j2k`, lossless 5-3, COD bit 2 set, COM
+  scrubbed, black-box-encoded) plus two §B.10.7.2 length-reader unit
+  tests. Suite total 574 (560 lib + 14 e2e, was 572).
 * **Clean-room round 320 (2026-06-16).** **Table A.19 `reset of context
   probabilities on coding pass boundaries` style bit** (Scod bit 1,
   `0x02`; T.800 §C.3.6 / §D.4, Annex J §J.18). A code-block whose
