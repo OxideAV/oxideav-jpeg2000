@@ -33,8 +33,11 @@ What is implemented:
   and `Lblock` segment-length reads, with optional SOP / EPH framing.
 - **Tier-1** — the MQ arithmetic decoder (Annex C) and all three Annex D
   coding passes (significance-propagation + sign, magnitude refinement,
-  cleanup with the run-length / UNIFORM shortcut), plus the §D.5
-  segmentation symbol.
+  cleanup with the run-length / UNIFORM shortcut), the §D.5
+  segmentation symbol, and the §C.3.6 / §D.4 **reset of context
+  probabilities** style bit (Table A.19 Scod bit 1) — contexts
+  re-initialise to their Table D.7 states at each coding-pass boundary
+  over the same single codeword segment.
 - **Reassembly** — per-coefficient `Nb(u, v)` magnitude-bit tracking for
   rate-truncated streams, dequantisation, the 5-3 and 9-7 inverse DWT,
   and the inverse multi-component transform.
@@ -54,8 +57,10 @@ These surface a clean `Error::NotImplemented` rather than mis-decoding:
   `COC` / `QCD` / `QCC` overrides (main-header `QCC` *is* honoured).
 - `RGN` region-of-interest, `POC` order changes mid-decode, and
   `PPM` / `PPT` packed-header markers.
-- The Table A.19 segmentation-changing style bits (bypass / reset /
-  termall).
+- The Table A.19 segment-splitting style bits — selective arithmetic
+  coding bypass (§D.6) and termination on each coding pass (§D.4.2),
+  which carve the code-block contribution into multiple §B.10.7.2
+  codeword segments (the §C.3.6 context-reset bit *is* honoured).
 - Position-keyed orders under non-power-of-two sub-sampling.
 - High-Throughput JPEG 2000 (HTJ2K) block coding.
 

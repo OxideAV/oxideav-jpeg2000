@@ -6,6 +6,25 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 320 (2026-06-16).** **Table A.19 `reset of context
+  probabilities on coding pass boundaries` style bit** (Scod bit 1,
+  `0x02`; T.800 §C.3.6 / §D.4, Annex J §J.18). A code-block whose
+  `COD.SPcod` code-block-style byte sets this bit is now decoded instead
+  of being rejected with `Error::NotImplemented`. Unlike the §C.3
+  termination and §D.6 bypass bits — which split the code-block
+  contribution into multiple §B.10.7.2 codeword segments — context reset
+  leaves the MQ arithmetic stream continuous (a single §B.10.7.1
+  segment), so only the Annex D context array is re-initialised to its
+  Table D.7 states at every coding-pass boundary. `BitPlaneSequencer`
+  gains a `reset_context_probabilities` toggle
+  (`with_reset_context_probabilities`); `decode_passes` restores the
+  context array after each pass when it is set. `decode_codestream`
+  threads the flag through `CodingParams` and drops it from the rejected
+  set; the §D.6 bypass and §D.4.2 per-pass-termination bits remain
+  rejected. Five unit tests pin the builder, flag composition, the
+  per-pass-reset oracle (matched against manual reset-between-passes
+  calls over one shared MQ segment), and the observable divergence from a
+  no-reset decode. Suite total 571 (558 lib + 13 e2e, was 566).
 * **Clean-room round 315 (2026-06-15).** **Main-header `QCC`
   per-component quantization override** (T.800 §A.6.5). A main-header
   `QCC` segment is now honoured instead of being rejected with

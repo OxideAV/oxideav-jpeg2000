@@ -1796,6 +1796,28 @@ pub struct BitPlaneSequencer {
     /// HTJ2K (Part 15) HT code-blocks opt out — the flag does not apply
     /// to HT code-block segments.
     predictable_termination: bool,
+    /// Whether the COD / COC Table A.19 `reset of context probabilities
+    /// on coding pass boundaries` flag (bit 1 of `Scod`, `0x02`) is set
+    /// for this code-block (T.800 §C.3.6, §D.4; Annex J §J.18 error
+    /// resilience tools — "the contexts may be reset after each coding
+    /// pass").
+    ///
+    /// When `true`, [`Self::decode_passes`] re-initialises the Annex D
+    /// context array to its Table D.7 reset states at every coding-pass
+    /// boundary (after each pass completes, before the next begins). The
+    /// MQ arithmetic stream itself is **not** disturbed — reset of
+    /// context probabilities only restores `I(CX)` / `MPS(CX)` to their
+    /// Table D.7 initial values per §C.3.6, leaving the continuous
+    /// single-§C.3-codeword-segment decode intact. The code-block
+    /// contribution therefore remains a single codeword segment
+    /// (§B.10.7.1): reset, unlike termination, does not split the
+    /// stream.
+    ///
+    /// The flag is taken from the COD / COC Table A.19
+    /// [`crate::CodeBlockStyle::reset_context_probabilities`] bit. It
+    /// composes freely with the §D.5 segmentation-symbol and §D.7
+    /// vertically-causal toggles.
+    reset_context_probabilities: bool,
 }
 
 impl BitPlaneSequencer {
@@ -1822,6 +1844,7 @@ impl BitPlaneSequencer {
             selective_arithmetic_coding_bypass: false,
             termination_on_each_coding_pass: false,
             predictable_termination: false,
+            reset_context_probabilities: false,
         }
     }
 
@@ -1871,6 +1894,33 @@ impl BitPlaneSequencer {
     /// Whether T.800 §D.7 vertically-causal context formation is on.
     pub fn vertically_causal_context(&self) -> bool {
         self.vertically_causal_context
+    }
+
+    /// Builder — enable T.800 §C.3.6 / §D.4 context-probability reset on
+    /// coding-pass boundaries for this code-block.
+    ///
+    /// When enabled, [`Self::decode_passes`] / [`Self::decode_packet`]
+    /// re-initialise the Annex D context array to its Table D.7 reset
+    /// states at every coding-pass boundary (after each pass, before the
+    /// next). The MQ arithmetic stream is untouched — the code-block
+    /// still decodes from a single continuous §C.3 codeword segment;
+    /// only the per-context `I(CX)` / `MPS(CX)` adaptive state is
+    /// restored to its initial values. This is the Annex J §J.18
+    /// "reset of contexts after each coding pass" error-resilience tool,
+    /// which lets the arithmetic coder recover its statistics after a bit
+    /// error in an earlier pass.
+    ///
+    /// The flag is taken from the COD / COC Table A.19
+    /// [`crate::CodeBlockStyle::reset_context_probabilities`] bit.
+    pub fn with_reset_context_probabilities(mut self, enabled: bool) -> Self {
+        self.reset_context_probabilities = enabled;
+        self
+    }
+
+    /// Whether T.800 §C.3.6 context-probability reset on coding-pass
+    /// boundaries is on.
+    pub fn reset_context_probabilities(&self) -> bool {
+        self.reset_context_probabilities
     }
 
     /// Builder — enable T.800 §D.6 selective arithmetic-coding bypass
@@ -2194,6 +2244,17 @@ impl BitPlaneSequencer {
             };
             total += n;
             self.passes_decoded = self.passes_decoded.saturating_add(1);
+            // §C.3.6 / §D.4: when the COD / COC Table A.19 reset bit is
+            // set the contexts are reset to their Table D.7 initial
+            // states at each coding-pass boundary — i.e. after every
+            // pass completes (and, for a cleanup pass with the §D.5 flag
+            // on, after the segmentation symbol has been drained). The MQ
+            // decoder is untouched: this only restores the adaptive
+            // per-context I(CX) / MPS(CX) probabilities, leaving the
+            // single continuous §C.3 codeword segment intact.
+            if self.reset_context_probabilities {
+                *ctx = reset_contexts();
+            }
         }
         Ok(total)
     }
@@ -4850,5 +4911,150 @@ mod tests {
             .unwrap();
         assert!(!block.sp_visited[0]);
         assert!(!block.sp_visited[1]);
+    }
+
+    // -- §C.3.6 / §D.4 reset of context probabilities (Scod bit-1) ----
+
+    #[test]
+    fn sequencer_reset_context_probabilities_default_off() {
+        let seq = BitPlaneSequencer::new(7);
+        assert!(!seq.reset_context_probabilities());
+    }
+
+    #[test]
+    fn sequencer_with_reset_context_probabilities_round_trips() {
+        // Builder monotonicity in both directions, matching the §D.5 /
+        // §D.6 / §D.7 / bit-2 / bit-4 builders.
+        let seq_off = BitPlaneSequencer::new(5);
+        assert!(!seq_off.reset_context_probabilities());
+
+        let seq_on = seq_off.with_reset_context_probabilities(true);
+        assert!(seq_on.reset_context_probabilities());
+
+        let seq_back = seq_on.with_reset_context_probabilities(false);
+        assert!(!seq_back.reset_context_probabilities());
+    }
+
+    #[test]
+    fn sequencer_reset_context_probabilities_composes_with_other_flags() {
+        // The Scod bit-1 reset toggle is independent of the §D.5 / §D.7 /
+        // §D.6 / bit-2 / bit-4 toggles — flipping it leaves the others
+        // untouched, and vice versa.
+        let base = BitPlaneSequencer::new(7)
+            .with_segmentation_symbols(true)
+            .with_vertically_causal_context(true)
+            .with_selective_arithmetic_coding_bypass(true)
+            .with_termination_on_each_coding_pass(true)
+            .with_predictable_termination(true);
+        assert!(!base.reset_context_probabilities());
+
+        let on = base.clone().with_reset_context_probabilities(true);
+        assert!(on.reset_context_probabilities());
+        assert!(on.segmentation_symbols());
+        assert!(on.vertically_causal_context());
+        assert!(on.selective_arithmetic_coding_bypass());
+        assert!(on.termination_on_each_coding_pass());
+        assert!(on.predictable_termination());
+
+        let off = on.with_reset_context_probabilities(false);
+        assert!(!off.reset_context_probabilities());
+        assert!(off.segmentation_symbols());
+        assert!(off.vertically_causal_context());
+        assert!(off.selective_arithmetic_coding_bypass());
+        assert!(off.termination_on_each_coding_pass());
+        assert!(off.predictable_termination());
+    }
+
+    #[test]
+    fn sequencer_reset_context_matches_manual_per_pass_reset_oracle() {
+        // §C.3.6 / §D.4 / Annex J §J.18: with Scod bit-1 set the contexts
+        // are re-initialised to their Table D.7 states at every coding-
+        // pass boundary, while the MQ arithmetic stream stays continuous
+        // (single §C.3 codeword segment per §B.10.7.1 — reset does NOT
+        // split the stream the way termination does).
+        //
+        // Subject: drive the four-pass schedule (bp cleanup, then a full
+        // SP/MR/cleanup set on the next bit-plane) through the sequencer
+        // with the reset toggle on, over ONE shared byte segment.
+        let bytes = [0xC3u8, 0x5A, 0x96, 0x7E, 0x21, 0xBD, 0x44, 0x91];
+        let bp_first = 6;
+
+        let mut subject = CodeBlock::new(SubBandOrientation::LL, 4, 4);
+        let mut subject_ctx = reset_contexts();
+        let mut seq = BitPlaneSequencer::new(bp_first).with_reset_context_probabilities(true);
+        seq.decode_packet(&mut subject, &bytes, 4, &mut subject_ctx)
+            .unwrap();
+
+        // Oracle: one shared MqDecoder across all four passes (single
+        // segment), but the context array is restored to Table D.7
+        // between every pass — exactly what bit-1 mandates.
+        let mut oracle = CodeBlock::new(SubBandOrientation::LL, 4, 4);
+        let mut oracle_ctx = reset_contexts();
+        let mut dec = MqDecoder::new(&bytes);
+        oracle
+            .cleanup_pass(bp_first, &mut dec, &mut oracle_ctx)
+            .unwrap();
+        oracle_ctx = reset_contexts();
+        let bp2 = bp_first - 1;
+        oracle
+            .significance_propagation_pass(bp2, &mut dec, &mut oracle_ctx)
+            .unwrap();
+        oracle_ctx = reset_contexts();
+        oracle
+            .magnitude_refinement_pass(bp2, &mut dec, &mut oracle_ctx)
+            .unwrap();
+        oracle_ctx = reset_contexts();
+        oracle.cleanup_pass(bp2, &mut dec, &mut oracle_ctx).unwrap();
+
+        for v in 0..4 {
+            for u in 0..4 {
+                assert_eq!(
+                    subject.coefficient(u, v),
+                    oracle.coefficient(u, v),
+                    "({u},{v}) must match the per-pass-reset oracle"
+                );
+            }
+        }
+        // The subject's context array, after the final pass, must equal a
+        // freshly-reset array (bit-1 resets after the last pass too).
+        assert_eq!(subject_ctx, reset_contexts());
+    }
+
+    #[test]
+    fn sequencer_reset_context_observably_differs_from_no_reset() {
+        // The reset toggle must actually change the sequencer's behaviour
+        // — it is not a no-op. The robust, fixture-independent witness is
+        // the post-decode context array: with bit-1 ON the array is
+        // restored to its Table D.7 reset state after the final pass
+        // boundary, whereas with bit-1 OFF the contexts have adapted away
+        // from Table D.7 across a multi-pass decode (§D.4 — the contexts
+        // persist and adapt over the code-block lifetime). A non-trivial
+        // multi-pass stream therefore leaves the two arrays unequal.
+        let bytes = [0xF3u8, 0x1C, 0xA7, 0x6B, 0x5D, 0x82, 0x39, 0xEE];
+        let bp_first = 6;
+
+        let mut with_reset = CodeBlock::new(SubBandOrientation::LL, 4, 4);
+        let mut ctx_on = reset_contexts();
+        BitPlaneSequencer::new(bp_first)
+            .with_reset_context_probabilities(true)
+            .decode_packet(&mut with_reset, &bytes, 4, &mut ctx_on)
+            .unwrap();
+
+        let mut without_reset = CodeBlock::new(SubBandOrientation::LL, 4, 4);
+        let mut ctx_off = reset_contexts();
+        BitPlaneSequencer::new(bp_first)
+            .decode_packet(&mut without_reset, &bytes, 4, &mut ctx_off)
+            .unwrap();
+
+        // bit-1 ON: final array equals a fresh Table D.7 reset.
+        assert_eq!(ctx_on, reset_contexts());
+        // bit-1 OFF: the contexts adapted, so they are NOT a fresh reset.
+        assert_ne!(
+            ctx_off,
+            reset_contexts(),
+            "a multi-pass decode without reset must adapt at least one context"
+        );
+        // The two modes therefore reached different context state.
+        assert_ne!(ctx_on, ctx_off);
     }
 }

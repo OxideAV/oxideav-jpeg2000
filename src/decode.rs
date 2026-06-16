@@ -385,6 +385,7 @@ struct CodingParams {
     sop_eph: SopEphMode,
     segmentation_symbols: bool,
     vertically_causal: bool,
+    reset_context_probabilities: bool,
 }
 
 /// Decode every component of one tile from the concatenated tile-part
@@ -600,7 +601,8 @@ fn decode_tile(
         let mut ctx = reset_contexts();
         let mut seq = BitPlaneSequencer::new(mb - 1 - p)
             .with_segmentation_symbols(params.segmentation_symbols)
-            .with_vertically_causal_context(params.vertically_causal);
+            .with_vertically_causal_context(params.vertically_causal)
+            .with_reset_context_probabilities(params.reset_context_probabilities);
         seq.decode_packet(&mut block, &acc.bytes, acc.passes, &mut ctx)?;
         // Record the §B.10.5 zero-MSB count so the reassembly bridge can
         // recover the full per-coefficient §D.2.1 Nb(u, v) =
@@ -810,12 +812,16 @@ pub fn decode_codestream(bytes: &[u8], cs: &J2kCodestream) -> Result<DecodedImag
 
     let style_flags = cod.code_block_style_flags();
     if style_flags.selective_arithmetic_coding_bypass()
-        || style_flags.reset_context_probabilities()
         || style_flags.termination_on_each_coding_pass()
     {
-        // These three Table A.19 bits change the §C.3 codeword
-        // segmentation; the single-segment tier-1 driver below would
-        // mis-decode them.
+        // These two Table A.19 bits split the code-block contribution
+        // into multiple §C.3 codeword segments (§B.10.7.2); the
+        // single-segment tier-1 driver below would mis-decode them.
+        //
+        // The §C.3.6 reset-context-probabilities bit (0x02) does NOT
+        // split the stream — it only re-initialises the Annex D contexts
+        // to their Table D.7 states at each pass boundary — so it is
+        // honoured directly (threaded into the BitPlaneSequencer below).
         return Err(Error::NotImplemented);
     }
 
@@ -842,6 +848,7 @@ pub fn decode_codestream(bytes: &[u8], cs: &J2kCodestream) -> Result<DecodedImag
         },
         segmentation_symbols: style_flags.segmentation_symbols(),
         vertically_causal: style_flags.vertically_causal_context(),
+        reset_context_probabilities: style_flags.reset_context_probabilities(),
     };
 
     // -- Image-area planes --
