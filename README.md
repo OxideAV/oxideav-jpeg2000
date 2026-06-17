@@ -51,6 +51,14 @@ What is implemented:
   `QCD` default (T.800 §A.6.5, `Main QCC > Main QCD`): each component's
   quantisation style, guard bits and step sizes are resolved
   independently.
+- **Per-component coding style** — main-header `COC` overrides of the
+  `COD` default (T.800 §A.6.2, `Main COC > Main COD`): each component's
+  decomposition-level count `NL`, code-block size, precinct partition
+  and wavelet kernel are resolved independently, so the per-component
+  geometry, tier-1 and inverse-DWT cascade all run against the right
+  parameters. The Table A.19 code-block **style** byte is held global
+  to the code; a `COC` that diverges from the `COD` style — or gives
+  different components different kernels — is cleanly rejected.
 - **Progression** — all five §B.12.1 orders (LRCP, RLCP, RPCL, PCRL,
   CPRL), §B.12.2 POC volume iteration, and **multi-layer** /
   **multi-precinct** reassembly.
@@ -59,8 +67,11 @@ What is implemented:
 
 These surface a clean `Error::NotImplemented` rather than mis-decoding:
 
-- `COC` per-component coding-style overrides, and tile-part `COD` /
-  `COC` / `QCD` / `QCC` overrides (main-header `QCC` *is* honoured).
+- A `COC` whose Table A.19 code-block **style** byte diverges from the
+  `COD`, or that gives different components different wavelet kernels
+  (the common `COC` override of per-component `NL` / code-block size /
+  precincts / kernel *is* honoured), and tile-part `COD` / `COC` /
+  `QCD` / `QCC` overrides (main-header `QCC` and `COC` *are* honoured).
 - `RGN` region-of-interest, `POC` order changes mid-decode, and
   `PPM` / `PPT` packed-header markers.
 - The Table A.19 selective arithmetic coding bypass style bit (§D.6),

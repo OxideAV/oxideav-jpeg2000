@@ -32,15 +32,19 @@
 //!   grid; no upsampling is performed),
 //! * SOP / EPH packet framing per the COD `Scod` bits.
 //!
+//! The main-header `QCC` per-component quantisation override (§A.6.5)
+//! and the main-header `COC` per-component coding-style override
+//! (§A.6.2 — per-component `NL`, code-block size, precincts and
+//! wavelet kernel) are honoured.
+//!
 //! Streams that need machinery this round does not wire are
 //! **rejected** with [`Error::NotImplemented`] rather than
-//! mis-decoded: `COC` / `QCC` per-component overrides, tile-part
-//! header overrides (`COD` / `QCD` inside a tile-part), `RGN` ROI
-//! shifts, `POC` progression-order changes, `PPM` / `PPT` packed
-//! packet headers, the `RPCL` / `PCRL` / `CPRL` progression orders,
-//! and the Table A.19 code-block-style bits that change codeword
-//! segmentation (selective arithmetic-coding bypass, context reset,
-//! termination on each coding pass).
+//! mis-decoded: a `COC` whose Table A.19 code-block **style** byte
+//! diverges from the `COD` (the style stays global), a `COC` that
+//! gives different components different wavelet kernels, tile-part
+//! header overrides (`COD` / `COC` / `QCD` / `QCC` inside a
+//! tile-part), `RGN` ROI shifts, `POC` progression-order changes, and
+//! `PPM` / `PPT` packed packet headers.
 //!
 //! All behaviour is derived from the staged T.800 specification
 //! text. The
@@ -71,7 +75,7 @@ use crate::reassemble::{
 use crate::t1::{reset_contexts, BitPlaneSequencer, CodeBlock};
 use crate::{
     Error, J2kCodestream, ProgressionOrder, QuantizationStyle, Siz, TilePartMarker,
-    WaveletTransform, MARKER_CAP, MARKER_COC, MARKER_POC, MARKER_RGN, MARKER_SIZ, MARKER_SOC,
+    WaveletTransform, MARKER_CAP, MARKER_POC, MARKER_RGN, MARKER_SIZ, MARKER_SOC,
 };
 
 /// `PPM` marker code (T.800 §A.7.4, `0xFF60`) — packed packet
@@ -129,14 +133,16 @@ pub struct DecodedImage {
 
 /// Re-scan the main-header byte span for marker segments the wiring
 /// cannot honour yet. [`crate::parse_j2k_header`] length-skips
-/// optional markers; silently ignoring `COC` / `RGN` / `POC` / `PPM`
-/// / `CAP` would mis-decode the stream, so their presence is surfaced
-/// as [`Error::NotImplemented`] here.
+/// optional markers; silently ignoring `RGN` / `POC` / `PPM` / `CAP`
+/// would mis-decode the stream, so their presence is surfaced as
+/// [`Error::NotImplemented`] here.
 ///
-/// `QCC` is **not** rejected: the main-header per-component
-/// quantization override (T.800 §A.6.5, `Main QCC > Main QCD`) is
-/// honoured — see [`crate::collect_main_header_qcc`] and
-/// [`resolve_component_quant`].
+/// `QCC` and `COC` are **not** rejected: the main-header per-component
+/// quantization override (T.800 §A.6.5, `Main QCC > Main QCD`) and the
+/// per-component coding-style override (T.800 §A.6.2, `Main COC > Main
+/// COD`) are honoured — see [`crate::collect_main_header_qcc`] /
+/// [`resolve_component_quant`] and [`crate::collect_main_header_coc`] /
+/// [`resolve_component_coding`].
 fn reject_unsupported_main_header_markers(bytes: &[u8], header_end: usize) -> Result<(), Error> {
     // SOC is 2 bytes with no length field; every other main-header
     // marker segment is `marker(2) + length(2) + payload(length-2)`.
@@ -144,7 +150,7 @@ fn reject_unsupported_main_header_markers(bytes: &[u8], header_end: usize) -> Re
     while pos + 4 <= header_end {
         let marker = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]);
         match marker {
-            MARKER_COC | MARKER_RGN | MARKER_POC | MARKER_PPM | MARKER_CAP => {
+            MARKER_RGN | MARKER_POC | MARKER_PPM | MARKER_CAP => {
                 return Err(Error::NotImplemented);
             }
             MARKER_SOC | MARKER_SIZ => {}
@@ -246,6 +252,100 @@ fn resolve_component_quant<'a>(
             style: qcc.style,
             spqcd: &qcc.spqcc,
             guard_bits: qcc.guard_bits,
+        };
+    }
+    Ok(out)
+}
+
+/// The per-component coding-style parameters resolved after the T.800
+/// §A.6.2 `Main COC > Main COD` precedence: decomposition levels, the
+/// code-block size exponents, the user-defined precinct list, and the
+/// wavelet kernel. The code-block **style** bits (Table A.19 — SOP/EPH
+/// framing, segmentation symbol, vertically-causal, context reset,
+/// per-pass termination, bypass) stay global to the code and are
+/// validated to match the main `COD` (see [`resolve_component_coding`]).
+#[derive(Clone)]
+struct ComponentCoding {
+    /// `SPcoc` decomposition levels, `NL`.
+    n_l: u8,
+    /// Code-block width exponent `xcb` = `code_block_width_exp + 2`.
+    xcb: u8,
+    /// Code-block height exponent `ycb` = `code_block_height_exp + 2`.
+    ycb: u8,
+    /// User-defined precinct exponents (one byte per resolution level)
+    /// or empty for maximum precincts (`PPx = PPy = 15`).
+    precincts: Vec<u8>,
+    /// Wavelet kernel selected for this component (Table A.20).
+    transform: WaveletTransform,
+}
+
+/// Resolve the per-component coding style for every component, applying
+/// any main-header `COC` override over the main `COD` (T.800 §A.6.2,
+/// `Main COC > Main COD`).
+///
+/// At most one `COC` may target a given component in the main header
+/// (§A.6.2); a duplicate, or a `Ccoc` out of range, is rejected as
+/// malformed.
+///
+/// A `COC` may change `NL` / code-block size / precincts / kernel
+/// per component, but the Table A.19 code-block **style** byte is held
+/// global to the code: the tier-1 driver and the packet-header
+/// segment-split are derived once from the main `COD`. A `COC` whose
+/// `code_block_style` differs from the main `COD` would require a
+/// per-component packet-segment split that is not wired, so it is
+/// surfaced as [`Error::NotImplemented`] rather than mis-decoded.
+fn resolve_component_coding(
+    num_components: usize,
+    cod: &crate::Cod,
+    cocs: &[crate::Coc],
+) -> Result<Vec<ComponentCoding>, Error> {
+    let cod_xcb = cod
+        .code_block_width_exp
+        .checked_add(2)
+        .ok_or(Error::InvalidMarkerLength)?;
+    let cod_ycb = cod
+        .code_block_height_exp
+        .checked_add(2)
+        .ok_or(Error::InvalidMarkerLength)?;
+    let default = ComponentCoding {
+        n_l: cod.decomposition_levels,
+        xcb: cod_xcb,
+        ycb: cod_ycb,
+        precincts: cod.precincts.clone(),
+        transform: cod.transform,
+    };
+    let mut out: Vec<ComponentCoding> = (0..num_components).map(|_| default.clone()).collect();
+    let mut seen = vec![false; num_components];
+    for coc in cocs {
+        let c = coc.component_index as usize;
+        if c >= num_components {
+            return Err(Error::InvalidMarkerLength);
+        }
+        if seen[c] {
+            // §A.6.2: no more than one COC per component per header.
+            return Err(Error::InvalidMarkerLength);
+        }
+        seen[c] = true;
+        // Table A.19 code-block style is global to the code; a COC that
+        // diverges from the main COD style is not wired (would need a
+        // per-component §B.10.7 segment split).
+        if coc.code_block_style != cod.code_block_style {
+            return Err(Error::NotImplemented);
+        }
+        let xcb = coc
+            .code_block_width_exp
+            .checked_add(2)
+            .ok_or(Error::InvalidMarkerLength)?;
+        let ycb = coc
+            .code_block_height_exp
+            .checked_add(2)
+            .ok_or(Error::InvalidMarkerLength)?;
+        out[c] = ComponentCoding {
+            n_l: coc.decomposition_levels,
+            xcb,
+            ycb,
+            precincts: coc.precincts.clone(),
+            transform: coc.transform,
         };
     }
     Ok(out)
@@ -381,15 +481,14 @@ fn completed_bitplanes(passes: u32) -> u32 {
 // Tile decode.
 // ---------------------------------------------------------------------------
 
-/// All COD-level knobs the per-tile decode consumes, resolved once.
+/// The COD-level knobs that stay **global** to the whole code
+/// (T.800 §A.6.1). The per-component coding style — `NL`, code-block
+/// size, precincts and the wavelet kernel — is resolved separately
+/// into [`ComponentCoding`] so a §A.6.2 `COC` override can change them
+/// per component.
 struct CodingParams {
-    n_l: u8,
-    xcb: u8,
-    ycb: u8,
-    precincts: Vec<u8>,
     layers: u16,
     progression: ProgressionOrder,
-    transform: WaveletTransform,
     mct: u8,
     sop_eph: SopEphMode,
     segmentation_symbols: bool,
@@ -409,6 +508,7 @@ struct CodingParams {
 fn decode_tile(
     siz: &Siz,
     params: &CodingParams,
+    comp_coding: &[ComponentCoding],
     comp_quant: &[ComponentQuant<'_>],
     tile_index: u32,
     body: &[u8],
@@ -427,11 +527,12 @@ fn decode_tile(
     let mut precinct_geom: BTreeMap<(u16, u8, u32), PrecinctCodeBlocks> = BTreeMap::new();
 
     for (c, tc) in tile.components.iter().enumerate() {
-        let levels = derive_resolution_levels(*tc, params.n_l);
+        let cc = comp_coding.get(c).ok_or(Error::InvalidMarkerLength)?;
+        let levels = derive_resolution_levels(*tc, cc.n_l);
         let mut per_res = Vec::with_capacity(levels.len());
         let mut res_layouts = Vec::with_capacity(levels.len());
         for level in &levels {
-            let pp = precinct_exponents_at(&params.precincts, level.r);
+            let pp = precinct_exponents_at(&cc.precincts, level.r);
             let partition = derive_precinct_partition(level, pp);
             let num = partition.num_precincts();
             let num = u32::try_from(num).map_err(|_| Error::InvalidMarkerLength)?;
@@ -451,16 +552,16 @@ fn decode_tile(
                 ppy: pp.ppy,
             });
             for k in 0..num {
-                let geom = derive_precinct_code_blocks(level, pp, params.xcb, params.ycb, k)?;
+                let geom = derive_precinct_code_blocks(level, pp, cc.xcb, cc.ycb, k)?;
                 precinct_geom.insert((c as u16, level.r, k), geom);
             }
         }
         infos.push(ComponentProgressionInfo {
-            num_decomposition_levels: params.n_l,
+            num_decomposition_levels: cc.n_l,
             precincts_per_resolution: per_res,
         });
         position_infos.push(ComponentPositionInfo {
-            num_decomposition_levels: params.n_l,
+            num_decomposition_levels: cc.n_l,
             xrsiz: siz.components[c].h_separation,
             yrsiz: siz.components[c].v_separation,
             resolutions: res_layouts,
@@ -615,13 +716,14 @@ fn decode_tile(
     for (c, levels) in levels_per_comp.iter().enumerate() {
         let precision = siz.components[c].precision_bits as u32;
         let cq = comp_quant.get(c).ok_or(Error::InvalidMarkerLength)?;
+        let cc = comp_coding.get(c).ok_or(Error::InvalidMarkerLength)?;
         quant_per_comp.push(resolve_band_quant(
             levels,
             cq.style,
             cq.spqcd,
             cq.guard_bits,
             precision,
-            params.n_l,
+            cc.n_l,
         )?);
     }
 
@@ -709,10 +811,11 @@ fn decode_tile(
     let mut planes_5x3: Vec<Vec<i32>> = Vec::new();
     let mut planes_9x7: Vec<Vec<f64>> = Vec::new();
     for (c, levels) in levels_per_comp.iter().enumerate() {
+        let cc = comp_coding.get(c).ok_or(Error::InvalidMarkerLength)?;
         let tc = &tile.components[c];
         let (tw, th) = (tc.width() as usize, tc.height() as usize);
         if tw == 0 || th == 0 {
-            match params.transform {
+            match cc.transform {
                 WaveletTransform::Reversible5x3 => planes_5x3.push(Vec::new()),
                 WaveletTransform::Irreversible9x7 => planes_9x7.push(Vec::new()),
                 WaveletTransform::Reserved(_) => return Err(Error::NotImplemented),
@@ -763,16 +866,16 @@ fn decode_tile(
             per_level_sources.push(WalkerBlockSource::from_precincts(&precinct_blocks)?);
         }
         let source = LevelKeyedSource {
-            n_l: params.n_l,
+            n_l: cc.n_l,
             per_level: per_level_sources,
         };
 
-        // §A.6.5: a QCC may override the quantisation style per
-        // component, but the COD/COC transform is global to this code;
-        // Table A.28 still requires each component's style to match the
+        // §A.6.2 / §A.6.5: a COC may override the wavelet kernel and a
+        // QCC the quantisation style per component; Table A.28 still
+        // requires each component's quantisation style to match the
         // kernel it is reconstructed with.
         let comp_style = comp_quant[c].style;
-        match params.transform {
+        match cc.transform {
             WaveletTransform::Reversible5x3 => {
                 if comp_style != QuantizationStyle::None {
                     // Table A.28: the reversible kernel pairs with the
@@ -810,12 +913,29 @@ fn decode_tile(
     }
 
     // -- Annex G: inverse MCT + DC level shift + clamp, per tile --
+    //
+    // The reassembly above split each component into the `planes_5x3`
+    // or `planes_9x7` lane by its own §A.6.2 kernel. The Annex G MCT
+    // (RCT / ICT) mixes the first three component planes together, so
+    // it requires every component to share one kernel: a COC that gave
+    // different components different kernels would interleave the two
+    // lanes and break the plane↔component index alignment the MCT mix
+    // relies on. Reject that (rare) mixed-kernel case rather than
+    // mis-decode; the common COC override (per-component NL / code-block
+    // size / precincts, same kernel) reconstructs fully.
+    let global_transform = comp_coding.first().map(|c| c.transform);
+    if let Some(t) = global_transform {
+        if comp_coding.iter().any(|c| c.transform != t) {
+            return Err(Error::NotImplemented);
+        }
+    }
+    let transform = global_transform.unwrap_or(WaveletTransform::Reversible5x3);
     let descriptors: Vec<ComponentDescriptor> = siz
         .components
         .iter()
         .map(ComponentDescriptor::from_siz_component)
         .collect();
-    match params.transform {
+    match transform {
         WaveletTransform::Reversible5x3 => {
             let mode = match params.mct {
                 0 => InverseMctMode::None,
@@ -890,6 +1010,12 @@ pub fn decode_codestream(bytes: &[u8], cs: &J2kCodestream) -> Result<DecodedImag
     let main_qccs = crate::collect_main_header_qcc(bytes, cs.header.bytes_consumed, csiz)?;
     let comp_quant = resolve_component_quant(siz.components.len(), qcd, &main_qccs)?;
 
+    // §A.6.2: resolve per-component coding style, applying any
+    // main-header COC over the main COD for the components it targets
+    // (NL / code-block size / precincts / kernel per component).
+    let main_cocs = crate::collect_main_header_coc(bytes, cs.header.bytes_consumed, csiz)?;
+    let comp_coding = resolve_component_coding(siz.components.len(), cod, &main_cocs)?;
+
     let style_flags = cod.code_block_style_flags();
     if style_flags.selective_arithmetic_coding_bypass() {
         // §D.6 selective arithmetic-coding bypass splits the code-block
@@ -912,19 +1038,8 @@ pub fn decode_codestream(bytes: &[u8], cs: &J2kCodestream) -> Result<DecodedImag
     let termination_on_each_coding_pass = style_flags.termination_on_each_coding_pass();
 
     let params = CodingParams {
-        n_l: cod.decomposition_levels,
-        xcb: cod
-            .code_block_width_exp
-            .checked_add(2)
-            .ok_or(Error::InvalidMarkerLength)?,
-        ycb: cod
-            .code_block_height_exp
-            .checked_add(2)
-            .ok_or(Error::InvalidMarkerLength)?,
-        precincts: cod.precincts.clone(),
         layers: cod.layers,
         progression: cod.progression,
-        transform: cod.transform,
         mct: cod.multi_component_transform,
         sop_eph: match (cod.sop_marker_allowed, cod.eph_marker_used) {
             (false, false) => SopEphMode::None,
@@ -981,7 +1096,14 @@ pub fn decode_codestream(bytes: &[u8], cs: &J2kCodestream) -> Result<DecodedImag
             body.extend_from_slice(slice);
         }
 
-        let tile_planes = decode_tile(siz, &params, &comp_quant, tile_index as u32, &body)?;
+        let tile_planes = decode_tile(
+            siz,
+            &params,
+            &comp_coding,
+            &comp_quant,
+            tile_index as u32,
+            &body,
+        )?;
 
         // Place each tile-component plane into its image-area plane at
         // the Equation B-12 offset.
@@ -1117,5 +1239,126 @@ mod tests {
         let a = qcc(0, QuantizationStyle::None, 1, &[0x40]);
         let b = qcc(0, QuantizationStyle::ScalarExpounded, 2, &[0x10, 0x20]);
         assert!(resolve_component_quant(2, &d, &[a, b]).is_err());
+    }
+
+    // -- §A.6.2 COC per-component coding-style override --
+
+    fn cod(
+        n_l: u8,
+        cb_w: u8,
+        cb_h: u8,
+        style: u8,
+        transform: WaveletTransform,
+        precincts: &[u8],
+    ) -> crate::Cod {
+        crate::Cod {
+            scod: u8::from(!precincts.is_empty()),
+            user_defined_precincts: !precincts.is_empty(),
+            sop_marker_allowed: false,
+            eph_marker_used: false,
+            progression: ProgressionOrder::Lrcp,
+            layers: 1,
+            multi_component_transform: 0,
+            decomposition_levels: n_l,
+            code_block_width_exp: cb_w,
+            code_block_height_exp: cb_h,
+            code_block_style: style,
+            transform,
+            precincts: precincts.to_vec(),
+        }
+    }
+
+    fn coc(
+        c: u16,
+        n_l: u8,
+        cb_w: u8,
+        cb_h: u8,
+        style: u8,
+        transform: WaveletTransform,
+        precincts: &[u8],
+    ) -> crate::Coc {
+        crate::Coc {
+            component_index: c,
+            scoc: u8::from(!precincts.is_empty()),
+            user_defined_precincts: !precincts.is_empty(),
+            decomposition_levels: n_l,
+            code_block_width_exp: cb_w,
+            code_block_height_exp: cb_h,
+            code_block_style: style,
+            transform,
+            precincts: precincts.to_vec(),
+        }
+    }
+
+    #[test]
+    fn resolve_component_coding_defaults_to_cod() {
+        // §A.6.2: with no COC, every component inherits the COD style.
+        let c = cod(3, 2, 2, 0, WaveletTransform::Reversible5x3, &[]);
+        let resolved = resolve_component_coding(3, &c, &[]).expect("resolve");
+        assert_eq!(resolved.len(), 3);
+        for cc in &resolved {
+            assert_eq!(cc.n_l, 3);
+            // Resolved xcb/ycb add the +2 Table A.18 offset.
+            assert_eq!(cc.xcb, 4);
+            assert_eq!(cc.ycb, 4);
+            assert_eq!(cc.transform, WaveletTransform::Reversible5x3);
+            assert!(cc.precincts.is_empty());
+        }
+    }
+
+    #[test]
+    fn resolve_component_coding_applies_override() {
+        // §A.6.2: a COC for component 1 overrides NL / code-block size /
+        // precincts / kernel only there. The style byte must match COD.
+        let base = cod(5, 4, 4, 0x00, WaveletTransform::Irreversible9x7, &[]);
+        let c1 = coc(
+            1,
+            2,
+            1,
+            1,
+            0x00,
+            WaveletTransform::Irreversible9x7,
+            &[0x44, 0x33, 0x22],
+        );
+        let resolved =
+            resolve_component_coding(3, &base, std::slice::from_ref(&c1)).expect("resolve");
+        // Components 0 and 2 keep the COD default (xcb = 4 + 2 = 6).
+        assert_eq!(resolved[0].n_l, 5);
+        assert_eq!(resolved[0].xcb, 6);
+        assert!(resolved[2].precincts.is_empty());
+        // Component 1 takes the COC values (xcb = 1 + 2 = 3).
+        assert_eq!(resolved[1].n_l, 2);
+        assert_eq!(resolved[1].xcb, 3);
+        assert_eq!(resolved[1].ycb, 3);
+        assert_eq!(resolved[1].precincts, &[0x44, 0x33, 0x22]);
+    }
+
+    #[test]
+    fn resolve_component_coding_rejects_out_of_range_index() {
+        let base = cod(3, 2, 2, 0, WaveletTransform::Reversible5x3, &[]);
+        let bad = coc(5, 3, 2, 2, 0, WaveletTransform::Reversible5x3, &[]);
+        assert!(resolve_component_coding(3, &base, std::slice::from_ref(&bad)).is_err());
+    }
+
+    #[test]
+    fn resolve_component_coding_rejects_duplicate_component() {
+        // §A.6.2: no more than one COC per component per header.
+        let base = cod(3, 2, 2, 0, WaveletTransform::Reversible5x3, &[]);
+        let a = coc(0, 3, 2, 2, 0, WaveletTransform::Reversible5x3, &[]);
+        let b = coc(0, 2, 1, 1, 0, WaveletTransform::Reversible5x3, &[]);
+        assert!(resolve_component_coding(2, &base, &[a, b]).is_err());
+    }
+
+    #[test]
+    fn resolve_component_coding_rejects_divergent_code_block_style() {
+        // The Table A.19 code-block style is held global; a COC that
+        // changes it relative to the COD is NotImplemented (it would
+        // need a per-component §B.10.7 segment split).
+        let base = cod(3, 2, 2, 0x00, WaveletTransform::Reversible5x3, &[]);
+        let diverge = coc(1, 3, 2, 2, 0x04, WaveletTransform::Reversible5x3, &[]);
+        assert!(matches!(
+            resolve_component_coding(2, &base, std::slice::from_ref(&diverge)),
+            Err(Error::NotImplemented)
+        ));
     }
 }

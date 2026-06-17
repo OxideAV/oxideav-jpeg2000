@@ -6,6 +6,31 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 329 (2026-06-18).** **Main-header `COC`
+  per-component coding-style override** (T.800 §A.6.2, `Main COC >
+  Main COD`). A main-header `COC` is now parsed and honoured instead of
+  rejected with `Error::NotImplemented`: each component's decomposition
+  levels `NL`, code-block size (`xcb` / `ycb`), precinct partition and
+  wavelet kernel are resolved independently and threaded through the
+  per-component resolution-level geometry, precinct / code-block
+  enumeration, quantisation-table derivation, tier-1 decode and the
+  §F.3.1 inverse-DWT cascade. A new `collect_main_header_coc` walker
+  (mirroring `collect_main_header_qcc`) re-reads the length-skipped
+  `COC` segments, and `resolve_component_coding` applies the §A.6.2
+  precedence, rejecting a duplicate or out-of-range `Ccoc`. The
+  `CodingParams` struct now holds only the genuinely global `COD`
+  knobs (layers, progression order, MCT, SOP/EPH); the per-component
+  style lives in a resolved `Vec<ComponentCoding>`. The Table A.19
+  code-block **style** byte is held global (a `COC` that diverges from
+  the `COD` style is `NotImplemented`, since it would need a
+  per-component §B.10.7 segment split), and a `COC` that gives
+  different components different wavelet kernels is rejected before the
+  Annex G MCT (which mixes the first three planes and so requires a
+  single shared kernel). Two pixel-exact e2e tests inject a redundant
+  `COC` restating the `COD` — one single-component (`gray-17x13-53`),
+  one multi-component under RCT (`rgb-16x16-rct-53`, `Ccoc = 1`) — plus
+  five `resolve_component_coding` unit tests (default / override /
+  out-of-range / duplicate / divergent-style rejection).
 * **Clean-room round 324 (2026-06-16).** **Table A.19 `termination on
   each coding pass` style bit** (Scod bit 2, `0x04`; T.800 §D.4.2). A
   code-block whose `COD.SPcod` code-block-style byte sets this bit is

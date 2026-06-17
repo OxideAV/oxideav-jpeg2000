@@ -224,6 +224,76 @@ fn gray_53_redundant_main_header_qcc_is_pixel_exact() {
     assert_eq!(img.components[0].samples, gray_17x13_pattern());
 }
 
+/// Injects a redundant main-header `COC` (T.800 §A.6.2) for component
+/// 0 into the single-component `gray-17x13-53` fixture, restating the
+/// fixture's `COD` per-component coding style byte-for-byte (same NL,
+/// code-block size, code-block style, kernel and precinct mode).
+///
+/// Because the override is identical to the default it replaces, the
+/// decode must remain **pixel-exact** versus the un-injected stream —
+/// which proves the wiring (a) no longer rejects a main-header `COC`
+/// with `Error::NotImplemented`, and (b) parses `Ccoc` / `Scoc` /
+/// `SPcoc` and routes them into the per-component coding resolution
+/// (`resolve_component_coding`) the geometry + tier-1 + IDWT cascade
+/// consume. A wrong `Ccoc` width, a mis-read `SPcoc` field, or a
+/// dropped precinct payload would change the geometry and break the
+/// equality.
+#[test]
+fn gray_53_redundant_main_header_coc_is_pixel_exact() {
+    use oxideav_jpeg2000::{WaveletTransform, MARKER_COC};
+
+    let cs = parse_codestream(GRAY_53).expect("parse");
+    let cod = &cs.header.cod;
+    let insert_at = cs.header.bytes_consumed;
+
+    // Sanity: the un-injected fixture has no COC (so this test really
+    // exercises the new path), and the insertion point is the SOT.
+    assert!(!GRAY_53[2..insert_at]
+        .windows(2)
+        .any(|w| w == MARKER_COC.to_be_bytes()));
+    assert_eq!(
+        u16::from_be_bytes([GRAY_53[insert_at], GRAY_53[insert_at + 1]]),
+        0xFF90, // SOT
+    );
+
+    // Build a COC for component 0 mirroring the COD. Csiz = 1 < 257 so
+    // Ccoc is 8-bit. Scoc carries only the precinct-defined low bit
+    // (Table A.23); SPcoc = NL, xcb, ycb, style, kernel, then NL+1
+    // precinct bytes when user-defined precincts are signalled.
+    let scoc = u8::from(cod.user_defined_precincts);
+    let kernel_byte = match cod.transform {
+        WaveletTransform::Irreversible9x7 => 0x00u8,
+        WaveletTransform::Reversible5x3 => 0x01u8,
+        WaveletTransform::Reserved(b) => b,
+    };
+    // Lcoc = 2 (length) + 1 (Ccoc) + 1 (Scoc) + 5 (SPcoc fixed) + precincts.
+    let lcoc = 2 + 1 + 1 + 5 + cod.precincts.len();
+    let mut coc = Vec::new();
+    coc.extend_from_slice(&MARKER_COC.to_be_bytes());
+    coc.extend_from_slice(&(lcoc as u16).to_be_bytes());
+    coc.push(0u8); // Ccoc = component 0
+    coc.push(scoc);
+    coc.push(cod.decomposition_levels);
+    coc.push(cod.code_block_width_exp);
+    coc.push(cod.code_block_height_exp);
+    coc.push(cod.code_block_style);
+    coc.push(kernel_byte);
+    coc.extend_from_slice(&cod.precincts);
+
+    let mut injected = Vec::with_capacity(GRAY_53.len() + coc.len());
+    injected.extend_from_slice(&GRAY_53[..insert_at]);
+    injected.extend_from_slice(&coc);
+    injected.extend_from_slice(&GRAY_53[insert_at..]);
+
+    // The injected COC must now be parsed (not skipped-then-rejected).
+    let parsed = parse_codestream(&injected).expect("parse with main-header COC");
+    assert_eq!(parsed.header.siz.components.len(), 1);
+
+    let img = decode_j2k(&injected).expect("decode with main-header COC");
+    assert_eq!(img.components.len(), 1);
+    assert_eq!(img.components[0].samples, gray_17x13_pattern());
+}
+
 #[test]
 fn gray_53_multi_tile_is_pixel_exact() {
     // Same raster, 8×8 tile grid → 3×2 = 6 tiles, exercising the
@@ -333,6 +403,55 @@ fn rgb_rct_53_lossless_is_pixel_exact() {
     for (c, exp) in img.components.iter().zip(expected.iter()) {
         assert_eq!((c.width, c.height), (16, 16));
         assert_eq!(c.precision_bits, 8);
+        assert_eq!(&c.samples, exp);
+    }
+}
+
+/// Multi-component §A.6.2 `COC`: inject a redundant `COC` for
+/// component 1 into the 3-component RGB/RCT fixture, restating the
+/// `COD`'s per-component coding style. The MCT (`SGcod` MCT = 1, stays
+/// in `COD`) and the two un-targeted components are untouched, so the
+/// decode stays pixel-exact — proving the per-component coding
+/// resolution routes a single-component `COC` correctly while the
+/// global progression / MCT path keeps consuming the `COD`.
+#[test]
+fn rgb_rct_53_redundant_main_header_coc_component1_is_pixel_exact() {
+    use oxideav_jpeg2000::{WaveletTransform, MARKER_COC};
+
+    let cs = parse_codestream(RGB_RCT_53).expect("parse");
+    let cod = &cs.header.cod;
+    let insert_at = cs.header.bytes_consumed;
+    assert_eq!(cs.header.siz.components.len(), 3);
+
+    let scoc = u8::from(cod.user_defined_precincts);
+    let kernel_byte = match cod.transform {
+        WaveletTransform::Irreversible9x7 => 0x00u8,
+        WaveletTransform::Reversible5x3 => 0x01u8,
+        WaveletTransform::Reserved(b) => b,
+    };
+    // Csiz = 3 < 257 → Ccoc is 8-bit.
+    let lcoc = 2 + 1 + 1 + 5 + cod.precincts.len();
+    let mut coc = Vec::new();
+    coc.extend_from_slice(&MARKER_COC.to_be_bytes());
+    coc.extend_from_slice(&(lcoc as u16).to_be_bytes());
+    coc.push(1u8); // Ccoc = component 1
+    coc.push(scoc);
+    coc.push(cod.decomposition_levels);
+    coc.push(cod.code_block_width_exp);
+    coc.push(cod.code_block_height_exp);
+    coc.push(cod.code_block_style);
+    coc.push(kernel_byte);
+    coc.extend_from_slice(&cod.precincts);
+
+    let mut injected = Vec::with_capacity(RGB_RCT_53.len() + coc.len());
+    injected.extend_from_slice(&RGB_RCT_53[..insert_at]);
+    injected.extend_from_slice(&coc);
+    injected.extend_from_slice(&RGB_RCT_53[insert_at..]);
+
+    let img = decode_j2k(&injected).expect("decode with main-header COC for component 1");
+    assert_eq!(img.components.len(), 3);
+    let expected = rgb_16x16_pattern();
+    for (c, exp) in img.components.iter().zip(expected.iter()) {
         assert_eq!(&c.samples, exp);
     }
 }

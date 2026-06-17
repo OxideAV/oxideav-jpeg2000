@@ -1446,6 +1446,36 @@ pub(crate) fn collect_main_header_qcc(
     Ok(out)
 }
 
+/// Collect every `COC` marker segment in the main-header byte span.
+///
+/// Mirrors [`collect_main_header_qcc`] for the §A.6.2 coding-style
+/// component override: [`parse_j2k_header`] length-skips `COC`, so the
+/// span is re-walked here and each `COC` re-parsed via the shared
+/// [`parse_coc`] validator. T.800 §A.6.2 precedence "Main COC > Main
+/// COD" is resolved by the decode wiring against this list.
+pub(crate) fn collect_main_header_coc(
+    bytes: &[u8],
+    header_end: usize,
+    csiz: u16,
+) -> Result<Vec<Coc>, Error> {
+    let mut out = Vec::new();
+    let mut pos = 2usize; // skip SOC (no length field)
+    while pos + 4 <= header_end {
+        let marker = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]);
+        if marker == MARKER_COC {
+            let mut reader = Reader::new(bytes);
+            reader.pos = pos + 2;
+            out.push(parse_coc(&mut reader, csiz)?);
+        }
+        let len = u16::from_be_bytes([bytes[pos + 2], bytes[pos + 3]]) as usize;
+        if len < 2 {
+            return Err(Error::InvalidMarkerLength);
+        }
+        pos += 2 + len;
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // Tile-part walker (T.800 §A.4.2 / §A.4.3 — SOT + SOD).
 // ---------------------------------------------------------------------------
