@@ -70,6 +70,18 @@ What is implemented:
   rewrites its per-coefficient `Nb(u, v)` before reassembly (background
   coefficients keep their magnitude and drop `Nb` by `s`; ROI
   coefficients keep their top `Mb` bits and cap `Nb = Mb`).
+- **Tile-part header overrides** — a tile's first tile-part
+  (`TPsot = 0`) `COD` / `COC` / `QCD` / `QCC` / `RGN` markers override
+  the main-header defaults for that tile only (T.800 §A.6.1 – §A.6.5).
+  The coding parameters are resolved **per tile** along the §A.6
+  precedence chains `Tile-part COC > Tile-part COD > Main COC > Main
+  COD` and `Tile-part QCC > Tile-part QCD > Main QCC > Main QCD`: a tile
+  `COD` supersedes the main `COD` and `COC`s for the whole tile (only
+  the tile `COC`s then refine it per component) and the quantisation
+  chain mirrors that shape; a tile `RGN` overrides the main ROI shift
+  for its component. The §A.6 "overrides only in `TPsot = 0`" rule and
+  the at-most-one / duplicate / out-of-range / divergent-style faults
+  are enforced.
 
 ### Not yet implemented
 
@@ -78,12 +90,13 @@ These surface a clean `Error::NotImplemented` rather than mis-decoding:
 - A `COC` whose Table A.19 code-block **style** byte diverges from the
   `COD`, or that gives different components different wavelet kernels
   (the common `COC` override of per-component `NL` / code-block size /
-  precincts / kernel *is* honoured), and tile-part `COD` / `COC` /
-  `QCD` / `QCC` overrides (main-header `QCC` and `COC` *are* honoured).
-- A non-Maxshift `RGN` style (Table A.25 `Srgn ≠ 0`) and tile-part
-  `RGN` overrides (main-header implicit-ROI / Maxshift `RGN` *is*
-  honoured), `POC` order changes mid-decode, and `PPM` / `PPT`
-  packed-header markers.
+  precincts / kernel *is* honoured), in both the main and tile-part
+  headers (main-header *and* tile-part `COD` / `COC` / `QCD` / `QCC`
+  overrides are otherwise honoured).
+- A non-Maxshift `RGN` style (Table A.25 `Srgn ≠ 0`) in either header
+  (main-header *and* tile-part implicit-ROI / Maxshift `RGN` *are*
+  honoured), `POC` order changes mid-decode (main-header or tile-part),
+  and `PPM` / `PPT` packed-header markers.
 - The Table A.19 selective arithmetic coding bypass style bit (§D.6),
   which carves the code-block contribution into AC + raw (lazy)
   §B.10.7.2 codeword segments and reads the significance-propagation /

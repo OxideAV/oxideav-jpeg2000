@@ -32,19 +32,22 @@
 //!   grid; no upsampling is performed),
 //! * SOP / EPH packet framing per the COD `Scod` bits.
 //!
-//! The main-header `QCC` per-component quantisation override (§A.6.5)
-//! and the main-header `COC` per-component coding-style override
-//! (§A.6.2 — per-component `NL`, code-block size, precincts and
-//! wavelet kernel) are honoured.
+//! The main-header `QCC` / `COC` per-component overrides (§A.6.5 /
+//! §A.6.2 — per-component `NL`, code-block size, precincts and wavelet
+//! kernel), the main-header `RGN` Maxshift ROI (§A.6.3 / §H.1), and the
+//! per-tile **tile-part header** `COD` / `COC` / `QCD` / `QCC` / `RGN`
+//! overrides (§A.6.1 – §A.6.5, resolved along the
+//! `Tile-part {COC,QCC} > Tile-part {COD,QCD} > Main {COC,QCC} >
+//! Main {COD,QCD}` precedence) are honoured.
 //!
 //! Streams that need machinery this round does not wire are
 //! **rejected** with [`Error::NotImplemented`] rather than
 //! mis-decoded: a `COC` whose Table A.19 code-block **style** byte
 //! diverges from the `COD` (the style stays global), a `COC` that
-//! gives different components different wavelet kernels, tile-part
-//! header overrides (`COD` / `COC` / `QCD` / `QCC` inside a
-//! tile-part), `RGN` ROI shifts, `POC` progression-order changes, and
-//! `PPM` / `PPT` packed packet headers.
+//! gives different components different wavelet kernels, a non-Maxshift
+//! `RGN` style (`Srgn ≠ 0`), `POC` progression-order changes
+//! (main-header or tile-part), and `PPM` / `PPT` packed packet
+//! headers.
 //!
 //! All behaviour is derived from the staged T.800 specification
 //! text. The
