@@ -62,6 +62,14 @@ What is implemented:
 - **Progression** — all five §B.12.1 orders (LRCP, RLCP, RPCL, PCRL,
   CPRL), §B.12.2 POC volume iteration, and **multi-layer** /
   **multi-precinct** reassembly.
+- **Region of interest** — main-header `RGN` implicit-ROI (Maxshift)
+  decode (T.800 §A.6.3 / §H.1): the `SPrgn` scaling value `s` is
+  resolved per component, the tier-1 schedule runs against the
+  increased coded bit budget `M'b = Mb + s`, and the §H.1 three-branch
+  de-scaling re-anchors each coefficient to the background `Mb` and
+  rewrites its per-coefficient `Nb(u, v)` before reassembly (background
+  coefficients keep their magnitude and drop `Nb` by `s`; ROI
+  coefficients keep their top `Mb` bits and cap `Nb = Mb`).
 
 ### Not yet implemented
 
@@ -72,8 +80,10 @@ These surface a clean `Error::NotImplemented` rather than mis-decoding:
   (the common `COC` override of per-component `NL` / code-block size /
   precincts / kernel *is* honoured), and tile-part `COD` / `COC` /
   `QCD` / `QCC` overrides (main-header `QCC` and `COC` *are* honoured).
-- `RGN` region-of-interest, `POC` order changes mid-decode, and
-  `PPM` / `PPT` packed-header markers.
+- A non-Maxshift `RGN` style (Table A.25 `Srgn ≠ 0`) and tile-part
+  `RGN` overrides (main-header implicit-ROI / Maxshift `RGN` *is*
+  honoured), `POC` order changes mid-decode, and `PPM` / `PPT`
+  packed-header markers.
 - The Table A.19 selective arithmetic coding bypass style bit (§D.6),
   which carves the code-block contribution into AC + raw (lazy)
   §B.10.7.2 codeword segments and reads the significance-propagation /

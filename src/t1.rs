@@ -442,6 +442,16 @@ pub struct CodeBlock {
     ///
     /// Toggle via [`Self::with_vertically_causal_context`].
     vertically_causal: bool,
+    /// Per-coefficient §D.2.1 `Nb(u, v)` after the §H.1 region-of-interest
+    /// (Maxshift) remap, when an `RGN` marker is in force. `None` (the
+    /// default) means no ROI: [`Self::effective_nb`] falls back to the
+    /// `P + decoded_bits` reading. When `Some`, every coefficient's
+    /// `Nb(u, v)` was rewritten by [`Self::apply_roi_maxshift`] (the
+    /// §H.1 steps subtract / cap `Nb` per coefficient class) and is read
+    /// directly from this vector. The magnitudes carried in
+    /// [`Self::coefficients`] are likewise rewritten in place to the
+    /// background-`Mb`-anchored values §E.1 expects.
+    roi_nb: Option<Vec<u32>>,
 }
 
 impl CodeBlock {
@@ -463,6 +473,7 @@ impl CodeBlock {
             decoded_bits: vec![0u32; width * height],
             zero_bit_planes: 0,
             vertically_causal: false,
+            roi_nb: None,
         }
     }
 
@@ -496,6 +507,7 @@ impl CodeBlock {
             decoded_bits: vec![0u32; width * height],
             zero_bit_planes: 0,
             vertically_causal: false,
+            roi_nb: None,
         }
     }
 
@@ -598,11 +610,77 @@ impl CodeBlock {
     /// §E.1.2.1 reconstruction in [`crate::reassemble`].
     pub fn effective_nb(&self, u: usize, v: usize, uniform_fallback: u32) -> u32 {
         debug_assert!(u < self.width && v < self.height);
+        // Under an `RGN` marker (T.800 §H.1) the per-coefficient Nb(u, v)
+        // was rewritten by the Maxshift remap; read it directly.
+        if let Some(roi) = &self.roi_nb {
+            return roi[u + v * self.width];
+        }
         if self.max_decoded_bits() == 0 {
             uniform_fallback
         } else {
             self.zero_bit_planes + self.decoded_bits[u + v * self.width]
         }
+    }
+
+    /// Apply the T.800 §H.1 region-of-interest (Maxshift) decode remap
+    /// to this code-block, given the background Equation E-2 `mb` and the
+    /// `SPrgn` scaling value `s` (§A.6.3 / Table A.26).
+    ///
+    /// The tier-1 driver must have decoded this block against the
+    /// **increased** bit budget `M'b = mb + s` (the encoder shifts ROI
+    /// coefficients up into the top `s` planes per §H.2), so every stored
+    /// magnitude is anchored at weight `2^(M'b − 1)`. This routine maps
+    /// each coefficient back to the background-`mb` anchor §E.1 expects,
+    /// applying the three §H.1 branches that switch on `Nb(u, v)` and on
+    /// whether any of the top `mb` MSBs (the bits at weights
+    /// `2^(M'b − 1) … 2^(M'b − mb)`, i.e. `magnitude >> s`) is non-zero:
+    ///
+    /// * `Nb < mb` (§H.1 step 2): no §H.1 modification. The magnitude is
+    ///   re-anchored from the `M'b` budget to the `mb` budget by §E.1's
+    ///   own `2^(mb − i)` weighting, which for the stored integer is
+    ///   `magnitude >> s`. `Nb` is unchanged.
+    /// * `Nb ≥ mb`, top `mb` MSBs non-zero (§H.1 step 3, ROI): the
+    ///   coefficient is a region-of-interest coefficient; keep its top
+    ///   `mb` bits (`magnitude >> s`) and cap `Nb = mb`.
+    /// * `Nb ≥ mb`, top `mb` MSBs all zero (§H.1 step 4, background):
+    ///   discard the (zero) top `s` MSBs and shift the remainder down `s`
+    ///   places (Equation H-1); on the stored integer this leaves the
+    ///   magnitude unchanged because its top `s` bits are already zero,
+    ///   and `Nb` drops to `max(0, Nb − s)` (Equation H-2).
+    ///
+    /// `s = 0` is a no-op (`M'b = mb`, every branch reduces to identity).
+    /// After this call [`Self::effective_nb`] returns the §H.1-remapped
+    /// `Nb(u, v)` and [`Self::coefficient`] the §E.1-ready magnitude.
+    pub fn apply_roi_maxshift(&mut self, mb: u32, s: u32) {
+        if s == 0 {
+            return;
+        }
+        let mut roi_nb = vec![0u32; self.width * self.height];
+        for ((slot, coeff), &decoded) in roi_nb
+            .iter_mut()
+            .zip(self.coefficients.iter_mut())
+            .zip(self.decoded_bits.iter())
+        {
+            // Per-coefficient Nb(u, v) under the M'b budget: P + decoded.
+            let nb = self.zero_bit_planes + decoded;
+            // Top `mb` MSBs of the M'b-anchored magnitude.
+            let top = coeff.magnitude >> s;
+            if nb >= mb && top == 0 {
+                // §H.1 step 4 — background: magnitude unchanged (its top
+                // `s` bits are already zero), Nb drops by `s`.
+                *slot = nb.saturating_sub(s);
+            } else if nb >= mb {
+                // §H.1 step 3 — ROI: keep the top `mb` bits, cap Nb = mb.
+                coeff.magnitude = top;
+                *slot = mb;
+            } else {
+                // §H.1 step 2 — Nb < mb: re-anchor only (magnitude >> s),
+                // Nb unchanged.
+                coeff.magnitude = top;
+                *slot = nb;
+            }
+        }
+        self.roi_nb = Some(roi_nb);
     }
 
     /// Run one §D.3.1 significance-propagation pass over the bit-plane
@@ -2938,6 +3016,100 @@ mod tests {
         assert_eq!(block.effective_nb(3, 0, 99), 2);
     }
 
+    // -- §H.1 region-of-interest (Maxshift) decode --------------------
+
+    #[test]
+    fn roi_maxshift_zero_shift_is_a_noop() {
+        // s = 0 ⇒ M'b = Mb; every §H.1 branch reduces to identity and no
+        // per-coefficient override is recorded.
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 2, 1);
+        block.mark_significant_for_test(0, 0, false, 0b1011);
+        block.set_decoded_bits_for_test(0, 0, 4);
+        block.set_zero_bit_planes(0);
+        block.apply_roi_maxshift(5, 0);
+        assert_eq!(block.coefficient(0, 0).magnitude, 0b1011);
+        // No roi_nb recorded → falls back to P + decoded_bits.
+        assert_eq!(block.effective_nb(0, 0, 99), 4);
+    }
+
+    #[test]
+    fn roi_maxshift_background_keeps_magnitude_and_drops_nb() {
+        // §H.1 step 4: Nb ≥ Mb and the top Mb MSBs (magnitude >> s) are
+        // all zero ⇒ background. Mb = 3, s = 4 ⇒ M'b = 7. A magnitude
+        // whose only set bits are below weight 2^s stays unchanged; Nb
+        // drops by s (Equation H-2).
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 1, 1);
+        // magnitude = 0b0000101 = 5, top 3 MSBs (>> 4) = 0 ⇒ background.
+        block.mark_significant_for_test(0, 0, false, 5);
+        // Nb = P + decoded = 0 + 6 = 6 ≥ Mb (3).
+        block.set_decoded_bits_for_test(0, 0, 6);
+        block.set_zero_bit_planes(0);
+        block.apply_roi_maxshift(3, 4);
+        assert_eq!(
+            block.coefficient(0, 0).magnitude,
+            5,
+            "background magnitude unchanged"
+        );
+        assert_eq!(block.effective_nb(0, 0, 99), 6 - 4, "Nb drops by s");
+    }
+
+    #[test]
+    fn roi_maxshift_roi_coefficient_divides_magnitude_and_caps_nb() {
+        // §H.1 step 3: Nb ≥ Mb and at least one of the top Mb MSBs is
+        // non-zero ⇒ ROI. Mb = 3, s = 4 ⇒ M'b = 7. A magnitude with a
+        // set bit at or above weight 2^s is shifted down by s (top Mb
+        // bits re-anchored to weight 2^(Mb−1)); Nb caps at Mb.
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 1, 1);
+        // magnitude = 0b1010011 = 83. >> 4 = 0b101 = 5 ⇒ ROI, qb = 5.
+        block.mark_significant_for_test(0, 0, true, 0b1010011);
+        block.set_decoded_bits_for_test(0, 0, 7); // Nb = 7 ≥ Mb (3).
+        block.set_zero_bit_planes(0);
+        block.apply_roi_maxshift(3, 4);
+        assert_eq!(
+            block.coefficient(0, 0).magnitude,
+            0b101,
+            "ROI magnitude = m >> s"
+        );
+        assert!(block.coefficient(0, 0).sign, "sign preserved");
+        assert_eq!(block.effective_nb(0, 0, 99), 3, "Nb capped at Mb");
+    }
+
+    #[test]
+    fn roi_maxshift_low_nb_coefficient_reanchors_only() {
+        // §H.1 step 2: Nb < Mb ⇒ no §H.1 shift, but §E.1 still re-anchors
+        // the M'b-budget magnitude to the background Mb (m >> s); Nb is
+        // unchanged. Mb = 6, s = 4 ⇒ M'b = 10; a coefficient that only
+        // reached Nb = 2 bits sits in the top of the M'b budget.
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 1, 1);
+        // magnitude = 0b11_0000_0000 = 768 (the two decoded MSBs at the
+        // top of the M'b = 10 budget). >> 4 = 0b11_0000 = 48.
+        block.mark_significant_for_test(0, 0, false, 0b11_0000_0000);
+        block.set_decoded_bits_for_test(0, 0, 2); // Nb = 2 < Mb (6).
+        block.set_zero_bit_planes(0);
+        block.apply_roi_maxshift(6, 4);
+        assert_eq!(
+            block.coefficient(0, 0).magnitude,
+            0b11_0000,
+            "re-anchored m >> s"
+        );
+        assert_eq!(block.effective_nb(0, 0, 99), 2, "Nb unchanged when Nb < Mb");
+    }
+
+    #[test]
+    fn roi_maxshift_uses_p_plus_decoded_for_nb_decision() {
+        // The Nb ≥ Mb gate uses the full §D.2.1 Nb = P + decoded_bits,
+        // not just the decoded count. With P = 4, decoded = 1, Mb = 3:
+        // Nb = 5 ≥ Mb, and a zero-top-MSB magnitude takes the background
+        // branch (Nb → 5 − s).
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 1, 1);
+        block.mark_significant_for_test(0, 0, false, 3); // < 2^s, background.
+        block.set_decoded_bits_for_test(0, 0, 1);
+        block.set_zero_bit_planes(4); // Nb = 4 + 1 = 5.
+        block.apply_roi_maxshift(3, 2); // Mb = 3, s = 2.
+        assert_eq!(block.coefficient(0, 0).magnitude, 3);
+        assert_eq!(block.effective_nb(0, 0, 99), 5 - 2);
+    }
+
     // -- Single-coefficient SP decode end-to-end ----------------------
 
     #[test]
@@ -3044,6 +3216,14 @@ mod tests {
         /// Test-only: set the "newly significant" flag for a coefficient.
         pub(super) fn set_newly_significant_for_test(&mut self, u: usize, v: usize) {
             self.newly_significant[u + v * self.width] = true;
+        }
+
+        /// Test-only: set a coefficient's decoded-bit count directly so a
+        /// known per-coefficient `Nb(u, v) = P + decoded_bits` can be
+        /// driven into [`CodeBlock::apply_roi_maxshift`] without replaying
+        /// the §D.3 passes.
+        pub(super) fn set_decoded_bits_for_test(&mut self, u: usize, v: usize, bits: u32) {
+            self.decoded_bits[u + v * self.width] = bits;
         }
     }
 

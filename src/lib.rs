@@ -1446,6 +1446,37 @@ pub(crate) fn collect_main_header_qcc(
     Ok(out)
 }
 
+/// Collect every `RGN` (region-of-interest, T.800 §A.6.3) marker
+/// segment in the main header.
+///
+/// Mirrors [`collect_main_header_qcc`] / [`collect_main_header_coc`]:
+/// [`parse_j2k_header`] length-skips `RGN`, so the main-header span is
+/// re-walked here and each `RGN` re-parsed via the shared [`parse_rgn`]
+/// validator. The decode wiring resolves the per-component Maxshift
+/// scaling value `s` (`SPrgn`, T.800 §H.1) against this list.
+pub(crate) fn collect_main_header_rgn(
+    bytes: &[u8],
+    header_end: usize,
+    csiz: u16,
+) -> Result<Vec<Rgn>, Error> {
+    let mut out = Vec::new();
+    let mut pos = 2usize; // skip SOC (no length field)
+    while pos + 4 <= header_end {
+        let marker = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]);
+        if marker == MARKER_RGN {
+            let mut reader = Reader::new(bytes);
+            reader.pos = pos + 2;
+            out.push(parse_rgn(&mut reader, csiz)?);
+        }
+        let len = u16::from_be_bytes([bytes[pos + 2], bytes[pos + 3]]) as usize;
+        if len < 2 {
+            return Err(Error::InvalidMarkerLength);
+        }
+        pos += 2 + len;
+    }
+    Ok(out)
+}
+
 /// Collect every `COC` marker segment in the main-header byte span.
 ///
 /// Mirrors [`collect_main_header_qcc`] for the §A.6.2 coding-style

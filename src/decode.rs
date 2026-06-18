@@ -75,7 +75,7 @@ use crate::reassemble::{
 use crate::t1::{reset_contexts, BitPlaneSequencer, CodeBlock};
 use crate::{
     Error, J2kCodestream, ProgressionOrder, QuantizationStyle, Siz, TilePartMarker,
-    WaveletTransform, MARKER_CAP, MARKER_POC, MARKER_RGN, MARKER_SIZ, MARKER_SOC,
+    WaveletTransform, MARKER_CAP, MARKER_POC, MARKER_SIZ, MARKER_SOC,
 };
 
 /// `PPM` marker code (T.800 §A.7.4, `0xFF60`) — packed packet
@@ -133,16 +133,18 @@ pub struct DecodedImage {
 
 /// Re-scan the main-header byte span for marker segments the wiring
 /// cannot honour yet. [`crate::parse_j2k_header`] length-skips
-/// optional markers; silently ignoring `RGN` / `POC` / `PPM` / `CAP`
-/// would mis-decode the stream, so their presence is surfaced as
+/// optional markers; silently ignoring `POC` / `PPM` / `CAP` would
+/// mis-decode the stream, so their presence is surfaced as
 /// [`Error::NotImplemented`] here.
 ///
-/// `QCC` and `COC` are **not** rejected: the main-header per-component
-/// quantization override (T.800 §A.6.5, `Main QCC > Main QCD`) and the
-/// per-component coding-style override (T.800 §A.6.2, `Main COC > Main
-/// COD`) are honoured — see [`crate::collect_main_header_qcc`] /
-/// [`resolve_component_quant`] and [`crate::collect_main_header_coc`] /
-/// [`resolve_component_coding`].
+/// `QCC`, `COC` and `RGN` are **not** rejected: the main-header
+/// per-component quantization override (T.800 §A.6.5, `Main QCC > Main
+/// QCD`), the per-component coding-style override (T.800 §A.6.2, `Main
+/// COC > Main COD`) and the §H.1 region-of-interest Maxshift decode are
+/// honoured — see [`crate::collect_main_header_qcc`] /
+/// [`resolve_component_quant`], [`crate::collect_main_header_coc`] /
+/// [`resolve_component_coding`], and [`crate::collect_main_header_rgn`] /
+/// [`resolve_component_roi_shift`].
 fn reject_unsupported_main_header_markers(bytes: &[u8], header_end: usize) -> Result<(), Error> {
     // SOC is 2 bytes with no length field; every other main-header
     // marker segment is `marker(2) + length(2) + payload(length-2)`.
@@ -150,7 +152,7 @@ fn reject_unsupported_main_header_markers(bytes: &[u8], header_end: usize) -> Re
     while pos + 4 <= header_end {
         let marker = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]);
         match marker {
-            MARKER_RGN | MARKER_POC | MARKER_PPM | MARKER_CAP => {
+            MARKER_POC | MARKER_PPM | MARKER_CAP => {
                 return Err(Error::NotImplemented);
             }
             MARKER_SOC | MARKER_SIZ => {}
@@ -253,6 +255,42 @@ fn resolve_component_quant<'a>(
             spqcd: &qcc.spqcc,
             guard_bits: qcc.guard_bits,
         };
+    }
+    Ok(out)
+}
+
+/// Resolve the per-component region-of-interest Maxshift scaling value
+/// `s` (T.800 §A.6.3 / §H.1) from the main-header `RGN` markers.
+///
+/// Returns one `s` per component: `0` for components with no `RGN`
+/// (no ROI), or the `SPrgn` shift for those that carry one. Only the
+/// `Srgn = 0` implicit-ROI (Maxshift) style is supported — it needs no
+/// mask at the decoder (§H.1 is purely amplitude-driven). Any other
+/// `Srgn`, an out-of-range `Crgn`, or a duplicate `RGN` for the same
+/// component is rejected (`Srgn ≠ 0` as [`Error::NotImplemented`], the
+/// structural faults as [`Error::InvalidMarkerLength`]).
+fn resolve_component_roi_shift(
+    num_components: usize,
+    rgns: &[crate::Rgn],
+) -> Result<Vec<u32>, Error> {
+    let mut out = vec![0u32; num_components];
+    let mut seen = vec![false; num_components];
+    for rgn in rgns {
+        let c = rgn.component_index as usize;
+        if c >= num_components {
+            return Err(Error::InvalidMarkerLength);
+        }
+        if seen[c] {
+            // §A.6.3: at most one RGN per component in the main header.
+            return Err(Error::InvalidMarkerLength);
+        }
+        seen[c] = true;
+        if rgn.srgn != 0 {
+            // Table A.25 only defines Srgn = 0 (implicit ROI / Maxshift);
+            // any other style is reserved and not wired.
+            return Err(Error::NotImplemented);
+        }
+        out[c] = u32::from(rgn.sprgn);
     }
     Ok(out)
 }
@@ -510,6 +548,7 @@ fn decode_tile(
     params: &CodingParams,
     comp_coding: &[ComponentCoding],
     comp_quant: &[ComponentQuant<'_>],
+    roi_shift: &[u32],
     tile_index: u32,
     body: &[u8],
 ) -> Result<Vec<Vec<i32>>, Error> {
@@ -751,12 +790,21 @@ fn decode_tile(
             .get(*sb as usize)
             .ok_or(Error::InvalidPacketHeader)?
             .mb;
+        // §H.1 / §H.2: under an `RGN` Maxshift the encoder shifts ROI
+        // coefficients up into the top `s` bit-planes, so the coded
+        // bit budget is `M'b = Mb + s`. The tier-1 schedule, the
+        // zero-bit-plane bound and the pass-count cap all run against
+        // `M'b`; the §H.1 de-scaling below re-anchors the magnitudes to
+        // the background `Mb` before reassembly. With no `RGN` `s = 0`
+        // and `mb_coded == mb`.
+        let s = roi_shift.get(*c as usize).copied().unwrap_or(0);
+        let mb_coded = mb.saturating_add(s);
         let p = acc.p.ok_or(Error::InvalidPacketHeader)?;
-        if p >= mb {
+        if p >= mb_coded {
             return Err(Error::InvalidPacketHeader);
         }
-        // §D.3: at most 3 (Mb − P) − 2 passes fit above bit-plane 0.
-        if acc.passes > 3 * (mb - p) - 2 {
+        // §D.3: at most 3 (M'b − P) − 2 passes fit above bit-plane 0.
+        if acc.passes > 3 * (mb_coded - p) - 2 {
             return Err(Error::InvalidPacketHeader);
         }
         let mut block = CodeBlock::new(
@@ -765,7 +813,7 @@ fn decode_tile(
             placement.height() as usize,
         );
         let mut ctx = reset_contexts();
-        let mut seq = BitPlaneSequencer::new(mb - 1 - p)
+        let mut seq = BitPlaneSequencer::new(mb_coded - 1 - p)
             .with_segmentation_symbols(params.segmentation_symbols)
             .with_vertically_causal_context(params.vertically_causal)
             .with_reset_context_probabilities(params.reset_context_probabilities)
@@ -795,6 +843,11 @@ fn decode_tile(
         // versus the per-block `nb` fallback below.
         block.set_zero_bit_planes(p);
         let nb = p + completed_bitplanes(acc.passes);
+        // §H.1 region-of-interest (Maxshift) decode: re-anchor every
+        // coefficient from the `M'b = Mb + s` coded budget back to the
+        // background `Mb` and rewrite the per-coefficient Nb(u, v). A
+        // no-op when `s == 0` (no `RGN` for this component).
+        block.apply_roi_maxshift(mb, s);
         decoded.push(DecodedBlock {
             component: *c,
             r: *r,
@@ -1016,6 +1069,12 @@ pub fn decode_codestream(bytes: &[u8], cs: &J2kCodestream) -> Result<DecodedImag
     let main_cocs = crate::collect_main_header_coc(bytes, cs.header.bytes_consumed, csiz)?;
     let comp_coding = resolve_component_coding(siz.components.len(), cod, &main_cocs)?;
 
+    // §A.6.3 / §H.1: resolve the per-component region-of-interest
+    // Maxshift scaling value `s` from any main-header `RGN`. Components
+    // with no `RGN` get `s = 0` (no ROI; the de-scaling is a no-op).
+    let main_rgns = crate::collect_main_header_rgn(bytes, cs.header.bytes_consumed, csiz)?;
+    let roi_shift = resolve_component_roi_shift(siz.components.len(), &main_rgns)?;
+
     let style_flags = cod.code_block_style_flags();
     if style_flags.selective_arithmetic_coding_bypass() {
         // §D.6 selective arithmetic-coding bypass splits the code-block
@@ -1101,6 +1160,7 @@ pub fn decode_codestream(bytes: &[u8], cs: &J2kCodestream) -> Result<DecodedImag
             &params,
             &comp_coding,
             &comp_quant,
+            &roi_shift,
             tile_index as u32,
             &body,
         )?;

@@ -294,6 +294,85 @@ fn gray_53_redundant_main_header_coc_is_pixel_exact() {
     assert_eq!(img.components[0].samples, gray_17x13_pattern());
 }
 
+/// Injects a main-header `RGN` (T.800 §A.6.3) for component 0 with
+/// `Srgn = 0` (implicit ROI / Maxshift) and `SPrgn = 0` (zero shift)
+/// into the single-component `gray-17x13-53` fixture.
+///
+/// A zero scaling value makes the §H.1 Maxshift decode an exact
+/// identity: the coded bit budget `M'b = Mb + 0 = Mb` is unchanged and
+/// every §H.1 branch reduces to a no-op, so the reconstruction must
+/// stay **pixel-exact** versus the un-injected stream. This proves the
+/// wiring (a) no longer rejects a main-header `RGN` with
+/// `Error::NotImplemented`, and (b) parses `Crgn` / `Srgn` / `SPrgn`
+/// and routes the resolved shift through `resolve_component_roi_shift`
+/// into the tier-1 budget and the §H.1 de-scaling without disturbing a
+/// non-ROI decode.
+#[test]
+fn gray_53_main_header_rgn_zero_shift_is_pixel_exact() {
+    use oxideav_jpeg2000::MARKER_RGN;
+
+    let cs = parse_codestream(GRAY_53).expect("parse");
+    let insert_at = cs.header.bytes_consumed;
+
+    // Sanity: the un-injected fixture has no RGN, and the insertion
+    // point is the SOT.
+    assert!(!GRAY_53[2..insert_at]
+        .windows(2)
+        .any(|w| w == MARKER_RGN.to_be_bytes()));
+    assert_eq!(
+        u16::from_be_bytes([GRAY_53[insert_at], GRAY_53[insert_at + 1]]),
+        0xFF90, // SOT
+    );
+
+    // Build an RGN for component 0. Csiz = 1 < 257 so Crgn is 8-bit.
+    // Lrgn = 2 (length) + 1 (Crgn) + 1 (Srgn) + 1 (SPrgn) = 5.
+    let mut rgn = Vec::new();
+    rgn.extend_from_slice(&MARKER_RGN.to_be_bytes());
+    rgn.extend_from_slice(&5u16.to_be_bytes());
+    rgn.push(0u8); // Crgn = component 0
+    rgn.push(0u8); // Srgn = 0 (implicit ROI / Maxshift)
+    rgn.push(0u8); // SPrgn = 0 (zero shift ⇒ §H.1 identity)
+
+    let mut injected = Vec::with_capacity(GRAY_53.len() + rgn.len());
+    injected.extend_from_slice(&GRAY_53[..insert_at]);
+    injected.extend_from_slice(&rgn);
+    injected.extend_from_slice(&GRAY_53[insert_at..]);
+
+    // The injected RGN must now be parsed (not skipped-then-rejected).
+    let parsed = parse_codestream(&injected).expect("parse with main-header RGN");
+    assert_eq!(parsed.header.siz.components.len(), 1);
+
+    let img = decode_j2k(&injected).expect("decode with main-header RGN");
+    assert_eq!(img.components.len(), 1);
+    assert_eq!(img.components[0].samples, gray_17x13_pattern());
+}
+
+/// A main-header `RGN` with a non-zero `Srgn` (any style other than the
+/// Table A.25 implicit-ROI / Maxshift `Srgn = 0`) is reserved and not
+/// wired; the decoder must surface a clean `Error::NotImplemented`
+/// rather than mis-decode.
+#[test]
+fn gray_53_main_header_rgn_non_maxshift_style_is_rejected() {
+    use oxideav_jpeg2000::{Error, MARKER_RGN};
+
+    let cs = parse_codestream(GRAY_53).expect("parse");
+    let insert_at = cs.header.bytes_consumed;
+
+    let mut rgn = Vec::new();
+    rgn.extend_from_slice(&MARKER_RGN.to_be_bytes());
+    rgn.extend_from_slice(&5u16.to_be_bytes());
+    rgn.push(0u8); // Crgn = component 0
+    rgn.push(1u8); // Srgn = 1 (reserved / not Maxshift)
+    rgn.push(3u8); // SPrgn
+
+    let mut injected = Vec::with_capacity(GRAY_53.len() + rgn.len());
+    injected.extend_from_slice(&GRAY_53[..insert_at]);
+    injected.extend_from_slice(&rgn);
+    injected.extend_from_slice(&GRAY_53[insert_at..]);
+
+    assert_eq!(decode_j2k(&injected), Err(Error::NotImplemented));
+}
+
 #[test]
 fn gray_53_multi_tile_is_pixel_exact() {
     // Same raster, 8×8 tile grid → 3×2 = 6 tiles, exercising the

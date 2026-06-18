@@ -6,6 +6,34 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 334 (2026-06-18).** **Main-header `RGN`
+  region-of-interest (Maxshift) decode** (T.800 §A.6.3 / §H.1). A
+  main-header `RGN` is now parsed and honoured instead of rejected with
+  `Error::NotImplemented`. A new `collect_main_header_rgn` walker
+  (mirroring `collect_main_header_qcc` / `_coc`) re-reads the
+  length-skipped `RGN` segments, and `resolve_component_roi_shift`
+  resolves a per-component implicit-ROI scaling value `s` (`SPrgn`),
+  rejecting a duplicate or out-of-range `Crgn` and any non-Maxshift
+  `Srgn ≠ 0` style. The tier-1 driver runs each ROI component's
+  code-blocks against the **increased** coded bit budget
+  `M'b = Mb + s` (zero-bit-plane bound and pass-count cap included),
+  and a new `CodeBlock::apply_roi_maxshift(mb, s)` applies the §H.1
+  three-branch de-scaling per coefficient before reassembly: §H.1
+  step 2 (`Nb < Mb`) re-anchors the magnitude to the background `Mb`
+  (`m >> s`) leaving `Nb` unchanged; step 3 (ROI, top `Mb` MSBs
+  non-zero) keeps the top `Mb` bits and caps `Nb = Mb`; step 4
+  (background, top `Mb` MSBs zero) leaves the magnitude and drops
+  `Nb` to `max(0, Nb − s)` per Equation H-2. A new per-coefficient
+  `roi_nb` override on `CodeBlock`, consulted by `effective_nb`,
+  carries the §H.1-remapped `Nb(u, v)` into the §E.1 reconstruction.
+  Five tier-1 unit tests pin the three §H.1 branches, the zero-shift
+  identity, and the `Nb = P + decoded` gating; two e2e tests inject a
+  main-header `RGN` into `gray-17x13-53` — a zero-shift Maxshift
+  (`Srgn = SPrgn = 0`) decodes pixel-exact (§H.1 identity), and a
+  `Srgn = 1` non-Maxshift style is rejected as `NotImplemented`.
+  Sourced only from `docs/image/jpeg2000/` (T.800 §A.6.3, §H.1, §E.1,
+  §D.2.1, §B.10.5).
+
 * **Clean-room round 329 (2026-06-18).** **Main-header `COC`
   per-component coding-style override** (T.800 §A.6.2, `Main COC >
   Main COD`). A main-header `COC` is now parsed and honoured instead of
