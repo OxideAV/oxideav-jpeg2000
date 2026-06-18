@@ -35,9 +35,16 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
   supersedes; tile `COC` outranks tile `COD`; tile `COC` alone; tile
   `QCD` supersedes; tile `QCC` outranks tile `QCD`; tile `QCC` alone;
   tile `RGN` per-component override; bypass-style rejection; duplicate
-  `COD` rejection; `POC` not-implemented). Sourced only from
-  `docs/image/jpeg2000/` (T.800 §A.6.1–§A.6.5). Suite total 599 (581
-  lib + 18 e2e, was 588).
+  `COD` rejection; `POC` not-implemented), plus four end-to-end
+  injection tests that splice a tile-part override into the gray 5-3
+  fixture's first tile-part header (`Psot` grown to match): a redundant
+  tile `COD` and a redundant tile `QCD` restating the main-header values
+  decode **pixel-exact** (proving the override is honoured, not
+  ignored-then-mis-decoded), a zero-shift Maxshift tile `RGN` is a §H.1
+  identity, and a tile `COD` setting the §D.6 bypass style bit is
+  rejected `NotImplemented`. Sourced only from `docs/image/jpeg2000/`
+  (T.800 §A.6.1–§A.6.5, §A.4.2 Table A.5). Suite total 603 (581 lib + 22
+  e2e, was 588).
 
 * **Clean-room round 334 (2026-06-18).** **Main-header `RGN`
   region-of-interest (Maxshift) decode** (T.800 §A.6.3 / §H.1). A

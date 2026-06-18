@@ -373,6 +373,189 @@ fn gray_53_main_header_rgn_non_maxshift_style_is_rejected() {
     assert_eq!(decode_j2k(&injected), Err(Error::NotImplemented));
 }
 
+/// Splice `seg` (a complete marker segment, marker code + length +
+/// payload) into the first tile-part header of `stream`, immediately
+/// before that tile-part's `SOD`, and grow the tile-part's `Psot`
+/// length field by `seg.len()` so the §A.4.2 framing stays consistent.
+///
+/// The first tile-part's `SOT` is located via the parsed codestream so
+/// the helper does not re-implement marker scanning; the `Psot` field
+/// lives at `sot_offset + 6` (T.800 Table A.5: `SOT` marker (2) +
+/// `Lsot` (2) + `Isot` (2) + `Psot` (4)).
+fn inject_into_first_tile_part_header(stream: &[u8], seg: &[u8]) -> Vec<u8> {
+    let cs = parse_codestream(stream).expect("parse for injection");
+    let tp = cs
+        .tile_parts
+        .iter()
+        .find(|tp| tp.sot.tile_part_index == 0)
+        .expect("a TPsot = 0 tile-part");
+    let sot_offset = tp.sot_offset;
+    let sod_offset = tp.sod_offset;
+
+    let mut out = Vec::with_capacity(stream.len() + seg.len());
+    out.extend_from_slice(&stream[..sod_offset]);
+    out.extend_from_slice(seg);
+    out.extend_from_slice(&stream[sod_offset..]);
+
+    // Grow Psot (4 bytes at sot_offset + 6) unless it is 0 ("until EOC",
+    // which needs no adjustment).
+    let psot_at = sot_offset + 6;
+    let psot = u32::from_be_bytes([
+        out[psot_at],
+        out[psot_at + 1],
+        out[psot_at + 2],
+        out[psot_at + 3],
+    ]);
+    if psot != 0 {
+        let grown = psot + seg.len() as u32;
+        out[psot_at..psot_at + 4].copy_from_slice(&grown.to_be_bytes());
+    }
+    out
+}
+
+/// §A.6.1 tile-part `COD` override. Inject a redundant `COD` into the
+/// first tile-part header of the gray 5-3 fixture restating the main
+/// `COD` byte-for-byte. Because the tile override equals the main
+/// default it supersedes, the decode must stay **pixel-exact** — which
+/// proves the tile-part `COD` is parsed, routed through the §A.6
+/// `Tile COD > Main COD` precedence, and drives the per-tile geometry +
+/// tier-1 + IDWT instead of being rejected with `Error::NotImplemented`.
+#[test]
+fn gray_53_redundant_tile_part_cod_is_pixel_exact() {
+    use oxideav_jpeg2000::{WaveletTransform, MARKER_COD};
+
+    let cs = parse_codestream(GRAY_53).expect("parse");
+    let cod = &cs.header.cod;
+
+    // Rebuild the COD segment from the parsed fields (T.800 Table A.12).
+    let scod = (u8::from(cod.user_defined_precincts))
+        | (u8::from(cod.sop_marker_allowed) << 1)
+        | (u8::from(cod.eph_marker_used) << 2);
+    let kernel_byte = match cod.transform {
+        WaveletTransform::Irreversible9x7 => 0x00u8,
+        WaveletTransform::Reversible5x3 => 0x01u8,
+        WaveletTransform::Reserved(b) => b,
+    };
+    // Lcod = 2 + 1 (Scod) + 4 (SGcod: prog, layers(2), mct) + 5 (SPcod
+    // fixed: NL, xcb, ycb, style, kernel) + precincts.
+    let lcod = 2 + 1 + 4 + 5 + cod.precincts.len();
+    let mut seg = Vec::new();
+    seg.extend_from_slice(&MARKER_COD.to_be_bytes());
+    seg.extend_from_slice(&(lcod as u16).to_be_bytes());
+    seg.push(scod);
+    seg.push(0u8); // SGcod progression order (LRCP = 0)
+    seg.extend_from_slice(&cod.layers.to_be_bytes());
+    seg.push(cod.multi_component_transform);
+    seg.push(cod.decomposition_levels);
+    seg.push(cod.code_block_width_exp);
+    seg.push(cod.code_block_height_exp);
+    seg.push(cod.code_block_style);
+    seg.push(kernel_byte);
+    seg.extend_from_slice(&cod.precincts);
+
+    let injected = inject_into_first_tile_part_header(GRAY_53, &seg);
+
+    // The injected COD must now appear in the tile-part markers (parsed,
+    // not skipped-then-rejected).
+    let parsed = parse_codestream(&injected).expect("parse with tile-part COD");
+    assert!(parsed.tile_parts.iter().any(|tp| tp
+        .markers
+        .iter()
+        .any(|m| matches!(m, oxideav_jpeg2000::TilePartMarker::Cod(_)))));
+
+    let img = decode_j2k(&injected).expect("decode with tile-part COD");
+    assert_eq!(img.components.len(), 1);
+    assert_eq!(img.components[0].samples, gray_17x13_pattern());
+}
+
+/// §A.6.4 tile-part `QCD` override. Inject a redundant `QCD` into the
+/// first tile-part header restating the main `QCD` byte-for-byte. The
+/// decode must stay **pixel-exact**, proving the tile-part `QCD` is
+/// routed through the §A.6 `Tile QCD > Main QCD` precedence into the
+/// per-component quantisation `resolve_band_quant` consumes.
+#[test]
+fn gray_53_redundant_tile_part_qcd_is_pixel_exact() {
+    use oxideav_jpeg2000::MARKER_QCD;
+
+    let cs = parse_codestream(GRAY_53).expect("parse");
+    let qcd = &cs.header.qcd;
+
+    // Lqcd = 2 + 1 (Sqcd) + SPqcd.
+    let lqcd = 2 + 1 + qcd.spqcd.len();
+    let mut seg = Vec::new();
+    seg.extend_from_slice(&MARKER_QCD.to_be_bytes());
+    seg.extend_from_slice(&(lqcd as u16).to_be_bytes());
+    seg.push(qcd.sqcd);
+    seg.extend_from_slice(&qcd.spqcd);
+
+    let injected = inject_into_first_tile_part_header(GRAY_53, &seg);
+
+    let parsed = parse_codestream(&injected).expect("parse with tile-part QCD");
+    assert!(parsed.tile_parts.iter().any(|tp| tp
+        .markers
+        .iter()
+        .any(|m| matches!(m, oxideav_jpeg2000::TilePartMarker::Qcd(_)))));
+
+    let img = decode_j2k(&injected).expect("decode with tile-part QCD");
+    assert_eq!(img.components.len(), 1);
+    assert_eq!(img.components[0].samples, gray_17x13_pattern());
+}
+
+/// §A.6.3 tile-part `RGN` with `Srgn = SPrgn = 0` (Maxshift, zero
+/// shift) is a §H.1 identity, so injecting it into the first tile-part
+/// header must leave the decode **pixel-exact** — proving the tile-part
+/// `RGN` is parsed and routed through the per-tile ROI resolution.
+#[test]
+fn gray_53_tile_part_rgn_zero_shift_is_pixel_exact() {
+    use oxideav_jpeg2000::MARKER_RGN;
+
+    let mut seg = Vec::new();
+    seg.extend_from_slice(&MARKER_RGN.to_be_bytes());
+    seg.extend_from_slice(&5u16.to_be_bytes());
+    seg.push(0u8); // Crgn = component 0
+    seg.push(0u8); // Srgn = 0 (Maxshift)
+    seg.push(0u8); // SPrgn = 0 (zero shift ⇒ §H.1 identity)
+
+    let injected = inject_into_first_tile_part_header(GRAY_53, &seg);
+    let img = decode_j2k(&injected).expect("decode with tile-part RGN");
+    assert_eq!(img.components.len(), 1);
+    assert_eq!(img.components[0].samples, gray_17x13_pattern());
+}
+
+/// A tile-part `COD` that sets the §D.6 selective-arithmetic-coding
+/// bypass style bit (Table A.19 bit 0) — unwired in the tier-1 driver —
+/// must surface a clean `Error::NotImplemented` for that tile even
+/// though the main `COD` did not set it.
+#[test]
+fn gray_53_tile_part_cod_bypass_style_is_rejected() {
+    use oxideav_jpeg2000::{Error, WaveletTransform, MARKER_COD};
+
+    let cs = parse_codestream(GRAY_53).expect("parse");
+    let cod = &cs.header.cod;
+    let kernel_byte = match cod.transform {
+        WaveletTransform::Irreversible9x7 => 0x00u8,
+        WaveletTransform::Reversible5x3 => 0x01u8,
+        WaveletTransform::Reserved(b) => b,
+    };
+    let lcod = 2 + 1 + 4 + 5 + cod.precincts.len();
+    let mut seg = Vec::new();
+    seg.extend_from_slice(&MARKER_COD.to_be_bytes());
+    seg.extend_from_slice(&(lcod as u16).to_be_bytes());
+    seg.push(0u8); // Scod = 0 (maximum precincts)
+    seg.push(0u8); // progression LRCP
+    seg.extend_from_slice(&cod.layers.to_be_bytes());
+    seg.push(cod.multi_component_transform);
+    seg.push(cod.decomposition_levels);
+    seg.push(cod.code_block_width_exp);
+    seg.push(cod.code_block_height_exp);
+    seg.push(0x01u8); // code-block style: §D.6 bypass bit set
+    seg.push(kernel_byte);
+    seg.extend_from_slice(&cod.precincts);
+
+    let injected = inject_into_first_tile_part_header(GRAY_53, &seg);
+    assert_eq!(decode_j2k(&injected), Err(Error::NotImplemented));
+}
+
 #[test]
 fn gray_53_multi_tile_is_pixel_exact() {
     // Same raster, 8×8 tile grid → 3×2 = 6 tiles, exercising the
