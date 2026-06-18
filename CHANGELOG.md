@@ -6,6 +6,39 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 338 (2026-06-19).** **Tile-part header coding
+  overrides** (T.800 §A.6.1 / §A.6.2 / §A.6.4 / §A.6.5 / §A.6.3). A
+  tile's first tile-part (`TPsot = 0`) `COD` / `COC` / `QCD` / `QCC` /
+  `RGN` markers are now honoured per tile instead of being rejected
+  wholesale with `Error::NotImplemented`. The coding parameters are
+  resolved **per tile** by layering the tile-part overrides on the
+  resolved main-header defaults along the §A.6 precedence chains
+  `Tile-part COC > Tile-part COD > Main COC > Main COD` and
+  `Tile-part QCC > Tile-part QCD > Main QCC > Main QCD`: a tile `COD`
+  supersedes the main `COD` **and** the main `COC`s for the whole tile
+  (only the tile `COC`s then refine it per component), and the
+  quantisation chain mirrors that shape; a tile `RGN` overrides the main
+  ROI shift for its component. A new `resolve_tile_coding` walks one
+  tile's `TilePartMarker`s into a `ResolvedTileCoding`
+  (`CodingParams` + per-component `ComponentCoding` / `ComponentQuant` +
+  `roi_shift`) that `decode_tile` consumes unchanged; the
+  `CodingParams` build is factored into `coding_params_from_cod` so a
+  tile `COD` that changes the global progression / layers / SOP-EPH /
+  Table A.19 style is re-derived, and the §D.6 bypass rejection follows
+  the tile `COD`. The §A.6 "overrides only in `TPsot = 0`" rule is
+  enforced (a `COD` / `COC` / `QCD` / `QCC` / `RGN` / `POC` in a later
+  tile-part of the same tile is rejected as malformed), as are the §A.6
+  "at most one `COD` / `QCD` per header" and the per-component
+  duplicate / out-of-range / divergent-style faults. Tile-part `POC` /
+  `PPT` overrides remain `NotImplemented`. 11 new `resolve_tile_coding`
+  unit tests pin the precedence (no-override identity; tile `COD`
+  supersedes; tile `COC` outranks tile `COD`; tile `COC` alone; tile
+  `QCD` supersedes; tile `QCC` outranks tile `QCD`; tile `QCC` alone;
+  tile `RGN` per-component override; bypass-style rejection; duplicate
+  `COD` rejection; `POC` not-implemented). Sourced only from
+  `docs/image/jpeg2000/` (T.800 §A.6.1–§A.6.5). Suite total 599 (581
+  lib + 18 e2e, was 588).
+
 * **Clean-room round 334 (2026-06-18).** **Main-header `RGN`
   region-of-interest (Maxshift) decode** (T.800 §A.6.3 / §H.1). A
   main-header `RGN` is now parsed and honoured instead of rejected with

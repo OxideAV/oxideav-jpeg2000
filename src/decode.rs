@@ -74,8 +74,8 @@ use crate::reassemble::{
 };
 use crate::t1::{reset_contexts, BitPlaneSequencer, CodeBlock};
 use crate::{
-    Error, J2kCodestream, ProgressionOrder, QuantizationStyle, Siz, TilePartMarker,
-    WaveletTransform, MARKER_CAP, MARKER_POC, MARKER_SIZ, MARKER_SOC,
+    Error, J2kCodestream, ProgressionOrder, QuantizationStyle, Siz, WaveletTransform, MARKER_CAP,
+    MARKER_POC, MARKER_SIZ, MARKER_SOC,
 };
 
 /// `PPM` marker code (T.800 §A.7.4, `0xFF60`) — packed packet
@@ -163,25 +163,6 @@ fn reject_unsupported_main_header_markers(bytes: &[u8], header_end: usize) -> Re
             return Err(Error::InvalidMarkerLength);
         }
         pos += 2 + len;
-    }
-    Ok(())
-}
-
-/// Reject tile-part-header marker segments that would alter the
-/// main-header coding parameters (not wired this round). `PLT` and
-/// `COM` are informational and pass through.
-fn reject_unsupported_tile_part_markers(markers: &[TilePartMarker]) -> Result<(), Error> {
-    for m in markers {
-        match m {
-            TilePartMarker::Plt(_) | TilePartMarker::Com(_) => {}
-            TilePartMarker::Cod(_)
-            | TilePartMarker::Coc(_)
-            | TilePartMarker::Qcd(_)
-            | TilePartMarker::Qcc(_)
-            | TilePartMarker::Rgn(_)
-            | TilePartMarker::Poc(_)
-            | TilePartMarker::Ppt(_) => return Err(Error::NotImplemented),
-        }
     }
     Ok(())
 }
@@ -524,6 +505,7 @@ fn completed_bitplanes(passes: u32) -> u32 {
 /// size, precincts and the wavelet kernel — is resolved separately
 /// into [`ComponentCoding`] so a §A.6.2 `COC` override can change them
 /// per component.
+#[derive(Clone)]
 struct CodingParams {
     layers: u16,
     progression: ProgressionOrder,
@@ -538,6 +520,299 @@ struct CodingParams {
     /// [`SegmentSplit::PerPass`] and the tier-1 driver opens a fresh
     /// [`crate::mq::MqDecoder`] per pass.
     termination_on_each_coding_pass: bool,
+}
+
+/// Build the global [`CodingParams`] from a resolved [`Cod`] (the
+/// main-header default, or a tile-part `COD` override per §A.6.1).
+///
+/// Rejects the §D.6 selective-arithmetic-coding-bypass code-block
+/// style (Table A.19 bit 0) — its raw / lazy SP-MR segment split is not
+/// wired into the tier-1 driver — and surfaces the §D.4.2 per-pass
+/// termination decision the packet reader needs.
+fn coding_params_from_cod(cod: &crate::Cod) -> Result<CodingParams, Error> {
+    let style_flags = cod.code_block_style_flags();
+    if style_flags.selective_arithmetic_coding_bypass() {
+        // §D.6 selective arithmetic-coding bypass splits the code-block
+        // into AC + raw (lazy) codeword segments and reads the SP / MR
+        // passes from bit-plane 5 onward directly from a bit-stuffed
+        // stream. That raw-mode dispatch is not wired into the tier-1
+        // driver below yet, so reject it cleanly.
+        return Err(Error::NotImplemented);
+    }
+    Ok(CodingParams {
+        layers: cod.layers,
+        progression: cod.progression,
+        mct: cod.multi_component_transform,
+        sop_eph: match (cod.sop_marker_allowed, cod.eph_marker_used) {
+            (false, false) => SopEphMode::None,
+            (true, false) => SopEphMode::SopOnly,
+            (false, true) => SopEphMode::EphOnly,
+            (true, true) => SopEphMode::SopAndEph,
+        },
+        segmentation_symbols: style_flags.segmentation_symbols(),
+        vertically_causal: style_flags.vertically_causal_context(),
+        reset_context_probabilities: style_flags.reset_context_probabilities(),
+        // §D.4.2 "termination on each coding pass" (Table A.19 bit 2)
+        // splits the contribution into one terminated §C.3 codeword
+        // segment per coding pass (§B.10.7.2). The §C.3.6 context-reset
+        // bit (0x02) does NOT split the stream — it only re-initialises
+        // the Annex D contexts to their Table D.7 states at each pass
+        // boundary — and is threaded into the `BitPlaneSequencer` rather
+        // than the packet reader.
+        termination_on_each_coding_pass: style_flags.termination_on_each_coding_pass(),
+    })
+}
+
+/// The fully-resolved coding parameters that drive one tile's decode,
+/// after the §A.6 `Tile-part {COC,QCC} > Tile-part {COD,QCD} >
+/// Main {COC,QCC} > Main {COD,QCD}` precedence has been applied.
+///
+/// `comp_quant` borrows the `SPqcd` / `SPqcc` payload from whichever
+/// marker won the precedence (a main-header `Qcd` / `Qcc`, or a
+/// tile-part `Qcd` / `Qcc` held in [`crate::TilePart::markers`]); all
+/// of those outlive the per-tile decode loop.
+struct ResolvedTileCoding<'a> {
+    params: CodingParams,
+    comp_coding: Vec<ComponentCoding>,
+    comp_quant: Vec<ComponentQuant<'a>>,
+    roi_shift: Vec<u32>,
+}
+
+/// Resolve the per-tile coding parameters by layering this tile's
+/// first-tile-part (`TPsot = 0`) `COD` / `COC` / `QCD` / `QCC` / `RGN`
+/// overrides on top of the resolved main-header defaults, per the §A.6
+/// precedence rules.
+///
+/// * `COD`/`COC` (§A.6.1 / §A.6.2): a tile-part `COD` overrides the
+///   main `COD` **and** the main `COC`s for the whole tile; a tile-part
+///   `COC` then overrides that per component. So the effective
+///   precedence for each component is
+///   `Tile COC > Tile COD > Main COC > Main COD` — when a tile `COD` is
+///   present the main `COC`s are discarded (the tile `COD` supersedes
+///   them), and only the tile `COC`s refine it.
+/// * `QCD`/`QCC` (§A.6.4 / §A.6.5): identical shape —
+///   `Tile QCC > Tile QCD > Main QCC > Main QCD`.
+/// * `RGN` (§A.6.3): a tile-part `RGN` overrides the main `RGN` for its
+///   component; components without a tile `RGN` keep the main one.
+///
+/// Per §A.6.1 / §A.6.2 / §A.6.4 / §A.6.5 these markers, if present in a
+/// multi-tile-part tile, appear only in the first tile-part — the
+/// caller passes that tile-part's `markers`.
+#[allow(clippy::too_many_arguments)]
+fn resolve_tile_coding<'a>(
+    num_components: usize,
+    main_cod: &'a crate::Cod,
+    main_rgns: &[crate::Rgn],
+    main_params: &CodingParams,
+    main_coding: &[ComponentCoding],
+    main_quant: &[ComponentQuant<'a>],
+    main_roi: &[u32],
+    tile_markers: &'a [crate::TilePartMarker],
+) -> Result<ResolvedTileCoding<'a>, Error> {
+    // Collect this tile's first-tile-part overrides, enforcing the §A.6
+    // "at most one per header" rule for the un-indexed COD / QCD.
+    let mut tile_cod: Option<&crate::Cod> = None;
+    let mut tile_qcd: Option<&crate::Qcd> = None;
+    let mut tile_cocs: Vec<&crate::Coc> = Vec::new();
+    let mut tile_qccs: Vec<&crate::Qcc> = Vec::new();
+    let mut tile_rgns: Vec<&crate::Rgn> = Vec::new();
+    for m in tile_markers {
+        match m {
+            crate::TilePartMarker::Cod(c) => {
+                if tile_cod.is_some() {
+                    return Err(Error::InvalidMarkerLength);
+                }
+                tile_cod = Some(c);
+            }
+            crate::TilePartMarker::Qcd(q) => {
+                if tile_qcd.is_some() {
+                    return Err(Error::InvalidMarkerLength);
+                }
+                tile_qcd = Some(q);
+            }
+            crate::TilePartMarker::Coc(c) => tile_cocs.push(c),
+            crate::TilePartMarker::Qcc(q) => tile_qccs.push(q),
+            crate::TilePartMarker::Rgn(r) => tile_rgns.push(r),
+            // PLT / COM are informational; the tier-2 walker reads the
+            // bit-stream lengths directly, so they need no resolution.
+            crate::TilePartMarker::Plt(_) | crate::TilePartMarker::Com(_) => {}
+            // POC / PPT tile-part overrides remain unwired.
+            crate::TilePartMarker::Poc(_) | crate::TilePartMarker::Ppt(_) => {
+                return Err(Error::NotImplemented);
+            }
+        }
+    }
+
+    // No overrides → the resolved main-header parameters apply verbatim.
+    if tile_cod.is_none()
+        && tile_qcd.is_none()
+        && tile_cocs.is_empty()
+        && tile_qccs.is_empty()
+        && tile_rgns.is_empty()
+    {
+        return Ok(ResolvedTileCoding {
+            params: main_params.clone(),
+            comp_coding: main_coding.to_vec(),
+            comp_quant: main_quant.to_vec(),
+            roi_shift: main_roi.to_vec(),
+        });
+    }
+
+    // -- Coding style (§A.6.1 / §A.6.2) --
+    // A tile COD supersedes the main COD *and* the main COCs; only the
+    // tile COCs then refine it. With no tile COD, the main COCs survive
+    // and the tile COCs override per component on top of them.
+    let (params, comp_coding) = if let Some(tcod) = tile_cod {
+        let params = coding_params_from_cod(tcod)?;
+        let comp_coding = resolve_component_coding(num_components, tcod, &cloned(&tile_cocs))?;
+        (params, comp_coding)
+    } else {
+        // Start from the main-header resolution, then let any tile COC
+        // override per component (the tile COC outranks the main COC).
+        let mut comp_coding = main_coding.to_vec();
+        apply_coc_overrides(&mut comp_coding, main_cod, &tile_cocs)?;
+        (main_params.clone(), comp_coding)
+    };
+
+    // -- Quantisation (§A.6.4 / §A.6.5) --
+    let comp_quant = if let Some(tqcd) = tile_qcd {
+        // A tile QCD supersedes the main QCD *and* the main QCCs; the
+        // tile QCCs then refine it per component. Seed every component
+        // from the tile QCD, then apply the tile QCCs on top.
+        let mut comp_quant: Vec<ComponentQuant<'a>> = (0..num_components)
+            .map(|_| ComponentQuant {
+                style: tqcd.style,
+                spqcd: &tqcd.spqcd,
+                guard_bits: tqcd.guard_bits,
+            })
+            .collect();
+        apply_qcc_overrides(&mut comp_quant, num_components, &tile_qccs)?;
+        comp_quant
+    } else {
+        let mut comp_quant = main_quant.to_vec();
+        apply_qcc_overrides(&mut comp_quant, num_components, &tile_qccs)?;
+        comp_quant
+    };
+
+    // -- Region of interest (§A.6.3) --
+    let roi_shift = if tile_rgns.is_empty() {
+        main_roi.to_vec()
+    } else {
+        apply_rgn_overrides(num_components, main_rgns, &tile_rgns)?
+    };
+
+    Ok(ResolvedTileCoding {
+        params,
+        comp_coding,
+        comp_quant,
+        roi_shift,
+    })
+}
+
+/// Clone a `Vec<&T>` into the owned `Vec<T>` the `resolve_*` helpers
+/// (which take `&[T]`) expect. Used to feed tile-part overrides — held
+/// as references into [`crate::TilePart::markers`] — through the same
+/// resolvers the main-header path uses.
+fn cloned<T: Clone>(refs: &[&T]) -> Vec<T> {
+    refs.iter().map(|&r| r.clone()).collect()
+}
+
+/// Apply tile-part `COC` overrides on top of an already-resolved
+/// per-component coding vector (the no-tile-COD branch). The tile COC
+/// outranks both the main COC (already folded into `coding`) and the
+/// main COD; its code-block style must still match the main COD's
+/// global style byte (the §B.10.7 segment split is derived once).
+fn apply_coc_overrides(
+    coding: &mut [ComponentCoding],
+    main_cod: &crate::Cod,
+    tile_cocs: &[&crate::Coc],
+) -> Result<(), Error> {
+    let mut seen = vec![false; coding.len()];
+    for coc in tile_cocs {
+        let c = coc.component_index as usize;
+        if c >= coding.len() {
+            return Err(Error::InvalidMarkerLength);
+        }
+        if seen[c] {
+            return Err(Error::InvalidMarkerLength);
+        }
+        seen[c] = true;
+        if coc.code_block_style != main_cod.code_block_style {
+            return Err(Error::NotImplemented);
+        }
+        let xcb = coc
+            .code_block_width_exp
+            .checked_add(2)
+            .ok_or(Error::InvalidMarkerLength)?;
+        let ycb = coc
+            .code_block_height_exp
+            .checked_add(2)
+            .ok_or(Error::InvalidMarkerLength)?;
+        coding[c] = ComponentCoding {
+            n_l: coc.decomposition_levels,
+            xcb,
+            ycb,
+            precincts: coc.precincts.clone(),
+            transform: coc.transform,
+        };
+    }
+    Ok(())
+}
+
+/// Apply tile-part `QCC` overrides on top of an already-resolved
+/// per-component quantisation vector (the no-tile-QCD branch). The tile
+/// QCC outranks both the main QCC (already folded into `quant`) and the
+/// main QCD.
+fn apply_qcc_overrides<'a>(
+    quant: &mut [ComponentQuant<'a>],
+    num_components: usize,
+    tile_qccs: &[&'a crate::Qcc],
+) -> Result<(), Error> {
+    let mut seen = vec![false; num_components];
+    for qcc in tile_qccs {
+        let c = qcc.component_index as usize;
+        if c >= num_components {
+            return Err(Error::InvalidMarkerLength);
+        }
+        if seen[c] {
+            return Err(Error::InvalidMarkerLength);
+        }
+        seen[c] = true;
+        quant[c] = ComponentQuant {
+            style: qcc.style,
+            spqcd: &qcc.spqcc,
+            guard_bits: qcc.guard_bits,
+        };
+    }
+    Ok(())
+}
+
+/// Apply tile-part `RGN` overrides (§A.6.3). The main-header `RGN`
+/// shifts seed the result; a tile `RGN` overrides its component. Only
+/// the Maxshift (`Srgn = 0`) style is wired; any other style, an
+/// out-of-range `Crgn`, or a duplicate tile `RGN` is rejected.
+fn apply_rgn_overrides(
+    num_components: usize,
+    main_rgns: &[crate::Rgn],
+    tile_rgns: &[&crate::Rgn],
+) -> Result<Vec<u32>, Error> {
+    let mut out = resolve_component_roi_shift(num_components, main_rgns)?;
+    let mut seen = vec![false; num_components];
+    for rgn in tile_rgns {
+        let c = rgn.component_index as usize;
+        if c >= num_components {
+            return Err(Error::InvalidMarkerLength);
+        }
+        if seen[c] {
+            return Err(Error::InvalidMarkerLength);
+        }
+        seen[c] = true;
+        if rgn.srgn != 0 {
+            return Err(Error::NotImplemented);
+        }
+        out[c] = u32::from(rgn.sprgn);
+    }
+    Ok(out)
 }
 
 /// Decode every component of one tile from the concatenated tile-part
@@ -1075,42 +1350,10 @@ pub fn decode_codestream(bytes: &[u8], cs: &J2kCodestream) -> Result<DecodedImag
     let main_rgns = crate::collect_main_header_rgn(bytes, cs.header.bytes_consumed, csiz)?;
     let roi_shift = resolve_component_roi_shift(siz.components.len(), &main_rgns)?;
 
-    let style_flags = cod.code_block_style_flags();
-    if style_flags.selective_arithmetic_coding_bypass() {
-        // §D.6 selective arithmetic-coding bypass splits the code-block
-        // into AC + raw (lazy) codeword segments and reads the SP / MR
-        // passes from bit-plane 5 onward directly from a bit-stuffed
-        // stream. That raw-mode dispatch is not wired into the tier-1
-        // driver below yet, so reject it cleanly.
-        return Err(Error::NotImplemented);
-    }
-    // §D.4.2 "termination on each coding pass" (Table A.19 bit 2) splits
-    // the contribution into one terminated §C.3 codeword segment per
-    // coding pass (§B.10.7.2). The packet reader reads the per-pass
-    // §B.10.7 lengths and the tier-1 driver opens a fresh MqDecoder per
-    // segment — so it is honoured here.
-    //
-    // The §C.3.6 reset-context-probabilities bit (0x02) does NOT split
-    // the stream — it only re-initialises the Annex D contexts to their
-    // Table D.7 states at each pass boundary — and is honoured directly
-    // (threaded into the BitPlaneSequencer below).
-    let termination_on_each_coding_pass = style_flags.termination_on_each_coding_pass();
-
-    let params = CodingParams {
-        layers: cod.layers,
-        progression: cod.progression,
-        mct: cod.multi_component_transform,
-        sop_eph: match (cod.sop_marker_allowed, cod.eph_marker_used) {
-            (false, false) => SopEphMode::None,
-            (true, false) => SopEphMode::SopOnly,
-            (false, true) => SopEphMode::EphOnly,
-            (true, true) => SopEphMode::SopAndEph,
-        },
-        segmentation_symbols: style_flags.segmentation_symbols(),
-        vertically_causal: style_flags.vertically_causal_context(),
-        reset_context_probabilities: style_flags.reset_context_probabilities(),
-        termination_on_each_coding_pass,
-    };
+    // The §D.6 bypass rejection and the §D.4.2 / §C.3.6 style decisions
+    // are folded into `coding_params_from_cod`, which is re-run per tile
+    // when a tile-part `COD` override changes the global style.
+    let params = coding_params_from_cod(cod)?;
 
     // -- Image-area planes --
     let areas = image_area(siz)?;
@@ -1136,7 +1379,6 @@ pub fn decode_codestream(bytes: &[u8], cs: &J2kCodestream) -> Result<DecodedImag
     // -- Group tile-parts by tile, ordered by TPsot --
     let mut parts_by_tile: BTreeMap<u16, Vec<&crate::TilePart>> = BTreeMap::new();
     for tp in &cs.tile_parts {
-        reject_unsupported_tile_part_markers(&tp.markers)?;
         parts_by_tile.entry(tp.sot.tile_index).or_default().push(tp);
     }
 
@@ -1145,6 +1387,49 @@ pub fn decode_codestream(bytes: &[u8], cs: &J2kCodestream) -> Result<DecodedImag
             return Err(Error::InvalidTilePartIndex);
         }
         parts.sort_by_key(|tp| tp.sot.tile_part_index);
+
+        // §A.6.1 / §A.6.2 / §A.6.4 / §A.6.5: COD / COC / QCD / QCC / RGN
+        // overrides may appear only in the first tile-part (TPsot = 0).
+        // A coding-style marker in a later tile-part of the same tile is
+        // malformed — reject it before resolving so a stray override is
+        // never silently dropped.
+        for tp in &parts {
+            if tp.sot.tile_part_index != 0 {
+                for m in &tp.markers {
+                    match m {
+                        crate::TilePartMarker::Cod(_)
+                        | crate::TilePartMarker::Coc(_)
+                        | crate::TilePartMarker::Qcd(_)
+                        | crate::TilePartMarker::Qcc(_)
+                        | crate::TilePartMarker::Rgn(_)
+                        | crate::TilePartMarker::Poc(_) => {
+                            return Err(Error::InvalidMarkerLength);
+                        }
+                        // PLT / PPT / COM may appear in any tile-part.
+                        crate::TilePartMarker::Plt(_)
+                        | crate::TilePartMarker::Ppt(_)
+                        | crate::TilePartMarker::Com(_) => {}
+                    }
+                }
+            }
+        }
+
+        // §A.6 precedence: layer this tile's TPsot = 0 overrides on the
+        // resolved main-header parameters. With no overrides this is the
+        // main-header resolution verbatim.
+        let first_markers: &[crate::TilePartMarker] =
+            parts.first().map(|tp| tp.markers.as_slice()).unwrap_or(&[]);
+        let tile_coding = resolve_tile_coding(
+            siz.components.len(),
+            cod,
+            &main_rgns,
+            &params,
+            &comp_coding,
+            &comp_quant,
+            &roi_shift,
+            first_markers,
+        )?;
+
         let mut body = Vec::new();
         for tp in &parts {
             let end = tp
@@ -1157,10 +1442,10 @@ pub fn decode_codestream(bytes: &[u8], cs: &J2kCodestream) -> Result<DecodedImag
 
         let tile_planes = decode_tile(
             siz,
-            &params,
-            &comp_coding,
-            &comp_quant,
-            &roi_shift,
+            &tile_coding.params,
+            &tile_coding.comp_coding,
+            &tile_coding.comp_quant,
+            &tile_coding.roi_shift,
             tile_index as u32,
             &body,
         )?;
@@ -1418,6 +1703,230 @@ mod tests {
         let diverge = coc(1, 3, 2, 2, 0x04, WaveletTransform::Reversible5x3, &[]);
         assert!(matches!(
             resolve_component_coding(2, &base, std::slice::from_ref(&diverge)),
+            Err(Error::NotImplemented)
+        ));
+    }
+
+    // -- §A.6 tile-part header override precedence --
+
+    fn rgn(c: u16, srgn: u8, sprgn: u8) -> crate::Rgn {
+        crate::Rgn {
+            component_index: c,
+            srgn,
+            sprgn,
+        }
+    }
+
+    /// Resolve the main-header default coding for the precedence tests:
+    /// the §A.6 `Tile > Main` layering starts from this.
+    fn main_defaults<'a>(
+        num: usize,
+        c: &'a crate::Cod,
+        q: &'a crate::Qcd,
+    ) -> (CodingParams, Vec<ComponentCoding>, Vec<ComponentQuant<'a>>) {
+        let params = coding_params_from_cod(c).expect("params");
+        let coding = resolve_component_coding(num, c, &[]).expect("coding");
+        let quant = resolve_component_quant(num, q, &[]).expect("quant");
+        (params, coding, quant)
+    }
+
+    #[test]
+    fn tile_no_overrides_keeps_main_resolution() {
+        // §A.6: a tile-part with no COD/COC/QCD/QCC/RGN inherits the
+        // resolved main-header parameters verbatim.
+        let c = cod(2, 2, 2, 0x00, WaveletTransform::Reversible5x3, &[]);
+        let q = qcd(QuantizationStyle::None, 2, &[0x40, 0x41, 0x42]);
+        let (params, coding, quant) = main_defaults(2, &c, &q);
+        let roi = vec![0u32; 2];
+        let resolved =
+            resolve_tile_coding(2, &c, &[], &params, &coding, &quant, &roi, &[]).expect("resolve");
+        assert_eq!(resolved.comp_coding[0].n_l, 2);
+        assert_eq!(resolved.comp_quant[0].guard_bits, 2);
+        assert_eq!(resolved.roi_shift, vec![0, 0]);
+        assert_eq!(resolved.params.layers, 1);
+    }
+
+    #[test]
+    fn tile_cod_supersedes_main_cod_for_whole_tile() {
+        // §A.6.1: a tile-part COD overrides the main COD (and COCs) for
+        // every component of the tile.
+        let main_c = cod(2, 2, 2, 0x00, WaveletTransform::Reversible5x3, &[]);
+        let q = qcd(QuantizationStyle::None, 2, &[0x40, 0x41, 0x42]);
+        let (params, coding, quant) = main_defaults(2, &main_c, &q);
+        let roi = vec![0u32; 2];
+        // Tile COD: NL = 4, code-block 8×8 (xcb=ycb=1 → +2 = 3).
+        let tile_c = cod(4, 1, 1, 0x00, WaveletTransform::Reversible5x3, &[]);
+        let markers = vec![crate::TilePartMarker::Cod(tile_c)];
+        let resolved =
+            resolve_tile_coding(2, &main_c, &[], &params, &coding, &quant, &roi, &markers)
+                .expect("resolve");
+        for cc in &resolved.comp_coding {
+            assert_eq!(cc.n_l, 4);
+            assert_eq!(cc.xcb, 3);
+        }
+    }
+
+    #[test]
+    fn tile_coc_outranks_tile_cod_per_component() {
+        // §A.6.2 precedence: Tile COC > Tile COD. A tile COC for
+        // component 1 refines the tile COD only there.
+        let main_c = cod(2, 2, 2, 0x00, WaveletTransform::Reversible5x3, &[]);
+        let q = qcd(QuantizationStyle::None, 2, &[0x40, 0x41, 0x42]);
+        let (params, coding, quant) = main_defaults(2, &main_c, &q);
+        let roi = vec![0u32; 2];
+        let tile_c = cod(4, 1, 1, 0x00, WaveletTransform::Reversible5x3, &[]);
+        let tile_coc1 = coc(1, 1, 2, 2, 0x00, WaveletTransform::Reversible5x3, &[]);
+        let markers = vec![
+            crate::TilePartMarker::Cod(tile_c),
+            crate::TilePartMarker::Coc(tile_coc1),
+        ];
+        let resolved =
+            resolve_tile_coding(2, &main_c, &[], &params, &coding, &quant, &roi, &markers)
+                .expect("resolve");
+        // Component 0 follows the tile COD (NL = 4); component 1 the COC.
+        assert_eq!(resolved.comp_coding[0].n_l, 4);
+        assert_eq!(resolved.comp_coding[1].n_l, 1);
+        assert_eq!(resolved.comp_coding[1].xcb, 4);
+    }
+
+    #[test]
+    fn tile_coc_alone_overrides_main_per_component() {
+        // §A.6.2: with no tile COD, a tile COC overrides the resolved
+        // main parameters for its component (and outranks the main COC).
+        let main_c = cod(3, 2, 2, 0x00, WaveletTransform::Reversible5x3, &[]);
+        let q = qcd(QuantizationStyle::None, 2, &[0x40, 0x41, 0x42, 0x43]);
+        let (params, coding, quant) = main_defaults(2, &main_c, &q);
+        let roi = vec![0u32; 2];
+        let tile_coc0 = coc(0, 1, 1, 1, 0x00, WaveletTransform::Reversible5x3, &[]);
+        let markers = vec![crate::TilePartMarker::Coc(tile_coc0)];
+        let resolved =
+            resolve_tile_coding(2, &main_c, &[], &params, &coding, &quant, &roi, &markers)
+                .expect("resolve");
+        assert_eq!(resolved.comp_coding[0].n_l, 1);
+        assert_eq!(resolved.comp_coding[0].xcb, 3);
+        // Component 1 keeps the main COD.
+        assert_eq!(resolved.comp_coding[1].n_l, 3);
+    }
+
+    #[test]
+    fn tile_qcd_supersedes_main_quant() {
+        // §A.6.4: a tile-part QCD overrides the main QCD/QCC for every
+        // component.
+        let main_c = cod(2, 2, 2, 0x00, WaveletTransform::Reversible5x3, &[]);
+        let main_q = qcd(QuantizationStyle::None, 2, &[0x40, 0x41, 0x42]);
+        let (params, coding, quant) = main_defaults(2, &main_c, &main_q);
+        let roi = vec![0u32; 2];
+        let tile_q = qcd(QuantizationStyle::None, 4, &[0x50, 0x51, 0x52]);
+        let markers = vec![crate::TilePartMarker::Qcd(tile_q)];
+        let resolved =
+            resolve_tile_coding(2, &main_c, &[], &params, &coding, &quant, &roi, &markers)
+                .expect("resolve");
+        for cq in &resolved.comp_quant {
+            assert_eq!(cq.guard_bits, 4);
+            assert_eq!(cq.spqcd, &[0x50, 0x51, 0x52]);
+        }
+    }
+
+    #[test]
+    fn tile_qcc_outranks_tile_qcd_per_component() {
+        // §A.6.5 precedence: Tile QCC > Tile QCD.
+        let main_c = cod(2, 2, 2, 0x00, WaveletTransform::Reversible5x3, &[]);
+        let main_q = qcd(QuantizationStyle::None, 2, &[0x40, 0x41, 0x42]);
+        let (params, coding, quant) = main_defaults(2, &main_c, &main_q);
+        let roi = vec![0u32; 2];
+        let tile_q = qcd(QuantizationStyle::None, 4, &[0x50, 0x51, 0x52]);
+        let tile_qcc1 = qcc(1, QuantizationStyle::None, 5, &[0x60, 0x61, 0x62]);
+        let markers = vec![
+            crate::TilePartMarker::Qcd(tile_q),
+            crate::TilePartMarker::Qcc(tile_qcc1),
+        ];
+        let resolved =
+            resolve_tile_coding(2, &main_c, &[], &params, &coding, &quant, &roi, &markers)
+                .expect("resolve");
+        // Component 0 follows the tile QCD; component 1 the tile QCC.
+        assert_eq!(resolved.comp_quant[0].guard_bits, 4);
+        assert_eq!(resolved.comp_quant[1].guard_bits, 5);
+        assert_eq!(resolved.comp_quant[1].spqcd, &[0x60, 0x61, 0x62]);
+    }
+
+    #[test]
+    fn tile_qcc_alone_overrides_main_per_component() {
+        // §A.6.5: with no tile QCD, a tile QCC overrides the resolved
+        // main quant for its component only.
+        let main_c = cod(2, 2, 2, 0x00, WaveletTransform::Reversible5x3, &[]);
+        let main_q = qcd(QuantizationStyle::None, 2, &[0x40, 0x41, 0x42]);
+        let (params, coding, quant) = main_defaults(2, &main_c, &main_q);
+        let roi = vec![0u32; 2];
+        let tile_qcc0 = qcc(0, QuantizationStyle::None, 6, &[0x70, 0x71, 0x72]);
+        let markers = vec![crate::TilePartMarker::Qcc(tile_qcc0)];
+        let resolved =
+            resolve_tile_coding(2, &main_c, &[], &params, &coding, &quant, &roi, &markers)
+                .expect("resolve");
+        assert_eq!(resolved.comp_quant[0].guard_bits, 6);
+        assert_eq!(resolved.comp_quant[1].guard_bits, 2);
+    }
+
+    #[test]
+    fn tile_rgn_overrides_main_roi_per_component() {
+        // §A.6.3: a tile-part RGN overrides the main RGN for its
+        // component; others keep the main shift.
+        let main_c = cod(2, 2, 2, 0x00, WaveletTransform::Reversible5x3, &[]);
+        let main_q = qcd(QuantizationStyle::None, 2, &[0x40, 0x41, 0x42]);
+        let (params, coding, quant) = main_defaults(2, &main_c, &main_q);
+        let main_rgns = [rgn(0, 0, 3)]; // component 0 has Maxshift s = 3.
+        let roi = resolve_component_roi_shift(2, &main_rgns).expect("roi");
+        let tile_rgn1 = rgn(1, 0, 7); // component 1 gets s = 7 in this tile.
+        let markers = vec![crate::TilePartMarker::Rgn(tile_rgn1)];
+        let resolved = resolve_tile_coding(
+            2, &main_c, &main_rgns, &params, &coding, &quant, &roi, &markers,
+        )
+        .expect("resolve");
+        assert_eq!(resolved.roi_shift, vec![3, 7]);
+    }
+
+    #[test]
+    fn tile_cod_bypass_style_is_rejected() {
+        // §D.6 selective arithmetic-coding bypass is unwired; a tile COD
+        // that sets it is rejected even though the main COD did not.
+        let main_c = cod(2, 2, 2, 0x00, WaveletTransform::Reversible5x3, &[]);
+        let main_q = qcd(QuantizationStyle::None, 2, &[0x40, 0x41, 0x42]);
+        let (params, coding, quant) = main_defaults(2, &main_c, &main_q);
+        let roi = vec![0u32; 2];
+        let tile_c = cod(2, 2, 2, 0x01, WaveletTransform::Reversible5x3, &[]);
+        let markers = vec![crate::TilePartMarker::Cod(tile_c)];
+        assert!(matches!(
+            resolve_tile_coding(2, &main_c, &[], &params, &coding, &quant, &roi, &markers),
+            Err(Error::NotImplemented)
+        ));
+    }
+
+    #[test]
+    fn tile_duplicate_cod_is_rejected() {
+        // §A.6.1: at most one COD per tile-part header.
+        let main_c = cod(2, 2, 2, 0x00, WaveletTransform::Reversible5x3, &[]);
+        let main_q = qcd(QuantizationStyle::None, 2, &[0x40, 0x41, 0x42]);
+        let (params, coding, quant) = main_defaults(2, &main_c, &main_q);
+        let roi = vec![0u32; 2];
+        let a = cod(2, 2, 2, 0x00, WaveletTransform::Reversible5x3, &[]);
+        let b = cod(3, 1, 1, 0x00, WaveletTransform::Reversible5x3, &[]);
+        let markers = vec![crate::TilePartMarker::Cod(a), crate::TilePartMarker::Cod(b)];
+        assert!(
+            resolve_tile_coding(2, &main_c, &[], &params, &coding, &quant, &roi, &markers).is_err()
+        );
+    }
+
+    #[test]
+    fn tile_poc_override_is_not_implemented() {
+        // A tile-part POC progression-order change is not wired.
+        let main_c = cod(2, 2, 2, 0x00, WaveletTransform::Reversible5x3, &[]);
+        let main_q = qcd(QuantizationStyle::None, 2, &[0x40, 0x41, 0x42]);
+        let (params, coding, quant) = main_defaults(2, &main_c, &main_q);
+        let roi = vec![0u32; 2];
+        let markers = vec![crate::TilePartMarker::Poc(crate::Poc {
+            progressions: Vec::new(),
+        })];
+        assert!(matches!(
+            resolve_tile_coding(2, &main_c, &[], &params, &coding, &quant, &roi, &markers),
             Err(Error::NotImplemented)
         ));
     }
