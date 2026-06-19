@@ -23,9 +23,15 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
   `RawBitReader`; the tier-1 driver alternates a fresh `MqDecoder` (AC
   spans) and `RawBitReader` (raw spans) on one continuous §D.3 schedule.
   Bit-2 ("termination on each coding pass") composes with bypass per the
-  §D.6 prose (every pass terminated, both raw passes included). Pinned
-  by a new pixel-exact `gray-40x40-bypass-53.j2k` end-to-end fixture and
-  Table D.9 span-split unit tests.
+  §D.6 prose (every pass terminated, both raw passes included). The raw
+  spans honour the §D.4.1 / §D.6-NOTE-2 `0xFF`-fill model via a new
+  `RawBitReader::new_with_d4_1_fill`: once a span's stored bytes run out
+  the reader extends it with synthesised `0xFF` (stuff-bit rule applied)
+  so a truncated / in-progress raw pass still decodes. Pinned by new
+  pixel-exact `gray-40x40-bypass-53.j2k` (5-3 lossless) and
+  `gray-40x40-bypass-tiled-53.j2k` (2×2 tiles) fixtures, a black-box-
+  tracked `gray-40x40-bypass-97.j2k` (9-7 irreversible) fixture, and
+  Table D.9 span-split + `0xFF`-fill unit tests.
 * **Clean-room round 338 (2026-06-19).** **Tile-part header coding
   overrides** (T.800 §A.6.1 / §A.6.2 / §A.6.4 / §A.6.5 / §A.6.3). A
   tile's first tile-part (`TPsot = 0`) `COD` / `COC` / `QCD` / `QCC` /

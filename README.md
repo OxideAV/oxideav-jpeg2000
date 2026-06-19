@@ -53,7 +53,11 @@ What is implemented:
   layers), and the tier-1 driver alternates a fresh MQ decoder and a
   raw-bit reader on one continuous §D.3 schedule. Bit-2 composes with
   bypass per the §D.6 prose (every pass terminated, both raw passes
-  included).
+  included). The raw spans honour the §D.4.1 / §D.6-NOTE-2 model — once
+  a span's stored bytes run out the reader extends it with synthesised
+  `0xFF` fill (stuff-bit rule applied) so a truncated or in-progress raw
+  pass still decodes. Validated end-to-end on the 5-3 lossless, 9-7
+  irreversible, and 2×2-tile bypass paths.
 - **Reassembly** — per-coefficient `Nb(u, v)` magnitude-bit tracking for
   rate-truncated streams, dequantisation, the 5-3 and 9-7 inverse DWT,
   and the inverse multi-component transform.

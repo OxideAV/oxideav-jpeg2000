@@ -1190,7 +1190,7 @@ fn decode_tile(
             if seg.is_raw {
                 // §D.6 raw (lazy) span — the SP / MR passes read from a
                 // bit-stuffed stream. The MQ context array is untouched.
-                let mut raw = crate::t1::RawBitReader::new(&seg.bytes);
+                let mut raw = crate::t1::RawBitReader::new_with_d4_1_fill(&seg.bytes);
                 seq.decode_passes_raw(&mut block, &mut raw, seg.passes)?;
             } else {
                 let mut decoder = crate::mq::MqDecoder::new(&seg.bytes);

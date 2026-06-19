@@ -253,10 +253,19 @@ pub struct RawBitReader<'a> {
     /// counted). Useful for callers that need to know how many bits a
     /// pass drew from the segment.
     bits_consumed: usize,
+    /// When `true`, once the real bytes are exhausted the reader
+    /// synthesises `0xFF` fill bytes (honouring the §D.6 stuff-bit rule)
+    /// rather than surfacing [`Error::UnexpectedEof`]. This mirrors the
+    /// §D.4.1 model the [`crate::mq::MqDecoder`] uses: the decoder may
+    /// extend the codeword segment with `0xFF` so the residual symbols
+    /// of an in-progress (or truncated, §D.6 NOTE 2) pass can still be
+    /// decoded. Off by default so the low-level reader stays strict.
+    d4_1_fill: bool,
 }
 
 impl<'a> RawBitReader<'a> {
-    /// Wrap a §D.6 raw-bit codeword segment.
+    /// Wrap a §D.6 raw-bit codeword segment. Reading past the end
+    /// surfaces [`Error::UnexpectedEof`].
     pub fn new(bytes: &'a [u8]) -> Self {
         Self {
             bytes,
@@ -265,6 +274,29 @@ impl<'a> RawBitReader<'a> {
             bits_remaining: 0,
             prev_was_ff: false,
             bits_consumed: 0,
+            d4_1_fill: false,
+        }
+    }
+
+    /// Wrap a §D.6 raw-bit codeword segment with §D.4.1 `0xFF` fill: once
+    /// the real bytes are exhausted the reader keeps returning bits drawn
+    /// from synthesised `0xFF` bytes (honouring the stuff-bit rule)
+    /// instead of [`Error::UnexpectedEof`].
+    ///
+    /// This is the model the tier-1 driver uses for the in-codestream
+    /// raw spans — §D.4.1 lets the decoder extend the segment with `0xFF`
+    /// so the residual bits of an in-progress or §D.6-NOTE-2-truncated
+    /// pass still decode, exactly as [`crate::mq::MqDecoder::new`]
+    /// synthesises `0xFF` for the AC path.
+    pub fn new_with_d4_1_fill(bytes: &'a [u8]) -> Self {
+        Self {
+            bytes,
+            byte_pos: 0,
+            current_byte: 0,
+            bits_remaining: 0,
+            prev_was_ff: false,
+            bits_consumed: 0,
+            d4_1_fill: true,
         }
     }
 
@@ -307,10 +339,17 @@ impl<'a> RawBitReader<'a> {
     /// itself is `0xFF` so the next call repeats the rule on the byte
     /// after it.
     fn load_next_byte(&mut self) -> Result<(), Error> {
-        if self.byte_pos >= self.bytes.len() {
-            return Err(Error::UnexpectedEof);
-        }
-        let raw = self.bytes[self.byte_pos];
+        let raw = if self.byte_pos >= self.bytes.len() {
+            if !self.d4_1_fill {
+                return Err(Error::UnexpectedEof);
+            }
+            // §D.4.1: extend the segment with synthesised 0xFF bytes.
+            // `byte_pos` still advances so the stuff-bit rule fires on
+            // each successive 0xFF.
+            0xFF
+        } else {
+            self.bytes[self.byte_pos]
+        };
         self.byte_pos += 1;
         if self.prev_was_ff {
             // §D.6 stuff bit — drop the top bit before exposing the
@@ -4390,6 +4429,28 @@ mod tests {
     fn raw_bit_reader_empty_input_eofs_on_first_read() {
         let mut r = RawBitReader::new(&[]);
         assert_eq!(r.read_bit(), Err(Error::UnexpectedEof));
+    }
+
+    #[test]
+    fn raw_bit_reader_d4_1_fill_synthesises_ff_past_end() {
+        // §D.4.1 fill: after the real byte (0x00, 8 payload bits = 0)
+        // the reader keeps returning bits from synthesised 0xFF bytes —
+        // the first 0xFF gives eight 1-bits, then the stuff-bit rule
+        // drops the top bit of the next (also 0xFF) byte.
+        let mut r = RawBitReader::new_with_d4_1_fill(&[0x00]);
+        for _ in 0..8 {
+            assert_eq!(r.read_bit().unwrap(), 0); // real byte
+        }
+        for _ in 0..8 {
+            assert_eq!(r.read_bit().unwrap(), 1); // first synthetic 0xFF
+        }
+        // Next byte is another synthetic 0xFF; its top bit is the §D.6
+        // stuff bit after the preceding 0xFF, so seven payload 1-bits.
+        for _ in 0..7 {
+            assert_eq!(r.read_bit().unwrap(), 1);
+        }
+        // No EOF — the fill never runs out.
+        assert_eq!(r.read_bit().unwrap(), 1);
     }
 
     #[test]

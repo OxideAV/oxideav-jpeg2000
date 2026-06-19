@@ -85,6 +85,25 @@ const GRAY_TERMALL_53: &[u8] = include_bytes!("data/gray-40x40-termall-53.j2k");
 // codec as a black box.
 const GRAY_BYPASS_53: &[u8] = include_bytes!("data/gray-40x40-bypass-53.j2k");
 
+// §D.6 bypass on the **9-7 irreversible** (lossy) path: 40×40 gray, NL
+// = 3, 8×8 code-blocks, single layer, COD code-block-style bit 0 set.
+// The raw (lazy) SP / MR passes from bit-plane 5 onward feed the
+// scalar-quantised inverse 9-7 DWT, so this exercises the bypass
+// dispatch through the irreversible reconstruction (not just the
+// lossless 5-3 round-trip). Pinned against a committed black-box decode
+// of the same codestream within the Annex F ±1 floating-point latitude.
+// COM markers scrubbed.
+const GRAY_BYPASS_97: &[u8] = include_bytes!("data/gray-40x40-bypass-97.j2k");
+const GRAY_BYPASS_97_REF_PGM: &[u8] = include_bytes!("data/gray-40x40-bypass-97-ref.pgm");
+
+// §D.6 bypass across a 20×20 tile grid (2×2 = 4 tiles), lossless 5-3,
+// NL = 3, 8×8 code-blocks, bypass style bit set. Each tile's
+// code-blocks run their own §D.3 schedule, so the absolute pass cursor
+// driving the Table D.9 segment split resets per tile / precinct: a
+// leak of the cursor across tiles would mis-split the AC + raw segments
+// and corrupt at least one tile. COM markers scrubbed.
+const GRAY_BYPASS_TILED_53: &[u8] = include_bytes!("data/gray-40x40-bypass-tiled-53.j2k");
+
 /// Deterministic 64×64 gray source pattern (the raster the multi-layer
 /// fixture was encoded from); same arithmetic family as
 /// [`gray_17x13_pattern`] with an extra high-frequency `(x ^ y)` term so
@@ -669,6 +688,58 @@ fn gray_53_termination_on_each_pass_is_pixel_exact() {
     assert_eq!(img.components.len(), 1);
     assert_eq!(img.components[0].precision_bits, 8);
     assert!(!img.components[0].is_signed);
+    assert_eq!(img.components[0].samples, gray_40x40_pattern());
+}
+
+#[test]
+fn gray_97_selective_arithmetic_coding_bypass_tracks_black_box_reference() {
+    // §D.6 bypass through the 9-7 irreversible reconstruction. The raw
+    // SP / MR passes feed the scalar-quantised inverse DWT; the decode
+    // must track the committed black-box reference within the Annex F
+    // ±1 floating-point latitude.
+    let cs = parse_codestream(GRAY_BYPASS_97).expect("parse");
+    assert!(
+        cs.header
+            .cod
+            .code_block_style_flags()
+            .selective_arithmetic_coding_bypass(),
+        "fixture must set the bypass style bit"
+    );
+    let img = decode_j2k(GRAY_BYPASS_97).expect("decode 9-7 bypass");
+    assert_eq!(img.components.len(), 1);
+    let c = &img.components[0];
+    assert_eq!((c.width, c.height), (40, 40));
+    let (rw, rh, payload) = pgm_payload(GRAY_BYPASS_97_REF_PGM);
+    assert_eq!((rw, rh), (40, 40));
+    assert_eq!(payload.len(), c.samples.len());
+    let mut max_diff = 0i32;
+    for (&ours, &refv) in c.samples.iter().zip(payload.iter()) {
+        max_diff = max_diff.max((ours - refv as i32).abs());
+    }
+    assert!(
+        max_diff <= 1,
+        "9-7 bypass decode deviates from the reference by {max_diff} (> 1)"
+    );
+}
+
+#[test]
+fn gray_53_bypass_multi_tile_is_pixel_exact() {
+    // §D.6 bypass across a 2×2 tile grid — pins that the Table D.9
+    // segment split's absolute pass cursor is per code-block (resetting
+    // per tile / precinct), not leaked across tiles.
+    let cs = parse_codestream(GRAY_BYPASS_TILED_53).expect("parse");
+    assert!(cs.tile_parts.len() >= 4, "expected one tile-part per tile");
+    assert!(
+        cs.header
+            .cod
+            .code_block_style_flags()
+            .selective_arithmetic_coding_bypass(),
+        "fixture must set the bypass style bit"
+    );
+    let img = decode_j2k(GRAY_BYPASS_TILED_53).expect("decode tiled bypass");
+    assert_eq!(img.width, 40);
+    assert_eq!(img.height, 40);
+    assert_eq!(img.components.len(), 1);
     assert_eq!(img.components[0].samples, gray_40x40_pattern());
 }
 
