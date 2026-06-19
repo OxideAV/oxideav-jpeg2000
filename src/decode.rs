@@ -1042,9 +1042,7 @@ fn decode_tile(
                     .bypass_cursor
                     .checked_add(contrib.coding_passes)
                     .ok_or(Error::InvalidPacketHeader)?;
-                for (&len, (span_passes, is_raw)) in
-                    contrib.segment_lengths.iter().zip(spans)
-                {
+                for (&len, (span_passes, is_raw)) in contrib.segment_lengths.iter().zip(spans) {
                     let len = len as usize;
                     let end = seg_pos.checked_add(len).ok_or(Error::PacketHeaderOverrun)?;
                     let bytes = body.get(seg_pos..end).ok_or(Error::PacketHeaderOverrun)?;
