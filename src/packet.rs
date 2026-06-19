@@ -556,6 +556,106 @@ fn read_segment_length_value(
     reader.read_bits(bits as u8)
 }
 
+/// The kind of coding pass at absolute pass index `i` within a
+/// code-block, per the T.800 §D.3 schedule. Index 0 is the first
+/// (cleanup-only) pass on the code-block's first non-empty bit-plane;
+/// from index 1 onward the passes run in repeating
+/// significance-propagation → magnitude-refinement → cleanup triples.
+///
+/// `0` = significance propagation, `1` = magnitude refinement,
+/// `2` = cleanup. Returned as a small tag so the §B.10.7.2 / Table D.9
+/// terminated-pass classification can be computed without pulling in
+/// the [`crate::t1::Pass`] type (this module is below tier-1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PassRole {
+    Sp,
+    Mr,
+    Cleanup,
+}
+
+/// Pass role at absolute pass index `i` (§D.3): index 0 is cleanup,
+/// then `(i − 1) mod 3` selects SP / MR / cleanup.
+fn pass_role(i: u32) -> PassRole {
+    if i == 0 {
+        return PassRole::Cleanup;
+    }
+    match (i - 1) % 3 {
+        0 => PassRole::Sp,
+        1 => PassRole::Mr,
+        _ => PassRole::Cleanup,
+    }
+}
+
+/// Whether the coding pass at absolute index `i` is **terminated** under
+/// the §D.6 selective-arithmetic-coding-bypass schedule (Table D.9),
+/// combined with the §D.4.2 "termination on each coding pass" flag.
+///
+/// Per Table D.9 and the §D.6 prose:
+///
+/// * bit-2 (termination on each coding pass) set → every pass is
+///   terminated, "including both raw passes".
+/// * otherwise the fourth cleanup pass (`i == 9`) terminates (the
+///   `AC, terminate` row that closes the AC region), and from bit-plane
+///   5 onward (`i ≥ 10`) every magnitude-refinement raw pass and every
+///   cleanup AC pass terminates while the significance-propagation raw
+///   pass does not.
+pub(crate) fn bypass_pass_terminated(i: u32, termination_on_each_coding_pass: bool) -> bool {
+    if termination_on_each_coding_pass {
+        return true;
+    }
+    if i == 9 {
+        // Table D.9 fourth cleanup — AC, terminate.
+        return true;
+    }
+    if i >= 10 {
+        return matches!(pass_role(i), PassRole::Mr | PassRole::Cleanup);
+    }
+    false
+}
+
+/// Whether the coding pass at absolute index `i` reads its bits from a
+/// §D.6 raw (lazy) stream rather than the MQ arithmetic decoder
+/// (Table D.9): the SP / MR passes from bit-plane 5 onward (`i ≥ 10`).
+/// Cleanup passes are always arithmetic-coded.
+pub(crate) fn bypass_pass_is_raw(i: u32) -> bool {
+    i >= 10 && matches!(pass_role(i), PassRole::Sp | PassRole::Mr)
+}
+
+/// Split a code-block's `passes` coding passes (running from absolute
+/// index `start_pass`) into the §B.10.7.2 / Table D.9 bypass codeword
+/// segments. Returns one `(span_passes, is_raw)` per segment, in coding
+/// order — `span_passes` is how many passes the segment carries and
+/// `is_raw` is whether the segment is decoded from a [`crate::t1::RawBitReader`]
+/// (its first pass is a raw SP / MR pass) rather than an
+/// [`crate::mq::MqDecoder`]. The boundaries are exactly where
+/// [`bypass_pass_terminated`] fires, plus the final included pass.
+pub(crate) fn bypass_segment_spans(
+    start_pass: u32,
+    passes: u32,
+    termination_on_each_coding_pass: bool,
+) -> Vec<(u32, bool)> {
+    let mut spans: Vec<(u32, bool)> = Vec::new();
+    if passes == 0 {
+        return spans;
+    }
+    let first = start_pass;
+    let last = start_pass + passes - 1;
+    let mut span_passes = 0u32;
+    let mut span_first = first;
+    for i in first..=last {
+        if span_passes == 0 {
+            span_first = i;
+        }
+        span_passes += 1;
+        let terminated = bypass_pass_terminated(i, termination_on_each_coding_pass) || i == last;
+        if terminated {
+            spans.push((span_passes, bypass_pass_is_raw(span_first)));
+            span_passes = 0;
+        }
+    }
+    spans
+}
+
 // ---------------------------------------------------------------------------
 // Geometry input + per-code-block state — T.800 §B.10.8.
 // ---------------------------------------------------------------------------
@@ -694,6 +794,12 @@ pub struct SubBandState {
     pub already_included: Vec<bool>,
     /// Per-code-block `Lblock` state (§B.10.7.1).
     pub lblock: Vec<LblockState>,
+    /// Per-code-block running count of coding passes already contributed
+    /// in **prior** packets (absolute pass cursor, §D.3). Needed by the
+    /// §B.10.7.2 / Table D.9 segment split (the terminated-pass set `T`
+    /// is keyed off the absolute pass index, which carries across
+    /// layers), indexed `y * width + x`.
+    pub passes_so_far: Vec<u32>,
     /// Sub-band grid dimensions.
     pub geometry: SubBandGeometry,
 }
@@ -707,6 +813,7 @@ impl SubBandState {
             zero_bitplane_tree: TagTree::new(geometry.width, geometry.height),
             already_included: vec![false; n],
             lblock: vec![LblockState::default(); n],
+            passes_so_far: vec![0u32; n],
             geometry,
         }
     }
@@ -919,6 +1026,15 @@ fn decode_one_code_block(
     // §B.10.6 — number of coding passes.
     let passes = decode_coding_passes(reader)?;
 
+    // Absolute pass cursor for this code-block at the **start** of this
+    // packet (the count of passes contributed by prior packets). The
+    // §B.10.7.2 / Table D.9 bypass split keys off the absolute pass
+    // index, so it carries across layers.
+    let start_pass = sub_band.passes_so_far[idx];
+    sub_band.passes_so_far[idx] = start_pass
+        .checked_add(passes)
+        .ok_or(Error::InvalidPacketHeader)?;
+
     // §B.10.7 — codeword-segment lengths. `split` decides how the
     // contribution's `passes` map onto §C.3 codeword segments:
     //
@@ -946,6 +1062,26 @@ fn decode_one_code_block(
             let mut lens = Vec::with_capacity(passes as usize);
             for _ in 0..passes {
                 lens.push(read_segment_length_value(lblock.lblock, 1, reader)?);
+            }
+            lens
+        }
+        SegmentSplit::Bypass {
+            termination_on_each_coding_pass,
+        } => {
+            // §B.10.7.2 / Table D.9: `T` is the set of **terminated**
+            // passes among those included in this packet, plus the final
+            // included pass if it is not already terminated. The passes
+            // run from absolute index `start_pass` to
+            // `start_pass + passes − 1`. Each signalled length covers the
+            // span from the previous boundary up to and including the
+            // next terminated pass; Equation B-19 widens by
+            // `floor(log2(passes_in_that_span))`. The increase-Lblock
+            // prefix is signalled **once** before the first length.
+            let spans = bypass_segment_spans(start_pass, passes, termination_on_each_coding_pass);
+            read_lblock_increment(lblock, reader)?;
+            let mut lens = Vec::with_capacity(spans.len());
+            for (sp, _is_raw) in spans {
+                lens.push(read_segment_length_value(lblock.lblock, sp, reader)?);
             }
             lens
         }
@@ -1004,6 +1140,24 @@ pub enum SegmentSplit {
     /// the `K` lengths covers exactly one pass (Equation B-19 widening
     /// is `floor(log2 1) = 0`).
     PerPass,
+    /// T.800 §D.6 selective arithmetic-coding bypass (Table A.19 bit 0).
+    /// The code-block contribution carves into AC and raw (lazy)
+    /// codeword segments per Table D.9: the SP / MR passes from
+    /// bit-plane 5 onward read raw bits, the cleanup passes stay AC, and
+    /// the §B.10.7.2 terminated-pass set `T` is the union of every
+    /// terminated pass (the fourth cleanup; from bit-plane 5 each MR raw
+    /// and cleanup AC pass) plus the final included pass. The number of
+    /// §B.10.7 lengths equals `|T|` over the passes included in this
+    /// packet, each sized for the passes it spans (Equation B-19).
+    ///
+    /// `termination_on_each_coding_pass` carries the COD / COC Table
+    /// A.19 bit-2 flag, which — when also set — terminates **every**
+    /// pass (including both raw passes), per the §D.6 prose.
+    Bypass {
+        /// Whether the §D.4.2 bit-2 "termination on each coding pass"
+        /// flag is also set (composes with bypass).
+        termination_on_each_coding_pass: bool,
+    },
 }
 
 /// Marker code — SOP (Start of packet, T.800 §A.8.1, `0xFF91`).
@@ -1112,6 +1266,105 @@ pub fn walk_packet_headers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- §D.6 / Table D.9 bypass segment split --------------------------
+
+    #[test]
+    fn pass_role_matches_d3_schedule() {
+        // Index 0 is the cleanup-only first pass; then SP / MR / cleanup
+        // triples repeat (§D.3).
+        assert_eq!(pass_role(0), PassRole::Cleanup);
+        assert_eq!(pass_role(1), PassRole::Sp);
+        assert_eq!(pass_role(2), PassRole::Mr);
+        assert_eq!(pass_role(3), PassRole::Cleanup);
+        assert_eq!(pass_role(9), PassRole::Cleanup); // fourth cleanup
+        assert_eq!(pass_role(10), PassRole::Sp); // first raw pass
+        assert_eq!(pass_role(11), PassRole::Mr);
+        assert_eq!(pass_role(12), PassRole::Cleanup);
+    }
+
+    #[test]
+    fn bypass_termination_follows_table_d9() {
+        // No bit-2: only the fourth cleanup (i=9) and, from bit-plane 5
+        // (i>=10), every MR raw and cleanup AC pass terminate; the SP raw
+        // pass does not.
+        for i in 0..9 {
+            assert!(
+                !bypass_pass_terminated(i, false),
+                "AC pass {i} not terminated"
+            );
+        }
+        assert!(bypass_pass_terminated(9, false)); // fourth cleanup
+        assert!(!bypass_pass_terminated(10, false)); // SP raw — not terminated
+        assert!(bypass_pass_terminated(11, false)); // MR raw — terminated
+        assert!(bypass_pass_terminated(12, false)); // cleanup AC — terminated
+        assert!(!bypass_pass_terminated(13, false)); // SP raw — not terminated
+                                                     // Bit-2 set → every pass terminated (including both raw passes).
+        for i in 0..14 {
+            assert!(
+                bypass_pass_terminated(i, true),
+                "pass {i} terminated under bit-2"
+            );
+        }
+    }
+
+    #[test]
+    fn bypass_is_raw_only_sp_mr_from_bitplane_five() {
+        assert!(!bypass_pass_is_raw(0));
+        assert!(!bypass_pass_is_raw(9)); // fourth cleanup — AC
+        assert!(bypass_pass_is_raw(10)); // SP raw
+        assert!(bypass_pass_is_raw(11)); // MR raw
+        assert!(!bypass_pass_is_raw(12)); // cleanup — always AC
+        assert!(bypass_pass_is_raw(13)); // SP raw
+    }
+
+    #[test]
+    fn bypass_segment_spans_default_schedule() {
+        // 14 passes from a fresh code-block: the AC region (10 passes,
+        // ending at the fourth cleanup) is one segment; then each
+        // bit-plane-5+ set splits into {SP raw, MR raw} (terminates on
+        // the MR) and {cleanup AC}.
+        let spans = bypass_segment_spans(0, 14, false);
+        assert_eq!(
+            spans,
+            vec![
+                (10, false), // passes 0..=9 AC, terminate on fourth cleanup
+                (2, true),   // passes 10,11 = SP raw + MR raw (terminate)
+                (1, false),  // pass 12 = cleanup AC (terminate)
+                (1, true),   // pass 13 = SP raw (final included pass → in T)
+            ]
+        );
+        // Total passes across spans equals the contribution.
+        assert_eq!(spans.iter().map(|(p, _)| p).sum::<u32>(), 14);
+    }
+
+    #[test]
+    fn bypass_segment_spans_short_block_single_ac_segment() {
+        // Fewer than 10 passes never reach the raw region — one AC
+        // segment carries every pass (the final-pass rule adds it to T).
+        let spans = bypass_segment_spans(0, 7, false);
+        assert_eq!(spans, vec![(7, false)]);
+    }
+
+    #[test]
+    fn bypass_segment_spans_termall_one_per_pass() {
+        // Bit-2 also set → every pass terminated, including both raw
+        // passes; each span is a single pass and carries its raw / AC tag.
+        let spans = bypass_segment_spans(0, 13, true);
+        assert_eq!(spans.len(), 13);
+        // Index 10 = SP raw, 11 = MR raw, 12 = cleanup AC.
+        assert_eq!(spans[10], (1, true));
+        assert_eq!(spans[11], (1, true));
+        assert_eq!(spans[12], (1, false));
+    }
+
+    #[test]
+    fn bypass_segment_spans_resume_across_layers() {
+        // A second packet resuming at absolute pass index 10 starts in
+        // the raw region: {SP raw, MR raw} then {cleanup AC}.
+        let spans = bypass_segment_spans(10, 3, false);
+        assert_eq!(spans, vec![(2, true), (1, false)]);
+    }
 
     /// Pack a sequence of bits (MSB-first) into a `Vec<u8>` per T.800
     /// §B.10.1: after every `0xFF` byte produced, the **next** bit

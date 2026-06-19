@@ -438,13 +438,35 @@ fn resolve_band_quant(
 /// included pass owns its own terminated §C.3 segment (§B.10.7.2), so
 /// `segments` holds one entry per pass — each a fresh MQ run that the
 /// tier-1 driver decodes against its own [`crate::mq::MqDecoder`].
+///
+/// Under the §D.6 selective-arithmetic-coding-bypass style the segments
+/// alternate AC and raw (lazy) spans per Table D.9, so each
+/// [`AccumSegment`] carries an `is_raw` flag the tier-1 driver consults
+/// to open a [`crate::t1::RawBitReader`] instead of a
+/// [`crate::mq::MqDecoder`].
 #[derive(Default)]
 struct BlockAccum {
     passes: u32,
     p: Option<u32>,
-    /// One `(segment bytes, passes carried by this segment)` per §C.3
-    /// codeword segment, in coding-pass order.
-    segments: Vec<(Vec<u8>, u32)>,
+    /// One entry per §C.3 codeword segment, in coding-pass order.
+    segments: Vec<AccumSegment>,
+    /// Running absolute pass cursor for the §D.6 bypass span split — the
+    /// count of passes accumulated by prior packets. Unused outside
+    /// bypass.
+    bypass_cursor: u32,
+}
+
+/// One accumulated §C.3 codeword segment for a code-block.
+struct AccumSegment {
+    /// The segment's body bytes (concatenated across packets only for
+    /// the single-segment, non-split case).
+    bytes: Vec<u8>,
+    /// Number of coding passes the segment carries.
+    passes: u32,
+    /// Whether the segment is a §D.6 raw (lazy) span — decoded from a
+    /// [`crate::t1::RawBitReader`] rather than an
+    /// [`crate::mq::MqDecoder`]. Always `false` outside §D.6 bypass.
+    is_raw: bool,
 }
 
 /// Key addressing one code-block inside one tile:
@@ -523,25 +545,24 @@ struct CodingParams {
     /// [`SegmentSplit::PerPass`] and the tier-1 driver opens a fresh
     /// [`crate::mq::MqDecoder`] per pass.
     termination_on_each_coding_pass: bool,
+    /// §D.6 "selective arithmetic coding bypass" (Table A.19 bit 0):
+    /// the SP / MR passes from bit-plane 5 onward read raw (lazy) bits
+    /// instead of the MQ arithmetic decoder, and the code-block
+    /// contribution carves into the §B.10.7.2 / Table D.9 AC + raw
+    /// codeword segments. When set the packet reader uses
+    /// [`SegmentSplit::Bypass`] and the tier-1 driver dispatches each
+    /// pass to its AC or raw entry point.
+    selective_arithmetic_coding_bypass: bool,
 }
 
 /// Build the global [`CodingParams`] from a resolved [`Cod`] (the
 /// main-header default, or a tile-part `COD` override per §A.6.1).
 ///
-/// Rejects the §D.6 selective-arithmetic-coding-bypass code-block
-/// style (Table A.19 bit 0) — its raw / lazy SP-MR segment split is not
-/// wired into the tier-1 driver — and surfaces the §D.4.2 per-pass
-/// termination decision the packet reader needs.
+/// Surfaces the §D.6 selective-arithmetic-coding-bypass (Table A.19
+/// bit 0) and §D.4.2 per-pass-termination decisions the packet reader
+/// and tier-1 driver need.
 fn coding_params_from_cod(cod: &crate::Cod) -> Result<CodingParams, Error> {
     let style_flags = cod.code_block_style_flags();
-    if style_flags.selective_arithmetic_coding_bypass() {
-        // §D.6 selective arithmetic-coding bypass splits the code-block
-        // into AC + raw (lazy) codeword segments and reads the SP / MR
-        // passes from bit-plane 5 onward directly from a bit-stuffed
-        // stream. That raw-mode dispatch is not wired into the tier-1
-        // driver below yet, so reject it cleanly.
-        return Err(Error::NotImplemented);
-    }
     Ok(CodingParams {
         layers: cod.layers,
         progression: cod.progression,
@@ -563,6 +584,11 @@ fn coding_params_from_cod(cod: &crate::Cod) -> Result<CodingParams, Error> {
         // boundary — and is threaded into the `BitPlaneSequencer` rather
         // than the packet reader.
         termination_on_each_coding_pass: style_flags.termination_on_each_coding_pass(),
+        // §D.6 selective arithmetic-coding bypass (Table A.19 bit 0):
+        // the tier-1 driver dispatches the SP / MR passes from bit-plane
+        // 5 onward to their raw entry points and the packet reader uses
+        // the §B.10.7.2 / Table D.9 `SegmentSplit::Bypass` length layout.
+        selective_arithmetic_coding_bypass: style_flags.selective_arithmetic_coding_bypass(),
     })
 }
 
@@ -935,7 +961,14 @@ fn decode_tile(
             },
         ));
     }
-    let split = if params.termination_on_each_coding_pass {
+    let split = if params.selective_arithmetic_coding_bypass {
+        // §D.6 bypass — Table D.9 AC + raw codeword-segment split.
+        // Bit-2 ("termination on each coding pass") composes: when also
+        // set every pass (including both raw passes) terminates.
+        SegmentSplit::Bypass {
+            termination_on_each_coding_pass: params.termination_on_each_coding_pass,
+        }
+    } else if params.termination_on_each_coding_pass {
         SegmentSplit::PerPass
     } else {
         SegmentSplit::Single
@@ -987,6 +1020,43 @@ fn decode_tile(
             //   tier-1 driver opens a fresh MQ decoder per entry. Push
             //   one entry per pass (no cross-layer concatenation: each
             //   terminated pass is independent).
+            // * §D.6 bypass segments (§B.10.7.2, Table D.9) — the packet
+            //   reader signalled `|T|` lengths sized for AC + raw spans.
+            //   Recompute the matching `(span_passes, is_raw)` from the
+            //   running absolute pass cursor (which carries across
+            //   layers) and record each segment with its raw / AC tag so
+            //   the tier-1 driver dispatches to the right reader.
+            if let SegmentSplit::Bypass {
+                termination_on_each_coding_pass,
+            } = split
+            {
+                let spans = crate::packet::bypass_segment_spans(
+                    entry.bypass_cursor,
+                    contrib.coding_passes,
+                    termination_on_each_coding_pass,
+                );
+                if spans.len() != contrib.segment_lengths.len() {
+                    return Err(Error::InvalidPacketHeader);
+                }
+                entry.bypass_cursor = entry
+                    .bypass_cursor
+                    .checked_add(contrib.coding_passes)
+                    .ok_or(Error::InvalidPacketHeader)?;
+                for (&len, (span_passes, is_raw)) in
+                    contrib.segment_lengths.iter().zip(spans)
+                {
+                    let len = len as usize;
+                    let end = seg_pos.checked_add(len).ok_or(Error::PacketHeaderOverrun)?;
+                    let bytes = body.get(seg_pos..end).ok_or(Error::PacketHeaderOverrun)?;
+                    entry.segments.push(AccumSegment {
+                        bytes: bytes.to_vec(),
+                        passes: span_passes,
+                        is_raw,
+                    });
+                    seg_pos = end;
+                }
+                continue;
+            }
             let num_segs = contrib.segment_lengths.len();
             if num_segs <= 1 {
                 let len = contrib.segment_lengths.first().copied().unwrap_or(0) as usize;
@@ -994,12 +1064,16 @@ fn decode_tile(
                 let bytes = body.get(seg_pos..end).ok_or(Error::PacketHeaderOverrun)?;
                 // Append onto the single shared segment for this block.
                 if entry.segments.is_empty() {
-                    entry.segments.push((Vec::new(), 0));
+                    entry.segments.push(AccumSegment {
+                        bytes: Vec::new(),
+                        passes: 0,
+                        is_raw: false,
+                    });
                 }
                 let seg = &mut entry.segments[0];
-                seg.0.extend_from_slice(bytes);
-                seg.1 = seg
-                    .1
+                seg.bytes.extend_from_slice(bytes);
+                seg.passes = seg
+                    .passes
                     .checked_add(contrib.coding_passes)
                     .ok_or(Error::InvalidPacketHeader)?;
                 seg_pos = end;
@@ -1020,7 +1094,11 @@ fn decode_tile(
                             .checked_sub(si as u32)
                             .ok_or(Error::InvalidPacketHeader)?
                     };
-                    entry.segments.push((bytes.to_vec(), seg_passes));
+                    entry.segments.push(AccumSegment {
+                        bytes: bytes.to_vec(),
+                        passes: seg_passes,
+                        is_raw: false,
+                    });
                     seg_pos = end;
                 }
             }
@@ -1095,22 +1173,31 @@ fn decode_tile(
             .with_segmentation_symbols(params.segmentation_symbols)
             .with_vertically_causal_context(params.vertically_causal)
             .with_reset_context_probabilities(params.reset_context_probabilities)
-            .with_termination_on_each_coding_pass(params.termination_on_each_coding_pass);
+            .with_termination_on_each_coding_pass(params.termination_on_each_coding_pass)
+            .with_selective_arithmetic_coding_bypass(params.selective_arithmetic_coding_bypass);
         // Drive the §D.3 pass schedule across this code-block's §C.3
-        // codeword segments. Each segment opens a fresh MqDecoder (the
+        // codeword segments. Each AC segment opens a fresh MqDecoder (the
         // MQ engine restarts per §C.3 at every termination boundary —
         // §D.4.1 0xFF-fill is synthesised by `MqDecoder::new`), while
         // the Annex D context array (`ctx`) persists across segments per
         // §D.4 (unless the §C.3.6 reset bit is set, which the sequencer
         // applies internally). The single-segment case is one iteration
         // carrying every pass; the §D.4.2 per-pass case is one iteration
-        // per terminated pass.
-        for (seg_bytes, seg_passes) in &acc.segments {
-            if *seg_passes == 0 {
+        // per terminated pass; the §D.6 bypass case alternates AC and
+        // raw spans (each raw span opens a fresh RawBitReader instead).
+        for seg in &acc.segments {
+            if seg.passes == 0 {
                 continue;
             }
-            let mut decoder = crate::mq::MqDecoder::new(seg_bytes);
-            seq.decode_passes(&mut block, &mut decoder, &mut ctx, *seg_passes)?;
+            if seg.is_raw {
+                // §D.6 raw (lazy) span — the SP / MR passes read from a
+                // bit-stuffed stream. The MQ context array is untouched.
+                let mut raw = crate::t1::RawBitReader::new(&seg.bytes);
+                seq.decode_passes_raw(&mut block, &mut raw, seg.passes)?;
+            } else {
+                let mut decoder = crate::mq::MqDecoder::new(&seg.bytes);
+                seq.decode_passes(&mut block, &mut decoder, &mut ctx, seg.passes)?;
+            }
         }
         // Record the §B.10.5 zero-MSB count so the reassembly bridge can
         // recover the full per-coefficient §D.2.1 Nb(u, v) =
@@ -1888,19 +1975,22 @@ mod tests {
     }
 
     #[test]
-    fn tile_cod_bypass_style_is_rejected() {
-        // §D.6 selective arithmetic-coding bypass is unwired; a tile COD
-        // that sets it is rejected even though the main COD did not.
+    fn tile_cod_bypass_style_propagates_into_resolved_params() {
+        // §D.6 selective arithmetic-coding bypass: a tile COD that sets
+        // the Table A.19 bit-0 style flag turns the bypass schedule on
+        // for that tile even though the main COD did not. The resolved
+        // tile params carry the flag into the tier-1 driver.
         let main_c = cod(2, 2, 2, 0x00, WaveletTransform::Reversible5x3, &[]);
         let main_q = qcd(QuantizationStyle::None, 2, &[0x40, 0x41, 0x42]);
         let (params, coding, quant) = main_defaults(2, &main_c, &main_q);
+        assert!(!params.selective_arithmetic_coding_bypass);
         let roi = vec![0u32; 2];
         let tile_c = cod(2, 2, 2, 0x01, WaveletTransform::Reversible5x3, &[]);
         let markers = vec![crate::TilePartMarker::Cod(tile_c)];
-        assert!(matches!(
-            resolve_tile_coding(2, &main_c, &[], &params, &coding, &quant, &roi, &markers),
-            Err(Error::NotImplemented)
-        ));
+        let resolved =
+            resolve_tile_coding(2, &main_c, &[], &params, &coding, &quant, &roi, &markers)
+                .expect("resolve");
+        assert!(resolved.params.selective_arithmetic_coding_bypass);
     }
 
     #[test]

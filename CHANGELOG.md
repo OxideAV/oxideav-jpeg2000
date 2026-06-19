@@ -6,6 +6,26 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 341 (2026-06-19).** **§D.6 selective
+  arithmetic-coding bypass** (T.800 Table A.19 Scod bit 0). The
+  code-block-style bypass bit is now decoded instead of rejected with
+  `Error::NotImplemented`. From bit-plane 5 onward the
+  significance-propagation and magnitude-refinement passes read raw
+  (lazy) bits from a §D.6 bit-stuffed stream (§D.6 stuff-bit rule, the
+  §D.6 Equation D-2 `signbit = raw_value` sign), while every cleanup
+  pass stays arithmetic-coded. The code-block contribution carves into
+  the §B.10.7.2 / Table D.9 AC + raw codeword segments via a new
+  `SegmentSplit::Bypass`: the terminated-pass set `T` (fourth cleanup;
+  from bit-plane 5 each MR raw and cleanup AC pass, plus the final
+  included pass) is keyed off the **absolute** pass index, so it carries
+  across layers (`SubBandState::passes_so_far`). A new
+  `BitPlaneSequencer::decode_passes_raw` drives the raw spans through a
+  `RawBitReader`; the tier-1 driver alternates a fresh `MqDecoder` (AC
+  spans) and `RawBitReader` (raw spans) on one continuous §D.3 schedule.
+  Bit-2 ("termination on each coding pass") composes with bypass per the
+  §D.6 prose (every pass terminated, both raw passes included). Pinned
+  by a new pixel-exact `gray-40x40-bypass-53.j2k` end-to-end fixture and
+  Table D.9 span-split unit tests.
 * **Clean-room round 338 (2026-06-19).** **Tile-part header coding
   overrides** (T.800 §A.6.1 / §A.6.2 / §A.6.4 / §A.6.5 / §A.6.3). A
   tile's first tile-part (`TPsot = 0`) `COD` / `COC` / `QCD` / `QCC` /

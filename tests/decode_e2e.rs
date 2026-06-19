@@ -70,6 +70,21 @@ const GRAY_MULTILAYER_53: &[u8] = include_bytes!("data/gray-64x64-multilayer-53.
 // markers scrubbed; encoded with an opaque CLI codec as a black box.
 const GRAY_TERMALL_53: &[u8] = include_bytes!("data/gray-40x40-termall-53.j2k");
 
+// §D.6 selective-arithmetic-coding-bypass (Table A.19 bit 0) fixture:
+// 40×40 gray, lossless 5-3, NL = 3, 8×8 code-blocks, single layer. The
+// COD code-block-style byte sets bit 0, so the significance-propagation
+// and magnitude-refinement passes from bit-plane 5 onward read raw
+// (lazy) bits from a bit-stuffed §D.6 stream while every cleanup pass
+// stays arithmetic-coded. The code-block contribution carves into the
+// §B.10.7.2 / Table D.9 AC + raw codeword segments, so the packet
+// header signals |T| lengths and the tier-1 driver alternates a fresh
+// MqDecoder (AC spans) and RawBitReader (raw spans) on one continuous
+// §D.3 schedule. A driver that decoded every pass through the MQ engine
+// would desync at the first raw boundary, so pixel-exactness here pins
+// the whole §D.6 path. COM markers scrubbed; encoded with an opaque CLI
+// codec as a black box.
+const GRAY_BYPASS_53: &[u8] = include_bytes!("data/gray-40x40-bypass-53.j2k");
+
 /// Deterministic 64×64 gray source pattern (the raster the multi-layer
 /// fixture was encoded from); same arithmetic family as
 /// [`gray_17x13_pattern`] with an extra high-frequency `(x ^ y)` term so
@@ -522,38 +537,39 @@ fn gray_53_tile_part_rgn_zero_shift_is_pixel_exact() {
     assert_eq!(img.components[0].samples, gray_17x13_pattern());
 }
 
-/// A tile-part `COD` that sets the §D.6 selective-arithmetic-coding
-/// bypass style bit (Table A.19 bit 0) — unwired in the tier-1 driver —
-/// must surface a clean `Error::NotImplemented` for that tile even
-/// though the main `COD` did not set it.
+/// §D.6 selective-arithmetic-coding bypass (Table A.19 bit 0), the main
+/// path: a 40×40 lossless 5-3 stream whose `COD` sets the bypass style.
+/// The SP / MR passes from bit-plane 5 onward are raw and the cleanup
+/// passes stay AC, split into the §B.10.7.2 / Table D.9 codeword
+/// segments — pixel-exactness pins the AC ↔ raw dispatch, the raw
+/// bit-stuffing reader and the segment-span split.
 #[test]
-fn gray_53_tile_part_cod_bypass_style_is_rejected() {
-    use oxideav_jpeg2000::{Error, WaveletTransform, MARKER_COD};
-
-    let cs = parse_codestream(GRAY_53).expect("parse");
-    let cod = &cs.header.cod;
-    let kernel_byte = match cod.transform {
-        WaveletTransform::Irreversible9x7 => 0x00u8,
-        WaveletTransform::Reversible5x3 => 0x01u8,
-        WaveletTransform::Reserved(b) => b,
-    };
-    let lcod = 2 + 1 + 4 + 5 + cod.precincts.len();
-    let mut seg = Vec::new();
-    seg.extend_from_slice(&MARKER_COD.to_be_bytes());
-    seg.extend_from_slice(&(lcod as u16).to_be_bytes());
-    seg.push(0u8); // Scod = 0 (maximum precincts)
-    seg.push(0u8); // progression LRCP
-    seg.extend_from_slice(&cod.layers.to_be_bytes());
-    seg.push(cod.multi_component_transform);
-    seg.push(cod.decomposition_levels);
-    seg.push(cod.code_block_width_exp);
-    seg.push(cod.code_block_height_exp);
-    seg.push(0x01u8); // code-block style: §D.6 bypass bit set
-    seg.push(kernel_byte);
-    seg.extend_from_slice(&cod.precincts);
-
-    let injected = inject_into_first_tile_part_header(GRAY_53, &seg);
-    assert_eq!(decode_j2k(&injected), Err(Error::NotImplemented));
+fn gray_53_selective_arithmetic_coding_bypass_is_pixel_exact() {
+    let cs = parse_codestream(GRAY_BYPASS_53).expect("parse");
+    assert!(
+        cs.header
+            .cod
+            .code_block_style_flags()
+            .selective_arithmetic_coding_bypass(),
+        "fixture must set the selective-arithmetic-coding-bypass style bit"
+    );
+    // And it must NOT set the termination-on-each-pass bit (so the
+    // Table D.9 default AC + raw split — not the all-terminated split —
+    // is exercised).
+    assert!(
+        !cs.header
+            .cod
+            .code_block_style_flags()
+            .termination_on_each_coding_pass(),
+        "fixture must not set the termination-on-each-coding-pass bit"
+    );
+    let img = decode_j2k(GRAY_BYPASS_53).expect("decode selective arithmetic coding bypass");
+    assert_eq!(img.width, 40);
+    assert_eq!(img.height, 40);
+    assert_eq!(img.components.len(), 1);
+    assert_eq!(img.components[0].precision_bits, 8);
+    assert!(!img.components[0].is_signed);
+    assert_eq!(img.components[0].samples, gray_40x40_pattern());
 }
 
 #[test]

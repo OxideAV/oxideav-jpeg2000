@@ -2336,6 +2336,60 @@ impl BitPlaneSequencer {
         }
         Ok(total)
     }
+
+    /// Lower-level entry point: run exactly `passes` Annex D coding
+    /// passes against a caller-built [`RawBitReader`], for a §D.6
+    /// selective-arithmetic-coding-bypass **raw (lazy) span**.
+    ///
+    /// Only the significance-propagation and magnitude-refinement passes
+    /// are ever decoded raw (Table D.9) — the cleanup pass is always
+    /// arithmetic-coded and never appears in a raw span — so this
+    /// method drives [`CodeBlock::significance_propagation_pass_raw`] /
+    /// [`CodeBlock::magnitude_refinement_pass_raw`] and rejects a
+    /// [`Pass::Cleanup`] boundary as [`Error::InvalidPacketHeader`]
+    /// (a malformed split that would put a cleanup pass in a raw
+    /// segment).
+    ///
+    /// The MQ context array is **not** referenced — raw passes touch no
+    /// MQ contexts (§D.6). The §C.3.6 context-reset bit therefore has no
+    /// effect across a raw span; the §D.3 significance / refinement
+    /// state of the [`CodeBlock`] still threads through so the next AC
+    /// pass resumes correctly.
+    ///
+    /// The sequencer advances `next_pass` / `current_bitplane` /
+    /// `passes_decoded` exactly as the AC driver does, so the AC and raw
+    /// spans interleave on one continuous §D.3 schedule.
+    pub fn decode_passes_raw(
+        &mut self,
+        block: &mut CodeBlock,
+        raw: &mut RawBitReader<'_>,
+        passes: u32,
+    ) -> Result<usize, Error> {
+        block.vertically_causal = self.vertically_causal_context;
+        let mut total = 0usize;
+        for _ in 0..passes {
+            let bitplane = self.current_bitplane;
+            let n = match self.next_pass {
+                Pass::Sp => {
+                    let n = block.significance_propagation_pass_raw(bitplane, raw)?;
+                    self.next_pass = Pass::Mr;
+                    n
+                }
+                Pass::Mr => {
+                    let n = block.magnitude_refinement_pass_raw(bitplane, raw)?;
+                    self.next_pass = Pass::Cleanup;
+                    n
+                }
+                // §D.6 / Table D.9: a cleanup pass is always AC-coded and
+                // is never carried in a raw span. Reaching one here means
+                // the segment split mis-assigned passes to a raw reader.
+                Pass::Cleanup => return Err(Error::InvalidPacketHeader),
+            };
+            total += n;
+            self.passes_decoded = self.passes_decoded.saturating_add(1);
+        }
+        Ok(total)
+    }
 }
 
 #[cfg(test)]

@@ -43,7 +43,17 @@ What is implemented:
   §B.10.7.2 multi-segment packet-header lengths are read (`K = passes`,
   one increase-`Lblock` prefix) and a fresh MQ decoder is opened per
   pass while the Annex D contexts persist across the per-pass
-  boundaries.
+  boundaries. The §D.6 **selective arithmetic-coding bypass** style bit
+  (Table A.19 Scod bit 0) is honoured: from bit-plane 5 onward the
+  significance-propagation and magnitude-refinement passes read raw
+  (lazy) bits from a §D.6 bit-stuffed stream while the cleanup passes
+  stay arithmetic-coded, the code-block contribution carves into the
+  §B.10.7.2 / Table D.9 AC + raw codeword segments (the terminated-pass
+  set `T` is keyed off the absolute pass index, so it carries across
+  layers), and the tier-1 driver alternates a fresh MQ decoder and a
+  raw-bit reader on one continuous §D.3 schedule. Bit-2 composes with
+  bypass per the §D.6 prose (every pass terminated, both raw passes
+  included).
 - **Reassembly** — per-coefficient `Nb(u, v)` magnitude-bit tracking for
   rate-truncated streams, dequantisation, the 5-3 and 9-7 inverse DWT,
   and the inverse multi-component transform.
@@ -97,12 +107,6 @@ These surface a clean `Error::NotImplemented` rather than mis-decoding:
   (main-header *and* tile-part implicit-ROI / Maxshift `RGN` *are*
   honoured), `POC` order changes mid-decode (main-header or tile-part),
   and `PPM` / `PPT` packed-header markers.
-- The Table A.19 selective arithmetic coding bypass style bit (§D.6),
-  which carves the code-block contribution into AC + raw (lazy)
-  §B.10.7.2 codeword segments and reads the significance-propagation /
-  magnitude-refinement passes from bit-plane 5 onward directly from a
-  bit-stuffed stream (the §C.3.6 context-reset and §D.4.2
-  per-pass-termination bits *are* honoured).
 - Position-keyed orders under non-power-of-two sub-sampling.
 - High-Throughput JPEG 2000 (HTJ2K) block coding.
 
