@@ -107,12 +107,20 @@ These surface a clean `Error::NotImplemented` rather than mis-decoding:
   precincts / kernel *is* honoured), in both the main and tile-part
   headers (main-header *and* tile-part `COD` / `COC` / `QCD` / `QCC`
   overrides are otherwise honoured).
-- A non-Maxshift `RGN` style (Table A.25 `Srgn ≠ 0`) in either header
-  (main-header *and* tile-part implicit-ROI / Maxshift `RGN` *are*
-  honoured), `POC` order changes mid-decode (main-header or tile-part),
-  and `PPM` / `PPT` packed-header markers.
+- A non-Maxshift `RGN` style. T.800 Table A.25 (Part 1) defines **only**
+  `Srgn = 0` (implicit ROI / Maxshift) — all other values are reserved
+  in Part 1, and the main-header *and* tile-part Maxshift `RGN` *are*
+  honoured. The "scaling based" arbitrary-shaped ROI (`Srgn = 1`
+  rectangle / `Srgn = 2` ellipse) is an **ISO/IEC 15444-2 (Part 2)**
+  extension (extended RGN marker + `Rsiz` capability + the Annex L
+  wavelet-domain ROI-mask generation and mask-driven L.1 de-scaling),
+  outside this Part-1 decoder's scope; an `Srgn ≠ 0` (or a Part-2
+  extended-length) `RGN` surfaces a clean error rather than mis-decoding.
+- `POC` order changes mid-decode (main-header or tile-part), and `PPM` /
+  `PPT` packed-header markers.
 - Position-keyed orders under non-power-of-two sub-sampling.
-- High-Throughput JPEG 2000 (HTJ2K) block coding.
+- High-Throughput JPEG 2000 (HTJ2K) block coding (ISO/IEC 15444-15 /
+  T.814).
 
 ## Public API
 

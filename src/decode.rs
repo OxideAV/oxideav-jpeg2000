@@ -1973,6 +1973,25 @@ mod tests {
     }
 
     #[test]
+    fn tile_rgn_non_maxshift_style_is_rejected() {
+        // T.800 Table A.25 (Part 1) defines only Srgn = 0 (Maxshift); a
+        // tile-part RGN with a non-zero Srgn is the Part-2 scaling-based
+        // arbitrary ROI, outside this Part-1 decoder. It is rejected with
+        // NotImplemented (not mis-decoded) — mirroring the main-header
+        // path.
+        let main_c = cod(2, 2, 2, 0x00, WaveletTransform::Reversible5x3, &[]);
+        let main_q = qcd(QuantizationStyle::None, 2, &[0x40, 0x41, 0x42]);
+        let (params, coding, quant) = main_defaults(2, &main_c, &main_q);
+        let roi = vec![0u32; 2];
+        let tile_rgn = rgn(1, 1, 7); // Srgn = 1 (Part-2 rectangle ROI).
+        let markers = vec![crate::TilePartMarker::Rgn(tile_rgn)];
+        assert!(matches!(
+            resolve_tile_coding(2, &main_c, &[], &params, &coding, &quant, &roi, &markers),
+            Err(Error::NotImplemented)
+        ));
+    }
+
+    #[test]
     fn tile_cod_bypass_style_propagates_into_resolved_params() {
         // §D.6 selective arithmetic-coding bypass: a tile COD that sets
         // the Table A.19 bit-0 style flag turns the bypass schedule on
