@@ -861,32 +861,43 @@ fn decode_quad_magsgn(grid: &mut HtGrid, magsgn: &mut MagSgnReader, q: usize) ->
 
 /// Decode an HTJ2K code-block from its HT cleanup segment (and, when
 /// `z_blk > 1`, its HT refinement segment), returning a [`CodeBlock`]
-/// with the recovered coefficient grid.
+/// plus the block-level `Nb` (number of decoded magnitude bit-planes,
+/// §D.2.1) for the §E.1 reconstruction.
 ///
+/// * `mb` — the sub-band's `Mb` (T.800 Equation E-2 / §B.10.5): the
+///   total number of magnitude bit-planes available for the band. The
+///   recovered magnitudes are positioned MSB-first so the least-
+///   significant decoded bit-plane sits at its true positional weight
+///   `2^(Mb − Nb)`, exactly as the Annex D MQ tier-1 path stores them,
+///   so [`crate::dequant::reconstruct_reversible`] /
+///   [`crate::dequant::reconstruct_irreversible`] consume the block
+///   identically regardless of which coder ran.
 /// * `cleanup` — the HT cleanup segment bytes (§B.2).
 /// * `refinement` — the HT refinement segment bytes; ignored when
 ///   `z_blk <= 1`.
 /// * `z_blk` — number of coding passes processed (§B.3): 1 = cleanup
 ///   only, 2 = + SigProp, 3 = + SigProp + MagRef.
-/// * `s_blk` — number of skipped magnitude bit-planes (§B.3 / §7.6).
-///
-/// The returned block carries the magnitude (anchored so the cleanup
-/// pass's least-significant decoded bit-plane sits at bit 0), sign and
-/// significance of every sample; `S_blk` is applied by the caller's
-/// dequantisation stage exactly as for an MQ-decoded block.
+/// * `s_blk` — number of skipped (zero) magnitude bit-planes for the HT
+///   set (§B.3 / §7.6). With `z_blk == 1` every sample has
+///   `Nb = S_blk + 1`.
+// The eight parameters are the irreducible §7.1 / §B.3 inputs the HT
+// block-decoder needs (geometry + Mb + the two segments + Z_blk + S_blk);
+// grouping them into a struct would only relocate the same fields.
+#[allow(clippy::too_many_arguments)]
 pub fn decode_ht_codeblock(
     orientation: SubBandOrientation,
     width: usize,
     height: usize,
+    mb: u32,
     cleanup: &[u8],
     refinement: &[u8],
     z_blk: u8,
     s_blk: u32,
-) -> Result<CodeBlock, Error> {
+) -> Result<(CodeBlock, u32), Error> {
     assert!(width >= 1 && height >= 1);
     if z_blk == 0 || cleanup.is_empty() {
         // No HT segments: all samples are 0 (§7.1.1).
-        return Ok(CodeBlock::new(orientation, width, height));
+        return Ok((CodeBlock::new(orientation, width, height), 0));
     }
 
     let mut grid = HtGrid::new(width, height);
@@ -906,22 +917,36 @@ pub fn decode_ht_codeblock(
         decode_magref(&grid, refinement, &mut r, &mut z)?;
     }
 
-    // §7.6 — assemble the output coefficient grid. The cleanup pass
-    // recovers μ_n directly; the SigProp/MagRef passes contribute one
-    // extra LSB (z_n) that we fold into the magnitude when present.
+    // §7.6 — block-level Nb. Every sample decoded down to bit-plane
+    // S_blk via the cleanup pass has Nb = S_blk + 1; the refinement
+    // passes add one further bit-plane (Nb = S_blk + 2) to refined
+    // samples. We report the cleanup-level Nb and fold any refinement
+    // bit directly into the magnitude integer (full precision where
+    // refined), which is exact for the full-decode case Nb ≥ Mb.
+    let nb = (s_blk + 1).min(mb);
+
     let mut coefficients = vec![Coefficient::default(); width * height];
     for y in 0..height {
         for x in 0..width {
             let idx = x + y * width;
             let mu = grid.mu[idx];
             let sigma = grid.sigma[idx];
-            // Fold the refinement bit: when z_n is set the decoder added
-            // one further magnitude bit-plane (the r_n bit) below μ_n's
-            // LSB (§7.6 MSB_{S_blk+2} = r_n).
-            let mag = if z[idx] != 0 {
-                (mu << 1) | (r[idx] as u32)
+            // Assemble the magnitude integer MSB-first. The cleanup pass
+            // recovers μ_n (S_blk + 1 bits); a refined sample contributes
+            // one further LSB (§7.6 MSB_{S_blk+2} = r_n).
+            let (bits, sample_nb) = if z[idx] != 0 {
+                ((mu << 1) | (r[idx] as u32), s_blk + 2)
             } else {
-                mu
+                (mu, s_blk + 1)
+            };
+            // Position the bits at their true §E.1 weight: shift up by
+            // (Mb − Nb) so the least-significant decoded bit sits at
+            // 2^(Mb − Nb), matching the Annex D convention. Clamp when
+            // Nb ≥ Mb (full decode — no shift).
+            let mag = if mb > sample_nb {
+                bits << (mb - sample_nb)
+            } else {
+                bits
             };
             // A cleanup-significant sample carries the cleanup sign; a
             // sample made newly significant only by the SigProp pass
@@ -937,9 +962,8 @@ pub fn decode_ht_codeblock(
         }
     }
 
-    let mut block = CodeBlock::from_coefficients(orientation, width, height, coefficients);
-    block.set_zero_bit_planes(s_blk);
-    Ok(block)
+    let block = CodeBlock::from_coefficients(orientation, width, height, coefficients);
+    Ok((block, nb))
 }
 
 /// §7.4 — HT SigProp decoding (refinement) pass.

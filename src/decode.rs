@@ -154,16 +154,42 @@ fn reject_unsupported_main_header_markers(bytes: &[u8], header_end: usize) -> Re
     let mut pos = 2usize; // skip SOC (already validated by the parser)
     while pos + 4 <= header_end {
         let marker = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]);
-        match marker {
-            MARKER_POC | MARKER_PPM | MARKER_CAP => {
-                return Err(Error::NotImplemented);
-            }
-            MARKER_SOC | MARKER_SIZ => {}
-            _ => {}
-        }
         let len = u16::from_be_bytes([bytes[pos + 2], bytes[pos + 3]]) as usize;
         if len < 2 {
             return Err(Error::InvalidMarkerLength);
+        }
+        match marker {
+            MARKER_POC | MARKER_PPM => {
+                return Err(Error::NotImplemented);
+            }
+            MARKER_CAP => {
+                // T.814 §A.3: the only CAP configuration this decoder
+                // honours is one that signals HTJ2K (Pcap bit 15 set). A
+                // CAP segment that signals some *other* capability we do
+                // not implement is rejected; one that signals only HT is
+                // accepted (the HT path is driven by the SPcod bit-6 flag
+                // per tile-component, parsed from COD/COC).
+                let seg_end = pos + 2 + len;
+                if seg_end > header_end || len < 6 {
+                    return Err(Error::InvalidMarkerLength);
+                }
+                let pcap = u32::from_be_bytes([
+                    bytes[pos + 4],
+                    bytes[pos + 5],
+                    bytes[pos + 6],
+                    bytes[pos + 7],
+                ]);
+                // Pcap15 = the 15th most-significant bit of the 32-bit
+                // Pcap field (bit index 32 − 15 = 17 from the LSB).
+                let pcap15 = (pcap >> (32 - 15)) & 1;
+                // Any capability bit other than Pcap15 means a Part we do
+                // not handle.
+                if pcap & !(1u32 << (32 - 15)) != 0 || pcap15 == 0 {
+                    return Err(Error::NotImplemented);
+                }
+            }
+            MARKER_SOC | MARKER_SIZ => {}
+            _ => {}
         }
         pos += 2 + len;
     }
@@ -553,6 +579,13 @@ struct CodingParams {
     /// [`SegmentSplit::Bypass`] and the tier-1 driver dispatches each
     /// pass to its AC or raw entry point.
     selective_arithmetic_coding_bypass: bool,
+    /// T.814 §A.4 SPcod bit 6: the tile-component's code-blocks are
+    /// HTJ2K (ITU-T T.814 | ISO/IEC 15444-15) HT code-blocks, decoded by
+    /// [`crate::ht`] rather than the Annex D MQ tier-1 path. When set,
+    /// the §D.6 / §D.4.2 flags (Table A.19 bits 0/2) do not apply to the
+    /// HT code-blocks (Table A.4) and are forced off so the packet reader
+    /// uses the single-segment layout.
+    high_throughput: bool,
 }
 
 /// Build the global [`CodingParams`] from a resolved [`Cod`] (the
@@ -563,6 +596,12 @@ struct CodingParams {
 /// and tier-1 driver need.
 fn coding_params_from_cod(cod: &crate::Cod) -> Result<CodingParams, Error> {
     let style_flags = cod.code_block_style_flags();
+    // T.814 §A.4: when bit 6 is set the code-blocks are HT code-blocks
+    // and the Table A.4 reading of the SPcod byte applies — bits 0/1/2/4/5
+    // (bypass / context-reset / per-pass-termination / predictable-
+    // termination / segmentation-symbols) do NOT apply to HT code-blocks.
+    // Only the vertically-causal bit 3 carries over. Force the rest off.
+    let ht = style_flags.high_throughput();
     Ok(CodingParams {
         layers: cod.layers,
         progression: cod.progression,
@@ -573,9 +612,10 @@ fn coding_params_from_cod(cod: &crate::Cod) -> Result<CodingParams, Error> {
             (false, true) => SopEphMode::EphOnly,
             (true, true) => SopEphMode::SopAndEph,
         },
-        segmentation_symbols: style_flags.segmentation_symbols(),
+        segmentation_symbols: !ht && style_flags.segmentation_symbols(),
         vertically_causal: style_flags.vertically_causal_context(),
-        reset_context_probabilities: style_flags.reset_context_probabilities(),
+        reset_context_probabilities: !ht && style_flags.reset_context_probabilities(),
+        high_throughput: ht,
         // §D.4.2 "termination on each coding pass" (Table A.19 bit 2)
         // splits the contribution into one terminated §C.3 codeword
         // segment per coding pass (§B.10.7.2). The §C.3.6 context-reset
@@ -583,12 +623,12 @@ fn coding_params_from_cod(cod: &crate::Cod) -> Result<CodingParams, Error> {
         // the Annex D contexts to their Table D.7 states at each pass
         // boundary — and is threaded into the `BitPlaneSequencer` rather
         // than the packet reader.
-        termination_on_each_coding_pass: style_flags.termination_on_each_coding_pass(),
+        termination_on_each_coding_pass: !ht && style_flags.termination_on_each_coding_pass(),
         // §D.6 selective arithmetic-coding bypass (Table A.19 bit 0):
         // the tier-1 driver dispatches the SP / MR passes from bit-plane
         // 5 onward to their raw entry points and the packet reader uses
         // the §B.10.7.2 / Table D.9 `SegmentSplit::Bypass` length layout.
-        selective_arithmetic_coding_bypass: style_flags.selective_arithmetic_coding_bypass(),
+        selective_arithmetic_coding_bypass: !ht && style_flags.selective_arithmetic_coding_bypass(),
     })
 }
 
@@ -1158,9 +1198,62 @@ fn decode_tile(
             return Err(Error::InvalidPacketHeader);
         }
         // §D.3: at most 3 (M'b − P) − 2 passes fit above bit-plane 0.
-        if acc.passes > 3 * (mb_coded - p) - 2 {
+        // The HT path has its own §B.3 cap (Z_blk ≤ 3) and a different
+        // pass↔bit-plane relationship, so the Annex D cap does not apply.
+        if !params.high_throughput && acc.passes > 3 * (mb_coded - p) - 2 {
             return Err(Error::InvalidPacketHeader);
         }
+        // -- HTJ2K (T.814) HT code-block path --
+        // When the tile-component signals HT block coding (SPcod bit 6),
+        // every code-block is an HT code-block (§A.4 HTONLY/HTDECLARED).
+        // The §B.2 HT segments map onto the accumulated codeword
+        // segments: the first carries the HT cleanup pass; a following
+        // non-empty segment carries the HT refinement passes (SigProp +
+        // optional MagRef). `Z_blk` is the number of coding passes in
+        // the (single) HT set this decode processes, capped at 3.
+        if params.high_throughput {
+            let cleanup = acc
+                .segments
+                .first()
+                .map(|s| s.bytes.as_slice())
+                .unwrap_or(&[]);
+            let refinement = acc
+                .segments
+                .get(1)
+                .map(|s| s.bytes.as_slice())
+                .unwrap_or(&[]);
+            // §B.3: Z_blk is the number of coding passes processed.
+            let z_blk = acc.passes.min(3) as u8;
+            // §B.3 S_blk for the first HT set: S_blk = P + P0 + S_skip,
+            // with P0 = S_skip = 0 for a single-HT-set code-block (the
+            // SINGLEHT case this round targets).
+            let s_blk = p;
+            let (mut block, nb_ht) = crate::ht::decode_ht_codeblock(
+                psb.orientation,
+                placement.width() as usize,
+                placement.height() as usize,
+                mb_coded,
+                cleanup,
+                refinement,
+                z_blk,
+                s_blk,
+            )?;
+            block.set_zero_bit_planes(p);
+            // §H.1 Maxshift de-scaling (no-op when s == 0).
+            block.apply_roi_maxshift(mb, s);
+            decoded.push(DecodedBlock {
+                component: *c,
+                r: *r,
+                precinct: *k,
+                sub_band: *sb,
+                cbx: *cbx,
+                cby: *cby,
+                nb: nb_ht,
+                block,
+            });
+            continue;
+        }
+
         let mut block = CodeBlock::new(
             psb.orientation,
             placement.width() as usize,
