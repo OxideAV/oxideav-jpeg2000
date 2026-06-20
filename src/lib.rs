@@ -116,6 +116,8 @@ pub mod decode;
 pub mod dequant;
 pub mod dwt;
 pub mod geometry;
+pub mod ht;
+pub(crate) mod ht_tables;
 pub mod jp2;
 pub mod mct;
 pub mod mq;
@@ -238,6 +240,12 @@ pub enum Error {
     /// (binary `1010`). Indicates that bit errors corrupted this
     /// bit-plane's compressed image data.
     SegmentationSymbolMismatch,
+    /// An HTJ2K (ITU-T T.814 | ISO/IEC 15444-15) HT segment did not
+    /// conform to the §7.1 bit-stream-recovery constraints — e.g. a
+    /// stuffing bit was non-zero, a state machine ran past its bound,
+    /// or a CxtVLC codeword failed to match any Annex C table entry.
+    /// The §7.1.1 `error()` state.
+    HtCorruptSegment,
 }
 
 impl core::fmt::Display for Error {
@@ -294,6 +302,10 @@ impl core::fmt::Display for Error {
             Error::SegmentationSymbolMismatch => write!(
                 f,
                 "JPEG 2000: §D.5 segmentation symbol decoded != 0xA (bit-plane corruption)"
+            ),
+            Error::HtCorruptSegment => write!(
+                f,
+                "JPEG 2000: malformed HTJ2K HT segment (T.814 §7.1 error())"
             ),
         }
     }
@@ -463,9 +475,27 @@ impl CodeBlockStyle {
         self.raw & 0x20 != 0
     }
 
-    /// The two high bits (`0xC0`) reserved per Table A.19's "decoders
-    /// may ignore" prose. Exposed for diagnostic-only inspection;
-    /// none of the six flag accessors above are affected.
+    /// `SPcod` / `SPcoc` bit 6 (`0x40`) — HTJ2K (ITU-T T.814 |
+    /// ISO/IEC 15444-15) high-throughput block coding is in use for the
+    /// tile-component (T.814 §A.4 Table A.3 / A.4). When set, the code-
+    /// blocks are decoded with [`crate::ht`] rather than the Annex D MQ
+    /// tier-1 path.
+    pub const fn high_throughput(self) -> bool {
+        self.raw & 0x40 != 0
+    }
+
+    /// `SPcod` / `SPcoc` bit 7 (`0x80`) — when set *together with* bit 6,
+    /// the tile-component is a MIXED set (T.814 §A.4): some code-blocks
+    /// are HT and some conform to T.800. With bit 6 set and bit 7 clear,
+    /// every code-block in the tile-component is an HT code-block.
+    pub const fn ht_mixed(self) -> bool {
+        self.raw & 0x80 != 0
+    }
+
+    /// The single reserved high bit (`0x80`) when bit 6 is clear — under
+    /// the T.800 Table A.19 reading both `0xC0` bits are reserved, but
+    /// under the T.814 reading bit 6 selects HT and bit 7 selects MIXED.
+    /// Exposed for diagnostic-only inspection.
     pub const fn reserved_high_bits(self) -> u8 {
         self.raw & 0xC0
     }
