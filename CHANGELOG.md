@@ -6,6 +6,31 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 351 (2026-06-20).** **HTJ2K multi-code-block
+  coverage + CxtVLC transcription audit.** Three new bit-exact HTJ2K
+  fixtures exercise the previously-untested **multiple-HT-code-blocks-
+  per-sub-band** path: a 64×64 / 1-decomposition image with 16×16
+  blocks (a 32×32 band tiling into four 16×16 HT blocks), a 128×128 /
+  4-decomposition image whose high-pass bands each carry several 32×32
+  HT blocks, and an irreversible (9-7) 64×64 / 3-decomposition
+  multi-block stream — all reconstruct sample-exact against
+  `ojph_expand`. The Annex C CxtVLC tables in `src/ht_tables.rs` were
+  audited against the T.814 spec listing and confirmed **byte-identical**
+  (all 444 + 358 entries). Every §7.1–§7.3 procedure (the bit-stream
+  readers, MEL decoder, U-VLC, quad contexts, predictors, MagSgn value
+  recovery and the first-line-pair special case) was re-verified
+  faithful to the spec text. One reproducible **HT corner bug** was
+  characterised but not isolated: a *small, very-high-energy* HT
+  code-block — as occurs in the high-pass sub-bands of a
+  **non-power-of-two** image dimension — over-reads the §7.1.2 MagSgn
+  bit-stream and surfaces `Error::HtCorruptSegment`. The minimal
+  reproducer is a 7×9 (or 10×10) reversible HT sub-band block whose
+  decoded per-quad `U_q` climbs above the sub-band `Mb` despite every
+  individual procedure matching the spec; isolating the divergence needs
+  a clean-room per-quad MagSgn / VLC bit-position reference trace (filed
+  as a docs gap). Power-of-two block geometries (8/16/32/64) decode
+  bit-exact regardless of energy.
+
 * **Clean-room round 347 (2026-06-20).** **High-Throughput JPEG 2000
   (HTJ2K) block decoder** — ITU-T T.814 | ISO/IEC 15444-15:2019,
   decoded end-to-end. A new `src/ht.rs` module implements the full

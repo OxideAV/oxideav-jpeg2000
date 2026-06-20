@@ -103,3 +103,59 @@ fn ht_gray32_irreversible_matches_ojph() {
         "irreversible reconstruction differs from ojph"
     );
 }
+
+#[test]
+fn ht_gray64_d1_multiblock_matches_ojph() {
+    // 64×64, one decomposition, 16×16 code-blocks — every sub-band carries
+    // **multiple** HT code-blocks (a 32×32 band tiles into four 16×16
+    // blocks), exercising the per-block §B.2 HT-segment routing across a
+    // full precinct of code-blocks rather than the one-block-per-band
+    // geometry of the earlier fixtures.
+    let bytes = include_bytes!("fixtures/ht_gray64_d1_multiblock.j2c");
+    let refpgm = include_bytes!("fixtures/ht_gray64_d1_multiblock_ref.pgm");
+    let (rw, rh, rdata) = parse_pgm(refpgm);
+    let img = oxideav_jpeg2000::decode_j2k(bytes).expect("decode");
+    let c = &img.components[0];
+    assert_eq!((c.width as usize, c.height as usize), (rw, rh));
+    assert_eq!(
+        c.samples, rdata,
+        "64×64 multi-code-block HT reconstruction differs"
+    );
+}
+
+#[test]
+fn ht_gray128_d4_multiblock_matches_ojph() {
+    // 128×128, four decompositions, 32×32 code-blocks. The deep
+    // decomposition spans five resolution levels, each high-pass sub-band
+    // tiling into several HT code-blocks, so the resolution→sub-band→
+    // code-block enumeration and the HT block-coder run end-to-end at
+    // scale.
+    let bytes = include_bytes!("fixtures/ht_gray128_d4_multiblock.j2c");
+    let refpgm = include_bytes!("fixtures/ht_gray128_d4_multiblock_ref.pgm");
+    let (rw, rh, rdata) = parse_pgm(refpgm);
+    let img = oxideav_jpeg2000::decode_j2k(bytes).expect("decode");
+    let c = &img.components[0];
+    assert_eq!((c.width as usize, c.height as usize), (rw, rh));
+    assert_eq!(
+        c.samples, rdata,
+        "128×128 / 4-decomp multi-code-block HT reconstruction differs"
+    );
+}
+
+#[test]
+fn ht_gray64_d3_irreversible_multiblock_matches_ojph() {
+    // Irreversible (9-7) HT with three decompositions and 32×32 blocks:
+    // the lossy reconstruction path combined with multiple code-blocks per
+    // band. Our coefficients match ojph's exactly (identical §E.1
+    // reconstruction over identical decoded coefficients).
+    let bytes = include_bytes!("fixtures/ht_gray64_d3_irv_multiblock.j2c");
+    let refpgm = include_bytes!("fixtures/ht_gray64_d3_irv_multiblock_ref.pgm");
+    let (rw, rh, rdata) = parse_pgm(refpgm);
+    let img = oxideav_jpeg2000::decode_j2k(bytes).expect("decode");
+    let c = &img.components[0];
+    assert_eq!((c.width as usize, c.height as usize), (rw, rh));
+    assert_eq!(
+        c.samples, rdata,
+        "irreversible multi-code-block HT reconstruction differs"
+    );
+}

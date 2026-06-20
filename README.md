@@ -112,11 +112,24 @@ What is implemented:
   and the 7.4 SigProp + 7.5 MagRef refinement passes folded into the
   7.6 sample output. Validated **bit-exact** against the
   `ojph_compress` / `ojph_expand` black-box validator across grayscale,
-  RGB (RCT), reversible 5-3 and irreversible 9-7, and 1-3 decomposition
-  levels. Currently covers the SINGLEHT / HTONLY / single-HT-set case;
-  the MULTIHT (multiple HT sets per code-block, bit-plane skipping via
-  zero-length HT sets) and placeholder-pass (`P0 > 0`) variants are not
-  yet exercised.
+  RGB (RCT), reversible 5-3 and irreversible 9-7, 1-4 decomposition
+  levels, and **multiple HT code-blocks per sub-band** (a 32×32 band
+  tiling into four 16×16 blocks, and a 128×128 / 4-decomposition image
+  whose high-pass bands each carry several 32×32 HT code-blocks). The
+  Annex C CxtVLC tables are confirmed byte-identical to the spec listing
+  (a transcription audit diffs all 802 entries). Currently covers the
+  SINGLEHT / HTONLY / single-HT-set case; the MULTIHT (multiple HT sets
+  per code-block, bit-plane skipping via zero-length HT sets) and
+  placeholder-pass (`P0 > 0`) variants are not yet exercised. One
+  **known limitation** remains: a small HT code-block (≈ ≤ 12 samples
+  per side) carrying *very high energy* coefficients — as arises in the
+  high-pass sub-bands of a **non-power-of-two** image dimension — can
+  over-read the §7.1.2 MagSgn bit-stream and surface
+  `Error::HtCorruptSegment`. Every clause-7 procedure and both CxtVLC
+  tables have been verified faithful to T.814, so the divergence is a
+  not-yet-isolated emergent decode error in that corner; pinning it
+  needs a clean-room per-quad MagSgn/VLC bit-position reference trace
+  (see the docs-gap note below).
 
 ### Not yet implemented
 
@@ -143,6 +156,15 @@ These surface a clean `Error::NotImplemented` rather than mis-decoding:
 - HTJ2K MULTIHT codestreams (more than one HT set per code-block) and
   HT code-blocks that begin with placeholder passes (`P0 > 0`); the
   SINGLEHT / single-HT-set HTJ2K path *is* decoded (see above).
+- A small, very-high-energy HT code-block from a **non-power-of-two**
+  sub-band can over-read the §7.1.2 MagSgn stream
+  (`Error::HtCorruptSegment`). Power-of-two block geometries decode
+  bit-exact at any energy. **Docs gap:** isolating this needs a
+  clean-room per-quad MagSgn / VLC bit-position reference trace for a
+  high-energy odd-dimension HT cleanup segment — every clause-7
+  procedure and both Annex C CxtVLC tables have been verified faithful
+  to T.814, so the spec text alone is insufficient to localise the
+  emergent divergence.
 
 ## Public API
 
