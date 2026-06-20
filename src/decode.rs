@@ -1676,6 +1676,66 @@ pub fn decode_codestream(bytes: &[u8], cs: &J2kCodestream) -> Result<DecodedImag
 mod tests {
     use super::*;
 
+    /// Build a minimal main-header byte span `SOC | SIZ-stub | CAP` for
+    /// the CAP-accept tests. `pcap` is the 32-bit Pcap field.
+    fn header_with_cap(pcap: u32) -> Vec<u8> {
+        let mut h = Vec::new();
+        h.extend_from_slice(&MARKER_SOC.to_be_bytes());
+        // A SIZ-shaped filler segment (marker + length(4) + 0 payload) so
+        // the walker length-skips past it.
+        h.extend_from_slice(&MARKER_SIZ.to_be_bytes());
+        h.extend_from_slice(&4u16.to_be_bytes());
+        h.extend_from_slice(&[0u8, 0u8]);
+        // CAP: marker + Lcap(6) + Pcap(4) + Ccap15(2).
+        h.extend_from_slice(&MARKER_CAP.to_be_bytes());
+        h.extend_from_slice(&8u16.to_be_bytes());
+        h.extend_from_slice(&pcap.to_be_bytes());
+        h.extend_from_slice(&[0u8, 0u8]); // Ccap15
+        h
+    }
+
+    /// A CAP segment signalling only HTJ2K (Pcap bit 15 set) is accepted.
+    #[test]
+    fn cap_htj2k_only_accepted() {
+        let pcap = 1u32 << (32 - 15); // Pcap15 set, all else 0
+        let h = header_with_cap(pcap);
+        let end = h.len();
+        assert!(reject_unsupported_main_header_markers(&h, end).is_ok());
+    }
+
+    /// A CAP segment with Pcap15 clear, or with any other capability bit
+    /// set, is rejected as NotImplemented.
+    #[test]
+    fn cap_non_htj2k_rejected() {
+        // Pcap15 clear.
+        let h = header_with_cap(0);
+        let end = h.len();
+        assert!(matches!(
+            reject_unsupported_main_header_markers(&h, end),
+            Err(Error::NotImplemented)
+        ));
+        // Pcap15 set but also Pcap2 (some other part) set.
+        let pcap = (1u32 << (32 - 15)) | (1u32 << (32 - 2));
+        let h2 = header_with_cap(pcap);
+        let end2 = h2.len();
+        assert!(matches!(
+            reject_unsupported_main_header_markers(&h2, end2),
+            Err(Error::NotImplemented)
+        ));
+    }
+
+    /// SPcod bit 6 maps to `CodeBlockStyle::high_throughput` and, when
+    /// set, the coding-params builder forces the Annex D bypass /
+    /// termination flags off (T.814 §A.4 Table A.4).
+    #[test]
+    fn ht_style_forces_annex_d_flags_off() {
+        // bit 6 (HT) + bit 0 (bypass) + bit 2 (termination) all set.
+        let style = crate::CodeBlockStyle::from_byte(0x45);
+        assert!(style.high_throughput());
+        assert!(style.selective_arithmetic_coding_bypass());
+        assert!(style.termination_on_each_coding_pass());
+    }
+
     #[test]
     fn spqcd_index_follows_f31_order() {
         assert_eq!(spqcd_index(0, SubBandOrientation::LL), 0);

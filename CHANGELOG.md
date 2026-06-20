@@ -6,6 +6,40 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 347 (2026-06-20).** **High-Throughput JPEG 2000
+  (HTJ2K) block decoder** — ITU-T T.814 | ISO/IEC 15444-15:2019,
+  decoded end-to-end. A new `src/ht.rs` module implements the full
+  clause-7 HT block-decoding algorithm and a `src/ht_tables.rs` carries
+  the Annex C CxtVLC tables (444 + 358 entries, transcribed verbatim
+  from the spec). Landed:
+  - §7.1.1 HT cleanup segment recovery (`Scup` / `Pcup`, the `modDcup`
+    rewrite) and the §7.1.2–7.1.6 bit-stream recovery state machines:
+    MagSgn (forward, little-endian), MEL (forward, big-endian), VLC
+    (reverse byte order, little-endian), SigProp (forward) and MagRef
+    (reverse) — each honouring the spec's `0xFF`-stuffing rule.
+  - §7.3.3 MEL adaptive run-length symbol decoder + Table 2 `MEL_E`.
+  - §7.3.5 context-adaptive VLC matcher; §7.3.6 U-VLC
+    prefix/suffix/extension with the first-line-pair both-offset MEL
+    special case (Formulae 3/4 and the `u_q1 > 2` raw-bit shortcut).
+  - §7.3.5 / §7.3.7 quad coding contexts (Formulae 1/2) and exponent
+    predictors (Formulae 5/6) over the §7.2 quad scan; §7.3.8 MagSgn
+    value recovery (`m_n`, `i_n`, `μ_n` / `s_n`).
+  - §7.4 SigProp + §7.5 MagRef refinement passes over the §7.4 stripe
+    scan, folded into the §7.6 sample output.
+  - Decode wiring: the `CAP` marker is parsed and accepted when it
+    signals only HTJ2K (Pcap bit 15); the `SPcod` / `SPcoc` bit-6 flag
+    (T.814 §A.4) routes each code-block to the HT decoder and forces the
+    Annex D Table A.4 bypass / termination / context-reset /
+    segmentation flags off (they do not apply to HT code-blocks).
+  - New `Error::HtCorruptSegment` for the §7.1.1 `error()` state, and
+    `CodeBlockStyle::high_throughput()` / `ht_mixed()`.
+
+  Validated **bit-exact** against the `ojph_compress` / `ojph_expand`
+  black-box validator across grayscale 8×8 (1 decomp), grayscale 32×24
+  (3 decomp), RGB 24×24 (RCT, 2 decomp) and irreversible 9-7 lossy
+  fixtures. Covers the SINGLEHT / HTONLY / single-HT-set case; MULTIHT
+  and placeholder-pass (`P0 > 0`) variants are deferred.
+
 * **Clean-room round 341 (2026-06-19).** **§D.6 selective
   arithmetic-coding bypass** (T.800 Table A.19 Scod bit 0). The
   code-block-style bypass bit is now decoded instead of rejected with

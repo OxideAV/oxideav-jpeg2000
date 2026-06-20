@@ -1267,4 +1267,50 @@ mod tests {
         assert_eq!(decode_u_suffix(&mut vlc, 2).unwrap(), 0);
         assert_eq!(decode_u_extension(&mut vlc, 0).unwrap(), 0);
     }
+
+    /// `magnitude_exponent` reproduces Table 1: E(0)=0, E(1)=1, E(2)=2,
+    /// E(3..=4)=3, E(5..=8)=4, E(9..=16)=5, … (`E = ⌈log2(2μ)⌉`).
+    #[test]
+    fn magnitude_exponent_table1() {
+        assert_eq!(magnitude_exponent(0), 0);
+        assert_eq!(magnitude_exponent(1), 1);
+        assert_eq!(magnitude_exponent(2), 2);
+        for mu in 3..=4 {
+            assert_eq!(magnitude_exponent(mu), 3, "μ={mu}");
+        }
+        for mu in 5..=8 {
+            assert_eq!(magnitude_exponent(mu), 4, "μ={mu}");
+        }
+        for mu in 9..=16 {
+            assert_eq!(magnitude_exponent(mu), 5, "μ={mu}");
+        }
+        for mu in 17..=32 {
+            assert_eq!(magnitude_exponent(mu), 6, "μ={mu}");
+        }
+    }
+
+    /// An all-zero / empty HT cleanup segment with `z_blk == 0` yields a
+    /// block of all-zero samples (§7.1.1: "If Z_blk equals 0 … all sample
+    /// output values for the block shall be 0").
+    #[test]
+    fn zero_zblk_yields_zero_block() {
+        let (block, nb) =
+            decode_ht_codeblock(SubBandOrientation::LL, 4, 4, 8, &[], &[], 0, 0).unwrap();
+        assert_eq!(nb, 0);
+        for v in 0..4 {
+            for u in 0..4 {
+                let c = block.coefficient(u, v);
+                assert_eq!(c.magnitude, 0);
+                assert!(!c.sigma);
+            }
+        }
+    }
+
+    /// A cleanup segment shorter than two bytes, or with an out-of-range
+    /// Scup, is rejected as a corrupt HT segment (§7.1.1 constraints).
+    #[test]
+    fn malformed_segment_rejected() {
+        let err = decode_ht_codeblock(SubBandOrientation::LL, 2, 2, 8, &[0x00], &[], 1, 0);
+        assert!(matches!(err, Err(Error::HtCorruptSegment)));
+    }
 }

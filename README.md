@@ -96,6 +96,27 @@ What is implemented:
   for its component. The §A.6 "overrides only in `TPsot = 0`" rule and
   the at-most-one / duplicate / out-of-range / divergent-style faults
   are enforced.
+- **High-Throughput JPEG 2000 (HTJ2K)** — the ITU-T T.814 | ISO/IEC
+  15444-15 high-throughput block coder, decoded end-to-end. The `CAP`
+  marker is parsed and accepted when it signals HTJ2K (Pcap bit 15) and
+  the `SPcod` / `SPcoc` bit-6 flag (T.814 A.4) routes each code-block to
+  the HT block decoder instead of the Annex D MQ path. The HT decoder
+  implements the full clause-7 algorithm: the 7.1 bit-stream recovery
+  state machines (MagSgn, MEL, VLC, SigProp, MagRef, each with the
+  spec's `0xFF`-stuffing rule), the 7.3.3 MEL adaptive run-length
+  decoder, the 7.3.5 context-adaptive VLC over the Annex C CxtVLC
+  tables (444 + 358 entries transcribed verbatim), the 7.3.6 U-VLC
+  prefix/suffix/extension (with the first-line-pair both-offset MEL
+  special case), the 7.3.5 / 7.3.7 quad contexts and exponent
+  predictors over the 7.2 quad scan, the 7.3.8 MagSgn value recovery,
+  and the 7.4 SigProp + 7.5 MagRef refinement passes folded into the
+  7.6 sample output. Validated **bit-exact** against the
+  `ojph_compress` / `ojph_expand` black-box validator across grayscale,
+  RGB (RCT), reversible 5-3 and irreversible 9-7, and 1-3 decomposition
+  levels. Currently covers the SINGLEHT / HTONLY / single-HT-set case;
+  the MULTIHT (multiple HT sets per code-block, bit-plane skipping via
+  zero-length HT sets) and placeholder-pass (`P0 > 0`) variants are not
+  yet exercised.
 
 ### Not yet implemented
 
@@ -119,8 +140,9 @@ These surface a clean `Error::NotImplemented` rather than mis-decoding:
 - `POC` order changes mid-decode (main-header or tile-part), and `PPM` /
   `PPT` packed-header markers.
 - Position-keyed orders under non-power-of-two sub-sampling.
-- High-Throughput JPEG 2000 (HTJ2K) block coding (ISO/IEC 15444-15 /
-  T.814).
+- HTJ2K MULTIHT codestreams (more than one HT set per code-block) and
+  HT code-blocks that begin with placeholder passes (`P0 > 0`); the
+  SINGLEHT / single-HT-set HTJ2K path *is* decoded (see above).
 
 ## Public API
 
