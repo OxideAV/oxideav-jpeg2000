@@ -186,12 +186,13 @@ pub const MARKER_COM: u16 = 0xFF64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     /// The codestream needs a coding tool the decode wiring does not
-    /// handle yet (e.g. `COC` / `QCC` overrides, `RGN` ROI, `POC`,
-    /// packed packet headers, the `RPCL` / `PCRL` / `CPRL`
-    /// progression orders, or the segmentation-changing Table A.19
-    /// code-block-style bits) — or the encoder entry point, which is
-    /// not implemented at all. See [`decode`] for the supported
-    /// surface.
+    /// handle yet (e.g. `PPM` / `PPT` packed packet headers, a
+    /// non-Maxshift / Part-2 `RGN` style, or a `COC` whose Table A.19
+    /// code-block-**style** byte diverges from the `COD`) — or the
+    /// encoder entry point, which is not implemented at all. The
+    /// `COC` / `QCC` / `RGN` / `POC` overrides, all five §B.12.1
+    /// progression orders, and the §A.6.6 progression order change *are*
+    /// honoured. See [`decode`] for the supported surface.
     NotImplemented,
     /// The codestream did not start with the SOC marker (T.800 §A.4.1).
     MissingSoc,
