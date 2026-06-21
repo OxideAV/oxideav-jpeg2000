@@ -1186,6 +1186,31 @@ fn consume_sop_if_present(bytes: &[u8]) -> Result<&[u8], Error> {
     Ok(&bytes[6..])
 }
 
+/// Peek the `Nsop` packet sequence number of a leading SOP marker
+/// **without consuming** it. Returns `None` when no SOP is present (the
+/// SOP is optional per-packet even when allowed, T.800 §A.8.1) or the
+/// slice is too short to hold a marker code.
+///
+/// A malformed SOP (wrong `Lsop`, or a marker code with fewer than the
+/// fixed six bytes following) is surfaced as [`Error::InvalidPacketHeader`]
+/// — the subsequent [`consume_sop_if_present`] would reject it anyway, but
+/// validating here keeps the §A.8.1 `Nsop` check self-contained.
+fn peek_sop_nsop(bytes: &[u8]) -> Result<Option<u16>, Error> {
+    if bytes.len() < 2 {
+        return Ok(None);
+    }
+    if u16::from_be_bytes([bytes[0], bytes[1]]) != MARKER_SOP {
+        return Ok(None);
+    }
+    if bytes.len() < 6 {
+        return Err(Error::InvalidPacketHeader);
+    }
+    if u16::from_be_bytes([bytes[2], bytes[3]]) != 4 {
+        return Err(Error::InvalidPacketHeader);
+    }
+    Ok(Some(u16::from_be_bytes([bytes[4], bytes[5]])))
+}
+
 /// After the packet header's bit reader byte-aligns, consume an
 /// optional EPH marker (2 bytes) at the slice tail. Returns the
 /// number of bytes consumed (0 or 2).
@@ -1236,9 +1261,25 @@ pub fn walk_packet_headers(
         std::collections::HashMap::new();
     let mut out = Vec::with_capacity(packets.len());
     let mut pos = 0usize;
-    for (precinct_index, geometry) in packets {
+    // §A.8.1 Nsop: the first packet in a coded tile is packet 0, and the
+    // count increments by one for *every* successive packet whether or
+    // not an SOP marker is actually emitted, rolling over at 65 536. When
+    // SOP framing is enabled and a packet carries an SOP, its Nsop must
+    // equal this running ordinal — a mismatch flags a desynchronised /
+    // lost packet, so it is rejected rather than silently mis-decoded.
+    let sop_allowed = matches!(sop_eph, SopEphMode::SopOnly | SopEphMode::SopAndEph);
+    for (packet_ordinal, (precinct_index, geometry)) in packets.iter().enumerate() {
         if pos > body.len() {
             return Err(Error::PacketHeaderOverrun);
+        }
+        if sop_allowed {
+            if let Some(nsop) = peek_sop_nsop(&body[pos..])? {
+                // The §A.8.1 counter wraps at 2^16.
+                let expected = (packet_ordinal % 65_536) as u16;
+                if nsop != expected {
+                    return Err(Error::InvalidPacketHeader);
+                }
+            }
         }
         let state = precincts.entry(*precinct_index).or_default();
         let header = decode_packet_header(&body[pos..], geometry, state, sop_eph, split)?;
@@ -2012,6 +2053,96 @@ mod tests {
         .unwrap();
         assert!(!h.non_zero_length);
         assert_eq!(h.bytes_consumed, packed.len());
+    }
+
+    #[test]
+    fn peek_sop_nsop_reads_sequence_number() {
+        // SOP with Nsop = 0x0123.
+        let bytes = [0xFFu8, 0x91, 0x00, 0x04, 0x01, 0x23, 0xAA];
+        assert_eq!(peek_sop_nsop(&bytes).unwrap(), Some(0x0123));
+        // No SOP marker → None (the slice is left for the header reader).
+        let no_sop = pack_bits(&[1, 0, 1]);
+        assert_eq!(peek_sop_nsop(&no_sop).unwrap(), None);
+        // SOP marker code but truncated body → rejected.
+        assert!(peek_sop_nsop(&[0xFFu8, 0x91, 0x00]).is_err());
+        // Wrong Lsop → rejected.
+        assert!(peek_sop_nsop(&[0xFFu8, 0x91, 0x00, 0x06, 0x00, 0x00]).is_err());
+    }
+
+    /// Build the two-packet body of `walk_two_packets_same_precinct_*`
+    /// with an SOP marker (carrying `nsop0` / `nsop1`) prefixing each
+    /// packet, plus the matching geometry pair.
+    fn two_sop_packets(nsop0: u16, nsop1: u16) -> (Vec<u8>, [(usize, PacketGeometry); 2]) {
+        let mut all = Vec::new();
+        all.extend([0xFFu8, 0x91, 0x00, 0x04]);
+        all.extend(nsop0.to_be_bytes());
+        all.extend(pack_bits(&[1, 1, 1, 0, 0, 1, 0, 1]));
+        all.extend([0u8; 5]); // 5 body bytes
+        all.extend([0xFFu8, 0x91, 0x00, 0x04]);
+        all.extend(nsop1.to_be_bytes());
+        all.extend(pack_bits(&[1, 1, 0, 0, 0, 1, 0]));
+        all.extend([0u8; 2]); // 2 body bytes
+        let g = |layer| PacketGeometry {
+            sub_bands: vec![SubBandGeometry {
+                width: 1,
+                height: 1,
+            }],
+            layer,
+        };
+        (all, [(0usize, g(0)), (0usize, g(1))])
+    }
+
+    #[test]
+    fn walk_validates_sequential_sop_nsop() {
+        // §A.8.1: Nsop = 0, 1 for the first two packets of a coded tile.
+        let (body, packets) = two_sop_packets(0, 1);
+        let headers =
+            walk_packet_headers(&body, &packets, SopEphMode::SopOnly, SegmentSplit::Single)
+                .unwrap();
+        assert_eq!(headers.len(), 2);
+        assert!(headers[0].non_zero_length);
+        assert!(headers[1].non_zero_length);
+    }
+
+    #[test]
+    fn walk_rejects_out_of_order_sop_nsop() {
+        // Second packet claims Nsop = 5 where the tile ordinal is 1 — a
+        // desynchronised / lost-packet signature, rejected.
+        let (body, packets) = two_sop_packets(0, 5);
+        assert!(
+            walk_packet_headers(&body, &packets, SopEphMode::SopOnly, SegmentSplit::Single)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn walk_accepts_out_of_order_nsop_when_packet_omits_sop() {
+        // §A.8.1: the SOP marker is optional per-packet even when allowed.
+        // The first packet carries a (correct) SOP; the second omits it.
+        // No Nsop is present on packet 1, so nothing is validated there —
+        // the absent-SOP case must not be treated as a sequence error.
+        let mut all = Vec::new();
+        all.extend([0xFFu8, 0x91, 0x00, 0x04, 0x00, 0x00]); // SOP, Nsop = 0
+        all.extend(pack_bits(&[1, 1, 1, 0, 0, 1, 0, 1]));
+        all.extend([0u8; 5]); // 5 body bytes
+                              // Packet 1: no SOP marker.
+        all.extend(pack_bits(&[1, 1, 0, 0, 0, 1, 0]));
+        all.extend([0u8; 2]); // 2 body bytes
+        let g = |layer| PacketGeometry {
+            sub_bands: vec![SubBandGeometry {
+                width: 1,
+                height: 1,
+            }],
+            layer,
+        };
+        let headers = walk_packet_headers(
+            &all,
+            &[(0usize, g(0)), (0usize, g(1))],
+            SopEphMode::SopOnly,
+            SegmentSplit::Single,
+        )
+        .unwrap();
+        assert_eq!(headers.len(), 2);
     }
 
     #[test]
