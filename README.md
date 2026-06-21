@@ -31,6 +31,10 @@ What is implemented:
 - **Tier-2** — the bit-stuffed packet-header reader (§B.10): tag trees,
   code-block inclusion, zero-bit-plane counts, coding-pass codewords,
   and `Lblock` segment-length reads, with optional SOP / EPH framing.
+  When SOP framing is enabled the §A.8.1 `Nsop` packet sequence number
+  is validated against the running per-tile packet ordinal (rolling over
+  at 65 536), so a desynchronised or lost packet is rejected rather than
+  mis-decoded; the per-packet-optional SOP rule is honoured.
 - **Tier-1** — the MQ arithmetic decoder (Annex C) and all three Annex D
   coding passes (significance-propagation + sign, magnitude refinement,
   cleanup with the run-length / UNIFORM shortcut), the §D.5
@@ -57,7 +61,14 @@ What is implemented:
   a span's stored bytes run out the reader extends it with synthesised
   `0xFF` fill (stuff-bit rule applied) so a truncated or in-progress raw
   pass still decodes. Validated end-to-end on the 5-3 lossless, 9-7
-  irreversible, and 2×2-tile bypass paths.
+  irreversible, and 2×2-tile bypass paths. The §D.4.2 **predictable
+  termination** style bit (Table A.19 Scod bit 4) is enforced as a
+  decode-time conformance check: each terminated MQ codeword segment's
+  decoder must land exactly on the `§B.10.7` segment boundary, so a
+  stream that signals predictable termination but whose segments were
+  not flushed by the §D.4.2 procedure (or is truncated) is rejected
+  rather than silently mis-decoded. Forced off for HT code-blocks
+  (T.814 Table A.13).
 - **Reassembly** — per-coefficient `Nb(u, v)` magnitude-bit tracking for
   rate-truncated streams, dequantisation, the 5-3 and 9-7 inverse DWT,
   and the inverse multi-component transform.
@@ -74,8 +85,13 @@ What is implemented:
   to the code; a `COC` that diverges from the `COD` style — or gives
   different components different kernels — is cleanly rejected.
 - **Progression** — all five §B.12.1 orders (LRCP, RLCP, RPCL, PCRL,
-  CPRL), §B.12.2 POC volume iteration, and **multi-layer** /
-  **multi-precinct** reassembly.
+  CPRL) and the §A.6.6 **progression order change** (`POC`) wired into
+  the decode driver: a main-header or first-tile-part `POC` drives the
+  §B.12.2 volume enumeration (each volume's component / resolution /
+  layer sub-range in its own order, with the per-(component, resolution,
+  precinct) "next unsent layer" cursor), under the §A.6.6 precedence
+  `Tile-part POC > Main POC > Tile-part COD > Main COD`. Plus
+  **multi-layer** / **multi-precinct** reassembly.
 - **Region of interest** — main-header `RGN` implicit-ROI (Maxshift)
   decode (T.800 §A.6.3 / §H.1): the `SPrgn` scaling value `s` is
   resolved per component, the tier-1 schedule runs against the
@@ -150,8 +166,9 @@ These surface a clean `Error::NotImplemented` rather than mis-decoding:
   wavelet-domain ROI-mask generation and mask-driven L.1 de-scaling),
   outside this Part-1 decoder's scope; an `Srgn ≠ 0` (or a Part-2
   extended-length) `RGN` surfaces a clean error rather than mis-decoding.
-- `POC` order changes mid-decode (main-header or tile-part), and `PPM` /
-  `PPT` packed-header markers.
+- `PPM` / `PPT` packed-header markers (the `POC` progression order
+  change is now wired into the decode driver — see **Progression**
+  above — for both the main-header and first-tile-part headers).
 - Position-keyed orders under non-power-of-two sub-sampling.
 - HTJ2K MULTIHT codestreams (more than one HT set per code-block) and
   HT code-blocks that begin with placeholder passes (`P0 > 0`); the

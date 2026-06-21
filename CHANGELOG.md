@@ -6,6 +6,31 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 357 (2026-06-21).** **Decode-robustness:
+  progression order change (`POC`), predictable termination, and SOP
+  `Nsop` validation.** Three self-contained features wired into the
+  decode driver:
+  * **§A.6.6 `POC`.** The §B.12.2 progression-order-change volume
+    enumerator (already implemented and unit-tested) now reaches the
+    decode path: a `collect_main_header_poc` re-scan plus a tile-part
+    `POC` resolver lower the governing marker — under the §A.6.6
+    precedence `Tile-part POC > Main POC > Tile-part COD > Main COD` —
+    into a `PocVolume` list that drives the per-tile packet enumeration.
+    `POC` is no longer rejected with `Error::NotImplemented`. Five
+    end-to-end fixture-injection tests prove pixel-exact decode across
+    the layer-keyed (LRCP, multi-layer), position-keyed (RPCL),
+    multi-component sub-range, and tile-part-precedence paths.
+  * **§D.4.2 predictable termination (Table A.19 bit 4).** Each
+    terminated MQ codeword segment is validated to land exactly on the
+    §B.10.7 segment boundary; a stream that signals predictable
+    termination but whose segments were not §D.4.2-flushed (or is
+    truncated) is rejected rather than silently mis-decoded. Forced off
+    for HT code-blocks per T.814 Table A.13.
+  * **§A.8.1 `Nsop` validation.** When SOP framing is enabled, each
+    SOP's `Nsop` is checked against the running per-tile packet ordinal
+    (rolling over at 65 536), surfacing a desynchronised / lost packet;
+    the per-packet-optional SOP rule is honoured.
+
 * **Clean-room round 351 (2026-06-20).** **HTJ2K multi-code-block
   coverage + CxtVLC transcription audit.** Three new bit-exact HTJ2K
   fixtures exercise the previously-untested **multiple-HT-code-blocks-
