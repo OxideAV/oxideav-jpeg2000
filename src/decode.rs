@@ -68,8 +68,9 @@ use crate::mct::{
 };
 use crate::packet::{PacketGeometry, SegmentSplit, SopEphMode, SubBandGeometry};
 use crate::progression::{
-    cprl_packet_order, lrcp_packet_order, pcrl_packet_order, rlcp_packet_order, rpcl_packet_order,
-    ComponentPositionInfo, ComponentProgressionInfo, ResolutionPrecinctLayout,
+    cprl_packet_order, lrcp_packet_order, pcrl_packet_order, poc_volume_packet_order,
+    rlcp_packet_order, rpcl_packet_order, ComponentPositionInfo, ComponentProgressionInfo,
+    PocVolume, ResolutionPrecinctLayout,
 };
 use crate::reassemble::{
     idwt_5x3, idwt_9x7, BlockSource, CodedCodeBlock, PrecinctBlocks, SubBandQuantization,
@@ -78,7 +79,7 @@ use crate::reassemble::{
 use crate::t1::{reset_contexts, BitPlaneSequencer, CodeBlock};
 use crate::{
     Error, J2kCodestream, ProgressionOrder, QuantizationStyle, Siz, WaveletTransform, MARKER_CAP,
-    MARKER_POC, MARKER_SIZ, MARKER_SOC,
+    MARKER_SIZ, MARKER_SOC,
 };
 
 /// `PPM` marker code (T.800 §A.7.4, `0xFF60`) — packed packet
@@ -136,18 +137,19 @@ pub struct DecodedImage {
 
 /// Re-scan the main-header byte span for marker segments the wiring
 /// cannot honour yet. [`crate::parse_j2k_header`] length-skips
-/// optional markers; silently ignoring `POC` / `PPM` / `CAP` would
-/// mis-decode the stream, so their presence is surfaced as
+/// optional markers; silently ignoring `PPM` / `CAP` would mis-decode
+/// the stream, so their presence is surfaced as
 /// [`Error::NotImplemented`] here.
 ///
-/// `QCC`, `COC` and `RGN` are **not** rejected: the main-header
+/// `QCC`, `COC`, `RGN` and `POC` are **not** rejected: the main-header
 /// per-component quantization override (T.800 §A.6.5, `Main QCC > Main
 /// QCD`), the per-component coding-style override (T.800 §A.6.2, `Main
-/// COC > Main COD`) and the §H.1 region-of-interest Maxshift decode are
-/// honoured — see [`crate::collect_main_header_qcc`] /
-/// [`resolve_component_quant`], [`crate::collect_main_header_coc`] /
-/// [`resolve_component_coding`], and [`crate::collect_main_header_rgn`] /
-/// [`resolve_component_roi_shift`].
+/// COC > Main COD`), the §H.1 region-of-interest Maxshift decode, and
+/// the §A.6.6 progression order change are honoured — see
+/// [`crate::collect_main_header_qcc`] / [`resolve_component_quant`],
+/// [`crate::collect_main_header_coc`] / [`resolve_component_coding`],
+/// [`crate::collect_main_header_rgn`] / [`resolve_component_roi_shift`],
+/// and [`crate::collect_main_header_poc`] / [`resolve_tile_coding`].
 fn reject_unsupported_main_header_markers(bytes: &[u8], header_end: usize) -> Result<(), Error> {
     // SOC is 2 bytes with no length field; every other main-header
     // marker segment is `marker(2) + length(2) + payload(length-2)`.
@@ -159,7 +161,10 @@ fn reject_unsupported_main_header_markers(bytes: &[u8], header_end: usize) -> Re
             return Err(Error::InvalidMarkerLength);
         }
         match marker {
-            MARKER_POC | MARKER_PPM => {
+            // POC (§A.6.6) is honoured — see `collect_main_header_poc` and
+            // the `resolve_tile_coding` POC-volume wiring; it is no longer
+            // rejected here.
+            MARKER_PPM => {
                 return Err(Error::NotImplemented);
             }
             MARKER_CAP => {
@@ -645,6 +650,12 @@ struct ResolvedTileCoding<'a> {
     comp_coding: Vec<ComponentCoding>,
     comp_quant: Vec<ComponentQuant<'a>>,
     roi_shift: Vec<u32>,
+    /// §A.6.6 progression order change volumes that apply to this tile,
+    /// after the `Tile-part POC > Main POC` precedence. Empty when no
+    /// `POC` governs the tile — in that case `params.progression` (the
+    /// COD's `SGcod` order) drives a single LRCP/RLCP/RPCL/PCRL/CPRL
+    /// enumeration as before.
+    poc_volumes: Vec<PocVolume>,
 }
 
 /// Resolve the per-tile coding parameters by layering this tile's
@@ -672,6 +683,7 @@ fn resolve_tile_coding<'a>(
     num_components: usize,
     main_cod: &'a crate::Cod,
     main_rgns: &[crate::Rgn],
+    main_poc: Option<&crate::Poc>,
     main_params: &CodingParams,
     main_coding: &[ComponentCoding],
     main_quant: &[ComponentQuant<'a>],
@@ -685,6 +697,7 @@ fn resolve_tile_coding<'a>(
     let mut tile_cocs: Vec<&crate::Coc> = Vec::new();
     let mut tile_qccs: Vec<&crate::Qcc> = Vec::new();
     let mut tile_rgns: Vec<&crate::Rgn> = Vec::new();
+    let mut tile_poc: Option<&crate::Poc> = None;
     for m in tile_markers {
         match m {
             crate::TilePartMarker::Cod(c) => {
@@ -702,17 +715,31 @@ fn resolve_tile_coding<'a>(
             crate::TilePartMarker::Coc(c) => tile_cocs.push(c),
             crate::TilePartMarker::Qcc(q) => tile_qccs.push(q),
             crate::TilePartMarker::Rgn(r) => tile_rgns.push(r),
+            // §A.6.6: at most one POC per header. A tile-part POC, when
+            // present, overrides the main POC for this tile.
+            crate::TilePartMarker::Poc(p) => {
+                if tile_poc.is_some() {
+                    return Err(Error::InvalidMarkerLength);
+                }
+                tile_poc = Some(p);
+            }
             // PLT / COM are informational; the tier-2 walker reads the
             // bit-stream lengths directly, so they need no resolution.
             crate::TilePartMarker::Plt(_) | crate::TilePartMarker::Com(_) => {}
-            // POC / PPT tile-part overrides remain unwired.
-            crate::TilePartMarker::Poc(_) | crate::TilePartMarker::Ppt(_) => {
+            // PPT tile-part overrides remain unwired.
+            crate::TilePartMarker::Ppt(_) => {
                 return Err(Error::NotImplemented);
             }
         }
     }
 
-    // No overrides → the resolved main-header parameters apply verbatim.
+    // §A.6.6 progression-order precedence: `Tile-part POC > Main POC`.
+    // (The COD-default order is captured separately in `params.progression`
+    // and used by the caller when no POC governs the tile.)
+    let poc_volumes = poc_volumes_for(tile_poc.or(main_poc));
+
+    // No overrides → the resolved main-header parameters apply verbatim
+    // (but a main-header POC may still govern this tile's packet order).
     if tile_cod.is_none()
         && tile_qcd.is_none()
         && tile_cocs.is_empty()
@@ -724,6 +751,7 @@ fn resolve_tile_coding<'a>(
             comp_coding: main_coding.to_vec(),
             comp_quant: main_quant.to_vec(),
             roi_shift: main_roi.to_vec(),
+            poc_volumes,
         });
     }
 
@@ -775,7 +803,21 @@ fn resolve_tile_coding<'a>(
         comp_coding,
         comp_quant,
         roi_shift,
+        poc_volumes,
     })
+}
+
+/// Convert the governing `POC` marker (already resolved through the
+/// §A.6.6 `Tile-part POC > Main POC` precedence) into the runtime
+/// [`PocVolume`] list the §B.12.2 enumerator consumes.
+///
+/// Returns an empty `Vec` when no `POC` governs the tile — the caller
+/// then falls back to the COD-default single-order enumeration.
+fn poc_volumes_for(poc: Option<&crate::Poc>) -> Vec<PocVolume> {
+    match poc {
+        Some(p) => p.progressions.iter().map(PocVolume::from_poc).collect(),
+        None => Vec::new(),
+    }
 }
 
 /// Clone a `Vec<&T>` into the owned `Vec<T>` the `resolve_*` helpers
@@ -887,12 +929,14 @@ fn apply_rgn_overrides(
 /// Decode every component of one tile from the concatenated tile-part
 /// body bytes. Returns one row-major `i32` grid per component
 /// (tile-component extent), already §G-level-shifted and clamped.
+#[allow(clippy::too_many_arguments)]
 fn decode_tile(
     siz: &Siz,
     params: &CodingParams,
     comp_coding: &[ComponentCoding],
     comp_quant: &[ComponentQuant<'_>],
     roi_shift: &[u32],
+    poc_volumes: &[PocVolume],
     tile_index: u32,
     body: &[u8],
 ) -> Result<Vec<Vec<i32>>, Error> {
@@ -953,26 +997,47 @@ fn decode_tile(
     }
 
     // -- §B.12 packet enumeration --
-    let descriptors = match params.progression {
-        ProgressionOrder::Lrcp => lrcp_packet_order(params.layers, &infos)?,
-        ProgressionOrder::Rlcp => rlcp_packet_order(params.layers, &infos)?,
-        // §B.12.1.3–5 require XRsiz / YRsiz to be powers of two for every
-        // component (the reference-grid corner divisibility tests only
-        // hold then). A non-power-of-two sub-sampling factor with one of
-        // these orders is malformed; reject rather than mis-order.
-        ProgressionOrder::Rpcl | ProgressionOrder::Pcrl | ProgressionOrder::Cprl => {
-            for pi in &position_infos {
-                if !pi.xrsiz.is_power_of_two() || !pi.yrsiz.is_power_of_two() {
-                    return Err(Error::NotImplemented);
-                }
-            }
-            match params.progression {
-                ProgressionOrder::Rpcl => rpcl_packet_order(params.layers, &position_infos)?,
-                ProgressionOrder::Pcrl => pcrl_packet_order(params.layers, &position_infos)?,
-                _ => cprl_packet_order(params.layers, &position_infos)?,
+    // §A.6.6 / §B.12.2: when a POC governs this tile, the packet order is
+    // the concatenation of its progression-order volumes (each volume's
+    // [start, end) component / resolution / layer sub-range emitted in its
+    // own Ppoc order, with the §B.12.2 "no packet ever repeated" cursor).
+    // Otherwise the COD-default single order (SGcod / Ppoc) drives the
+    // whole tile. The position-keyed orders (RPCL / PCRL / CPRL — used
+    // either as the COD default or inside a POC volume) require power-of-
+    // two XRsiz / YRsiz per §B.12.1.3–5; a non-power-of-two factor is
+    // malformed for those orders, so reject rather than mis-order.
+    let needs_position_order = if poc_volumes.is_empty() {
+        matches!(
+            params.progression,
+            ProgressionOrder::Rpcl | ProgressionOrder::Pcrl | ProgressionOrder::Cprl
+        )
+    } else {
+        poc_volumes.iter().any(|v| {
+            matches!(
+                v.order,
+                ProgressionOrder::Rpcl | ProgressionOrder::Pcrl | ProgressionOrder::Cprl
+            )
+        })
+    };
+    if needs_position_order {
+        for pi in &position_infos {
+            if !pi.xrsiz.is_power_of_two() || !pi.yrsiz.is_power_of_two() {
+                return Err(Error::NotImplemented);
             }
         }
-        _ => return Err(Error::NotImplemented),
+    }
+
+    let descriptors = if !poc_volumes.is_empty() {
+        poc_volume_packet_order(poc_volumes, params.layers, &infos, &position_infos)?
+    } else {
+        match params.progression {
+            ProgressionOrder::Lrcp => lrcp_packet_order(params.layers, &infos)?,
+            ProgressionOrder::Rlcp => rlcp_packet_order(params.layers, &infos)?,
+            ProgressionOrder::Rpcl => rpcl_packet_order(params.layers, &position_infos)?,
+            ProgressionOrder::Pcrl => pcrl_packet_order(params.layers, &position_infos)?,
+            ProgressionOrder::Cprl => cprl_packet_order(params.layers, &position_infos)?,
+            ProgressionOrder::Reserved(_) => return Err(Error::NotImplemented),
+        }
     };
 
     // -- §B.10 packet-header walk --
@@ -1531,6 +1596,11 @@ pub fn decode_codestream(bytes: &[u8], cs: &J2kCodestream) -> Result<DecodedImag
     let main_rgns = crate::collect_main_header_rgn(bytes, cs.header.bytes_consumed, csiz)?;
     let roi_shift = resolve_component_roi_shift(siz.components.len(), &main_rgns)?;
 
+    // §A.6.6: a main-header POC, if present, overrides the COD/COC
+    // default progression order for every tile that does not itself
+    // carry a tile-part POC.
+    let main_poc = crate::collect_main_header_poc(bytes, cs.header.bytes_consumed, csiz)?;
+
     // The §D.6 bypass rejection and the §D.4.2 / §C.3.6 style decisions
     // are folded into `coding_params_from_cod`, which is re-run per tile
     // when a tile-part `COD` override changes the global style.
@@ -1604,6 +1674,7 @@ pub fn decode_codestream(bytes: &[u8], cs: &J2kCodestream) -> Result<DecodedImag
             siz.components.len(),
             cod,
             &main_rgns,
+            main_poc.as_ref(),
             &params,
             &comp_coding,
             &comp_quant,
@@ -1627,6 +1698,7 @@ pub fn decode_codestream(bytes: &[u8], cs: &J2kCodestream) -> Result<DecodedImag
             &tile_coding.comp_coding,
             &tile_coding.comp_quant,
             &tile_coding.roi_shift,
+            &tile_coding.poc_volumes,
             tile_index as u32,
             &body,
         )?;
@@ -1979,8 +2051,8 @@ mod tests {
         let q = qcd(QuantizationStyle::None, 2, &[0x40, 0x41, 0x42]);
         let (params, coding, quant) = main_defaults(2, &c, &q);
         let roi = vec![0u32; 2];
-        let resolved =
-            resolve_tile_coding(2, &c, &[], &params, &coding, &quant, &roi, &[]).expect("resolve");
+        let resolved = resolve_tile_coding(2, &c, &[], None, &params, &coding, &quant, &roi, &[])
+            .expect("resolve");
         assert_eq!(resolved.comp_coding[0].n_l, 2);
         assert_eq!(resolved.comp_quant[0].guard_bits, 2);
         assert_eq!(resolved.roi_shift, vec![0, 0]);
@@ -1998,9 +2070,18 @@ mod tests {
         // Tile COD: NL = 4, code-block 8×8 (xcb=ycb=1 → +2 = 3).
         let tile_c = cod(4, 1, 1, 0x00, WaveletTransform::Reversible5x3, &[]);
         let markers = vec![crate::TilePartMarker::Cod(tile_c)];
-        let resolved =
-            resolve_tile_coding(2, &main_c, &[], &params, &coding, &quant, &roi, &markers)
-                .expect("resolve");
+        let resolved = resolve_tile_coding(
+            2,
+            &main_c,
+            &[],
+            None,
+            &params,
+            &coding,
+            &quant,
+            &roi,
+            &markers,
+        )
+        .expect("resolve");
         for cc in &resolved.comp_coding {
             assert_eq!(cc.n_l, 4);
             assert_eq!(cc.xcb, 3);
@@ -2021,9 +2102,18 @@ mod tests {
             crate::TilePartMarker::Cod(tile_c),
             crate::TilePartMarker::Coc(tile_coc1),
         ];
-        let resolved =
-            resolve_tile_coding(2, &main_c, &[], &params, &coding, &quant, &roi, &markers)
-                .expect("resolve");
+        let resolved = resolve_tile_coding(
+            2,
+            &main_c,
+            &[],
+            None,
+            &params,
+            &coding,
+            &quant,
+            &roi,
+            &markers,
+        )
+        .expect("resolve");
         // Component 0 follows the tile COD (NL = 4); component 1 the COC.
         assert_eq!(resolved.comp_coding[0].n_l, 4);
         assert_eq!(resolved.comp_coding[1].n_l, 1);
@@ -2040,9 +2130,18 @@ mod tests {
         let roi = vec![0u32; 2];
         let tile_coc0 = coc(0, 1, 1, 1, 0x00, WaveletTransform::Reversible5x3, &[]);
         let markers = vec![crate::TilePartMarker::Coc(tile_coc0)];
-        let resolved =
-            resolve_tile_coding(2, &main_c, &[], &params, &coding, &quant, &roi, &markers)
-                .expect("resolve");
+        let resolved = resolve_tile_coding(
+            2,
+            &main_c,
+            &[],
+            None,
+            &params,
+            &coding,
+            &quant,
+            &roi,
+            &markers,
+        )
+        .expect("resolve");
         assert_eq!(resolved.comp_coding[0].n_l, 1);
         assert_eq!(resolved.comp_coding[0].xcb, 3);
         // Component 1 keeps the main COD.
@@ -2059,9 +2158,18 @@ mod tests {
         let roi = vec![0u32; 2];
         let tile_q = qcd(QuantizationStyle::None, 4, &[0x50, 0x51, 0x52]);
         let markers = vec![crate::TilePartMarker::Qcd(tile_q)];
-        let resolved =
-            resolve_tile_coding(2, &main_c, &[], &params, &coding, &quant, &roi, &markers)
-                .expect("resolve");
+        let resolved = resolve_tile_coding(
+            2,
+            &main_c,
+            &[],
+            None,
+            &params,
+            &coding,
+            &quant,
+            &roi,
+            &markers,
+        )
+        .expect("resolve");
         for cq in &resolved.comp_quant {
             assert_eq!(cq.guard_bits, 4);
             assert_eq!(cq.spqcd, &[0x50, 0x51, 0x52]);
@@ -2081,9 +2189,18 @@ mod tests {
             crate::TilePartMarker::Qcd(tile_q),
             crate::TilePartMarker::Qcc(tile_qcc1),
         ];
-        let resolved =
-            resolve_tile_coding(2, &main_c, &[], &params, &coding, &quant, &roi, &markers)
-                .expect("resolve");
+        let resolved = resolve_tile_coding(
+            2,
+            &main_c,
+            &[],
+            None,
+            &params,
+            &coding,
+            &quant,
+            &roi,
+            &markers,
+        )
+        .expect("resolve");
         // Component 0 follows the tile QCD; component 1 the tile QCC.
         assert_eq!(resolved.comp_quant[0].guard_bits, 4);
         assert_eq!(resolved.comp_quant[1].guard_bits, 5);
@@ -2100,9 +2217,18 @@ mod tests {
         let roi = vec![0u32; 2];
         let tile_qcc0 = qcc(0, QuantizationStyle::None, 6, &[0x70, 0x71, 0x72]);
         let markers = vec![crate::TilePartMarker::Qcc(tile_qcc0)];
-        let resolved =
-            resolve_tile_coding(2, &main_c, &[], &params, &coding, &quant, &roi, &markers)
-                .expect("resolve");
+        let resolved = resolve_tile_coding(
+            2,
+            &main_c,
+            &[],
+            None,
+            &params,
+            &coding,
+            &quant,
+            &roi,
+            &markers,
+        )
+        .expect("resolve");
         assert_eq!(resolved.comp_quant[0].guard_bits, 6);
         assert_eq!(resolved.comp_quant[1].guard_bits, 2);
     }
@@ -2119,7 +2245,7 @@ mod tests {
         let tile_rgn1 = rgn(1, 0, 7); // component 1 gets s = 7 in this tile.
         let markers = vec![crate::TilePartMarker::Rgn(tile_rgn1)];
         let resolved = resolve_tile_coding(
-            2, &main_c, &main_rgns, &params, &coding, &quant, &roi, &markers,
+            2, &main_c, &main_rgns, None, &params, &coding, &quant, &roi, &markers,
         )
         .expect("resolve");
         assert_eq!(resolved.roi_shift, vec![3, 7]);
@@ -2139,7 +2265,17 @@ mod tests {
         let tile_rgn = rgn(1, 1, 7); // Srgn = 1 (Part-2 rectangle ROI).
         let markers = vec![crate::TilePartMarker::Rgn(tile_rgn)];
         assert!(matches!(
-            resolve_tile_coding(2, &main_c, &[], &params, &coding, &quant, &roi, &markers),
+            resolve_tile_coding(
+                2,
+                &main_c,
+                &[],
+                None,
+                &params,
+                &coding,
+                &quant,
+                &roi,
+                &markers
+            ),
             Err(Error::NotImplemented)
         ));
     }
@@ -2157,9 +2293,18 @@ mod tests {
         let roi = vec![0u32; 2];
         let tile_c = cod(2, 2, 2, 0x01, WaveletTransform::Reversible5x3, &[]);
         let markers = vec![crate::TilePartMarker::Cod(tile_c)];
-        let resolved =
-            resolve_tile_coding(2, &main_c, &[], &params, &coding, &quant, &roi, &markers)
-                .expect("resolve");
+        let resolved = resolve_tile_coding(
+            2,
+            &main_c,
+            &[],
+            None,
+            &params,
+            &coding,
+            &quant,
+            &roi,
+            &markers,
+        )
+        .expect("resolve");
         assert!(resolved.params.selective_arithmetic_coding_bypass);
     }
 
@@ -2173,24 +2318,144 @@ mod tests {
         let a = cod(2, 2, 2, 0x00, WaveletTransform::Reversible5x3, &[]);
         let b = cod(3, 1, 1, 0x00, WaveletTransform::Reversible5x3, &[]);
         let markers = vec![crate::TilePartMarker::Cod(a), crate::TilePartMarker::Cod(b)];
-        assert!(
-            resolve_tile_coding(2, &main_c, &[], &params, &coding, &quant, &roi, &markers).is_err()
-        );
+        assert!(resolve_tile_coding(
+            2,
+            &main_c,
+            &[],
+            None,
+            &params,
+            &coding,
+            &quant,
+            &roi,
+            &markers
+        )
+        .is_err());
+    }
+
+    /// A `PocProgression` covering the whole component/resolution/layer
+    /// cube for one of the §A.6.6 orders.
+    fn poc_entry(order: ProgressionOrder) -> crate::PocProgression {
+        crate::PocProgression {
+            resolution_start: 0,
+            component_start: 0,
+            layer_end: 1,
+            resolution_end: 33,
+            component_end: 256,
+            progression: order,
+        }
     }
 
     #[test]
-    fn tile_poc_override_is_not_implemented() {
-        // A tile-part POC progression-order change is not wired.
+    fn tile_poc_resolves_into_volumes() {
+        // §A.6.6: a tile-part POC is honoured — its progressions become
+        // the runtime PocVolume list driving §B.12.2 enumeration.
         let main_c = cod(2, 2, 2, 0x00, WaveletTransform::Reversible5x3, &[]);
         let main_q = qcd(QuantizationStyle::None, 2, &[0x40, 0x41, 0x42]);
         let (params, coding, quant) = main_defaults(2, &main_c, &main_q);
         let roi = vec![0u32; 2];
         let markers = vec![crate::TilePartMarker::Poc(crate::Poc {
-            progressions: Vec::new(),
+            progressions: vec![poc_entry(ProgressionOrder::Rlcp)],
         })];
-        assert!(matches!(
-            resolve_tile_coding(2, &main_c, &[], &params, &coding, &quant, &roi, &markers),
-            Err(Error::NotImplemented)
-        ));
+        let resolved = resolve_tile_coding(
+            2,
+            &main_c,
+            &[],
+            None,
+            &params,
+            &coding,
+            &quant,
+            &roi,
+            &markers,
+        )
+        .expect("tile POC resolves");
+        assert_eq!(resolved.poc_volumes.len(), 1);
+        assert_eq!(resolved.poc_volumes[0].order, ProgressionOrder::Rlcp);
+    }
+
+    #[test]
+    fn tile_poc_overrides_main_poc() {
+        // §A.6.6 precedence: Tile-part POC > Main POC. When both are
+        // present the tile-part POC wins for that tile.
+        let main_c = cod(2, 2, 2, 0x00, WaveletTransform::Reversible5x3, &[]);
+        let main_q = qcd(QuantizationStyle::None, 2, &[0x40, 0x41, 0x42]);
+        let (params, coding, quant) = main_defaults(2, &main_c, &main_q);
+        let roi = vec![0u32; 2];
+        let main_poc = crate::Poc {
+            progressions: vec![poc_entry(ProgressionOrder::Lrcp)],
+        };
+        let markers = vec![crate::TilePartMarker::Poc(crate::Poc {
+            progressions: vec![poc_entry(ProgressionOrder::Cprl)],
+        })];
+        let resolved = resolve_tile_coding(
+            2,
+            &main_c,
+            &[],
+            Some(&main_poc),
+            &params,
+            &coding,
+            &quant,
+            &roi,
+            &markers,
+        )
+        .expect("resolve");
+        assert_eq!(resolved.poc_volumes.len(), 1);
+        // The tile-part POC (CPRL) supersedes the main POC (LRCP).
+        assert_eq!(resolved.poc_volumes[0].order, ProgressionOrder::Cprl);
+    }
+
+    #[test]
+    fn main_poc_applies_when_no_tile_poc() {
+        // §A.6.6: with no tile-part POC the main-header POC governs the
+        // tile, even when there are no other tile overrides.
+        let main_c = cod(2, 2, 2, 0x00, WaveletTransform::Reversible5x3, &[]);
+        let main_q = qcd(QuantizationStyle::None, 2, &[0x40, 0x41, 0x42]);
+        let (params, coding, quant) = main_defaults(2, &main_c, &main_q);
+        let roi = vec![0u32; 2];
+        let main_poc = crate::Poc {
+            progressions: vec![poc_entry(ProgressionOrder::Rpcl)],
+        };
+        let resolved = resolve_tile_coding(
+            2,
+            &main_c,
+            &[],
+            Some(&main_poc),
+            &params,
+            &coding,
+            &quant,
+            &roi,
+            &[],
+        )
+        .expect("resolve");
+        assert_eq!(resolved.poc_volumes.len(), 1);
+        assert_eq!(resolved.poc_volumes[0].order, ProgressionOrder::Rpcl);
+    }
+
+    #[test]
+    fn duplicate_tile_poc_is_rejected() {
+        // §A.6.6: at most one POC per header.
+        let main_c = cod(2, 2, 2, 0x00, WaveletTransform::Reversible5x3, &[]);
+        let main_q = qcd(QuantizationStyle::None, 2, &[0x40, 0x41, 0x42]);
+        let (params, coding, quant) = main_defaults(2, &main_c, &main_q);
+        let roi = vec![0u32; 2];
+        let markers = vec![
+            crate::TilePartMarker::Poc(crate::Poc {
+                progressions: vec![poc_entry(ProgressionOrder::Lrcp)],
+            }),
+            crate::TilePartMarker::Poc(crate::Poc {
+                progressions: vec![poc_entry(ProgressionOrder::Rlcp)],
+            }),
+        ];
+        assert!(resolve_tile_coding(
+            2,
+            &main_c,
+            &[],
+            None,
+            &params,
+            &coding,
+            &quant,
+            &roi,
+            &markers
+        )
+        .is_err());
     }
 }

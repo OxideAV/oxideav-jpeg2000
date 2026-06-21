@@ -1537,6 +1537,42 @@ pub(crate) fn collect_main_header_coc(
     Ok(out)
 }
 
+/// Collect the main-header `POC` (progression order change, T.800
+/// §A.6.6) marker segment, if present.
+///
+/// Mirrors [`collect_main_header_qcc`] / [`collect_main_header_coc`]:
+/// [`parse_j2k_header`] length-skips `POC`, so the main-header span is
+/// re-walked here and the `POC` re-parsed via the shared [`parse_poc`]
+/// validator. Per T.800 §A.6.6 "At most one POC marker segment may
+/// appear in any header", so a second main-header `POC` is rejected.
+/// The decode wiring resolves the §A.6.6 precedence (`Tile-part POC >
+/// Main POC > Tile-part COD > Main COD`) against this value.
+pub(crate) fn collect_main_header_poc(
+    bytes: &[u8],
+    header_end: usize,
+    csiz: u16,
+) -> Result<Option<Poc>, Error> {
+    let mut out: Option<Poc> = None;
+    let mut pos = 2usize; // skip SOC (no length field)
+    while pos + 4 <= header_end {
+        let marker = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]);
+        if marker == MARKER_POC {
+            if out.is_some() {
+                return Err(Error::InvalidMarkerLength);
+            }
+            let mut reader = Reader::new(bytes);
+            reader.pos = pos + 2;
+            out = Some(parse_poc(&mut reader, csiz)?);
+        }
+        let len = u16::from_be_bytes([bytes[pos + 2], bytes[pos + 3]]) as usize;
+        if len < 2 {
+            return Err(Error::InvalidMarkerLength);
+        }
+        pos += 2 + len;
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // Tile-part walker (T.800 §A.4.2 / §A.4.3 — SOT + SOD).
 // ---------------------------------------------------------------------------

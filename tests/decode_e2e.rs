@@ -935,6 +935,149 @@ fn rgb_cprl_53_lossless_is_pixel_exact() {
     assert_position_keyed_pixel_exact(RGB_CPRL_53, ProgressionOrder::Cprl);
 }
 
+/// Build a single-progression `POC` marker segment (T.800 §A.6.6,
+/// Table A.32) covering the *whole* component / resolution / layer cube
+/// of a `Csiz < 257` codestream, emitting it in `order`.
+///
+/// `RSpoc = 0`, `REpoc = nl + 1` (resolution levels are `0..=NL`, so the
+/// exclusive end is `NL + 1`), `CSpoc = 0`, `CEpoc = csiz`,
+/// `LYEpoc = layers`. Because the volume spans every packet, decoding
+/// against it must yield exactly the same image the COD-default order
+/// would — the only thing that changes is the §B.12.2 enumeration path
+/// that is exercised.
+fn make_poc_full_cube(order: ProgressionOrder, nl: u8, csiz: u8, layers: u16) -> Vec<u8> {
+    use oxideav_jpeg2000::MARKER_POC;
+    let ppoc = match order {
+        ProgressionOrder::Lrcp => 0u8,
+        ProgressionOrder::Rlcp => 1,
+        ProgressionOrder::Rpcl => 2,
+        ProgressionOrder::Pcrl => 3,
+        ProgressionOrder::Cprl => 4,
+        ProgressionOrder::Reserved(b) => b,
+    };
+    // Csiz < 257 → CSpoc / CEpoc are 8-bit; one entry is 7 bytes.
+    // Lpoc = 2 (length) + 7 (one progression).
+    let mut poc = Vec::new();
+    poc.extend_from_slice(&MARKER_POC.to_be_bytes());
+    poc.extend_from_slice(&9u16.to_be_bytes()); // Lpoc
+    poc.push(0u8); // RSpoc
+    poc.push(0u8); // CSpoc
+    poc.extend_from_slice(&layers.to_be_bytes()); // LYEpoc
+    poc.push(nl + 1); // REpoc (exclusive)
+    poc.push(csiz); // CEpoc (exclusive)
+    poc.push(ppoc); // Ppoc
+    poc
+}
+
+/// Splice a complete marker segment into the main header immediately
+/// before the first `SOT`.
+fn inject_into_main_header(stream: &[u8], seg: &[u8]) -> Vec<u8> {
+    let cs = parse_codestream(stream).expect("parse for main-header injection");
+    let insert_at = cs.header.bytes_consumed;
+    assert_eq!(
+        u16::from_be_bytes([stream[insert_at], stream[insert_at + 1]]),
+        0xFF90, // SOT
+        "insertion point must be the first SOT"
+    );
+    let mut out = Vec::with_capacity(stream.len() + seg.len());
+    out.extend_from_slice(&stream[..insert_at]);
+    out.extend_from_slice(seg);
+    out.extend_from_slice(&stream[insert_at..]);
+    out
+}
+
+/// §A.6.6 main-header `POC` restating the gray 5-3 fixture's COD-default
+/// LRCP order over the whole cube. The POC now *drives* the §B.12.2
+/// packet enumeration (instead of the COD's `SGcod` order), so a
+/// pixel-exact decode proves the POC path is wired and produces the same
+/// packet visitation as the default LRCP walk.
+#[test]
+fn gray_53_main_header_poc_lrcp_is_pixel_exact() {
+    let poc = make_poc_full_cube(ProgressionOrder::Lrcp, 2, 1, 1);
+    let injected = inject_into_main_header(GRAY_53, &poc);
+    // The POC must now parse rather than be rejected as NotImplemented.
+    parse_codestream(&injected).expect("parse with main-header POC");
+    let img = decode_j2k(&injected).expect("decode with main-header POC");
+    assert_eq!(img.components.len(), 1);
+    assert_eq!(img.components[0].samples, gray_17x13_pattern());
+}
+
+/// §A.6.6 main-header `POC` restating LRCP over the multi-layer gray
+/// fixture (5 quality layers). The POC volume's `LYEpoc = layers` spans
+/// every quality layer, so the §B.12.2 per-(component, resolution,
+/// precinct) "next unsent layer" cursor must walk all five layers in
+/// LRCP order — matching the physical packet layout. Pixel-exactness
+/// pins the multi-layer POC-volume cursor.
+///
+/// (Restating a *different* order, e.g. RLCP, would not be pixel-exact:
+/// the codestream's packet bodies are physically laid out in the
+/// encoded LRCP order, and tier-2 reads them sequentially in the
+/// enumerated order — a POC that contradicts the physical layout
+/// describes a different, malformed stream, so it is intentionally not
+/// asserted here.)
+#[test]
+fn gray_53_multilayer_main_header_poc_lrcp_is_pixel_exact() {
+    let cs = parse_codestream(GRAY_MULTILAYER_53).expect("parse");
+    let layers = cs.header.cod.layers;
+    assert!(layers >= 2, "fixture must be multi-layer");
+    assert_eq!(cs.header.cod.progression, ProgressionOrder::Lrcp);
+    let poc = make_poc_full_cube(ProgressionOrder::Lrcp, 2, 1, layers);
+    let injected = inject_into_main_header(GRAY_MULTILAYER_53, &poc);
+    let img = decode_j2k(&injected).expect("decode multi-layer with LRCP POC");
+    assert_eq!((img.width, img.height), (64, 64));
+    assert_eq!(img.components[0].samples, gray_64x64_pattern());
+}
+
+/// §A.6.6 main-header `POC` over the 3-component RGB/RCT fixture,
+/// restating LRCP over the full `CSpoc = 0 .. CEpoc = 3` component
+/// sub-range. Exercises the per-component sub-range iteration of the POC
+/// volume; the inverse RCT and all three planes must come back exact.
+#[test]
+fn rgb_rct_53_main_header_poc_lrcp_is_pixel_exact() {
+    let cs = parse_codestream(RGB_RCT_53).expect("parse");
+    assert_eq!(cs.header.siz.components.len(), 3);
+    let poc = make_poc_full_cube(ProgressionOrder::Lrcp, 2, 3, 1);
+    let injected = inject_into_main_header(RGB_RCT_53, &poc);
+    let img = decode_j2k(&injected).expect("decode 3-comp with main-header POC");
+    assert_eq!(img.components.len(), 3);
+    let expected = rgb_16x16_pattern();
+    for (c, exp) in img.components.iter().zip(expected.iter()) {
+        assert_eq!(&c.samples, exp);
+    }
+}
+
+/// §A.6.6 main-header `POC` restating the **position-keyed** RPCL order
+/// over the 48×32 RGB fixture whose COD default is already RPCL. This
+/// drives the POC enumerator down the `ComponentPositionInfo` path
+/// (resolution-level / precinct-position keyed) rather than the
+/// layer-keyed one, with the §B.12.1.3 power-of-two XRsiz/YRsiz check.
+#[test]
+fn rgb_rpcl_53_main_header_poc_rpcl_is_pixel_exact() {
+    let cs = parse_codestream(RGB_RPCL_53).expect("parse");
+    assert_eq!(cs.header.cod.progression, ProgressionOrder::Rpcl);
+    let poc = make_poc_full_cube(ProgressionOrder::Rpcl, 2, 3, 1);
+    let injected = inject_into_main_header(RGB_RPCL_53, &poc);
+    let img = decode_j2k(&injected).expect("decode with RPCL POC");
+    assert_eq!((img.width, img.height), (48, 32));
+    let expected = rgb_48x32_pattern();
+    for (c, exp) in img.components.iter().zip(expected.iter()) {
+        assert_eq!(&c.samples, exp);
+    }
+}
+
+/// §A.6.6 precedence path: a **tile-part** `POC` (in the first tile-part
+/// header) restating LRCP over the gray fixture's cube. Proves the
+/// `Tile-part POC` resolution route decodes (not just the main-header
+/// one), reusing the Psot-growing tile-part injector.
+#[test]
+fn gray_53_tile_part_poc_lrcp_is_pixel_exact() {
+    let poc = make_poc_full_cube(ProgressionOrder::Lrcp, 2, 1, 1);
+    let injected = inject_into_first_tile_part_header(GRAY_53, &poc);
+    let img = decode_j2k(&injected).expect("decode with tile-part POC");
+    assert_eq!(img.components.len(), 1);
+    assert_eq!(img.components[0].samples, gray_17x13_pattern());
+}
+
 #[test]
 fn truncated_codestream_is_rejected() {
     let cut = &GRAY_53[..GRAY_53.len() / 2];
