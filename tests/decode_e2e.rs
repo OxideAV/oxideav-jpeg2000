@@ -1078,6 +1078,52 @@ fn gray_53_tile_part_poc_lrcp_is_pixel_exact() {
     assert_eq!(img.components[0].samples, gray_17x13_pattern());
 }
 
+/// Set Table A.19 bit 4 (predictable termination) in the main-header
+/// `COD`'s code-block-style byte. The `COD` layout (Table A.15) is
+/// `marker(2) Lcod(2) Scod(1) SGcod(prog 1, layers 2, MCT 1) SPcod(NL 1,
+/// xcb 1, ycb 1, style 1, …)`, so the style byte sits 13 bytes past the
+/// marker code.
+fn set_predictable_termination(stream: &[u8]) -> Vec<u8> {
+    use oxideav_jpeg2000::MARKER_COD;
+    let cs = parse_codestream(stream).expect("parse");
+    let end = cs.header.bytes_consumed;
+    let mut out = stream.to_vec();
+    let mut pos = 2usize;
+    while pos + 4 <= end {
+        let marker = u16::from_be_bytes([out[pos], out[pos + 1]]);
+        let len = u16::from_be_bytes([out[pos + 2], out[pos + 3]]) as usize;
+        if marker == MARKER_COD {
+            let style_off = pos + 2 + 2 + 1 + 4 + 3;
+            out[style_off] |= 0x10; // Table A.19 bit 4
+            return out;
+        }
+        pos += 2 + len;
+    }
+    panic!("no COD in main header");
+}
+
+/// §D.4.2 predictable-termination error resilience: a codestream that
+/// *signals* predictable termination (Table A.19 bit 4) but whose
+/// codeword segments were not flushed by the §D.4.2 procedure must be
+/// rejected — the decoder's `BP` does not land on the §B.10.7 segment
+/// boundary. The committed gray fixture was encoded *without*
+/// predictable termination, so flipping the signalling bit makes the
+/// signalled contract and the actual segment bytes disagree, and the
+/// decode-time check surfaces it instead of returning a corrupt image.
+#[test]
+fn gray_53_predictable_termination_mismatch_is_rejected() {
+    // Sanity: the unmodified fixture decodes pixel-exact.
+    assert_eq!(
+        decode_j2k(GRAY_53).expect("baseline").components[0].samples,
+        gray_17x13_pattern()
+    );
+    let mutated = set_predictable_termination(GRAY_53);
+    assert!(
+        decode_j2k(&mutated).is_err(),
+        "a stream falsely signalling predictable termination must be rejected"
+    );
+}
+
 #[test]
 fn truncated_codestream_is_rejected() {
     let cut = &GRAY_53[..GRAY_53.len() / 2];

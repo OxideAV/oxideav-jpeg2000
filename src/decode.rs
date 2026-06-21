@@ -584,6 +584,16 @@ struct CodingParams {
     /// [`SegmentSplit::Bypass`] and the tier-1 driver dispatches each
     /// pass to its AC or raw entry point.
     selective_arithmetic_coding_bypass: bool,
+    /// §D.4.2 "predictable termination" (Table A.19 bit 4): every
+    /// terminated §C.3 codeword segment in the packet body was flushed by
+    /// the §D.4.2 procedure so a conforming decoder's `BP` lands exactly
+    /// at the signalled segment end. When set the tier-1 driver validates
+    /// each terminated MQ segment with
+    /// [`crate::mq::MqDecoder::predictable_termination_satisfied`] and
+    /// rejects a stream whose decoder ran short or long — an
+    /// error-resilience check. Forced off for HT code-blocks (Table A.13
+    /// "does not apply to HT code-blocks").
+    predictable_termination: bool,
     /// T.814 §A.4 SPcod bit 6: the tile-component's code-blocks are
     /// HTJ2K (ITU-T T.814 | ISO/IEC 15444-15) HT code-blocks, decoded by
     /// [`crate::ht`] rather than the Annex D MQ tier-1 path. When set,
@@ -634,6 +644,10 @@ fn coding_params_from_cod(cod: &crate::Cod) -> Result<CodingParams, Error> {
         // 5 onward to their raw entry points and the packet reader uses
         // the §B.10.7.2 / Table D.9 `SegmentSplit::Bypass` length layout.
         selective_arithmetic_coding_bypass: !ht && style_flags.selective_arithmetic_coding_bypass(),
+        // §D.4.2 predictable termination (Table A.19 bit 4): a decode-time
+        // conformance check on each terminated MQ codeword segment. Forced
+        // off for HT code-blocks (Table A.13).
+        predictable_termination: !ht && style_flags.predictable_termination(),
     })
 }
 
@@ -1330,7 +1344,8 @@ fn decode_tile(
             .with_vertically_causal_context(params.vertically_causal)
             .with_reset_context_probabilities(params.reset_context_probabilities)
             .with_termination_on_each_coding_pass(params.termination_on_each_coding_pass)
-            .with_selective_arithmetic_coding_bypass(params.selective_arithmetic_coding_bypass);
+            .with_selective_arithmetic_coding_bypass(params.selective_arithmetic_coding_bypass)
+            .with_predictable_termination(params.predictable_termination);
         // Drive the §D.3 pass schedule across this code-block's §C.3
         // codeword segments. Each AC segment opens a fresh MqDecoder (the
         // MQ engine restarts per §C.3 at every termination boundary —
@@ -1353,6 +1368,20 @@ fn decode_tile(
             } else {
                 let mut decoder = crate::mq::MqDecoder::new(&seg.bytes);
                 seq.decode_passes(&mut block, &mut decoder, &mut ctx, seg.passes)?;
+                // §D.4.2 predictable termination (Table A.19 bit 4): every
+                // non-raw `AccumSegment` is a terminated §C.3 codeword
+                // segment, so a conforming decoder's `BP` must land exactly
+                // at the signalled segment end (every byte consumed, or
+                // parked on a trailing 0xFF marker prefix). A decoder that
+                // ran short or long — or that fell back to §D.4.1 0xFF fill
+                // because the segment was truncated — fails the check; the
+                // §B.10.7 length and the codeword segment disagree, which
+                // this error-resilience flag exists to surface.
+                if params.predictable_termination
+                    && !decoder.predictable_termination_satisfied(seg.bytes.len())
+                {
+                    return Err(Error::InvalidPacketHeader);
+                }
             }
         }
         // Record the §B.10.5 zero-MSB count so the reassembly bridge can
@@ -1806,6 +1835,36 @@ mod tests {
         assert!(style.high_throughput());
         assert!(style.selective_arithmetic_coding_bypass());
         assert!(style.termination_on_each_coding_pass());
+    }
+
+    #[test]
+    fn predictable_termination_bit_is_read_into_coding_params() {
+        // Table A.19 bit 4 (0x10) set in the COD's code-block style byte
+        // surfaces as CodingParams::predictable_termination so the tier-1
+        // driver runs the §D.4.2 conformance check.
+        let with = cod(2, 2, 2, 0x10, WaveletTransform::Reversible5x3, &[]);
+        assert!(
+            coding_params_from_cod(&with)
+                .unwrap()
+                .predictable_termination
+        );
+        let without = cod(2, 2, 2, 0x00, WaveletTransform::Reversible5x3, &[]);
+        assert!(
+            !coding_params_from_cod(&without)
+                .unwrap()
+                .predictable_termination
+        );
+    }
+
+    #[test]
+    fn ht_forces_predictable_termination_off() {
+        // T.814 Table A.13: predictable termination "does not apply to HT
+        // code-blocks". bit 6 (HT) + bit 4 (predictable termination) →
+        // the builder forces predictable termination off.
+        let ht_pterm = cod(2, 2, 2, 0x50, WaveletTransform::Reversible5x3, &[]);
+        let params = coding_params_from_cod(&ht_pterm).unwrap();
+        assert!(params.high_throughput);
+        assert!(!params.predictable_termination);
     }
 
     #[test]
