@@ -167,6 +167,8 @@ pub const MARKER_POC: u16 = 0xFF5F;
 pub const MARKER_PLT: u16 = 0xFF58;
 /// `PPT` — Packed packet headers, tile-part header (T.800 Table A.39).
 pub const MARKER_PPT: u16 = 0xFF61;
+/// `PPM` — Packed packet headers, main header (T.800 Table A.38).
+pub const MARKER_PPM: u16 = 0xFF60;
 /// `CAP` — Extended capabilities (T.800 Table A.11bis).
 pub const MARKER_CAP: u16 = 0xFF50;
 /// `PRF` — Profile (T.800 Table A.11quater).
@@ -1574,6 +1576,99 @@ pub(crate) fn collect_main_header_poc(
     Ok(out)
 }
 
+/// Re-scans the already-validated main header for `PPM` marker segments
+/// (T.800 §A.7.4) and reconstructs the relocated per-tile-part packet-
+/// header buffers.
+///
+/// `PPM` moves *all* tiles' packet headers into the main header. Each
+/// `PPM` segment carries `Zppm` (its index in the series) and a run of
+/// `Ippm` bytes; concatenated in increasing `Zppm` order the bytes form
+/// the structure
+///
+/// ```text
+///   Nppm_0 (u32)  Ippm_0 (Nppm_0 bytes)
+///   Nppm_1 (u32)  Ippm_1 (Nppm_1 bytes)
+///   ...
+/// ```
+///
+/// — one `(Nppm, Ippm)` pair per **tile-part** in the order the
+/// tile-parts appear in the codestream (not per tile). The `Nppm`
+/// length prefixes may straddle `PPM` segment boundaries, so the
+/// payloads are concatenated first and parsed afterwards.
+///
+/// Returns `None` when the main header carries no `PPM`. Otherwise
+/// returns one relocated-header buffer per tile-part, in codestream
+/// order; the decode driver maps each tile-part to its buffer by that
+/// ordinal.
+pub(crate) fn collect_main_header_ppm(
+    bytes: &[u8],
+    header_end: usize,
+) -> Result<Option<Vec<Vec<u8>>>, Error> {
+    // Collect (Zppm, payload-slice) across the main header.
+    let mut segs: Vec<(u8, &[u8])> = Vec::new();
+    let mut pos = 2usize; // skip SOC (no length field)
+    while pos + 4 <= header_end {
+        let marker = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]);
+        let len = u16::from_be_bytes([bytes[pos + 2], bytes[pos + 3]]) as usize;
+        if len < 2 {
+            return Err(Error::InvalidMarkerLength);
+        }
+        if marker == MARKER_PPM {
+            // Lppm >= 7 (Table A.38): 2 (length) + 1 (Zppm) + >=4 (one
+            // Nppm). The payload after Zppm is the Ippm/Nppm byte run.
+            if len < 3 {
+                return Err(Error::InvalidMarkerLength);
+            }
+            let seg_start = pos + 4; // past marker + Lppm
+            let z = *bytes.get(seg_start).ok_or(Error::InvalidMarkerLength)?;
+            let payload_start = seg_start + 1;
+            let payload_end = pos + 2 + len;
+            if payload_end > header_end {
+                return Err(Error::InvalidMarkerLength);
+            }
+            segs.push((z, &bytes[payload_start..payload_end]));
+        }
+        pos += 2 + len;
+    }
+    if segs.is_empty() {
+        return Ok(None);
+    }
+    // §A.7.4: order by Zppm; the indices must form the contiguous run
+    // 0..N with each value present exactly once.
+    segs.sort_by_key(|(z, _)| *z);
+    for (expected, (z, _)) in segs.iter().enumerate() {
+        let expected = u8::try_from(expected).map_err(|_| Error::InvalidMarkerLength)?;
+        if *z != expected {
+            return Err(Error::InvalidMarkerLength);
+        }
+    }
+    // Concatenate every segment's payload, then split into the
+    // (Nppm, Ippm) per-tile-part series.
+    let total: usize = segs.iter().map(|(_, b)| b.len()).sum();
+    let mut concat = Vec::with_capacity(total);
+    for (_, b) in &segs {
+        concat.extend_from_slice(b);
+    }
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    let mut i = 0usize;
+    while i < concat.len() {
+        // Each tile-part entry begins with a 4-byte Nppm length.
+        if i + 4 > concat.len() {
+            return Err(Error::InvalidMarkerLength);
+        }
+        let nppm =
+            u32::from_be_bytes([concat[i], concat[i + 1], concat[i + 2], concat[i + 3]]) as usize;
+        i += 4;
+        let end = i.checked_add(nppm).ok_or(Error::InvalidMarkerLength)?;
+        if end > concat.len() {
+            return Err(Error::InvalidMarkerLength);
+        }
+        out.push(concat[i..end].to_vec());
+        i = end;
+    }
+    Ok(Some(out))
+}
+
 // ---------------------------------------------------------------------------
 // Tile-part walker (T.800 §A.4.2 / §A.4.3 — SOT + SOD).
 // ---------------------------------------------------------------------------
@@ -2790,5 +2885,109 @@ mod tests {
         assert!(flags.segmentation_symbols());
         assert!(!flags.predictable_termination());
         assert_eq!(h.cod.code_block_style, 0x20);
+    }
+
+    // -- PPM relocated-header reconstruction (T.800 §A.7.4) ------------
+
+    /// Build a single `PPM` marker segment with index `zppm` carrying
+    /// the raw `payload` bytes (the Nppm/Ippm byte run).
+    fn ppm_segment(zppm: u8, payload: &[u8]) -> Vec<u8> {
+        // Lppm = 2 (length) + 1 (Zppm) + payload.
+        let lppm = 2 + 1 + payload.len();
+        let mut v = Vec::new();
+        v.extend_from_slice(&MARKER_PPM.to_be_bytes());
+        v.extend_from_slice(&(lppm as u16).to_be_bytes());
+        v.push(zppm);
+        v.extend_from_slice(payload);
+        v
+    }
+
+    /// Wrap PPM segments in a minimal `SOC | <ppm...>` main header and
+    /// run `collect_main_header_ppm` over it.
+    fn collect_ppm(segments: &[Vec<u8>]) -> Result<Option<Vec<Vec<u8>>>, Error> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&MARKER_SOC.to_be_bytes());
+        for s in segments {
+            v.extend_from_slice(s);
+        }
+        let end = v.len();
+        collect_main_header_ppm(&v, end)
+    }
+
+    #[test]
+    fn ppm_none_without_marker() {
+        let mut v = Vec::new();
+        v.extend_from_slice(&MARKER_SOC.to_be_bytes());
+        // A non-PPM (COM) segment so the walker still length-skips.
+        v.extend_from_slice(&0xFF64u16.to_be_bytes());
+        v.extend_from_slice(&4u16.to_be_bytes());
+        v.extend_from_slice(&[0u8, 0u8]);
+        let end = v.len();
+        assert_eq!(collect_main_header_ppm(&v, end).unwrap(), None);
+    }
+
+    #[test]
+    fn ppm_single_segment_two_tile_parts() {
+        // Two tile-parts: Nppm=3,Ippm=[A,B,C] then Nppm=2,Ippm=[D,E].
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&3u32.to_be_bytes());
+        payload.extend_from_slice(&[0xA, 0xB, 0xC]);
+        payload.extend_from_slice(&2u32.to_be_bytes());
+        payload.extend_from_slice(&[0xD, 0xE]);
+        let got = collect_ppm(&[ppm_segment(0, &payload)]).unwrap().unwrap();
+        assert_eq!(got, vec![vec![0xA, 0xB, 0xC], vec![0xD, 0xE]]);
+    }
+
+    #[test]
+    fn ppm_nppm_straddles_segment_boundary() {
+        // The (Nppm, Ippm) series may split across PPM segment
+        // boundaries (§A.7.4): the first segment ends mid-Ippm and the
+        // second segment continues it. Single tile-part, Nppm=5,
+        // Ippm=[1,2,3,4,5]; the 4-byte Nppm and the first 2 Ippm bytes
+        // live in Zppm=0, the rest in Zppm=1.
+        let mut s0 = Vec::new();
+        s0.extend_from_slice(&5u32.to_be_bytes());
+        s0.extend_from_slice(&[1, 2]); // first 2 Ippm bytes
+        let s1 = vec![3u8, 4, 5]; // remaining 3 Ippm bytes
+        let got = collect_ppm(&[ppm_segment(0, &s0), ppm_segment(1, &s1)])
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, vec![vec![1, 2, 3, 4, 5]]);
+    }
+
+    #[test]
+    fn ppm_orders_by_zppm() {
+        // Segments emitted out of order in the codestream must be
+        // concatenated by increasing Zppm. Zppm=1 carries the tail,
+        // Zppm=0 carries the head; single tile-part Nppm=4 Ippm=[9,8,7,6].
+        let mut head = Vec::new();
+        head.extend_from_slice(&4u32.to_be_bytes());
+        head.extend_from_slice(&[9, 8]);
+        let tail = vec![7u8, 6];
+        // Emit Zppm=1 (tail) before Zppm=0 (head).
+        let got = collect_ppm(&[ppm_segment(1, &tail), ppm_segment(0, &head)])
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, vec![vec![9, 8, 7, 6]]);
+    }
+
+    #[test]
+    fn ppm_rejects_zppm_gap() {
+        let mut p = Vec::new();
+        p.extend_from_slice(&1u32.to_be_bytes());
+        p.push(0xFF);
+        // Zppm 0 and 2 with no 1.
+        let err = collect_ppm(&[ppm_segment(0, &p), ppm_segment(2, &p)]).unwrap_err();
+        assert_eq!(err, Error::InvalidMarkerLength);
+    }
+
+    #[test]
+    fn ppm_rejects_truncated_nppm_run() {
+        // Nppm claims 9 bytes but only 2 are present.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&9u32.to_be_bytes());
+        payload.extend_from_slice(&[0x1, 0x2]);
+        let err = collect_ppm(&[ppm_segment(0, &payload)]).unwrap_err();
+        assert_eq!(err, Error::InvalidMarkerLength);
     }
 }

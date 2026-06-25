@@ -35,14 +35,20 @@ What is implemented:
   is validated against the running per-tile packet ordinal (rolling over
   at 65 536), so a desynchronised or lost packet is rejected rather than
   mis-decoded; the per-packet-optional SOP rule is honoured.
-  **Relocated packet headers** (`PPT`, §A.7.5) are decoded: when a
-  tile's tile-part headers carry `PPT` marker segments, every packet
-  header is read from the concatenated `Ippt` payload (ordered by
-  `Zppt`, with a gap / duplicate in the `0..N` run rejected as a lost
-  segment) while the tile body supplies only packet data. The §A.8.1 /
-  §A.8.2 framing split is honoured — an in-body `SOP` (with its `Nsop`
-  still validated) precedes each packet's data and a required `EPH`
-  trails each header inside the relocated header buffer.
+  **Relocated packet headers** (`PPT`, §A.7.5; `PPM`, §A.7.4) are
+  decoded: when a tile's tile-part headers carry `PPT` marker segments
+  (or the main header carries a `PPM`), every packet header is read from
+  the relocated payload while the tile body supplies only packet data.
+  `PPT` payloads are concatenated per tile in `Zppt` order; a `PPM`
+  payload is gathered in `Zppm` order across the main header, split into
+  the per-tile-part `(Nppm, Ippm)` series (handling an `Nppm` run that
+  straddles a `PPM` segment boundary), and mapped onto each tile's
+  tile-parts by codestream ordinal. A gap / duplicate in either
+  `Z`-index run is rejected as a lost segment, and `PPM` alongside `PPT`
+  is rejected (§A.7.4 mutual exclusion). The §A.8.1 / §A.8.2 framing
+  split is honoured — an in-body `SOP` (with its `Nsop` still
+  validated) precedes each packet's data and a required `EPH` trails
+  each header inside the relocated header buffer.
 - **Tier-1** — the MQ arithmetic decoder (Annex C) and all three Annex D
   coding passes (significance-propagation + sign, magnitude refinement,
   cleanup with the run-length / UNIFORM shortcut), the §D.5
@@ -174,10 +180,6 @@ These surface a clean `Error::NotImplemented` rather than mis-decoding:
   wavelet-domain ROI-mask generation and mask-driven L.1 de-scaling),
   outside this Part-1 decoder's scope; an `Srgn ≠ 0` (or a Part-2
   extended-length) `RGN` surfaces a clean error rather than mis-decoding.
-- `PPM` packed-header markers (main-header relocation of *all* tiles'
-  packet headers). The tile-part `PPT` relocation *is* decoded — see
-  **Tier-2** above; only the main-header `PPM` variant (and its
-  mutual-exclusion-with-`PPT` rule) remains unwired.
 - Position-keyed orders under non-power-of-two sub-sampling.
 - HTJ2K MULTIHT codestreams (more than one HT set per code-block) and
   HT code-blocks that begin with placeholder passes (`P0 > 0`); the

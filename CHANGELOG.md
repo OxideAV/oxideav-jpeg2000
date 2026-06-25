@@ -7,6 +7,22 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 ### Added
 
 * **Clean-room round 370 (2026-06-25).** **Relocated packet headers —
+  main-header `PPM` (T.800 §A.7.4).** Building on the `PPT` path, a
+  `PPM` marker segment in the main header — which moves *all* tiles'
+  packet headers into the main header — is now decoded. A
+  `collect_main_header_ppm` re-scan gathers every `PPM` segment, orders
+  them by `Zppm` (gap / duplicate rejected), concatenates their `Ippm`
+  payloads, and splits the result into the per-tile-part
+  `(Nppm, Ippm)` series — including the case where an `Nppm` length
+  prefix or its `Ippm` run straddles a `PPM` segment boundary. The
+  decode driver maps each tile's tile-parts to their relocated buffer
+  by codestream ordinal, concatenates them in `TPsot` order, and feeds
+  the result to the separate-buffer packet walk. `PPM` alongside `PPT`
+  is rejected as malformed (§A.7.4 mutual exclusion). `PPM` no longer
+  returns `Error::NotImplemented`. Six unit tests cover the
+  single-segment / multi-tile-part split, `Nppm`-straddles-boundary
+  reconstruction, `Zppm` ordering, and the gap / truncated-run faults.
+* **Clean-room round 370 (2026-06-25).** **Relocated packet headers —
   `PPT` (T.800 §A.7.5).** The tier-2 packet-header walk gained a
   separate-buffer mode (`walk_packet_headers_separate`) for the case
   where a tile's packet headers have been moved out of the bit stream

@@ -164,9 +164,11 @@ fn reject_unsupported_main_header_markers(bytes: &[u8], header_end: usize) -> Re
             // POC (§A.6.6) is honoured — see `collect_main_header_poc` and
             // the `resolve_tile_coding` POC-volume wiring; it is no longer
             // rejected here.
-            MARKER_PPM => {
-                return Err(Error::NotImplemented);
-            }
+            // PPM (§A.7.4): relocated packet headers for all tiles. The
+            // payload is gathered and re-streamed by
+            // `collect_main_header_ppm` + the decode driver, so it is no
+            // longer rejected here; the length-skip below steps past it.
+            MARKER_PPM => {}
             MARKER_CAP => {
                 // T.814 §A.3: the only CAP configuration this decoder
                 // honours is one that signals HTJ2K (Pcap bit 15 set). A
@@ -1713,6 +1715,32 @@ pub fn decode_codestream(bytes: &[u8], cs: &J2kCodestream) -> Result<DecodedImag
     // carry a tile-part POC.
     let main_poc = crate::collect_main_header_poc(bytes, cs.header.bytes_consumed, csiz)?;
 
+    // §A.7.4: a main-header `PPM` relocates *every* tile's packet headers
+    // into the main header, one `(Nppm, Ippm)` entry per tile-part in
+    // codestream order. When present, no in-stream packet headers and no
+    // `PPT` may appear (a `PPT` alongside `PPM` is malformed). The
+    // per-tile-part relocated buffers are mapped onto the tile-parts by
+    // their codestream ordinal below.
+    let main_ppm = crate::collect_main_header_ppm(bytes, cs.header.bytes_consumed)?;
+    if main_ppm.is_some() {
+        for tp in &cs.tile_parts {
+            if tp
+                .markers
+                .iter()
+                .any(|m| matches!(m, crate::TilePartMarker::Ppt(_)))
+            {
+                // §A.7.4 / §A.7.5: PPM and PPT are mutually exclusive.
+                return Err(Error::InvalidMarkerLength);
+            }
+        }
+    }
+    // Map each tile-part to its codestream ordinal (the PPM series is
+    // indexed by this ordinal).
+    let mut tp_ordinal: BTreeMap<(u16, u8), usize> = BTreeMap::new();
+    for (i, tp) in cs.tile_parts.iter().enumerate() {
+        tp_ordinal.insert((tp.sot.tile_index, tp.sot.tile_part_index), i);
+    }
+
     // The §D.6 bypass rejection and the §D.4.2 / §C.3.6 style decisions
     // are folded into `coding_params_from_cod`, which is re-run per tile
     // when a tile-part `COD` override changes the global style.
@@ -1804,16 +1832,34 @@ pub fn decode_codestream(bytes: &[u8], cs: &J2kCodestream) -> Result<DecodedImag
             body.extend_from_slice(slice);
         }
 
-        // §A.7.5: when one or more PPT marker segments appear in the
-        // tile's tile-part headers, every packet header is relocated out
-        // of the bit stream into the concatenated `Ippt` payload. Gather
-        // them in increasing `Zppt` order (within a tile-part the parser
-        // preserves codestream order, and tile-parts are already sorted
-        // by TPsot, so the relocated header stream is assembled in
-        // packet-decode order). The `Zppt` indices across all the tile's
-        // PPTs must form the contiguous run `0..N` exactly once each — a
-        // gap or duplicate signals a lost or mis-ordered PPT segment.
-        let relocated = gather_ppt_headers(&parts)?;
+        // §A.7.4 / §A.7.5: resolve the relocated packet-header buffer for
+        // this tile, if any.
+        //
+        // * `PPM` (main header) — concatenate the per-tile-part buffers
+        //   the `collect_main_header_ppm` series assigned to this tile's
+        //   tile-parts, in TPsot order (the same order `parts` is sorted
+        //   in). Each tile-part's buffer is addressed by its codestream
+        //   ordinal.
+        // * `PPT` (tile-part headers) — gather the `Ippt` payloads in
+        //   increasing `Zppt` order across the tile's tile-parts. Within a
+        //   tile-part the parser preserves codestream order and the
+        //   tile-parts are already TPsot-sorted, so the relocated header
+        //   stream is assembled in packet-decode order; the `Zppt` indices
+        //   must form the contiguous run `0..N` exactly once each — a gap
+        //   or duplicate signals a lost or mis-ordered PPT segment.
+        let relocated: Option<Vec<u8>> = if let Some(ppm) = &main_ppm {
+            let mut buf = Vec::new();
+            for tp in &parts {
+                let ord = *tp_ordinal
+                    .get(&(tp.sot.tile_index, tp.sot.tile_part_index))
+                    .ok_or(Error::InvalidTilePartIndex)?;
+                let entry = ppm.get(ord).ok_or(Error::InvalidMarkerLength)?;
+                buf.extend_from_slice(entry);
+            }
+            Some(buf)
+        } else {
+            gather_ppt_headers(&parts)?
+        };
 
         let tile_planes = decode_tile(
             siz,
