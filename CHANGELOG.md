@@ -6,6 +6,18 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 370 (2026-06-25).** **End-to-end validation of the
+  relocated-header (`PPT` / `PPM`) decode path.** The tier-2 geometry +
+  enumeration + walk half of `decode_tile` was factored into a reusable
+  `build_tile_packet_plan` / `walk_tile_packet_headers` /
+  `decode_tile_from_plan` split (no behavioural change — all prior
+  fixtures stay pixel-exact). A clean-room transcoder built on the plan
+  relocates a real single-tile-part fixture's in-stream packet headers
+  into a `PPT` segment (and, separately, a main-header `PPM`); five new
+  end-to-end tests decode the transcoded streams and assert **pixel-
+  identical** output versus the in-stream originals across the 5-3
+  lossless and 9-7 irreversible multi-resolution paths, plus a
+  `PPM` + `PPT` mutual-exclusion rejection.
 * **Clean-room round 370 (2026-06-25).** **Relocated packet headers —
   main-header `PPM` (T.800 §A.7.4).** Building on the `PPT` path, a
   `PPM` marker segment in the main header — which moves *all* tiles'

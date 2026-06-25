@@ -70,7 +70,7 @@ use crate::packet::{PacketGeometry, SegmentSplit, SopEphMode, SubBandGeometry};
 use crate::progression::{
     cprl_packet_order, lrcp_packet_order, pcrl_packet_order, poc_volume_packet_order,
     rlcp_packet_order, rpcl_packet_order, ComponentPositionInfo, ComponentProgressionInfo,
-    PocVolume, ResolutionPrecinctLayout,
+    PacketDescriptor, PocVolume, ResolutionPrecinctLayout,
 };
 use crate::reassemble::{
     idwt_5x3, idwt_9x7, BlockSource, CodedCodeBlock, PrecinctBlocks, SubBandQuantization,
@@ -1004,6 +1004,69 @@ fn decode_tile(
     // in `body` as in §B.10.
     relocated_headers: Option<&[u8]>,
 ) -> Result<Vec<Vec<i32>>, Error> {
+    // -- §B.6–§B.12 tile packet plan (geometry, enumeration, walk split) --
+    let TilePacketPlan {
+        levels_per_comp,
+        precinct_geom,
+        descriptors,
+        packets,
+        split,
+    } = build_tile_packet_plan(siz, params, comp_coding, poc_volumes, tile_index)?;
+
+    // -- §A.7.4 / §A.7.5: when packet headers are relocated into PPM / PPT
+    // segments the header stream and data stream live in two buffers, so
+    // each packet carries an explicit body offset. The in-stream §B.10
+    // path recovers the data start from `pos + header.bytes_consumed`
+    // instead. Normalise both into a `(header, data_offset)` list so the
+    // segment-slicing replay below is identical for the two framings.
+    let headers =
+        walk_tile_packet_headers(body, &packets, params.sop_eph, split, relocated_headers)?;
+
+    decode_tile_from_plan(
+        siz,
+        params,
+        comp_coding,
+        comp_quant,
+        roi_shift,
+        tile_index,
+        body,
+        &levels_per_comp,
+        &precinct_geom,
+        &descriptors,
+        &headers,
+        split,
+    )
+}
+
+/// The geometry + enumeration artefacts a tile's tier-2 walk and tier-1
+/// decode consume — produced once by [`build_tile_packet_plan`] and
+/// shared by the decode driver and the relocated-header transcoder.
+struct TilePacketPlan {
+    /// Per-component resolution-level geometry (LL + per-level bands).
+    levels_per_comp: Vec<Vec<ResolutionLevel>>,
+    /// (component, resolution, precinct) → precinct code-block geometry.
+    precinct_geom: BTreeMap<(u16, u8, u32), PrecinctCodeBlocks>,
+    /// Packet enumeration order (§B.12 / §B.12.2).
+    descriptors: Vec<PacketDescriptor>,
+    /// One `(precinct-state-id, geometry)` per packet, in `descriptors`
+    /// order, for the tier-2 header walk.
+    packets: Vec<(usize, PacketGeometry)>,
+    /// The §B.10.7 codeword-segment split selected by the Table A.19
+    /// code-block-style bits.
+    split: SegmentSplit,
+}
+
+/// Builds the [`TilePacketPlan`] for one tile: per-component
+/// resolution-level + precinct geometry (§B.6–§B.9), the §B.12 /
+/// §B.12.2 packet enumeration order, the per-packet
+/// [`PacketGeometry`], and the §B.10.7 segment split.
+fn build_tile_packet_plan(
+    siz: &Siz,
+    params: &CodingParams,
+    comp_coding: &[ComponentCoding],
+    poc_volumes: &[PocVolume],
+    tile_index: u32,
+) -> Result<TilePacketPlan, Error> {
     let tile = derive_tile_geometry(siz, tile_index)?;
     let num_components = siz.components.len();
 
@@ -1142,42 +1205,84 @@ fn decode_tile(
     } else {
         SegmentSplit::Single
     };
-    // §A.7.4 / §A.7.5: when packet headers are relocated into PPM / PPT
-    // segments the header stream and data stream live in two buffers, so
-    // each packet carries an explicit body offset. The in-stream §B.10
-    // path recovers the data start from `pos + header.bytes_consumed`
-    // instead. Normalise both into a `(header, data_offset)` list so the
-    // segment-slicing replay below is identical for the two framings.
-    let headers: Vec<(crate::packet::PacketHeader, usize)> =
-        if let Some(header_bytes) = relocated_headers {
-            let walked = crate::packet::walk_packet_headers_separate(
-                header_bytes,
-                body,
-                &packets,
-                params.sop_eph,
-                split,
-            )?;
-            walked
-                .into_iter()
-                .map(|rp| (rp.header, rp.body_offset))
-                .collect()
-        } else {
-            let walked = crate::packet::walk_packet_headers(body, &packets, params.sop_eph, split)?;
-            let mut pos = 0usize;
-            let mut out = Vec::with_capacity(walked.len());
-            for header in walked {
-                let data_offset = pos
-                    .checked_add(header.bytes_consumed)
-                    .ok_or(Error::PacketHeaderOverrun)?;
-                let body_bytes = usize::try_from(header.total_body_bytes())
-                    .map_err(|_| Error::PacketHeaderOverrun)?;
-                pos = data_offset
-                    .checked_add(body_bytes)
-                    .ok_or(Error::PacketHeaderOverrun)?;
-                out.push((header, data_offset));
-            }
-            out
-        };
+
+    Ok(TilePacketPlan {
+        levels_per_comp,
+        precinct_geom,
+        descriptors,
+        packets,
+        split,
+    })
+}
+
+/// Walks one tile's packet headers, normalising the two framings into a
+/// `(header, data_offset)` list where `data_offset` is the offset into
+/// `body` at which each packet's code-block data begins.
+///
+/// * `relocated_headers = Some(buf)` — the §A.7.4 / §A.7.5 relocated
+///   path: headers come from `buf`, body holds only data.
+/// * `relocated_headers = None` — the §B.10 in-stream path: headers are
+///   interleaved with data in `body`, and the data start is recovered
+///   from each header's `bytes_consumed`.
+fn walk_tile_packet_headers(
+    body: &[u8],
+    packets: &[(usize, PacketGeometry)],
+    sop_eph: SopEphMode,
+    split: SegmentSplit,
+    relocated_headers: Option<&[u8]>,
+) -> Result<Vec<(crate::packet::PacketHeader, usize)>, Error> {
+    if let Some(header_bytes) = relocated_headers {
+        let walked = crate::packet::walk_packet_headers_separate(
+            header_bytes,
+            body,
+            packets,
+            sop_eph,
+            split,
+        )?;
+        Ok(walked
+            .into_iter()
+            .map(|rp| (rp.header, rp.body_offset))
+            .collect())
+    } else {
+        let walked = crate::packet::walk_packet_headers(body, packets, sop_eph, split)?;
+        let mut pos = 0usize;
+        let mut out = Vec::with_capacity(walked.len());
+        for header in walked {
+            let data_offset = pos
+                .checked_add(header.bytes_consumed)
+                .ok_or(Error::PacketHeaderOverrun)?;
+            let body_bytes = usize::try_from(header.total_body_bytes())
+                .map_err(|_| Error::PacketHeaderOverrun)?;
+            pos = data_offset
+                .checked_add(body_bytes)
+                .ok_or(Error::PacketHeaderOverrun)?;
+            out.push((header, data_offset));
+        }
+        Ok(out)
+    }
+}
+
+/// Tier-1 / reassembly half of [`decode_tile`], operating on the
+/// already-built [`TilePacketPlan`] and the walked packet headers. Split
+/// out so the geometry/walk half can be reused by the relocated-header
+/// transcoder.
+#[allow(clippy::too_many_arguments)]
+fn decode_tile_from_plan(
+    siz: &Siz,
+    params: &CodingParams,
+    comp_coding: &[ComponentCoding],
+    comp_quant: &[ComponentQuant<'_>],
+    roi_shift: &[u32],
+    tile_index: u32,
+    body: &[u8],
+    levels_per_comp: &[Vec<ResolutionLevel>],
+    precinct_geom: &BTreeMap<(u16, u8, u32), PrecinctCodeBlocks>,
+    descriptors: &[PacketDescriptor],
+    headers: &[(crate::packet::PacketHeader, usize)],
+    split: SegmentSplit,
+) -> Result<Vec<Vec<i32>>, Error> {
+    let num_components = siz.components.len();
+    let tile = derive_tile_geometry(siz, tile_index)?;
 
     // -- Replay body offsets; accumulate per-code-block segments --
     let mut accum: BTreeMap<BlockKey, BlockAccum> = BTreeMap::new();
@@ -1914,6 +2019,264 @@ pub fn decode_codestream(bytes: &[u8], cs: &J2kCodestream) -> Result<DecodedImag
     })
 }
 
+/// Rebuilds a single-tile / single-tile-part J2K codestream so that the
+/// tile's packet headers are **relocated** out of the bit stream into a
+/// `PPT` marker segment (T.800 §A.7.5) — a clean-room transcoder used to
+/// exercise the relocated-header decode path end-to-end against a real
+/// fixture.
+///
+/// The input must have exactly one tile-part, carry no `SOP` / `EPH`
+/// framing, and not already use `PPM` / `PPT`. For each packet the
+/// in-stream header bytes are split from the data bytes; the headers are
+/// concatenated into the `Ippt` payload of a fresh `PPT` segment
+/// inserted just before the tile-part's `SOD`, and the body is rewritten
+/// to hold only the concatenated packet data. `Psot` is corrected for
+/// the new tile-part length.
+///
+/// Test-only (gated behind `cfg(test)`); not part of the public API.
+#[cfg(test)]
+pub(crate) fn relocate_single_tilepart_to_ppt(bytes: &[u8]) -> Result<Vec<u8>, Error> {
+    let cs = crate::parse_codestream(bytes)?;
+    if cs.tile_parts.len() != 1 {
+        return Err(Error::NotImplemented);
+    }
+    let tp = &cs.tile_parts[0];
+
+    let siz = &cs.header.siz;
+    let cod = &cs.header.cod;
+    let qcd = &cs.header.qcd;
+    let csiz = siz.components.len() as u16;
+    let main_qccs = crate::collect_main_header_qcc(bytes, cs.header.bytes_consumed, csiz)?;
+    let comp_quant = resolve_component_quant(siz.components.len(), qcd, &main_qccs)?;
+    let main_cocs = crate::collect_main_header_coc(bytes, cs.header.bytes_consumed, csiz)?;
+    let comp_coding = resolve_component_coding(siz.components.len(), cod, &main_cocs)?;
+    let main_poc = crate::collect_main_header_poc(bytes, cs.header.bytes_consumed, csiz)?;
+    let main_rgns = crate::collect_main_header_rgn(bytes, cs.header.bytes_consumed, csiz)?;
+    let roi_shift = resolve_component_roi_shift(siz.components.len(), &main_rgns)?;
+    let params = coding_params_from_cod(cod)?;
+
+    let tile_coding = resolve_tile_coding(
+        siz.components.len(),
+        cod,
+        &main_rgns,
+        main_poc.as_ref(),
+        &params,
+        &comp_coding,
+        &comp_quant,
+        &roi_shift,
+        &tp.markers,
+    )?;
+
+    // The transcoder only handles the un-framed in-stream case.
+    if !matches!(tile_coding.params.sop_eph, crate::packet::SopEphMode::None) {
+        return Err(Error::NotImplemented);
+    }
+
+    let body = bytes
+        .get(tp.body_offset..tp.body_offset + tp.body_len)
+        .ok_or(Error::PsotOverflow)?;
+
+    // Build the tile's packet plan, walk the in-stream headers, and split
+    // each packet's header bytes from its data bytes.
+    let plan = build_tile_packet_plan(
+        siz,
+        &tile_coding.params,
+        &tile_coding.comp_coding,
+        &tile_coding.poc_volumes,
+        tp.sot.tile_index as u32,
+    )?;
+    let headers = walk_tile_packet_headers(
+        body,
+        &plan.packets,
+        tile_coding.params.sop_eph,
+        plan.split,
+        None,
+    )?;
+
+    let mut header_buf: Vec<u8> = Vec::new();
+    let mut data_buf: Vec<u8> = Vec::new();
+    for (header, data_offset) in &headers {
+        // Inline header bytes occupy `[packet_start, data_offset)`. With
+        // no SOP framing `packet_start` is the previous packet's data end,
+        // which equals the running `header_buf`-relative bookkeeping — but
+        // we recover the exact header span from the body directly: the
+        // header is `bytes_consumed` long ending at `data_offset`.
+        let head_start = data_offset
+            .checked_sub(header.bytes_consumed)
+            .ok_or(Error::PacketHeaderOverrun)?;
+        header_buf.extend_from_slice(&body[head_start..*data_offset]);
+        let data_len =
+            usize::try_from(header.total_body_bytes()).map_err(|_| Error::PacketHeaderOverrun)?;
+        let end = data_offset
+            .checked_add(data_len)
+            .ok_or(Error::PacketHeaderOverrun)?;
+        data_buf.extend_from_slice(
+            body.get(*data_offset..end)
+                .ok_or(Error::PacketHeaderOverrun)?,
+        );
+    }
+
+    // Build a PPT segment: Lppt = 2 (length) + 1 (Zppt) + Ippt.
+    if header_buf.len() + 3 > u16::MAX as usize {
+        return Err(Error::NotImplemented);
+    }
+    let mut ppt = Vec::new();
+    ppt.extend_from_slice(&crate::MARKER_PPT.to_be_bytes());
+    ppt.extend_from_slice(&((header_buf.len() + 3) as u16).to_be_bytes());
+    ppt.push(0u8); // Zppt = 0
+    ppt.extend_from_slice(&header_buf);
+
+    // Reassemble: [.. up to SOD) + PPT + SOD + data-only body.
+    // The tile-part header runs from `sot_offset` to `sod_offset`; insert
+    // the PPT just before the 2-byte SOD marker.
+    let pre_sod = bytes.get(..tp.sod_offset).ok_or(Error::PsotOverflow)?;
+    let sod = bytes
+        .get(tp.sod_offset..tp.sod_offset + 2)
+        .ok_or(Error::PsotOverflow)?;
+    let post_body = bytes
+        .get(tp.body_offset + tp.body_len..)
+        .ok_or(Error::PsotOverflow)?;
+
+    let mut out = Vec::new();
+    out.extend_from_slice(pre_sod);
+    out.extend_from_slice(&ppt);
+    out.extend_from_slice(sod);
+    out.extend_from_slice(&data_buf);
+    out.extend_from_slice(post_body);
+
+    // Correct Psot: bytes from the SOT marker to the end of the tile-part
+    // data. New length = old (sot_offset..sod_offset) header + PPT + 2
+    // (SOD) + data_buf.
+    let new_psot = (tp.sod_offset - tp.sot_offset) + ppt.len() + 2 + data_buf.len();
+    let new_psot = u32::try_from(new_psot).map_err(|_| Error::PsotOverflow)?;
+    // Psot lives at sot_offset + 2 (marker) + 2 (Lsot) + 2 (Isot) = +6.
+    let psot_at = tp.sot_offset + 6;
+    out[psot_at..psot_at + 4].copy_from_slice(&new_psot.to_be_bytes());
+
+    Ok(out)
+}
+
+/// Like [`relocate_single_tilepart_to_ppt`] but relocates the headers
+/// into a main-header `PPM` segment (T.800 §A.7.4) instead of a tile-part
+/// `PPT`. The single tile-part's headers become the `(Nppm, Ippm)` entry
+/// for tile-part 0, inserted just before the first `SOT`.
+///
+/// Test-only; not part of the public API.
+#[cfg(test)]
+pub(crate) fn relocate_single_tilepart_to_ppm(bytes: &[u8]) -> Result<Vec<u8>, Error> {
+    // Reuse the PPT transcoder to obtain the split header / data buffers,
+    // then re-shape them into a PPM layout. We re-derive the split here to
+    // avoid coupling the two output formats.
+    let cs = crate::parse_codestream(bytes)?;
+    if cs.tile_parts.len() != 1 {
+        return Err(Error::NotImplemented);
+    }
+    let tp = &cs.tile_parts[0];
+
+    let siz = &cs.header.siz;
+    let cod = &cs.header.cod;
+    let qcd = &cs.header.qcd;
+    let csiz = siz.components.len() as u16;
+    let main_qccs = crate::collect_main_header_qcc(bytes, cs.header.bytes_consumed, csiz)?;
+    let comp_quant = resolve_component_quant(siz.components.len(), qcd, &main_qccs)?;
+    let main_cocs = crate::collect_main_header_coc(bytes, cs.header.bytes_consumed, csiz)?;
+    let comp_coding = resolve_component_coding(siz.components.len(), cod, &main_cocs)?;
+    let main_poc = crate::collect_main_header_poc(bytes, cs.header.bytes_consumed, csiz)?;
+    let main_rgns = crate::collect_main_header_rgn(bytes, cs.header.bytes_consumed, csiz)?;
+    let roi_shift = resolve_component_roi_shift(siz.components.len(), &main_rgns)?;
+    let params = coding_params_from_cod(cod)?;
+    let tile_coding = resolve_tile_coding(
+        siz.components.len(),
+        cod,
+        &main_rgns,
+        main_poc.as_ref(),
+        &params,
+        &comp_coding,
+        &comp_quant,
+        &roi_shift,
+        &tp.markers,
+    )?;
+    if !matches!(tile_coding.params.sop_eph, crate::packet::SopEphMode::None) {
+        return Err(Error::NotImplemented);
+    }
+    let body = bytes
+        .get(tp.body_offset..tp.body_offset + tp.body_len)
+        .ok_or(Error::PsotOverflow)?;
+    let plan = build_tile_packet_plan(
+        siz,
+        &tile_coding.params,
+        &tile_coding.comp_coding,
+        &tile_coding.poc_volumes,
+        tp.sot.tile_index as u32,
+    )?;
+    let headers = walk_tile_packet_headers(
+        body,
+        &plan.packets,
+        tile_coding.params.sop_eph,
+        plan.split,
+        None,
+    )?;
+    let mut header_buf: Vec<u8> = Vec::new();
+    let mut data_buf: Vec<u8> = Vec::new();
+    for (header, data_offset) in &headers {
+        let head_start = data_offset
+            .checked_sub(header.bytes_consumed)
+            .ok_or(Error::PacketHeaderOverrun)?;
+        header_buf.extend_from_slice(&body[head_start..*data_offset]);
+        let data_len =
+            usize::try_from(header.total_body_bytes()).map_err(|_| Error::PacketHeaderOverrun)?;
+        let end = data_offset
+            .checked_add(data_len)
+            .ok_or(Error::PacketHeaderOverrun)?;
+        data_buf.extend_from_slice(
+            body.get(*data_offset..end)
+                .ok_or(Error::PacketHeaderOverrun)?,
+        );
+    }
+
+    // PPM Ippm payload for the single tile-part: Nppm (u32) + Ippm.
+    let mut ppm_payload = Vec::new();
+    ppm_payload.extend_from_slice(&(header_buf.len() as u32).to_be_bytes());
+    ppm_payload.extend_from_slice(&header_buf);
+    // Lppm = 2 (length) + 1 (Zppm) + payload.
+    if ppm_payload.len() + 3 > u16::MAX as usize {
+        return Err(Error::NotImplemented);
+    }
+    let mut ppm = Vec::new();
+    ppm.extend_from_slice(&crate::MARKER_PPM.to_be_bytes());
+    ppm.extend_from_slice(&((ppm_payload.len() + 3) as u16).to_be_bytes());
+    ppm.push(0u8); // Zppm = 0
+    ppm.extend_from_slice(&ppm_payload);
+
+    // Reassemble: [.. up to first SOT) + PPM + [SOT .. SOD] + SOD +
+    // data-only body. The PPM is a main-header marker, inserted before the
+    // first SOT.
+    let pre_sot = bytes.get(..tp.sot_offset).ok_or(Error::PsotOverflow)?;
+    let sot_to_sod = bytes
+        .get(tp.sot_offset..tp.sod_offset + 2)
+        .ok_or(Error::PsotOverflow)?;
+    let post_body = bytes
+        .get(tp.body_offset + tp.body_len..)
+        .ok_or(Error::PsotOverflow)?;
+
+    let mut out = Vec::new();
+    out.extend_from_slice(pre_sot);
+    out.extend_from_slice(&ppm);
+    out.extend_from_slice(sot_to_sod);
+    out.extend_from_slice(&data_buf);
+    out.extend_from_slice(post_body);
+
+    // Correct Psot (does NOT include the main-header PPM): old header span
+    // + 2 (SOD) + data_buf.
+    let new_psot = (tp.sod_offset - tp.sot_offset) + 2 + data_buf.len();
+    let new_psot = u32::try_from(new_psot).map_err(|_| Error::PsotOverflow)?;
+    // The SOT moved forward by the inserted PPM length.
+    let psot_at = tp.sot_offset + ppm.len() + 6;
+    out[psot_at..psot_at + 4].copy_from_slice(&new_psot.to_be_bytes());
+
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1999,6 +2362,106 @@ mod tests {
         let parts = [&tp];
         assert!(matches!(
             gather_ppt_headers(&parts),
+            Err(Error::InvalidMarkerLength)
+        ));
+    }
+
+    // -- End-to-end PPT relocation against a real fixture --------------
+
+    /// A real single-tile-part fixture, transcoded so its packet headers
+    /// move into a `PPT` segment, must decode **pixel-identically** to the
+    /// in-stream original — proving the full relocated-header decode path
+    /// (gather → separate walk → tier-1) reconstructs the same image.
+    #[test]
+    fn ppt_relocated_gray_53_matches_inline() {
+        const GRAY_53: &[u8] = include_bytes!("../tests/data/gray-17x13-53.j2k");
+        let original = decode_j2k(GRAY_53).expect("decode in-stream original");
+
+        let relocated = relocate_single_tilepart_to_ppt(GRAY_53).expect("relocate to PPT");
+
+        // The transcoded stream genuinely carries a PPT now.
+        let cs = crate::parse_codestream(&relocated).expect("parse relocated");
+        assert!(cs.tile_parts[0]
+            .markers
+            .iter()
+            .any(|m| matches!(m, crate::TilePartMarker::Ppt(_))));
+
+        let decoded = decode_j2k(&relocated).expect("decode relocated PPT stream");
+        assert_eq!(decoded.components.len(), original.components.len());
+        for (a, b) in decoded.components.iter().zip(original.components.iter()) {
+            assert_eq!(a.samples, b.samples, "PPT-relocated decode diverged");
+        }
+    }
+
+    /// The same fixture's 9-7 irreversible multi-resolution sibling, to
+    /// exercise relocation over multiple packets (NL > 0) and the lossy
+    /// path.
+    #[test]
+    fn ppt_relocated_gray_97_matches_inline() {
+        const GRAY_97: &[u8] = include_bytes!("../tests/data/gray-32x32-97full.j2k");
+        let original = decode_j2k(GRAY_97).expect("decode in-stream original");
+        let relocated = relocate_single_tilepart_to_ppt(GRAY_97).expect("relocate to PPT");
+        let decoded = decode_j2k(&relocated).expect("decode relocated PPT stream");
+        assert_eq!(decoded.components.len(), original.components.len());
+        for (a, b) in decoded.components.iter().zip(original.components.iter()) {
+            assert_eq!(a.samples, b.samples, "PPT-relocated 9-7 decode diverged");
+        }
+    }
+
+    /// The same fixtures relocated into a main-header `PPM` must also
+    /// decode pixel-identically, proving the §A.7.4 gather + per-tile-part
+    /// `(Nppm, Ippm)` split + separate-walk path.
+    #[test]
+    fn ppm_relocated_gray_53_matches_inline() {
+        const GRAY_53: &[u8] = include_bytes!("../tests/data/gray-17x13-53.j2k");
+        let original = decode_j2k(GRAY_53).expect("decode in-stream original");
+        let relocated = relocate_single_tilepart_to_ppm(GRAY_53).expect("relocate to PPM");
+        let decoded = decode_j2k(&relocated).expect("decode relocated PPM stream");
+        for (a, b) in decoded.components.iter().zip(original.components.iter()) {
+            assert_eq!(a.samples, b.samples, "PPM-relocated decode diverged");
+        }
+    }
+
+    #[test]
+    fn ppm_relocated_gray_97_matches_inline() {
+        const GRAY_97: &[u8] = include_bytes!("../tests/data/gray-32x32-97full.j2k");
+        let original = decode_j2k(GRAY_97).expect("decode in-stream original");
+        let relocated = relocate_single_tilepart_to_ppm(GRAY_97).expect("relocate to PPM");
+        let decoded = decode_j2k(&relocated).expect("decode relocated PPM stream");
+        for (a, b) in decoded.components.iter().zip(original.components.iter()) {
+            assert_eq!(a.samples, b.samples, "PPM-relocated 9-7 decode diverged");
+        }
+    }
+
+    /// A stream carrying *both* a main-header `PPM` and a tile-part `PPT`
+    /// is malformed (§A.7.4 mutual exclusion) — the decoder rejects it.
+    #[test]
+    fn ppm_with_ppt_is_rejected() {
+        const GRAY_53: &[u8] = include_bytes!("../tests/data/gray-17x13-53.j2k");
+        // Relocate to PPM, then also splice a (harmless, empty-ish) PPT
+        // into the tile-part header to violate the mutual-exclusion rule.
+        let ppm_stream = relocate_single_tilepart_to_ppm(GRAY_53).expect("relocate to PPM");
+        let cs = crate::parse_codestream(&ppm_stream).expect("parse ppm stream");
+        let tp = &cs.tile_parts[0];
+        // Insert a 4-byte PPT (Lppt=3: Zppt + 0 Ippt bytes is invalid;
+        // use 1 Ippt byte → Lppt=4) just before SOD.
+        let mut ppt = Vec::new();
+        ppt.extend_from_slice(&crate::MARKER_PPT.to_be_bytes());
+        ppt.extend_from_slice(&4u16.to_be_bytes());
+        ppt.push(0u8); // Zppt
+        ppt.push(0u8); // 1 Ippt byte
+        let mut spliced = Vec::new();
+        spliced.extend_from_slice(&ppm_stream[..tp.sod_offset]);
+        spliced.extend_from_slice(&ppt);
+        spliced.extend_from_slice(&ppm_stream[tp.sod_offset..]);
+        // Fix Psot for the inserted PPT bytes so parsing reaches decode
+        // (the PPM transcoder always writes a concrete, non-zero Psot).
+        let new_psot = tp.sot.psot + ppt.len() as u32;
+        let psot_at = tp.sot_offset + 6;
+        spliced[psot_at..psot_at + 4].copy_from_slice(&new_psot.to_be_bytes());
+        // Decode must reject the PPM+PPT combination.
+        assert!(matches!(
+            decode_j2k(&spliced),
             Err(Error::InvalidMarkerLength)
         ));
     }
