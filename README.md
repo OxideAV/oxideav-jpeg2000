@@ -35,6 +35,14 @@ What is implemented:
   is validated against the running per-tile packet ordinal (rolling over
   at 65 536), so a desynchronised or lost packet is rejected rather than
   mis-decoded; the per-packet-optional SOP rule is honoured.
+  **Relocated packet headers** (`PPT`, §A.7.5) are decoded: when a
+  tile's tile-part headers carry `PPT` marker segments, every packet
+  header is read from the concatenated `Ippt` payload (ordered by
+  `Zppt`, with a gap / duplicate in the `0..N` run rejected as a lost
+  segment) while the tile body supplies only packet data. The §A.8.1 /
+  §A.8.2 framing split is honoured — an in-body `SOP` (with its `Nsop`
+  still validated) precedes each packet's data and a required `EPH`
+  trails each header inside the relocated header buffer.
 - **Tier-1** — the MQ arithmetic decoder (Annex C) and all three Annex D
   coding passes (significance-propagation + sign, magnitude refinement,
   cleanup with the run-length / UNIFORM shortcut), the §D.5
@@ -166,9 +174,10 @@ These surface a clean `Error::NotImplemented` rather than mis-decoding:
   wavelet-domain ROI-mask generation and mask-driven L.1 de-scaling),
   outside this Part-1 decoder's scope; an `Srgn ≠ 0` (or a Part-2
   extended-length) `RGN` surfaces a clean error rather than mis-decoding.
-- `PPM` / `PPT` packed-header markers (the `POC` progression order
-  change is now wired into the decode driver — see **Progression**
-  above — for both the main-header and first-tile-part headers).
+- `PPM` packed-header markers (main-header relocation of *all* tiles'
+  packet headers). The tile-part `PPT` relocation *is* decoded — see
+  **Tier-2** above; only the main-header `PPM` variant (and its
+  mutual-exclusion-with-`PPT` rule) remains unwired.
 - Position-keyed orders under non-power-of-two sub-sampling.
 - HTJ2K MULTIHT codestreams (more than one HT set per code-block) and
   HT code-blocks that begin with placeholder passes (`P0 > 0`); the

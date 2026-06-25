@@ -1300,6 +1300,108 @@ pub fn walk_packet_headers(
     Ok(out)
 }
 
+/// One packet's parsed header plus the byte offset, **within the
+/// tile-part body**, at which the packet's code-block data begins.
+///
+/// Used by the relocated-header ([`walk_packet_headers_separate`])
+/// path: with `PPM` / `PPT` in play the header stream and the data
+/// stream live in distinct buffers, so the caller cannot recover the
+/// data start from the in-stream `PacketHeader::bytes_consumed`. This
+/// pairs each header with its concrete data offset instead.
+#[derive(Debug, Clone)]
+pub struct RelocatedPacket {
+    /// The parsed packet header (decoded out of the relocated
+    /// `PPM` / `PPT` header buffer).
+    pub header: PacketHeader,
+    /// Offset into the tile-part **body** at which this packet's
+    /// code-block segment data begins (after any in-body `SOP`).
+    pub body_offset: usize,
+}
+
+/// Walks a series of packet headers when they have been **relocated**
+/// out of the bit-stream into `PPM` / `PPT` marker segments
+/// (T.800 §A.7.4 / §A.7.5).
+///
+/// Unlike [`walk_packet_headers`], the headers and the packet data
+/// occupy two separate buffers:
+///
+/// * `header_bytes` — the concatenated `Ippm` / `Ippt` payload (all
+///   segments in increasing `Zppm` / `Zppt` order). Each packet header
+///   is decoded from here; the `§B.10.1` bit-stuffing rule and (when
+///   `EPH` is signalled) the trailing `EPH` marker live in this buffer
+///   per §A.8.2.
+/// * `body` — the tile-part compressed-data portion, which now holds
+///   *only* packet data (no in-stream headers). Per §A.8.1 an optional
+///   `SOP` marker segment may still precede each packet's data here.
+///
+/// Returns one [`RelocatedPacket`] per geometry entry, each carrying
+/// the parsed header and the body offset at which that packet's
+/// code-block data begins. The caller slices code-block segments out
+/// of `body` starting at `body_offset`.
+pub fn walk_packet_headers_separate(
+    header_bytes: &[u8],
+    body: &[u8],
+    packets: &[(usize, PacketGeometry)],
+    sop_eph: SopEphMode,
+    split: SegmentSplit,
+) -> Result<Vec<RelocatedPacket>, Error> {
+    // §A.8.1 / §A.8.2: when headers are relocated, SOP (if allowed)
+    // sits in the body before each packet's data, and EPH (if
+    // required) sits in the header buffer after each header. Split the
+    // mode so the header decoder sees only EPH and the body walk sees
+    // only SOP.
+    let header_mode = match sop_eph {
+        SopEphMode::EphOnly | SopEphMode::SopAndEph => SopEphMode::EphOnly,
+        _ => SopEphMode::None,
+    };
+    let sop_in_body = matches!(sop_eph, SopEphMode::SopOnly | SopEphMode::SopAndEph);
+
+    let mut precincts: std::collections::HashMap<usize, PrecinctState> =
+        std::collections::HashMap::new();
+    let mut out = Vec::with_capacity(packets.len());
+    let mut hpos = 0usize;
+    let mut bpos = 0usize;
+    for (packet_ordinal, (precinct_index, geometry)) in packets.iter().enumerate() {
+        if hpos > header_bytes.len() || bpos > body.len() {
+            return Err(Error::PacketHeaderOverrun);
+        }
+        // §A.8.1: an SOP in the body must carry the running ordinal.
+        if sop_in_body {
+            if let Some(nsop) = peek_sop_nsop(&body[bpos..])? {
+                let expected = (packet_ordinal % 65_536) as u16;
+                if nsop != expected {
+                    return Err(Error::InvalidPacketHeader);
+                }
+                // Consume the six-byte SOP marker segment from the body.
+                bpos = bpos.checked_add(6).ok_or(Error::PacketHeaderOverrun)?;
+            }
+        }
+        let state = precincts.entry(*precinct_index).or_default();
+        let header =
+            decode_packet_header(&header_bytes[hpos..], geometry, state, header_mode, split)?;
+        hpos = hpos
+            .checked_add(header.bytes_consumed)
+            .ok_or(Error::PacketHeaderOverrun)?;
+        if hpos > header_bytes.len() {
+            return Err(Error::PacketHeaderOverrun);
+        }
+        let body_offset = bpos;
+        let body_bytes = header.total_body_bytes();
+        let body_bytes = usize::try_from(body_bytes).map_err(|_| Error::PacketHeaderOverrun)?;
+        bpos = bpos
+            .checked_add(body_bytes)
+            .ok_or(Error::PacketHeaderOverrun)?;
+        if bpos > body.len() {
+            return Err(Error::PacketHeaderOverrun);
+        }
+        out.push(RelocatedPacket {
+            header,
+            body_offset,
+        });
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // Tests — synthetic bit-stuffed buffers built from T.800 §B.10.
 // ---------------------------------------------------------------------------
@@ -1949,6 +2051,143 @@ mod tests {
         // The second packet didn't read a zero-bitplane field — its
         // contribution's zero_bit_planes is None.
         assert!(headers[1].contributions[0].zero_bit_planes.is_none());
+    }
+
+    // -- Relocated-header (PPM / PPT) walker, T.800 §A.7.4 / §A.7.5 ------
+
+    /// The relocated walker must recover exactly the same packet headers
+    /// and code-block contributions as the in-stream walker when the same
+    /// stream is split into separate header / data buffers.
+    ///
+    /// Build the two-packet, single-precinct, two-layer stream from
+    /// `walk_two_packets_same_precinct_inclusion_persists`, then peel its
+    /// byte-aligned packet headers off into one buffer and the code-block
+    /// data into another — exactly the relocation PPT performs — and
+    /// assert the relocated walk reproduces the inline result byte-for-
+    /// byte, with body offsets pointing at the right data spans.
+    #[test]
+    fn separate_walk_matches_inline_two_packets() {
+        let h0 = pack_bits(&[1, 1, 1, 0, 0, 1, 0, 1]); // packet-0 header
+        let d0 = [0xAAu8; 5]; // packet-0 data (length 5)
+        let h1 = pack_bits(&[1, 1, 0, 0, 0, 1, 0]); // packet-1 header
+        let d1 = [0xBBu8; 2]; // packet-1 data (length 2)
+
+        // In-stream layout: header then data, interleaved.
+        let mut inline = Vec::new();
+        inline.extend_from_slice(&h0);
+        inline.extend_from_slice(&d0);
+        inline.extend_from_slice(&h1);
+        inline.extend_from_slice(&d1);
+
+        // Relocated layout: all headers concatenated; all data
+        // concatenated; two distinct buffers.
+        let mut header_buf = Vec::new();
+        header_buf.extend_from_slice(&h0);
+        header_buf.extend_from_slice(&h1);
+        let mut data_buf = Vec::new();
+        data_buf.extend_from_slice(&d0);
+        data_buf.extend_from_slice(&d1);
+
+        let g = |layer| PacketGeometry {
+            sub_bands: vec![SubBandGeometry {
+                width: 1,
+                height: 1,
+            }],
+            layer,
+        };
+        let packets = [(0usize, g(0)), (0usize, g(1))];
+
+        let inline_headers =
+            walk_packet_headers(&inline, &packets, SopEphMode::None, SegmentSplit::Single).unwrap();
+        let relocated = walk_packet_headers_separate(
+            &header_buf,
+            &data_buf,
+            &packets,
+            SopEphMode::None,
+            SegmentSplit::Single,
+        )
+        .unwrap();
+
+        assert_eq!(relocated.len(), inline_headers.len());
+        // Body offsets address the two data spans in `data_buf`.
+        assert_eq!(relocated[0].body_offset, 0);
+        assert_eq!(relocated[1].body_offset, 5);
+        for (rp, ih) in relocated.iter().zip(inline_headers.iter()) {
+            assert_eq!(rp.header.non_zero_length, ih.non_zero_length);
+            assert_eq!(rp.header.contributions.len(), ih.contributions.len());
+            for (rc, ic) in rp.header.contributions.iter().zip(ih.contributions.iter()) {
+                assert_eq!(rc.included, ic.included);
+                assert_eq!(rc.segment_lengths, ic.segment_lengths);
+                assert_eq!(rc.coding_passes, ic.coding_passes);
+                assert_eq!(rc.zero_bit_planes, ic.zero_bit_planes);
+            }
+        }
+    }
+
+    /// With EPH framing the relocated walk consumes the trailing EPH
+    /// from the **header** buffer (§A.8.2) and an SOP from the **body**
+    /// buffer (§A.8.1) — the two markers live in different streams once
+    /// the headers are moved into PPT.
+    #[test]
+    fn separate_walk_sop_in_body_eph_in_header() {
+        // One non-empty packet, single 1×1 block, length-4 segment.
+        let header_bits = pack_bits(&[1, 1, 1, 0, 0, 1, 0, 0]); // length 4
+        let mut header_buf = header_bits;
+        header_buf.extend_from_slice(&[0xFF, 0x92]); // EPH after the header
+
+        // Body: SOP (Nsop = 0) then the 4 data bytes.
+        let mut data_buf = vec![0xFFu8, 0x91, 0x00, 0x04, 0x00, 0x00];
+        data_buf.extend_from_slice(&[0xCCu8; 4]);
+
+        let geom = PacketGeometry {
+            sub_bands: vec![SubBandGeometry {
+                width: 1,
+                height: 1,
+            }],
+            layer: 0,
+        };
+        let relocated = walk_packet_headers_separate(
+            &header_buf,
+            &data_buf,
+            &[(0usize, geom)],
+            SopEphMode::SopAndEph,
+            SegmentSplit::Single,
+        )
+        .unwrap();
+        assert_eq!(relocated.len(), 1);
+        // Data begins after the 6-byte SOP in the body.
+        assert_eq!(relocated[0].body_offset, 6);
+        assert!(relocated[0].header.non_zero_length);
+        assert_eq!(
+            relocated[0].header.contributions[0].segment_lengths,
+            vec![4]
+        );
+    }
+
+    /// A body SOP whose Nsop does not match the running packet ordinal
+    /// flags a lost / mis-ordered packet (§A.8.1) even when the headers
+    /// are relocated.
+    #[test]
+    fn separate_walk_rejects_wrong_body_nsop() {
+        let header_buf = pack_bits(&[0]); // single empty packet
+                                          // SOP carrying Nsop = 7 for what should be packet 0.
+        let data_buf = vec![0xFFu8, 0x91, 0x00, 0x04, 0x00, 0x07];
+        let geom = PacketGeometry {
+            sub_bands: vec![SubBandGeometry {
+                width: 1,
+                height: 1,
+            }],
+            layer: 0,
+        };
+        let err = walk_packet_headers_separate(
+            &header_buf,
+            &data_buf,
+            &[(0usize, geom)],
+            SopEphMode::SopAndEph,
+            SegmentSplit::Single,
+        )
+        .unwrap_err();
+        assert_eq!(err, Error::InvalidPacketHeader);
     }
 
     #[test]

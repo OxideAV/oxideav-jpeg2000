@@ -6,6 +6,25 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 370 (2026-06-25).** **Relocated packet headers —
+  `PPT` (T.800 §A.7.5).** The tier-2 packet-header walk gained a
+  separate-buffer mode (`walk_packet_headers_separate`) for the case
+  where a tile's packet headers have been moved out of the bit stream
+  into one or more `PPT` marker segments. The decode driver now gathers
+  every `PPT` `Ippt` payload across the tile's tile-parts, orders them
+  by `Zppt` (a gap or duplicate in the `0..N` run is rejected as a lost
+  / mis-ordered segment), concatenates them, and decodes each packet's
+  header from that buffer while the tile body supplies only the packet
+  data. The §A.8.1 / §A.8.2 framing split is honoured: when `SOP` is
+  allowed it sits in the body before each packet's data (and its `Nsop`
+  is still validated against the running ordinal), while a required
+  `EPH` sits in the relocated header buffer after each header. `PPT` is
+  no longer rejected with `Error::NotImplemented`. A walker-equivalence
+  unit test proves the relocated walk reproduces the in-stream walk
+  byte-for-byte (same contributions, same segment lengths) with correct
+  per-packet body offsets, plus `SOP`-in-body / `EPH`-in-header framing,
+  body-`Nsop` mismatch rejection, and the `Zppt` order / gap / duplicate
+  checks.
 * **Clean-room round 357 (2026-06-21).** **Decode-robustness:
   progression order change (`POC`), predictable termination, and SOP
   `Nsop` validation.** Three self-contained features wired into the

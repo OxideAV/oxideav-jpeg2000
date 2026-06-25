@@ -691,6 +691,46 @@ struct ResolvedTileCoding<'a> {
 ///
 /// Per §A.6.1 / §A.6.2 / §A.6.4 / §A.6.5 these markers, if present in a
 /// multi-tile-part tile, appear only in the first tile-part — the
+/// Gathers the relocated packet-header payload (T.800 §A.7.5) for one
+/// tile, concatenating the `Ippt` bytes of every `PPT` marker segment
+/// across the tile's tile-parts.
+///
+/// Returns `None` when the tile carries no `PPT` (the §B.10 in-stream
+/// path applies). When `PPT` is present, the `Zppt` indices across all
+/// the tile's segments must form the contiguous run `0..N`, each value
+/// appearing exactly once — a gap or duplicate is rejected as a lost or
+/// mis-ordered relocated-header segment (§A.7.5 "increasing `Zppt`").
+fn gather_ppt_headers(parts: &[&crate::TilePart]) -> Result<Option<Vec<u8>>, Error> {
+    // Collect (Zppt, payload) across the tile, preserving codestream
+    // order so equal-Zppt duplicates are detected deterministically.
+    let mut segs: Vec<(u8, &[u8])> = Vec::new();
+    for tp in parts {
+        for m in &tp.markers {
+            if let crate::TilePartMarker::Ppt(p) = m {
+                segs.push((p.z_index, p.packet_headers.as_slice()));
+            }
+        }
+    }
+    if segs.is_empty() {
+        return Ok(None);
+    }
+    // §A.7.5: order by Zppt; the set must be exactly 0..N with no gaps
+    // or duplicates.
+    segs.sort_by_key(|(z, _)| *z);
+    for (expected, (z, _)) in segs.iter().enumerate() {
+        let expected = u8::try_from(expected).map_err(|_| Error::InvalidMarkerLength)?;
+        if *z != expected {
+            return Err(Error::InvalidMarkerLength);
+        }
+    }
+    let total: usize = segs.iter().map(|(_, b)| b.len()).sum();
+    let mut buf = Vec::with_capacity(total);
+    for (_, b) in &segs {
+        buf.extend_from_slice(b);
+    }
+    Ok(Some(buf))
+}
+
 /// caller passes that tile-part's `markers`.
 #[allow(clippy::too_many_arguments)]
 fn resolve_tile_coding<'a>(
@@ -739,11 +779,13 @@ fn resolve_tile_coding<'a>(
             }
             // PLT / COM are informational; the tier-2 walker reads the
             // bit-stream lengths directly, so they need no resolution.
-            crate::TilePartMarker::Plt(_) | crate::TilePartMarker::Com(_) => {}
-            // PPT tile-part overrides remain unwired.
-            crate::TilePartMarker::Ppt(_) => {
-                return Err(Error::NotImplemented);
-            }
+            // PPT carries relocated packet headers (§A.7.5); the caller
+            // gathers and concatenates them across the tile's tile-parts
+            // and feeds the buffer to `decode_tile`, so coding-parameter
+            // resolution ignores it here.
+            crate::TilePartMarker::Plt(_)
+            | crate::TilePartMarker::Com(_)
+            | crate::TilePartMarker::Ppt(_) => {}
         }
     }
 
@@ -953,6 +995,12 @@ fn decode_tile(
     poc_volumes: &[PocVolume],
     tile_index: u32,
     body: &[u8],
+    // Relocated packet-header buffer (concatenated `PPM` / `PPT`
+    // `Ippm` / `Ippt` payload, T.800 §A.7.4 / §A.7.5). When `Some`,
+    // every packet's header is decoded from here and `body` holds
+    // only the packet data; when `None` the headers are interleaved
+    // in `body` as in §B.10.
+    relocated_headers: Option<&[u8]>,
 ) -> Result<Vec<Vec<i32>>, Error> {
     let tile = derive_tile_geometry(siz, tile_index)?;
     let num_components = siz.components.len();
@@ -1092,15 +1140,47 @@ fn decode_tile(
     } else {
         SegmentSplit::Single
     };
-    let headers = crate::packet::walk_packet_headers(body, &packets, params.sop_eph, split)?;
+    // §A.7.4 / §A.7.5: when packet headers are relocated into PPM / PPT
+    // segments the header stream and data stream live in two buffers, so
+    // each packet carries an explicit body offset. The in-stream §B.10
+    // path recovers the data start from `pos + header.bytes_consumed`
+    // instead. Normalise both into a `(header, data_offset)` list so the
+    // segment-slicing replay below is identical for the two framings.
+    let headers: Vec<(crate::packet::PacketHeader, usize)> =
+        if let Some(header_bytes) = relocated_headers {
+            let walked = crate::packet::walk_packet_headers_separate(
+                header_bytes,
+                body,
+                &packets,
+                params.sop_eph,
+                split,
+            )?;
+            walked
+                .into_iter()
+                .map(|rp| (rp.header, rp.body_offset))
+                .collect()
+        } else {
+            let walked = crate::packet::walk_packet_headers(body, &packets, params.sop_eph, split)?;
+            let mut pos = 0usize;
+            let mut out = Vec::with_capacity(walked.len());
+            for header in walked {
+                let data_offset = pos
+                    .checked_add(header.bytes_consumed)
+                    .ok_or(Error::PacketHeaderOverrun)?;
+                let body_bytes = usize::try_from(header.total_body_bytes())
+                    .map_err(|_| Error::PacketHeaderOverrun)?;
+                pos = data_offset
+                    .checked_add(body_bytes)
+                    .ok_or(Error::PacketHeaderOverrun)?;
+                out.push((header, data_offset));
+            }
+            out
+        };
 
     // -- Replay body offsets; accumulate per-code-block segments --
     let mut accum: BTreeMap<BlockKey, BlockAccum> = BTreeMap::new();
-    let mut pos = 0usize;
-    for (desc, header) in descriptors.iter().zip(headers.iter()) {
-        let mut seg_pos = pos
-            .checked_add(header.bytes_consumed)
-            .ok_or(Error::PacketHeaderOverrun)?;
+    for (desc, (header, data_offset)) in descriptors.iter().zip(headers.iter()) {
+        let mut seg_pos = *data_offset;
         for contrib in &header.contributions {
             if !contrib.included {
                 continue;
@@ -1220,7 +1300,10 @@ fn decode_tile(
                 }
             }
         }
-        pos = seg_pos;
+        // `seg_pos` now sits at this packet's data end; the next packet's
+        // data offset is carried explicitly in `headers`, so no running
+        // cursor needs to be threaded across iterations.
+        let _ = seg_pos;
     }
 
     // -- Per-component quantisation tables (§A.6.5 QCC override) --
@@ -1721,6 +1804,17 @@ pub fn decode_codestream(bytes: &[u8], cs: &J2kCodestream) -> Result<DecodedImag
             body.extend_from_slice(slice);
         }
 
+        // §A.7.5: when one or more PPT marker segments appear in the
+        // tile's tile-part headers, every packet header is relocated out
+        // of the bit stream into the concatenated `Ippt` payload. Gather
+        // them in increasing `Zppt` order (within a tile-part the parser
+        // preserves codestream order, and tile-parts are already sorted
+        // by TPsot, so the relocated header stream is assembled in
+        // packet-decode order). The `Zppt` indices across all the tile's
+        // PPTs must form the contiguous run `0..N` exactly once each — a
+        // gap or duplicate signals a lost or mis-ordered PPT segment.
+        let relocated = gather_ppt_headers(&parts)?;
+
         let tile_planes = decode_tile(
             siz,
             &tile_coding.params,
@@ -1730,6 +1824,7 @@ pub fn decode_codestream(bytes: &[u8], cs: &J2kCodestream) -> Result<DecodedImag
             &tile_coding.poc_volumes,
             tile_index as u32,
             &body,
+            relocated.as_deref(),
         )?;
 
         // Place each tile-component plane into its image-area plane at
@@ -1776,6 +1871,91 @@ pub fn decode_codestream(bytes: &[u8], cs: &J2kCodestream) -> Result<DecodedImag
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a tile-part carrying the given `(Zppt, payload)` PPT
+    /// segments (plus, optionally, a leading COM so the PPTs are not the
+    /// only markers). Offsets are dummies — `gather_ppt_headers` only
+    /// reads the markers.
+    fn tile_part_with_ppts(tile_part_index: u8, ppts: &[(u8, &[u8])]) -> crate::TilePart {
+        let markers = ppts
+            .iter()
+            .map(|(z, b)| {
+                crate::TilePartMarker::Ppt(crate::Ppt {
+                    z_index: *z,
+                    packet_headers: b.to_vec(),
+                })
+            })
+            .collect();
+        crate::TilePart {
+            sot: crate::Sot {
+                tile_index: 0,
+                psot: 0,
+                tile_part_index,
+                num_tile_parts: 0,
+            },
+            sot_offset: 0,
+            sod_offset: 0,
+            body_offset: 0,
+            body_len: 0,
+            markers,
+        }
+    }
+
+    /// No PPT in any tile-part → `None` (the §B.10 in-stream path).
+    #[test]
+    fn gather_ppt_none_without_ppt() {
+        let tp = tile_part_with_ppts(0, &[]);
+        let parts = [&tp];
+        assert_eq!(gather_ppt_headers(&parts).unwrap(), None);
+    }
+
+    /// PPTs across two tile-parts are concatenated in increasing Zppt
+    /// order (§A.7.5), independent of the codestream order they appear.
+    #[test]
+    fn gather_ppt_concatenates_in_zppt_order() {
+        // tp0 carries Zppt=1, tp1 carries Zppt=0 — the gather must emit
+        // segment 0's bytes first regardless.
+        let tp0 = tile_part_with_ppts(0, &[(1u8, &[0xCC, 0xDD][..])]);
+        let tp1 = tile_part_with_ppts(1, &[(0u8, &[0xAA, 0xBB][..])]);
+        let parts = [&tp0, &tp1];
+        let got = gather_ppt_headers(&parts).unwrap().unwrap();
+        assert_eq!(got, vec![0xAA, 0xBB, 0xCC, 0xDD]);
+    }
+
+    /// Multiple PPTs in one tile-part header are ordered by Zppt too.
+    #[test]
+    fn gather_ppt_multiple_in_one_header() {
+        let tp = tile_part_with_ppts(
+            0,
+            &[(2u8, &[0x33][..]), (0u8, &[0x11][..]), (1u8, &[0x22][..])],
+        );
+        let parts = [&tp];
+        let got = gather_ppt_headers(&parts).unwrap().unwrap();
+        assert_eq!(got, vec![0x11, 0x22, 0x33]);
+    }
+
+    /// A gap in the Zppt run (0, 2 with no 1) is a lost relocated-header
+    /// segment — rejected.
+    #[test]
+    fn gather_ppt_rejects_zppt_gap() {
+        let tp = tile_part_with_ppts(0, &[(0u8, &[0x11][..]), (2u8, &[0x22][..])]);
+        let parts = [&tp];
+        assert!(matches!(
+            gather_ppt_headers(&parts),
+            Err(Error::InvalidMarkerLength)
+        ));
+    }
+
+    /// A duplicated Zppt is rejected (each index must appear once).
+    #[test]
+    fn gather_ppt_rejects_zppt_duplicate() {
+        let tp = tile_part_with_ppts(0, &[(0u8, &[0x11][..]), (0u8, &[0x22][..])]);
+        let parts = [&tp];
+        assert!(matches!(
+            gather_ppt_headers(&parts),
+            Err(Error::InvalidMarkerLength)
+        ));
+    }
 
     /// Build a minimal main-header byte span `SOC | SIZ-stub | CAP` for
     /// the CAP-accept tests. `pcap` is the 32-bit Pcap field.
