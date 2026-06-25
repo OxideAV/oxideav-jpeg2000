@@ -48,7 +48,12 @@ What is implemented:
   is rejected (§A.7.4 mutual exclusion). The §A.8.1 / §A.8.2 framing
   split is honoured — an in-body `SOP` (with its `Nsop` still
   validated) precedes each packet's data and a required `EPH` trails
-  each header inside the relocated header buffer.
+  each header inside the relocated header buffer. Both relocations are
+  validated **pixel-exact** end-to-end: a clean-room transcoder moves a
+  real fixture's in-stream headers into `PPT` / `PPM` and the decoded
+  output is asserted identical to the in-stream original across the 5-3
+  lossless and 9-7 irreversible multi-resolution, multi-precinct,
+  multi-layer and RGB/RCT paths.
 - **Tier-1** — the MQ arithmetic decoder (Annex C) and all three Annex D
   coding passes (significance-propagation + sign, magnitude refinement,
   cleanup with the run-length / UNIFORM shortcut), the §D.5

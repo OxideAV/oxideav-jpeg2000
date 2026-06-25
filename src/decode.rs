@@ -2433,6 +2433,49 @@ mod tests {
         }
     }
 
+    /// Broader single-tile-part fixtures (multi-precinct, multi-layer,
+    /// RGB / RCT) relocated into both `PPT` and `PPM` must decode
+    /// pixel-identically — exercising many-packets-per-tile-part
+    /// relocation across multiple precincts, layers and components.
+    #[test]
+    fn relocated_broad_fixtures_match_inline() {
+        const MULTIPRECINCT: &[u8] =
+            include_bytes!("../tests/data/gray-40x40-multiprecinct-53.j2k");
+        const MULTILAYER: &[u8] = include_bytes!("../tests/data/gray-64x64-multilayer-53.j2k");
+        const RGB_RCT: &[u8] = include_bytes!("../tests/data/rgb-16x16-rct-53.j2k");
+
+        for (name, fixture) in [
+            ("multiprecinct", MULTIPRECINCT),
+            ("multilayer", MULTILAYER),
+            ("rgb-rct", RGB_RCT),
+        ] {
+            let original = decode_j2k(fixture).expect("decode original");
+            for (kind, relocated) in [
+                (
+                    "PPT",
+                    relocate_single_tilepart_to_ppt(fixture).expect("relocate PPT"),
+                ),
+                (
+                    "PPM",
+                    relocate_single_tilepart_to_ppm(fixture).expect("relocate PPM"),
+                ),
+            ] {
+                let decoded = decode_j2k(&relocated).expect("decode relocated");
+                assert_eq!(
+                    decoded.components.len(),
+                    original.components.len(),
+                    "{name}/{kind} component count"
+                );
+                for (a, b) in decoded.components.iter().zip(original.components.iter()) {
+                    assert_eq!(
+                        a.samples, b.samples,
+                        "{name}/{kind} relocated decode diverged"
+                    );
+                }
+            }
+        }
+    }
+
     /// A stream carrying *both* a main-header `PPM` and a tile-part `PPT`
     /// is malformed (§A.7.4 mutual exclusion) — the decoder rejects it.
     #[test]
