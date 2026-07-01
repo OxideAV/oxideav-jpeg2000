@@ -1385,6 +1385,120 @@ fn mixed_kernel_with_mct_is_rejected() {
     );
 }
 
+/// Generalised clean-room assembler: splice N single-component,
+/// single-tile J2K streams — each of identical geometry, MCT off, one
+/// layer / one precinct — into one N-component CPRL codestream. The COD
+/// default kernel is component 0's; every component whose kernel differs
+/// from the default gets a `COC` (Table A.15 SPcoc transformation) plus
+/// a `QCC` copied from that source stream's `QCD`. Bodies concatenate in
+/// CPRL component order. This exercises the mixed-kernel lane interleave
+/// with **non-adjacent** lane assignments (e.g. 9-7 / 5-3 / 9-7), which a
+/// two-component splice cannot.
+fn assemble_multi_component(sources: &[&[u8]]) -> Vec<u8> {
+    assert!(!sources.is_empty());
+    let base = sources[0];
+    let siz = marker_payload(base, find_marker(base, 0xFF51));
+    let csiz_pos = 2 + 4 * 8;
+    assert_eq!(u16::from_be_bytes([siz[csiz_pos], siz[csiz_pos + 1]]), 1);
+    let comp_desc = &siz[csiz_pos + 2..csiz_pos + 5];
+
+    // -- SIZ with Csiz = N, N identical component descriptors. --
+    let mut new_siz = Vec::new();
+    new_siz.extend_from_slice(&siz[..csiz_pos]);
+    new_siz.extend_from_slice(&(sources.len() as u16).to_be_bytes());
+    for _ in sources {
+        new_siz.extend_from_slice(comp_desc);
+    }
+
+    // -- COD: component 0's kernel is the default; progression -> CPRL. --
+    let cod0 = marker_payload(base, find_marker(base, 0xFF52)).to_vec();
+    let default_transform = *cod0.last().unwrap();
+    let mut new_cod = cod0.clone();
+    new_cod[1] = 0x04; // CPRL
+    assert_eq!(new_cod[4], 0x00, "COD MCT must be off");
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&0xFF4Fu16.to_be_bytes()); // SOC
+    out.extend_from_slice(&wrap_marker(0xFF51, &new_siz));
+    out.extend_from_slice(&wrap_marker(0xFF52, &new_cod));
+
+    // -- Per-component COC for any kernel differing from the default. --
+    for (i, src) in sources.iter().enumerate() {
+        let cod = marker_payload(src, find_marker(src, 0xFF52));
+        let transform = *cod.last().unwrap();
+        if transform != default_transform {
+            let spcod = &cod[5..]; // SPcod tail = SPcoc for Csiz < 257
+            let mut coc = vec![i as u8, 0x00]; // Ccoc, Scoc
+            coc.extend_from_slice(spcod);
+            out.extend_from_slice(&wrap_marker(0xFF53, &coc));
+        }
+    }
+
+    // -- QCD default (component 0); per-component QCC where kernels differ. --
+    let qcd0 = marker_payload(base, find_marker(base, 0xFF5C));
+    out.extend_from_slice(&wrap_marker(0xFF5C, qcd0));
+    for (i, src) in sources.iter().enumerate() {
+        let cod = marker_payload(src, find_marker(src, 0xFF52));
+        if *cod.last().unwrap() != default_transform {
+            let qcd = marker_payload(src, find_marker(src, 0xFF5C));
+            let mut qcc = vec![i as u8];
+            qcc.extend_from_slice(qcd);
+            out.extend_from_slice(&wrap_marker(0xFF5D, &qcc));
+        }
+    }
+
+    // -- SOT (Psot patched) + SOD + concatenated bodies (CPRL order) + EOC. --
+    let sot_off = out.len();
+    out.extend_from_slice(&0xFF90u16.to_be_bytes());
+    out.extend_from_slice(&10u16.to_be_bytes());
+    out.extend_from_slice(&0u16.to_be_bytes()); // Isot
+    out.extend_from_slice(&0u32.to_be_bytes()); // Psot (patched)
+    out.push(0); // TPsot
+    out.push(1); // TNsot
+    out.extend_from_slice(&0xFF93u16.to_be_bytes()); // SOD
+    for src in sources {
+        out.extend_from_slice(tile_body(src));
+    }
+    out.extend_from_slice(&0xFFD9u16.to_be_bytes()); // EOC
+    let psot = (out.len() - 2 - sot_off) as u32;
+    out[sot_off + 6..sot_off + 10].copy_from_slice(&psot.to_be_bytes());
+    out
+}
+
+/// Three components with *interleaved* kernels — 9-7 / 5-3 / 9-7 — so
+/// the reassembly's two lanes carry non-contiguous component sets
+/// (9-7 lane = {0, 2}, 5-3 lane = {1}). A lane-tag or in-lane-index slip
+/// would place component 2's 9-7 plane where component 1's 5-3 plane
+/// belongs (or vice versa); asserting each component against its own
+/// single-component decode pins the interleave exactly.
+#[test]
+fn mixed_kernel_three_components_interleaved_lanes() {
+    let ref97 = decode_j2k(GRAY_MK_97).expect("decode 9-7 source");
+    let ref53 = decode_j2k(GRAY_MK_53).expect("decode 5-3 source");
+    let expected = [
+        &ref97.components[0].samples,
+        &ref53.components[0].samples,
+        &ref97.components[0].samples,
+    ];
+
+    let stream = assemble_multi_component(&[GRAY_MK_97, GRAY_MK_53, GRAY_MK_97]);
+    let img = decode_j2k(&stream).expect("decode 9-7/5-3/9-7 mixed-kernel stream");
+    assert_eq!(img.components.len(), 3);
+    for (c, exp) in expected.iter().enumerate() {
+        assert_eq!(
+            &img.components[c].samples, *exp,
+            "component {c} landed in the wrong kernel lane"
+        );
+    }
+    // The 5-3 (lossless) middle plane must differ from the 9-7 (lossy)
+    // outer planes, so a lane mix-up could not hide behind identical data.
+    assert_ne!(img.components[0].samples, img.components[1].samples);
+    assert_eq!(
+        img.components[0].samples, img.components[2].samples,
+        "the two 9-7 components share a source and must match"
+    );
+}
+
 /// Minimal binary-PPM (P6, maxval 255) parser → `(w, h, interleaved
 /// RGB payload)`.
 fn ppm_payload(bytes: &[u8]) -> (usize, usize, &[u8]) {
