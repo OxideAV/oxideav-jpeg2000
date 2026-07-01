@@ -6,6 +6,27 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 382 (2026-07-02).** **Tier-1 EBCOT *forward*
+  coding passes (T.800 Annex D §D.3).** `CodeBlock` gained the encode
+  counterparts of its three AC decode passes —
+  `significance_propagation_encode` (§D.3.1), `magnitude_refinement_encode`
+  (§D.3.3), and `cleanup_encode` (§D.3.4, including the Table D.5
+  run-length mode and the §D.3.2 sign subroutine `D = sb ⊕ XORbit`).
+  Each mirrors its decode sibling bit-for-bit — identical §D.1 stripe
+  scan, identical Table D.1 / D.3 / D.4 context formation via the shared
+  private neighbour / label helpers, and the identical progressive-
+  significance state update — but takes the magnitude / sign bit from a
+  caller-supplied `targets` grid of known quantised coefficients and
+  feeds each decision to `mqenc::MqEncoder`. Because the progressive
+  `coefficients` evolve exactly as a decoder would reconstruct them,
+  every context label matches and the produced codeword segment decodes
+  back to the same coefficients. Validated by seven encode → flush →
+  decode round-trip tests (single-coefficient, all four sub-band
+  orientations, sparse run-length, partial bottom stripe, dense random
+  16×16, all-zero, and deep high-magnitude many-plane blocks) that assert
+  every coefficient's magnitude / significance / sign is recovered
+  exactly through the §D.3 pass schedule (cleanup-only top plane, then
+  SP → MR → cleanup down to plane 0).
 * **Clean-room round 382 (2026-07-02).** **MQ arithmetic *encoder*
   (T.800 Annex C §C.2) — the first encode-side subsystem.** A new
   [`mqenc::MqEncoder`] implements the compressing counterpart of the

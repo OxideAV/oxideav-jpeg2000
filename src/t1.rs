@@ -112,6 +112,7 @@
 
 use crate::geometry::SubBandOrientation;
 use crate::mq::{MqContext, MqDecoder};
+use crate::mqenc::MqEncoder;
 use crate::Error;
 
 /// First Annex D context label devoted to significance propagation
@@ -1037,6 +1038,209 @@ impl CodeBlock {
         }
 
         Ok(newly)
+    }
+
+    // === Encode-side Annex D forward coding passes ===================
+    //
+    // These mirror the AC decode passes above bit-for-bit: identical §D.1
+    // scan order, identical Table D.1 / D.3 / D.4 / D.5 context formation,
+    // and the identical progressive-significance state update. The only
+    // difference is that the magnitude / sign bit fed to each MQ coding
+    // decision comes from the caller-supplied `targets` (the fully-known
+    // quantised coefficients) rather than the decoder, and the decision is
+    // handed to [`MqEncoder::encode`]. Because `self.coefficients` evolves
+    // exactly as the decoder would reconstruct it, every context label the
+    // encoder computes equals the label the decoder will compute — so the
+    // produced codeword segment decodes back to the same coefficients. The
+    // block must be freshly [`Self::new`]-constructed (all-insignificant
+    // progressive state); `targets` is the row-major `width * height`
+    // coefficient grid to code.
+
+    /// Encode one §D.3.1 significance-propagation pass (the forward
+    /// counterpart of [`Self::significance_propagation_pass`]).
+    pub fn significance_propagation_encode(
+        &mut self,
+        bitplane: u32,
+        targets: &[Coefficient],
+        encoder: &mut MqEncoder,
+        ctx: &mut [MqContext; NUM_CONTEXTS],
+    ) {
+        for flag in &mut self.newly_significant {
+            *flag = false;
+        }
+        for flag in &mut self.sp_visited {
+            *flag = false;
+        }
+        let weight: u32 = 1u32 << bitplane;
+        let mut v0 = 0usize;
+        while v0 < self.height {
+            let stripe_h = core::cmp::min(4, self.height - v0);
+            for u in 0..self.width {
+                for dv in 0..stripe_h {
+                    let v = v0 + dv;
+                    let idx = u + v * self.width;
+                    if self.coefficients[idx].sigma {
+                        continue;
+                    }
+                    let label = significance_context_label(
+                        self.orientation,
+                        self.neighbours_in_stripe(u, v, v0, stripe_h),
+                    );
+                    if label == 0 {
+                        continue;
+                    }
+                    let bit = ((targets[idx].magnitude >> bitplane) & 1) as u8;
+                    encoder.encode(&mut ctx[SP_CTX_OFFSET + label as usize], bit);
+                    self.sp_visited[idx] = true;
+                    self.decoded_bits[idx] += 1;
+                    if bit == 1 {
+                        self.code_sign_encode(u, v, weight, targets, v0, stripe_h, encoder, ctx);
+                        self.newly_significant[idx] = true;
+                    }
+                }
+            }
+            v0 += 4;
+        }
+    }
+
+    /// Encode one §D.3.3 magnitude-refinement pass (the forward
+    /// counterpart of [`Self::magnitude_refinement_pass`]).
+    pub fn magnitude_refinement_encode(
+        &mut self,
+        bitplane: u32,
+        targets: &[Coefficient],
+        encoder: &mut MqEncoder,
+        ctx: &mut [MqContext; NUM_CONTEXTS],
+    ) {
+        let weight: u32 = 1u32 << bitplane;
+        let mut v0 = 0usize;
+        while v0 < self.height {
+            let stripe_h = core::cmp::min(4, self.height - v0);
+            for u in 0..self.width {
+                for dv in 0..stripe_h {
+                    let v = v0 + dv;
+                    let idx = u + v * self.width;
+                    let coef = self.coefficients[idx];
+                    if !coef.sigma || self.newly_significant[idx] {
+                        continue;
+                    }
+                    let label = refinement_context_label(
+                        self.neighbours_in_stripe(u, v, v0, stripe_h),
+                        coef.already_refined,
+                    );
+                    let bit = ((targets[idx].magnitude >> bitplane) & 1) as u8;
+                    encoder.encode(&mut ctx[REFINEMENT_CTX_OFFSET + label as usize], bit);
+                    let mut updated = coef;
+                    if bit == 1 {
+                        updated.magnitude |= weight;
+                    }
+                    updated.already_refined = true;
+                    self.coefficients[idx] = updated;
+                    self.decoded_bits[idx] += 1;
+                }
+            }
+            v0 += 4;
+        }
+    }
+
+    /// Encode one §D.3.4 cleanup pass (the forward counterpart of
+    /// [`Self::cleanup_pass`]), including the Table D.5 run-length mode.
+    pub fn cleanup_encode(
+        &mut self,
+        bitplane: u32,
+        targets: &[Coefficient],
+        encoder: &mut MqEncoder,
+        ctx: &mut [MqContext; NUM_CONTEXTS],
+    ) {
+        let weight: u32 = 1u32 << bitplane;
+        let mut v0 = 0usize;
+        while v0 < self.height {
+            let stripe_h = core::cmp::min(4, self.height - v0);
+            for u in 0..self.width {
+                let mut start_dv = 0usize;
+                if stripe_h == 4 && self.column_run_length_eligible(u, v0) {
+                    // First column entry whose target bit is 1 on this
+                    // bit-plane (top to bottom), if any.
+                    let first_sig = (0..4).find(|&dv| {
+                        (targets[u + (v0 + dv) * self.width].magnitude >> bitplane) & 1 == 1
+                    });
+                    match first_sig {
+                        None => {
+                            encoder.encode(&mut ctx[RUN_LENGTH_CTX], 0);
+                            for dv in 0..4 {
+                                self.decoded_bits[u + (v0 + dv) * self.width] += 1;
+                            }
+                            continue;
+                        }
+                        Some(first) => {
+                            encoder.encode(&mut ctx[RUN_LENGTH_CTX], 1);
+                            // Two UNIFORM bits, MSB then LSB, of the 0-based
+                            // index of the first significant coefficient.
+                            encoder.encode(&mut ctx[UNIFORM_CTX], ((first >> 1) & 1) as u8);
+                            encoder.encode(&mut ctx[UNIFORM_CTX], (first & 1) as u8);
+                            let v = v0 + first;
+                            self.code_sign_encode(
+                                u, v, weight, targets, v0, stripe_h, encoder, ctx,
+                            );
+                            for dv in 0..=first {
+                                self.decoded_bits[u + (v0 + dv) * self.width] += 1;
+                            }
+                            start_dv = first + 1;
+                        }
+                    }
+                }
+                for dv in start_dv..stripe_h {
+                    let v = v0 + dv;
+                    let idx = u + v * self.width;
+                    if self.coefficients[idx].sigma || self.sp_visited[idx] {
+                        continue;
+                    }
+                    let label = significance_context_label(
+                        self.orientation,
+                        self.neighbours_in_stripe(u, v, v0, stripe_h),
+                    );
+                    let bit = ((targets[idx].magnitude >> bitplane) & 1) as u8;
+                    self.decoded_bits[idx] += 1;
+                    encoder.encode(&mut ctx[SP_CTX_OFFSET + label as usize], bit);
+                    if bit == 1 {
+                        self.code_sign_encode(u, v, weight, targets, v0, stripe_h, encoder, ctx);
+                    }
+                }
+            }
+            v0 += 4;
+        }
+    }
+
+    /// Encode the §D.3.2 sign subroutine for a coefficient made
+    /// significant on this bit-plane, and fold the magnitude bit + sign
+    /// into the progressive state (the forward counterpart of
+    /// [`Self::make_significant_with_sign`]).
+    ///
+    /// The sign context / XORbit come from the Table D.3 lookup; the
+    /// decoder recovers `sb = D ⊕ XORbit`, so the encoder emits
+    /// `D = sb ⊕ XORbit`.
+    #[allow(clippy::too_many_arguments)]
+    fn code_sign_encode(
+        &mut self,
+        u: usize,
+        v: usize,
+        weight: u32,
+        targets: &[Coefficient],
+        stripe_v0: usize,
+        stripe_h: usize,
+        encoder: &mut MqEncoder,
+        ctx: &mut [MqContext; NUM_CONTEXTS],
+    ) {
+        let idx = u + v * self.width;
+        let nb = self.neighbours_in_stripe(u, v, stripe_v0, stripe_h);
+        let (sign_label, xorbit) = sign_context_label(nb);
+        let sign_bit = targets[idx].sign;
+        let d = (sign_bit as u8) ^ xorbit;
+        encoder.encode(&mut ctx[SIGN_CTX_OFFSET + sign_label as usize], d);
+        let coef = &mut self.coefficients[idx];
+        coef.magnitude |= weight;
+        coef.sigma = true;
+        coef.sign = sign_bit;
     }
 
     /// Run one §D.6 **raw-mode** significance-propagation pass over the
@@ -5351,5 +5555,193 @@ mod tests {
         );
         // The two modes therefore reached different context state.
         assert_ne!(ctx_on, ctx_off);
+    }
+
+    // -- Tier-1 forward-pass round-trip (encode → decode) -------------
+
+    /// Encode a code-block of known coefficients through the §D.3 forward
+    /// passes (single default-style codeword segment, §D.3 pass schedule:
+    /// cleanup-only on the top bit-plane, then SP → MR → cleanup down to
+    /// bit-plane 0), flush, then decode the bytes back through the AC
+    /// decode passes with the same schedule and assert every coefficient
+    /// magnitude / significance / sign round-trips exactly.
+    fn tier1_roundtrip(orient: SubBandOrientation, w: usize, h: usize, targets: Vec<Coefficient>) {
+        assert_eq!(targets.len(), w * h);
+        let maxmag = targets.iter().map(|c| c.magnitude).max().unwrap_or(0);
+        if maxmag == 0 {
+            // All-zero block: nothing to code; a fresh decode block is
+            // already all-zero, so the round-trip is trivially exact.
+            return;
+        }
+        let top = 31 - maxmag.leading_zeros();
+
+        // Encode.
+        let mut enc = CodeBlock::new(orient, w, h);
+        let mut encoder = MqEncoder::new();
+        let mut ectx = reset_contexts();
+        enc.cleanup_encode(top, &targets, &mut encoder, &mut ectx);
+        for p in (0..top).rev() {
+            enc.significance_propagation_encode(p, &targets, &mut encoder, &mut ectx);
+            enc.magnitude_refinement_encode(p, &targets, &mut encoder, &mut ectx);
+            enc.cleanup_encode(p, &targets, &mut encoder, &mut ectx);
+        }
+        let bytes = encoder.flush();
+
+        // Decode.
+        let mut dec = CodeBlock::new(orient, w, h);
+        let mut decoder = MqDecoder::new(&bytes);
+        let mut dctx = reset_contexts();
+        dec.cleanup_pass(top, &mut decoder, &mut dctx).unwrap();
+        for p in (0..top).rev() {
+            dec.significance_propagation_pass(p, &mut decoder, &mut dctx)
+                .unwrap();
+            dec.magnitude_refinement_pass(p, &mut decoder, &mut dctx)
+                .unwrap();
+            dec.cleanup_pass(p, &mut decoder, &mut dctx).unwrap();
+        }
+
+        for v in 0..h {
+            for u in 0..w {
+                let t = targets[u + v * w];
+                let d = dec.coefficient(u, v);
+                assert_eq!(d.magnitude, t.magnitude, "magnitude ({u},{v})");
+                assert_eq!(d.sigma, t.magnitude != 0, "sigma ({u},{v})");
+                if t.magnitude != 0 {
+                    assert_eq!(d.sign, t.sign, "sign ({u},{v})");
+                }
+            }
+        }
+    }
+
+    /// Build a coefficient grid from `(magnitude, sign)` pairs, zeroing the
+    /// sign of any zero-magnitude coefficient (its sign is never coded).
+    fn coeffs(mags_signs: &[(u32, bool)]) -> Vec<Coefficient> {
+        mags_signs
+            .iter()
+            .map(|&(m, s)| Coefficient {
+                magnitude: m,
+                sigma: false,
+                sign: m != 0 && s,
+                already_refined: false,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tier1_encode_single_significant() {
+        // One significant coefficient in an otherwise empty 4x4 block.
+        let mut g = vec![(0u32, false); 16];
+        g[5] = (13, true);
+        tier1_roundtrip(SubBandOrientation::LL, 4, 4, coeffs(&g));
+    }
+
+    #[test]
+    fn tier1_encode_all_orientations() {
+        // A small fixed pattern under every sub-band orientation (the
+        // Table D.1 / D.3 columns differ per orientation).
+        let g = coeffs(&[
+            (3, false),
+            (0, false),
+            (7, true),
+            (1, false),
+            (0, false),
+            (5, true),
+            (2, false),
+            (0, false),
+            (9, false),
+            (0, false),
+            (0, false),
+            (4, true),
+            (1, true),
+            (6, false),
+            (0, false),
+            (2, true),
+        ]);
+        for orient in [
+            SubBandOrientation::LL,
+            SubBandOrientation::HL,
+            SubBandOrientation::LH,
+            SubBandOrientation::HH,
+        ] {
+            tier1_roundtrip(orient, 4, 4, g.clone());
+        }
+    }
+
+    #[test]
+    fn tier1_encode_sparse_runlength() {
+        // A tall, sparse 4-wide block: full 4-row stripes with columns of
+        // all-insignificant zero-context coefficients exercise the §D.3.4
+        // run-length mode on the encode side.
+        let mut g = vec![(0u32, false); 4 * 12];
+        g[4 * 5 + 1] = (11, true); // one lone significant coefficient
+        g[4 * 9 + 2] = (3, false);
+        tier1_roundtrip(SubBandOrientation::HL, 4, 12, coeffs(&g));
+    }
+
+    #[test]
+    fn tier1_encode_partial_bottom_stripe() {
+        // Height 6 → a full 4-row stripe plus a 2-row partial stripe,
+        // exercising the non-run-length partial-stripe cleanup path.
+        let mut state: u32 = 0x2468_ACE0;
+        let mut g = Vec::with_capacity(5 * 6);
+        for _ in 0..30 {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let m = (state >> 26) & 0x1F; // 0..31, biased sparse
+            let s = (state >> 3) & 1 == 1;
+            g.push((if m < 20 { 0 } else { m }, s));
+        }
+        tier1_roundtrip(SubBandOrientation::LH, 5, 6, coeffs(&g));
+    }
+
+    #[test]
+    fn tier1_encode_dense_random() {
+        // A dense pseudo-random block drives magnitude refinement (many
+        // coefficients significant early, refined on later planes) across
+        // all three passes and both the run-length and normal cleanup
+        // branches.
+        let mut state: u32 = 0xC0FF_EE42;
+        let mut g = Vec::with_capacity(16 * 16);
+        for _ in 0..256 {
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            let m = (state >> 20) & 0x7F; // 0..127
+            let s = (state >> 2) & 1 == 1;
+            g.push((m, s));
+        }
+        tier1_roundtrip(SubBandOrientation::HH, 16, 16, coeffs(&g));
+    }
+
+    #[test]
+    fn tier1_encode_all_zero_is_trivial() {
+        // An all-zero block codes nothing and round-trips trivially.
+        tier1_roundtrip(
+            SubBandOrientation::LL,
+            8,
+            8,
+            coeffs(&vec![(0u32, false); 64]),
+        );
+    }
+
+    #[test]
+    fn tier1_encode_high_magnitude_many_planes() {
+        // Large magnitudes exercise many bit-planes (deep MR chains).
+        let g = coeffs(&[
+            (1023, true),
+            (512, false),
+            (0, false),
+            (256, true),
+            (7, false),
+            (900, true),
+            (0, false),
+            (128, false),
+            (64, true),
+            (0, false),
+            (1000, false),
+            (3, true),
+            (0, false),
+            (777, true),
+            (15, false),
+            (600, false),
+        ]);
+        tier1_roundtrip(SubBandOrientation::HL, 4, 4, g);
     }
 }
