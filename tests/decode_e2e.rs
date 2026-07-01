@@ -32,6 +32,17 @@ const RGB_RPCL_53: &[u8] = include_bytes!("data/rgb-48x32-rpcl-53.j2k");
 const RGB_PCRL_53: &[u8] = include_bytes!("data/rgb-48x32-pcrl-53.j2k");
 const RGB_CPRL_53: &[u8] = include_bytes!("data/rgb-48x32-cprl-53.j2k");
 
+// §B.12.1.5 CPRL with **non-power-of-two** sub-sampling (XRsiz = YRsiz =
+// 3). §B.12.1.3 (RPCL) and §B.12.1.4 (PCRL) require power-of-two
+// XRsiz / YRsiz, but §B.12.1.5 (CPRL) states no such restriction: the
+// component-major sweep emits each component's precincts in its own
+// (y, x, resolution) order, so an arbitrary integer sub-sampling only
+// rescales that one component's reference-grid corners. Three-component
+// lossless 5-3, MCT off, NL = 2, one precinct per level. Pinned against
+// a committed black-box reference decode (comment-scrubbed P6 PPM).
+const RGB_CPRL_SUB3_53: &[u8] = include_bytes!("data/rgb-24x24-cprl-sub3-53.j2k");
+const RGB_CPRL_SUB3_REF_PPM: &[u8] = include_bytes!("data/rgb-24x24-cprl-sub3-53-ref.ppm");
+
 // Multi-precinct §B.6 / §B.7 fixture: 40×40 gray, lossless 5-3, NL = 2,
 // 8×8 code-blocks (xcb = ycb = 3), precinct exponents PPx = PPy = 4
 // (16×16 precinct cells) at every resolution. The precinct cell (16) is
@@ -1371,5 +1382,74 @@ fn mixed_kernel_with_mct_is_rejected() {
     assert!(
         decode_j2k(&mixed).is_err(),
         "a mixed-kernel tile with an active MCT must be rejected"
+    );
+}
+
+/// Minimal binary-PPM (P6, maxval 255) parser → `(w, h, interleaved
+/// RGB payload)`.
+fn ppm_payload(bytes: &[u8]) -> (usize, usize, &[u8]) {
+    let mut toks: Vec<&[u8]> = Vec::new();
+    let mut i = 0usize;
+    while toks.len() < 4 {
+        while bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if bytes[i] == b'#' {
+            while bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        let start = i;
+        while !bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        toks.push(&bytes[start..i]);
+    }
+    assert_eq!(toks[0], b"P6");
+    let w: usize = std::str::from_utf8(toks[1]).unwrap().parse().unwrap();
+    let h: usize = std::str::from_utf8(toks[2]).unwrap().parse().unwrap();
+    assert_eq!(toks[3], b"255");
+    (w, h, &bytes[i + 1..])
+}
+
+/// §B.12.1.5: a CPRL codestream with non-power-of-two sub-sampling
+/// (XRsiz = YRsiz = 3) must decode — the power-of-two constraint is
+/// stated only for RPCL (§B.12.1.3) and PCRL (§B.12.1.4). Every
+/// component plane must match the committed black-box reference decode.
+#[test]
+fn cprl_non_power_of_two_subsampling_matches_reference() {
+    let img = decode_j2k(RGB_CPRL_SUB3_53).expect("decode CPRL with XRsiz=YRsiz=3");
+    assert_eq!(img.components.len(), 3);
+    let (w, h, rgb) = ppm_payload(RGB_CPRL_SUB3_REF_PPM);
+    for (c, comp) in img.components.iter().enumerate() {
+        assert_eq!(
+            (comp.width as usize, comp.height as usize),
+            (w, h),
+            "component {c} dimensions differ from the reference"
+        );
+        let plane: Vec<i32> = (0..w * h).map(|p| rgb[p * 3 + c] as i32).collect();
+        assert_eq!(
+            comp.samples, plane,
+            "component {c} diverged from the reference CPRL decode"
+        );
+    }
+}
+
+/// The companion negative: RPCL (§B.12.1.3) *does* require power-of-two
+/// sub-sampling. Flipping the assembled CPRL stream's COD progression
+/// byte to RPCL (3) while leaving XRsiz = YRsiz = 3 must be rejected.
+#[test]
+fn rpcl_non_power_of_two_subsampling_is_rejected() {
+    // Baseline: the CPRL stream decodes.
+    assert!(decode_j2k(RGB_CPRL_SUB3_53).is_ok());
+    let mut mutated = RGB_CPRL_SUB3_53.to_vec();
+    // COD SGcod progression byte = marker(2) + Lcod(2) + Scod(1) => the
+    // first SGcod byte sits 5 past the COD marker.
+    let cod_off = find_marker(&mutated, 0xFF52);
+    mutated[cod_off + 5] = 0x02; // RPCL (Table A.16)
+    assert!(
+        decode_j2k(&mutated).is_err(),
+        "RPCL requires power-of-two sub-sampling (§B.12.1.3) — non-pow2 must be rejected"
     );
 }

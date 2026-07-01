@@ -1129,24 +1129,29 @@ fn build_tile_packet_plan(
     // [start, end) component / resolution / layer sub-range emitted in its
     // own Ppoc order, with the §B.12.2 "no packet ever repeated" cursor).
     // Otherwise the COD-default single order (SGcod / Ppoc) drives the
-    // whole tile. The position-keyed orders (RPCL / PCRL / CPRL — used
-    // either as the COD default or inside a POC volume) require power-of-
-    // two XRsiz / YRsiz per §B.12.1.3–5; a non-power-of-two factor is
-    // malformed for those orders, so reject rather than mis-order.
-    let needs_position_order = if poc_volumes.is_empty() {
+    // whole tile. Two of the three position-keyed orders constrain the
+    // sub-sampling: §B.12.1.3 states XRsiz / YRsiz "must be powers of
+    // two" for **RPCL** and §B.12.1.4 that they "shall be powers of two"
+    // for **PCRL**. §B.12.1.5 (**CPRL**) states no such requirement — a
+    // CPRL sweep is component-major, so each component's precincts are
+    // emitted in its own (y, x, resolution) order and an arbitrary
+    // XRsiz / YRsiz only rescales that one component's reference-grid
+    // corners, which the `ref_grid_*` projection handles for any integer
+    // factor. So the power-of-two gate fires only for RPCL / PCRL (as the
+    // COD default or inside a POC volume); a non-power-of-two factor
+    // there is malformed and rejected rather than mis-ordered, while
+    // CPRL proceeds with any sub-sampling.
+    let needs_pow2_position_order = if poc_volumes.is_empty() {
         matches!(
             params.progression,
-            ProgressionOrder::Rpcl | ProgressionOrder::Pcrl | ProgressionOrder::Cprl
+            ProgressionOrder::Rpcl | ProgressionOrder::Pcrl
         )
     } else {
-        poc_volumes.iter().any(|v| {
-            matches!(
-                v.order,
-                ProgressionOrder::Rpcl | ProgressionOrder::Pcrl | ProgressionOrder::Cprl
-            )
-        })
+        poc_volumes
+            .iter()
+            .any(|v| matches!(v.order, ProgressionOrder::Rpcl | ProgressionOrder::Pcrl))
     };
-    if needs_position_order {
+    if needs_pow2_position_order {
         for pi in &position_infos {
             if !pi.xrsiz.is_power_of_two() || !pi.yrsiz.is_power_of_two() {
                 return Err(Error::NotImplemented);

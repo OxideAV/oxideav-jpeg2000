@@ -6,6 +6,21 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 382 (2026-07-02).** **CPRL under non-power-of-two
+  sub-sampling (T.800 §B.12.1.5).** §B.12.1.3 (RPCL) states `XRsiz` /
+  `YRsiz` "must be powers of two" and §B.12.1.4 (PCRL) "shall be powers
+  of two", but §B.12.1.5 (CPRL) carries no such restriction — the
+  component-major sweep emits each component's precincts in its own
+  (y, x, resolution) order, so an arbitrary integer sub-sampling only
+  rescales that one component's reference-grid corners, which the
+  `ref_grid_*` projection already handles for any factor. The
+  power-of-two gate is now scoped to RPCL / PCRL only (as the COD
+  default or inside a POC volume), so a `-s 3,3`-style CPRL stream that
+  was previously rejected as `Error::NotImplemented` now decodes.
+  Validated bit-exact against a committed black-box reference decode of
+  a three-component XRsiz = YRsiz = 3 CPRL codestream, plus a companion
+  test confirming the same non-power-of-two factor is still rejected
+  under RPCL.
 * **Clean-room round 382 (2026-07-02).** **Mixed wavelet kernels per
   component (T.800 §A.6.2 / Table A.17), MCT off.** A `COC` may now give
   one component the 5-3 reversible kernel and another the 9-7

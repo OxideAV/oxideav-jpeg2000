@@ -121,7 +121,11 @@ What is implemented:
   layer sub-range in its own order, with the per-(component, resolution,
   precinct) "next unsent layer" cursor), under the §A.6.6 precedence
   `Tile-part POC > Main POC > Tile-part COD > Main COD`. Plus
-  **multi-layer** / **multi-precinct** reassembly.
+  **multi-layer** / **multi-precinct** reassembly. The position-keyed
+  orders project each precinct to its reference-grid corner for any
+  integer `XRsiz` / `YRsiz`; the power-of-two requirement is enforced
+  only for RPCL (§B.12.1.3) and PCRL (§B.12.1.4), while **CPRL**
+  (§B.12.1.5) decodes at **non-power-of-two sub-sampling** too.
 - **Region of interest** — main-header `RGN` implicit-ROI (Maxshift)
   decode (T.800 §A.6.3 / §H.1): the `SPrgn` scaling value `s` is
   resolved per component, the tier-1 schedule runs against the
@@ -198,7 +202,11 @@ These surface a clean `Error::NotImplemented` rather than mis-decoding:
   wavelet-domain ROI-mask generation and mask-driven L.1 de-scaling),
   outside this Part-1 decoder's scope; an `Srgn ≠ 0` (or a Part-2
   extended-length) `RGN` surfaces a clean error rather than mis-decoding.
-- Position-keyed orders under non-power-of-two sub-sampling.
+- **RPCL / PCRL** under non-power-of-two sub-sampling — §B.12.1.3
+  ("must") and §B.12.1.4 ("shall") require power-of-two `XRsiz` / `YRsiz`
+  for those two orders, so a non-power-of-two factor there is rejected.
+  **CPRL** (§B.12.1.5) carries no such restriction and *is* decoded at
+  any integer sub-sampling.
 - HTJ2K MULTIHT codestreams (more than one HT set per code-block) and
   HT code-blocks that begin with placeholder passes (`P0 > 0`); the
   SINGLEHT / single-HT-set HTJ2K path *is* decoded (see above).
