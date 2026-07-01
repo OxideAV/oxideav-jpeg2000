@@ -121,6 +121,7 @@ pub(crate) mod ht_tables;
 pub mod jp2;
 pub mod mct;
 pub mod mq;
+pub mod mqenc;
 pub mod packet;
 pub mod progression;
 pub mod reassemble;

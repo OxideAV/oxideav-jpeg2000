@@ -463,6 +463,18 @@ impl MqContext {
         self.mps
     }
 
+    /// Set the current Table C.2 index `I(CX)` (the §C.2.5 NMPS / NLPS
+    /// transition applied by the [`crate::mqenc`] encoder).
+    pub fn set_index(&mut self, index: u8) {
+        self.index = index;
+    }
+
+    /// Flip the more-probable-symbol sense `MPS(CX)` (the §C.2.5 SWITCH
+    /// action, shared by the encoder and decoder LPS paths).
+    pub fn flip_mps(&mut self) {
+        self.mps = !self.mps;
+    }
+
     /// Reset this context to its initial state (§C.3.6). The caller
     /// supplies the initial state appropriate for this `CX`; this is a
     /// convenience for resetting to an arbitrary Table D.7 row.

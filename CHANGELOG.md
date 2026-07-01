@@ -6,6 +6,23 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 382 (2026-07-02).** **MQ arithmetic *encoder*
+  (T.800 Annex C §C.2) — the first encode-side subsystem.** A new
+  [`mqenc::MqEncoder`] implements the compressing counterpart of the
+  §C.3 decoder: INITENC (§C.2.8), ENCODE → CODEMPS / CODELPS with the
+  conditional MPS/LPS exchange (§C.2.4, Figures C.6 / C.7), RENORME
+  (§C.2.6), the BYTEOUT bit-stuffing and carry handling (§C.2.7), and
+  FLUSH with SETBITS + the trailing-`0xFF` discard (§C.2.9). It shares
+  the Table C.2 `QE` rows and the Table D.7 initial states with the
+  decoder (new `MqContext::set_index` / `flip_mps` mutators expose the
+  §C.2.5 NMPS / NLPS / SWITCH transitions). Validated as the exact
+  inverse of `mq::MqDecoder`: eight round-trip tests feed all-zero,
+  all-one, alternating, pseudo-random, carry-heavy (~7/8 ones), and
+  interleaved-multi-context decision streams (up to 8000 symbols)
+  through encode + flush and assert the decoder reproduces every
+  decision bit-for-bit, plus an empty-flush and a trailing-byte-never-
+  `0xFF` invariant. This is the foundation for the tier-1 EBCOT encode
+  passes.
 * **Clean-room round 382 (2026-07-02).** **CPRL under non-power-of-two
   sub-sampling (T.800 §B.12.1.5).** §B.12.1.3 (RPCL) states `XRsiz` /
   `YRsiz` "must be powers of two" and §B.12.1.4 (PCRL) "shall be powers
