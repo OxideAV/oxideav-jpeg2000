@@ -100,9 +100,20 @@ What is implemented:
   decomposition-level count `NL`, code-block size, precinct partition
   and wavelet kernel are resolved independently, so the per-component
   geometry, tier-1 and inverse-DWT cascade all run against the right
-  parameters. The Table A.19 code-block **style** byte is held global
-  to the code; a `COC` that diverges from the `COD` style — or gives
-  different components different kernels — is cleanly rejected.
+  parameters. **Mixed wavelet kernels per component** are honoured when
+  no multiple-component transform is active (`Rmct = 0`): Table A.17
+  only pairs the MCT (RCT / ICT) with one kernel shared across
+  components 0–2, but with the MCT off §G.1.2 collapses to a
+  per-component DC level-shift + clamp with no cross-component coupling,
+  so a tile whose `COC` gives one component the 5-3 kernel and another
+  the 9-7 kernel reconstructs each in its own `i32` / `f64` lane and
+  re-interleaves them into component order. Validated end-to-end by a
+  clean-room assembler that splices a 5-3 and a 9-7 single-component
+  stream into one two-component codestream and asserts each component
+  reconstructs identically to its standalone decode. A mixed-kernel tile
+  that *also* signals an MCT (`Rmct = 1`) is rejected. The Table A.19
+  code-block **style** byte is held global to the code; a `COC` that
+  diverges from the `COD` style is cleanly rejected.
 - **Progression** — all five §B.12.1 orders (LRCP, RLCP, RPCL, PCRL,
   CPRL) and the §A.6.6 **progression order change** (`POC`) wired into
   the decode driver: a main-header or first-tile-part `POC` drives the
@@ -171,11 +182,13 @@ What is implemented:
 These surface a clean `Error::NotImplemented` rather than mis-decoding:
 
 - A `COC` whose Table A.19 code-block **style** byte diverges from the
-  `COD`, or that gives different components different wavelet kernels
-  (the common `COC` override of per-component `NL` / code-block size /
-  precincts / kernel *is* honoured), in both the main and tile-part
+  `COD` (the common `COC` override of per-component `NL` / code-block
+  size / precincts / kernel *is* honoured, including **different kernels
+  per component** when the MCT is off), in both the main and tile-part
   headers (main-header *and* tile-part `COD` / `COC` / `QCD` / `QCC`
-  overrides are otherwise honoured).
+  overrides are otherwise honoured). A mixed-kernel tile that also
+  signals a multiple-component transform (`Rmct = 1`) is rejected — the
+  RCT / ICT requires one kernel across components 0–2.
 - A non-Maxshift `RGN` style. T.800 Table A.25 (Part 1) defines **only**
   `Srgn = 0` (implicit ROI / Maxshift) — all other values are reserved
   in Part 1, and the main-header *and* tile-part Maxshift `RGN` *are*

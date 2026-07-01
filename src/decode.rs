@@ -1601,16 +1601,32 @@ fn decode_tile_from_plan(
     }
 
     // -- Per-component: bridge → reassemble → §F.3.1 IDWT cascade --
+    //
+    // Each component's reconstructed samples land in one of two lanes,
+    // keyed by its §A.6.2 wavelet kernel: the 5-3 lane (`i32`) or the
+    // 9-7 lane (`f64`, integerised later). `comp_lane[c]` records which
+    // lane the component's plane went into and its index within that
+    // lane, so a tile whose COC gave different components different
+    // kernels can be re-interleaved back into component order after the
+    // §G reconstruct (see below). When every component shares one kernel
+    // one lane is empty and `comp_lane` is the identity within the other.
     let mut planes_5x3: Vec<Vec<i32>> = Vec::new();
     let mut planes_9x7: Vec<Vec<f64>> = Vec::new();
+    let mut comp_lane: Vec<(WaveletTransform, usize)> = Vec::with_capacity(levels_per_comp.len());
     for (c, levels) in levels_per_comp.iter().enumerate() {
         let cc = comp_coding.get(c).ok_or(Error::InvalidMarkerLength)?;
         let tc = &tile.components[c];
         let (tw, th) = (tc.width() as usize, tc.height() as usize);
         if tw == 0 || th == 0 {
             match cc.transform {
-                WaveletTransform::Reversible5x3 => planes_5x3.push(Vec::new()),
-                WaveletTransform::Irreversible9x7 => planes_9x7.push(Vec::new()),
+                WaveletTransform::Reversible5x3 => {
+                    comp_lane.push((WaveletTransform::Reversible5x3, planes_5x3.len()));
+                    planes_5x3.push(Vec::new());
+                }
+                WaveletTransform::Irreversible9x7 => {
+                    comp_lane.push((WaveletTransform::Irreversible9x7, planes_9x7.len()));
+                    planes_9x7.push(Vec::new());
+                }
                 WaveletTransform::Reserved(_) => return Err(Error::NotImplemented),
             }
             continue;
@@ -1683,6 +1699,7 @@ fn decode_tile_from_plan(
                 if grid.width != tw || grid.height != th {
                     return Err(Error::InvalidMarkerLength);
                 }
+                comp_lane.push((WaveletTransform::Reversible5x3, planes_5x3.len()));
                 planes_5x3.push(grid.data);
             }
             WaveletTransform::Irreversible9x7 => {
@@ -1699,6 +1716,7 @@ fn decode_tile_from_plan(
                 if grid.width != tw || grid.height != th {
                     return Err(Error::InvalidMarkerLength);
                 }
+                comp_lane.push((WaveletTransform::Irreversible9x7, planes_9x7.len()));
                 planes_9x7.push(grid.data);
             }
             WaveletTransform::Reserved(_) => return Err(Error::NotImplemented),
@@ -1708,64 +1726,119 @@ fn decode_tile_from_plan(
     // -- Annex G: inverse MCT + DC level shift + clamp, per tile --
     //
     // The reassembly above split each component into the `planes_5x3`
-    // or `planes_9x7` lane by its own §A.6.2 kernel. The Annex G MCT
-    // (RCT / ICT) mixes the first three component planes together, so
-    // it requires every component to share one kernel: a COC that gave
-    // different components different kernels would interleave the two
-    // lanes and break the plane↔component index alignment the MCT mix
-    // relies on. Reject that (rare) mixed-kernel case rather than
-    // mis-decode; the common COC override (per-component NL / code-block
-    // size / precincts, same kernel) reconstructs fully.
-    let global_transform = comp_coding.first().map(|c| c.transform);
-    if let Some(t) = global_transform {
-        if comp_coding.iter().any(|c| c.transform != t) {
-            return Err(Error::NotImplemented);
-        }
-    }
-    let transform = global_transform.unwrap_or(WaveletTransform::Reversible5x3);
+    // or `planes_9x7` lane by its own §A.6.2 kernel, tracking the lane +
+    // in-lane index in `comp_lane`. Two cases:
+    //
+    //   * **Uniform kernel** — every component shares one kernel, so one
+    //     lane holds all components in component order and the other is
+    //     empty. The §G reconstruct (RCT / ICT / none) runs on that lane
+    //     and the result is already component-ordered.
+    //   * **Mixed kernel** — a COC gave different components different
+    //     wavelet kernels, so both lanes are populated. The Annex G MCT
+    //     (RCT / ICT) mixes the first three *component* planes together,
+    //     which only stays well-defined when those three share one kernel
+    //     and one lane; a mixed-kernel tile that also signals an MCT is
+    //     rejected. With **no** MCT (`Rmct = 0`), though, §G.1.2 reduces
+    //     to a per-component inverse DC level shift + clamp with no
+    //     cross-component coupling, so each lane is reconstructed
+    //     independently (`InverseMctMode::None`) and the two lanes are
+    //     re-interleaved into component order via `comp_lane`.
+    let mixed_kernel = {
+        let first = comp_coding.first().map(|c| c.transform);
+        first.is_some_and(|t| comp_coding.iter().any(|c| c.transform != t))
+    };
     let descriptors: Vec<ComponentDescriptor> = siz
         .components
         .iter()
         .map(ComponentDescriptor::from_siz_component)
         .collect();
-    match transform {
-        WaveletTransform::Reversible5x3 => {
-            let mode = match params.mct {
+
+    // Descriptors for each lane, in that lane's push order (component
+    // order within the lane). The `_multi` reconstructs expect their
+    // descriptor slice to line up 1:1 with the plane slice.
+    let desc_5x3: Vec<ComponentDescriptor> = comp_lane
+        .iter()
+        .enumerate()
+        .filter(|(_, (k, _))| matches!(k, WaveletTransform::Reversible5x3))
+        .map(|(c, _)| descriptors[c])
+        .collect();
+    let desc_9x7: Vec<ComponentDescriptor> = comp_lane
+        .iter()
+        .enumerate()
+        .filter(|(_, (k, _))| matches!(k, WaveletTransform::Irreversible9x7))
+        .map(|(c, _)| descriptors[c])
+        .collect();
+
+    if mixed_kernel {
+        // §G: a mixed-kernel tile with an active MCT (RCT / ICT) would
+        // feed planes of two different lanes into the transform's first
+        // three inputs — undefined. Reject it; the common same-kernel
+        // COC override reconstructs fully. With no MCT the two lanes are
+        // independent and both are reconstructed below.
+        if params.mct != 0 {
+            return Err(Error::NotImplemented);
+        }
+    }
+
+    // Reconstruct the 5-3 lane (`i32`) in place when populated.
+    if !planes_5x3.is_empty() {
+        let mode = if mixed_kernel {
+            InverseMctMode::None
+        } else {
+            match params.mct {
                 0 => InverseMctMode::None,
                 1 => InverseMctMode::Rct,
                 _ => return Err(Error::NotImplemented),
-            };
-            let mut refs: Vec<&mut [i32]> =
-                planes_5x3.iter_mut().map(|v| v.as_mut_slice()).collect();
-            reconstruct_tile_components_5x3_multi(&mut refs, &descriptors, mode)?;
-            Ok(planes_5x3)
-        }
-        WaveletTransform::Irreversible9x7 => {
-            let mode = match params.mct {
+            }
+        };
+        let mut refs: Vec<&mut [i32]> = planes_5x3.iter_mut().map(|v| v.as_mut_slice()).collect();
+        reconstruct_tile_components_5x3_multi(&mut refs, &desc_5x3, mode)?;
+    }
+
+    // Reconstruct the 9-7 lane (`f64` → `f32` → `i32`) when populated.
+    let outputs_9x7: Vec<Vec<i32>> = if planes_9x7.is_empty() {
+        Vec::new()
+    } else {
+        let mode = if mixed_kernel {
+            InverseMctMode::None
+        } else {
+            match params.mct {
                 0 => InverseMctMode::None,
                 1 => InverseMctMode::Ict,
                 _ => return Err(Error::NotImplemented),
-            };
-            let mut comps_f32: Vec<Vec<f32>> = planes_9x7
-                .iter()
-                .map(|p| p.iter().map(|&v| v as f32).collect())
-                .collect();
-            let mut outputs: Vec<Vec<i32>> =
-                planes_9x7.iter().map(|p| vec![0i32; p.len()]).collect();
-            let mut comp_refs: Vec<&mut [f32]> =
-                comps_f32.iter_mut().map(|v| v.as_mut_slice()).collect();
-            let mut out_refs: Vec<&mut [i32]> =
-                outputs.iter_mut().map(|v| v.as_mut_slice()).collect();
-            reconstruct_tile_components_9x7_multi(
-                &mut comp_refs,
-                &mut out_refs,
-                &descriptors,
-                mode,
-            )?;
-            Ok(outputs)
+            }
+        };
+        let mut comps_f32: Vec<Vec<f32>> = planes_9x7
+            .iter()
+            .map(|p| p.iter().map(|&v| v as f32).collect())
+            .collect();
+        let mut outputs: Vec<Vec<i32>> = planes_9x7.iter().map(|p| vec![0i32; p.len()]).collect();
+        let mut comp_refs: Vec<&mut [f32]> =
+            comps_f32.iter_mut().map(|v| v.as_mut_slice()).collect();
+        let mut out_refs: Vec<&mut [i32]> = outputs.iter_mut().map(|v| v.as_mut_slice()).collect();
+        reconstruct_tile_components_9x7_multi(&mut comp_refs, &mut out_refs, &desc_9x7, mode)?;
+        outputs
+    };
+
+    // Re-interleave the two lanes into component order via `comp_lane`.
+    // In the uniform-kernel case one lane is empty and this is a plain
+    // move of the populated lane; in the mixed-kernel case it stitches
+    // the 5-3 and 9-7 outputs back into the SIZ component sequence the
+    // caller places into the image-area planes.
+    let mut result: Vec<Vec<i32>> = Vec::with_capacity(comp_lane.len());
+    for &(kind, idx) in &comp_lane {
+        match kind {
+            WaveletTransform::Reversible5x3 => {
+                result.push(std::mem::take(&mut planes_5x3[idx]));
+            }
+            WaveletTransform::Irreversible9x7 => {
+                let out = outputs_9x7.get(idx).ok_or(Error::InvalidMarkerLength)?;
+                result.push(out.clone());
+            }
+            WaveletTransform::Reserved(_) => return Err(Error::NotImplemented),
         }
-        WaveletTransform::Reserved(_) => Err(Error::NotImplemented),
     }
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------

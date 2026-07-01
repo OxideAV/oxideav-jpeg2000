@@ -6,6 +6,24 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 382 (2026-07-02).** **Mixed wavelet kernels per
+  component (T.800 §A.6.2 / Table A.17), MCT off.** A `COC` may now give
+  one component the 5-3 reversible kernel and another the 9-7
+  irreversible kernel in the same tile, provided no multiple-component
+  transform is signalled (`Rmct = 0`). Table A.17 pairs the MCT with a
+  single kernel shared across components 0–2, but with the MCT off
+  §G.1.2 reduces to a per-component DC level-shift + clamp with no
+  cross-component coupling, so the reassembly reconstructs each
+  component in its own `i32` (5-3) or `f64` (9-7) lane and re-interleaves
+  the lanes back into SIZ component order via a per-component lane tag. A
+  mixed-kernel tile that *also* signals an MCT is rejected (previously
+  *all* mixed-kernel tiles were rejected as `Error::NotImplemented`).
+  Validated end-to-end by a clean-room assembler that splices a 5-3 and
+  a 9-7 single-component stream into one CPRL two-component codestream
+  (component-1 `COC` selecting the 9-7 kernel, `QCC` carrying its
+  quantisation) and asserts each component reconstructs identically to
+  its standalone single-component decode, plus a rejection test for the
+  `Rmct = 1` mixed-kernel case.
 * **Clean-room round 370 (2026-06-25).** **End-to-end validation of the
   relocated-header (`PPT` / `PPM`) decode path.** The tier-2 geometry +
   enumeration + walk half of `decode_tile` was factored into a reusable

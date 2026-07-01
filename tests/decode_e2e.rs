@@ -104,6 +104,21 @@ const GRAY_BYPASS_97_REF_PGM: &[u8] = include_bytes!("data/gray-40x40-bypass-97-
 // and corrupt at least one tile. COM markers scrubbed.
 const GRAY_BYPASS_TILED_53: &[u8] = include_bytes!("data/gray-40x40-bypass-tiled-53.j2k");
 
+// §A.6.2 mixed-kernel-per-component pair: the *same* 16×16 gray raster
+// encoded two ways with MCT off (`Rmct = 0`), NL = 2, 32×32 code-blocks
+// (one block per sub-band), one precinct, one layer — once with the 5-3
+// reversible filter and once with the 9-7 irreversible filter. The
+// clean-room assembler below splices these two single-component streams
+// into one two-component codestream whose COD default kernel is 5-3 and
+// whose component-1 COC (Table A.15 SPcoc transformation = 0) selects
+// the 9-7 kernel. Table A.17 permits a per-component kernel only when no
+// multiple-component transform is signalled (`Rmct = 0`); with MCT off
+// §G.1.2 reduces to a per-component DC level-shift + clamp, so the two
+// kernels reconstruct independently and are re-interleaved into
+// component order. COM markers are scrubbed by the assembler.
+const GRAY_MK_53: &[u8] = include_bytes!("data/gray-16x16-mct0-53.j2k");
+const GRAY_MK_97: &[u8] = include_bytes!("data/gray-16x16-mct0-97.j2k");
+
 /// Deterministic 64×64 gray source pattern (the raster the multi-layer
 /// fixture was encoded from); same arithmetic family as
 /// [`gray_17x13_pattern`] with an extra high-frequency `(x ^ y)` term so
@@ -1128,4 +1143,233 @@ fn gray_53_predictable_termination_mismatch_is_rejected() {
 fn truncated_codestream_is_rejected() {
     let cut = &GRAY_53[..GRAY_53.len() / 2];
     assert!(decode_j2k(cut).is_err());
+}
+
+// -------------------------------------------------------------------------
+// §A.6.2 mixed-kernel-per-component (Rmct = 0) assembly + decode.
+// -------------------------------------------------------------------------
+
+/// Find the byte offset of a two-byte marker in the main header (before
+/// the first `SOT`). Panics if absent.
+fn find_marker(bytes: &[u8], marker: u16) -> usize {
+    let m = marker.to_be_bytes();
+    let mut pos = 2usize; // skip SOC
+    loop {
+        assert!(pos + 4 <= bytes.len(), "marker {marker:#06x} not found");
+        if bytes[pos] == m[0] && bytes[pos + 1] == m[1] {
+            return pos;
+        }
+        // SOT ends the main header.
+        if bytes[pos] == 0xFF && bytes[pos + 1] == 0x90 {
+            panic!("marker {marker:#06x} not found before SOT");
+        }
+        let len = u16::from_be_bytes([bytes[pos + 2], bytes[pos + 3]]) as usize;
+        pos += 2 + len;
+    }
+}
+
+/// Read a `(marker, Lxxx, payload)` segment's payload slice.
+fn marker_payload(bytes: &[u8], off: usize) -> &[u8] {
+    let len = u16::from_be_bytes([bytes[off + 2], bytes[off + 3]]) as usize;
+    &bytes[off + 4..off + 2 + len]
+}
+
+/// Extract the tile body (bytes after `SOD`, minus any trailing `EOC`).
+fn tile_body(bytes: &[u8]) -> &[u8] {
+    let sod = find_sod(bytes);
+    let mut body = &bytes[sod + 2..];
+    if body.len() >= 2 && body[body.len() - 2] == 0xFF && body[body.len() - 1] == 0xD9 {
+        body = &body[..body.len() - 2];
+    }
+    body
+}
+
+fn find_sod(bytes: &[u8]) -> usize {
+    let mut pos = 0usize;
+    while pos + 2 <= bytes.len() {
+        if bytes[pos] == 0xFF && bytes[pos + 1] == 0x93 {
+            return pos;
+        }
+        pos += 1;
+    }
+    panic!("no SOD");
+}
+
+/// Clean-room assembler: splice two single-component single-tile J2K
+/// codestreams — one 5-3, one 9-7, both `Rmct = 0`, identical geometry,
+/// one layer / one precinct — into a single two-component codestream.
+///
+/// The COD default kernel stays 5-3 and the progression is rewritten to
+/// **CPRL** (component-major) so component 0's packets precede all of
+/// component 1's. A COC selects the 9-7 kernel for component 1 (Table
+/// A.15 SPcoc transformation byte) and a QCC carries the 9-7 stream's
+/// quantisation for it. The two bodies concatenate in CPRL order:
+/// component 0's (r0, r1, r2) packets then component 1's — which for a
+/// single-layer / single-precinct stream is exactly each source body's
+/// own LRCP ordering, so no packet-level re-interleave is needed.
+///
+/// Markers are built from the T.800 Annex A layout; the packet bodies
+/// are the opaque encoder's bytes, spliced verbatim.
+fn assemble_mixed_kernel(base53: &[u8], other97: &[u8]) -> Vec<u8> {
+    // -- SIZ: bump Csiz 1 -> 2 and append a duplicate component
+    //    descriptor (both components share the 8-bit / 1×1 geometry). --
+    let siz_off = find_marker(base53, 0xFF51);
+    let siz = marker_payload(base53, siz_off);
+    // SIZ layout: Rsiz(2) Xsiz(4) Ysiz(4) XOsiz(4) YOsiz(4) XTsiz(4)
+    // YTsiz(4) XTOsiz(4) YTOsiz(4) Csiz(2) then Csiz×{Ssiz(1) XRsiz(1)
+    // YRsiz(1)}.
+    let csiz_pos = 2 + 4 * 8; // 38
+    let csiz = u16::from_be_bytes([siz[csiz_pos], siz[csiz_pos + 1]]);
+    assert_eq!(csiz, 1, "assembler expects single-component sources");
+    let comp_desc = &siz[csiz_pos + 2..csiz_pos + 5]; // Ssiz XRsiz YRsiz
+    let mut new_siz = Vec::new();
+    new_siz.extend_from_slice(&siz[..csiz_pos]);
+    new_siz.extend_from_slice(&2u16.to_be_bytes()); // Csiz = 2
+    new_siz.extend_from_slice(comp_desc); // component 0
+    new_siz.extend_from_slice(comp_desc); // component 1 (identical)
+    let new_siz_seg = wrap_marker(0xFF51, &new_siz);
+
+    // -- COD: keep 5-3 default kernel, rewrite progression -> CPRL. --
+    let cod_off = find_marker(base53, 0xFF52);
+    let cod = marker_payload(base53, cod_off);
+    let mut new_cod = cod.to_vec();
+    // COD payload: Scod(1) SGcod{prog(1) layers(2) mct(1)} SPcod{…}.
+    new_cod[1] = 0x04; // SGcod progression = CPRL (Table A.16)
+    assert_eq!(new_cod[4], 0x00, "COD MCT must be off");
+    let cod_transform = *new_cod.last().unwrap();
+    assert_eq!(cod_transform, 0x01, "base COD must be the 5-3 kernel");
+    let new_cod_seg = wrap_marker(0xFF52, &new_cod);
+
+    // -- COC for component 1: SPcoc copied from the 9-7 stream's COD. --
+    let cod97_off = find_marker(other97, 0xFF52);
+    let cod97 = marker_payload(other97, cod97_off);
+    // SPcoc = COD SPcod tail (after Scod + SGcod). For a Csiz < 257
+    // stream Ccoc is one byte.
+    let spcod97 = &cod97[5..];
+    assert_eq!(*spcod97.last().unwrap(), 0x00, "other COD must be 9-7");
+    let mut coc_payload = vec![0x01u8, 0x00]; // Ccoc = 1, Scoc = 0
+    coc_payload.extend_from_slice(spcod97);
+    let coc_seg = wrap_marker(0xFF53, &coc_payload);
+
+    // -- QCD: keep the 5-3 stream's (component 0 default). --
+    let qcd_off = find_marker(base53, 0xFF5C);
+    let qcd = marker_payload(base53, qcd_off);
+    let new_qcd_seg = wrap_marker(0xFF5C, qcd);
+
+    // -- QCC for component 1: the 9-7 stream's QCD payload. --
+    let qcd97_off = find_marker(other97, 0xFF5C);
+    let qcd97 = marker_payload(other97, qcd97_off);
+    let mut qcc_payload = vec![0x01u8]; // Cqcc = 1
+    qcc_payload.extend_from_slice(qcd97);
+    let qcc_seg = wrap_marker(0xFF5D, &qcc_payload);
+
+    // -- Tile body: component 0 (5-3) then component 1 (9-7). --
+    let body53 = tile_body(base53);
+    let body97 = tile_body(other97);
+    let mut body = Vec::new();
+    body.extend_from_slice(body53);
+    body.extend_from_slice(body97);
+
+    // -- SOT: Psot = length from SOT marker to the end of the tile data.
+    //    Layout Lsot(2)=10 Isot(2) Psot(4) TPsot(1) TNsot(1). --
+    let sot: Vec<u8> = {
+        let mut s = Vec::new();
+        s.extend_from_slice(&0xFF90u16.to_be_bytes());
+        s.extend_from_slice(&10u16.to_be_bytes()); // Lsot
+        s.extend_from_slice(&0u16.to_be_bytes()); // Isot = tile 0
+                                                  // Psot patched below once the body length is known.
+        s.extend_from_slice(&0u32.to_be_bytes());
+        s.push(0); // TPsot
+        s.push(1); // TNsot
+        s
+    };
+    let sod = 0xFF93u16.to_be_bytes();
+
+    // -- Assemble: SOC SIZ COD COC QCD QCC SOT SOD body EOC. --
+    let mut out = Vec::new();
+    out.extend_from_slice(&0xFF4Fu16.to_be_bytes()); // SOC
+    out.extend_from_slice(&new_siz_seg);
+    out.extend_from_slice(&new_cod_seg);
+    out.extend_from_slice(&coc_seg);
+    out.extend_from_slice(&new_qcd_seg);
+    out.extend_from_slice(&qcc_seg);
+    let sot_off = out.len();
+    out.extend_from_slice(&sot);
+    out.extend_from_slice(&sod);
+    out.extend_from_slice(&body);
+    out.extend_from_slice(&0xFFD9u16.to_be_bytes()); // EOC
+
+    // Psot = bytes from the SOT marker through the end of the tile data
+    // (excludes the trailing EOC). Psot field sits at sot_off + 6.
+    let psot = (out.len() - 2 - sot_off) as u32;
+    out[sot_off + 6..sot_off + 10].copy_from_slice(&psot.to_be_bytes());
+    out
+}
+
+/// Wrap a payload in a `marker Lxxx payload` segment (Lxxx counts the
+/// length field itself plus the payload).
+fn wrap_marker(marker: u16, payload: &[u8]) -> Vec<u8> {
+    let mut seg = Vec::with_capacity(4 + payload.len());
+    seg.extend_from_slice(&marker.to_be_bytes());
+    seg.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+    seg.extend_from_slice(payload);
+    seg
+}
+
+/// A two-component codestream whose components use *different* wavelet
+/// kernels (component 0 = 5-3, component 1 = 9-7), MCT off. Each
+/// component must reconstruct exactly as if it were decoded from its own
+/// single-component stream — the mixed-kernel reassembly interleaves the
+/// two lanes back into component order.
+#[test]
+fn mixed_kernel_per_component_mct0_reconstructs_both_lanes() {
+    // Reference: decode each single-component source on its own.
+    let ref53 = decode_j2k(GRAY_MK_53).expect("decode 5-3 source");
+    let ref97 = decode_j2k(GRAY_MK_97).expect("decode 9-7 source");
+    assert_eq!(ref53.components.len(), 1);
+    assert_eq!(ref97.components.len(), 1);
+
+    let mixed = assemble_mixed_kernel(GRAY_MK_53, GRAY_MK_97);
+    let img = decode_j2k(&mixed).expect("decode mixed-kernel two-component stream");
+    assert_eq!(img.components.len(), 2, "two components expected");
+    assert_eq!(img.width, 16);
+    assert_eq!(img.height, 16);
+
+    // Component 0 rode the 5-3 lane; component 1 rode the 9-7 lane. Each
+    // must match its own single-component decode bit-for-bit.
+    assert_eq!(
+        img.components[0].samples, ref53.components[0].samples,
+        "component 0 (5-3 kernel) diverged from its single-component decode"
+    );
+    assert_eq!(
+        img.components[1].samples, ref97.components[0].samples,
+        "component 1 (9-7 kernel) diverged from its single-component decode"
+    );
+
+    // The two lanes carry genuinely different reconstructions (5-3 is
+    // lossless, 9-7 is lossy over the same raster), so a lane mix-up
+    // would have surfaced above; assert they differ to keep the test
+    // honest about exercising the interleave.
+    assert_ne!(
+        img.components[0].samples, img.components[1].samples,
+        "the 5-3 and 9-7 lanes should reconstruct differently"
+    );
+}
+
+/// A mixed-kernel tile that *also* signals a multiple-component
+/// transform (`Rmct = 1`) is rejected: Table A.17 pairs a single kernel
+/// with the MCT, so feeding two different lanes into the RCT/ICT first
+/// three inputs is undefined. The assembler flips the COD MCT byte on.
+#[test]
+fn mixed_kernel_with_mct_is_rejected() {
+    let mut mixed = assemble_mixed_kernel(GRAY_MK_53, GRAY_MK_97);
+    // Flip the COD SGcod MCT byte to 1. COD sits right after SIZ; locate
+    // it and set the MCT byte (Scod(1) + SGcod{prog(1) layers(2) mct(1)}
+    // => marker(2) Lcod(2) + 1 + 1 + 2 = offset 8 from the marker).
+    let cod_off = find_marker(&mixed, 0xFF52);
+    mixed[cod_off + 8] = 0x01; // Rmct = 1
+    assert!(
+        decode_j2k(&mixed).is_err(),
+        "a mixed-kernel tile with an active MCT must be rejected"
+    );
 }
