@@ -40,14 +40,22 @@
 //! `Tile-part {COC,QCC} > Tile-part {COD,QCD} > Main {COC,QCC} >
 //! Main {COD,QCD}` precedence) are honoured.
 //!
+//! A `COC` may give different components different wavelet kernels when
+//! no multiple-component transform is active (`Rmct = 0`): §G.1.2 then
+//! reduces to a per-component DC level-shift + clamp, so each component
+//! reconstructs in its own kernel lane and the lanes re-interleave into
+//! component order. A mixed-kernel tile that *also* signals an MCT is
+//! rejected (Table A.17 pairs the MCT with one kernel across
+//! components 0–2).
+//!
 //! Streams that need machinery this round does not wire are
 //! **rejected** with [`Error::NotImplemented`] rather than
 //! mis-decoded: a `COC` whose Table A.19 code-block **style** byte
-//! diverges from the `COD` (the style stays global), a `COC` that
-//! gives different components different wavelet kernels, a non-Maxshift
-//! `RGN` style (`Srgn ≠ 0`), `POC` progression-order changes
-//! (main-header or tile-part), and `PPM` / `PPT` packed packet
-//! headers.
+//! diverges from the `COD` (the style stays global), a non-Maxshift
+//! `RGN` style (`Srgn ≠ 0`), and RPCL / PCRL under non-power-of-two
+//! sub-sampling (§B.12.1.3 / §B.12.1.4 require power-of-two `XRsiz` /
+//! `YRsiz`; CPRL — §B.12.1.5 — carries no such restriction and is
+//! decoded at any factor).
 //!
 //! All behaviour is derived from the staged T.800 specification
 //! text. The

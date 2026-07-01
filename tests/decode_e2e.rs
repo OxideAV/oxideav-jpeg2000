@@ -1317,6 +1317,82 @@ fn assemble_mixed_kernel(base53: &[u8], other97: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Like [`assemble_mixed_kernel`] but places the component-1 `COC` /
+/// `QCC` overrides in the **tile-part header** (between `SOT` and `SOD`)
+/// instead of the main header, exercising the §A.6.1 tile-part
+/// precedence route for a mixed-kernel tile. The main header carries
+/// only the two-component `SIZ`, the default-5-3 `COD` (CPRL) and the
+/// 5-3 `QCD`; the tile-part header restates component 1 as 9-7.
+fn assemble_mixed_kernel_tilepart(base53: &[u8], other97: &[u8]) -> Vec<u8> {
+    let siz = marker_payload(base53, find_marker(base53, 0xFF51));
+    let csiz_pos = 2 + 4 * 8;
+    assert_eq!(u16::from_be_bytes([siz[csiz_pos], siz[csiz_pos + 1]]), 1);
+    let comp_desc = &siz[csiz_pos + 2..csiz_pos + 5];
+    let mut new_siz = Vec::new();
+    new_siz.extend_from_slice(&siz[..csiz_pos]);
+    new_siz.extend_from_slice(&2u16.to_be_bytes());
+    new_siz.extend_from_slice(comp_desc);
+    new_siz.extend_from_slice(comp_desc);
+
+    let mut new_cod = marker_payload(base53, find_marker(base53, 0xFF52)).to_vec();
+    new_cod[1] = 0x04; // CPRL
+    assert_eq!(*new_cod.last().unwrap(), 0x01, "base must be 5-3");
+
+    let cod97 = marker_payload(other97, find_marker(other97, 0xFF52));
+    let spcod97 = &cod97[5..];
+    let mut coc_payload = vec![0x01u8, 0x00];
+    coc_payload.extend_from_slice(spcod97);
+    let coc_seg = wrap_marker(0xFF53, &coc_payload);
+
+    let qcd = marker_payload(base53, find_marker(base53, 0xFF5C));
+    let qcd97 = marker_payload(other97, find_marker(other97, 0xFF5C));
+    let mut qcc_payload = vec![0x01u8];
+    qcc_payload.extend_from_slice(qcd97);
+    let qcc_seg = wrap_marker(0xFF5D, &qcc_payload);
+
+    let mut body = Vec::new();
+    body.extend_from_slice(tile_body(base53));
+    body.extend_from_slice(tile_body(other97));
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&0xFF4Fu16.to_be_bytes()); // SOC
+    out.extend_from_slice(&wrap_marker(0xFF51, &new_siz));
+    out.extend_from_slice(&wrap_marker(0xFF52, &new_cod));
+    out.extend_from_slice(&wrap_marker(0xFF5C, qcd));
+    let sot_off = out.len();
+    out.extend_from_slice(&0xFF90u16.to_be_bytes());
+    out.extend_from_slice(&10u16.to_be_bytes());
+    out.extend_from_slice(&0u16.to_be_bytes());
+    out.extend_from_slice(&0u32.to_be_bytes());
+    out.push(0); // TPsot = 0 (overrides allowed only here)
+    out.push(1);
+    // Tile-part header markers: COC + QCC for component 1, then SOD.
+    out.extend_from_slice(&coc_seg);
+    out.extend_from_slice(&qcc_seg);
+    out.extend_from_slice(&0xFF93u16.to_be_bytes()); // SOD
+    out.extend_from_slice(&body);
+    out.extend_from_slice(&0xFFD9u16.to_be_bytes());
+    let psot = (out.len() - 2 - sot_off) as u32;
+    out[sot_off + 6..sot_off + 10].copy_from_slice(&psot.to_be_bytes());
+    out
+}
+
+/// The §A.6.1 tile-part precedence route also decodes a mixed-kernel
+/// tile: with the component-1 `COC` (9-7) and `QCC` living in the
+/// tile-part header rather than the main header, each component must
+/// still reconstruct identically to its single-component decode.
+#[test]
+fn mixed_kernel_via_tile_part_header_reconstructs_both_lanes() {
+    let ref53 = decode_j2k(GRAY_MK_53).expect("decode 5-3 source");
+    let ref97 = decode_j2k(GRAY_MK_97).expect("decode 9-7 source");
+    let stream = assemble_mixed_kernel_tilepart(GRAY_MK_53, GRAY_MK_97);
+    let img = decode_j2k(&stream).expect("decode tile-part mixed-kernel stream");
+    assert_eq!(img.components.len(), 2);
+    assert_eq!(img.components[0].samples, ref53.components[0].samples);
+    assert_eq!(img.components[1].samples, ref97.components[0].samples);
+    assert_ne!(img.components[0].samples, img.components[1].samples);
+}
+
 /// Wrap a payload in a `marker Lxxx payload` segment (Lxxx counts the
 /// length field itself plus the payload).
 fn wrap_marker(marker: u16, payload: &[u8]) -> Vec<u8> {
