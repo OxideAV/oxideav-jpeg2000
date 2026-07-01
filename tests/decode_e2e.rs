@@ -43,6 +43,17 @@ const RGB_CPRL_53: &[u8] = include_bytes!("data/rgb-48x32-cprl-53.j2k");
 const RGB_CPRL_SUB3_53: &[u8] = include_bytes!("data/rgb-24x24-cprl-sub3-53.j2k");
 const RGB_CPRL_SUB3_REF_PPM: &[u8] = include_bytes!("data/rgb-24x24-cprl-sub3-53-ref.ppm");
 
+// CPRL, non-power-of-two sub-sampling (XRsiz = YRsiz = 3), **multiple
+// precincts** (user-defined 16×16 precinct cells, 8×8 code-blocks,
+// NL = 2) over a 48×48 three-component raster. Here the §B.12.1.5
+// component-major sweep must order several precincts per resolution by
+// their reference-grid corners, and the `ref_grid_*` projection scales
+// each corner by the non-power-of-two XRsiz / YRsiz — so any slip in the
+// non-pow2 corner arithmetic would mis-order the packet walk and corrupt
+// the reconstruction. Pinned against a comment-scrubbed P6 reference.
+const RGB_CPRL_SUB3_MP_53: &[u8] = include_bytes!("data/rgb-48x48-cprl-sub3-mp-53.j2k");
+const RGB_CPRL_SUB3_MP_REF_PPM: &[u8] = include_bytes!("data/rgb-48x48-cprl-sub3-mp-53-ref.ppm");
+
 // Multi-precinct §B.6 / §B.7 fixture: 40×40 gray, lossless 5-3, NL = 2,
 // 8×8 code-blocks (xcb = ycb = 3), precinct exponents PPx = PPy = 4
 // (16×16 precinct cells) at every resolution. The precinct cell (16) is
@@ -1626,6 +1637,30 @@ fn cprl_non_power_of_two_subsampling_matches_reference() {
     }
 }
 
+/// CPRL, non-power-of-two sub-sampling, with **multiple precincts** per
+/// resolution. The §B.12.1.5 sweep now orders several precincts by their
+/// reference-grid corners, each scaled by the non-pow2 XRsiz / YRsiz — so
+/// this exercises the corner arithmetic the single-precinct case above
+/// left trivial. Every component must match the reference decode.
+#[test]
+fn cprl_non_power_of_two_multi_precinct_matches_reference() {
+    let img = decode_j2k(RGB_CPRL_SUB3_MP_53).expect("decode multi-precinct CPRL sub-3");
+    assert_eq!(img.components.len(), 3);
+    let (w, h, rgb) = ppm_payload(RGB_CPRL_SUB3_MP_REF_PPM);
+    for (c, comp) in img.components.iter().enumerate() {
+        assert_eq!(
+            (comp.width as usize, comp.height as usize),
+            (w, h),
+            "component {c} dimensions differ from the reference"
+        );
+        let plane: Vec<i32> = (0..w * h).map(|p| rgb[p * 3 + c] as i32).collect();
+        assert_eq!(
+            comp.samples, plane,
+            "component {c} diverged from the multi-precinct CPRL reference"
+        );
+    }
+}
+
 /// The companion negative: RPCL (§B.12.1.3) *does* require power-of-two
 /// sub-sampling. Flipping the assembled CPRL stream's COD progression
 /// byte to RPCL (3) while leaving XRsiz = YRsiz = 3 must be rejected.
@@ -1641,5 +1676,18 @@ fn rpcl_non_power_of_two_subsampling_is_rejected() {
     assert!(
         decode_j2k(&mutated).is_err(),
         "RPCL requires power-of-two sub-sampling (§B.12.1.3) — non-pow2 must be rejected"
+    );
+}
+
+/// PCRL (§B.12.1.4) likewise "shall be powers of two": the same non-pow2
+/// CPRL stream re-flagged as PCRL must be rejected.
+#[test]
+fn pcrl_non_power_of_two_subsampling_is_rejected() {
+    let mut mutated = RGB_CPRL_SUB3_53.to_vec();
+    let cod_off = find_marker(&mutated, 0xFF52);
+    mutated[cod_off + 5] = 0x01; // PCRL (Table A.16)
+    assert!(
+        decode_j2k(&mutated).is_err(),
+        "PCRL requires power-of-two sub-sampling (§B.12.1.4) — non-pow2 must be rejected"
     );
 }
