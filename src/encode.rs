@@ -237,7 +237,40 @@ pub fn encode_j2k_lossless(
     nl: u8,
     cb_exp: (u8, u8),
 ) -> Result<Vec<u8>, Error> {
+    encode_impl(planes, width, height, nl, cb_exp, false)
+}
+
+/// Encode exactly three 8-bit RGB planes into a **lossless** Part-1 J2K
+/// codestream with the §G.2 **reversible component transform** (RCT,
+/// `SGcod` MCT = 1, Table A.17).
+///
+/// The DC-shifted planes go through the Equation G-3/G-4/G-5 forward
+/// RCT before the 5-3 cascade; the chrominance components carry one
+/// extra bit of dynamic range (§G.2), signalled through main-header
+/// `QCC` markers whose exponents use `RI + 1` (picked up by the
+/// decoder's §A.6.5 `Main QCC over Main QCD` precedence). For
+/// correlated RGB input the RCT stream is smaller than three
+/// independent planes; decoding is still bit-exact.
+pub fn encode_j2k_lossless_rct(
+    planes: &[&[u8]; 3],
+    width: u32,
+    height: u32,
+    nl: u8,
+    cb_exp: (u8, u8),
+) -> Result<Vec<u8>, Error> {
+    encode_impl(planes.as_slice(), width, height, nl, cb_exp, true)
+}
+
+fn encode_impl(
+    planes: &[&[u8]],
+    width: u32,
+    height: u32,
+    nl: u8,
+    cb_exp: (u8, u8),
+    use_rct: bool,
+) -> Result<Vec<u8>, Error> {
     let (xcb, ycb) = cb_exp;
+    debug_assert!(!use_rct || planes.len() == 3);
     if planes.is_empty()
         || width == 0
         || height == 0
@@ -281,13 +314,22 @@ pub fn encode_j2k_lossless(
     };
 
     // -- Forward transform per component ------------------------------
+    // §G.1.2 DC level shift, then (optionally) the §G.2 forward RCT
+    // across components 0–2, then the per-component §F.4 cascade.
     let dc = 1i32 << (PRECISION - 1);
-    let bands: Vec<ComponentBands> = planes
+    let mut shifted: Vec<Vec<i32>> = planes
         .iter()
-        .map(|p| {
-            let shifted: Vec<i32> = p.iter().map(|&s| s as i32 - dc).collect();
-            forward_cascade(shifted, width as usize, height as usize, nl)
-        })
+        .map(|p| p.iter().map(|&s| s as i32 - dc).collect())
+        .collect();
+    if use_rct {
+        // Split into three disjoint &mut [i32] (MSRV-friendly).
+        let (head, tail) = shifted.split_at_mut(1);
+        let (mid, tail2) = tail.split_at_mut(1);
+        crate::mct::forward_rct(&mut head[0], &mut mid[0], &mut tail2[0])?;
+    }
+    let bands: Vec<ComponentBands> = shifted
+        .into_iter()
+        .map(|p| forward_cascade(p, width as usize, height as usize, nl))
         .collect();
 
     // -- Geometry (shared with the decoder) ---------------------------
@@ -343,7 +385,14 @@ pub fn encode_j2k_lossless(
                         };
                         &bands[ci].high[lev - 1][oi]
                     };
-                    let eps = u32::from(PRECISION) + u32::from(band_gain(psb.orientation));
+                    // §G.2: RCT chrominance carries one extra bit of
+                    // dynamic range, signalled via this component's QCC.
+                    let ri = if use_rct && ci > 0 {
+                        u32::from(PRECISION) + 1
+                    } else {
+                        u32::from(PRECISION)
+                    };
+                    let eps = ri + u32::from(band_gain(psb.orientation));
                     let mb = u32::from(GUARD_BITS) + eps - 1;
                     for (bi, cb) in psb.code_blocks.iter().enumerate() {
                         let (bw, bh) = (cb.width() as usize, cb.height() as usize);
@@ -456,34 +505,49 @@ pub fn encode_j2k_lossless(
     push_segment(&mut out, MARKER_SIZ, &siz_payload);
 
     // COD (Tables A.13 – A.21): Scod = 0 (no precincts / SOP / EPH),
-    // LRCP, 1 layer, no MCT, NL levels, code-block exponents − 2,
-    // style 0, 5-3 reversible.
+    // LRCP, 1 layer, MCT per `use_rct` (Table A.17), NL levels,
+    // code-block exponents − 2, style 0, 5-3 reversible.
     let cod_payload = [
         0u8, // Scod
         0,   // SGcod: progression = LRCP
         0,
-        1,       // SGcod: layers = 1
-        0,       // SGcod: MCT off
-        nl,      // SPcod: NL
-        xcb - 2, // SPcod: xcb − 2
-        ycb - 2, // SPcod: ycb − 2
-        0,       // SPcod: code-block style
-        1,       // SPcod: transform = 5-3 reversible (Table A.20)
+        1,             // SGcod: layers = 1
+        use_rct as u8, // SGcod: MCT (Table A.17)
+        nl,            // SPcod: NL
+        xcb - 2,       // SPcod: xcb − 2
+        ycb - 2,       // SPcod: ycb − 2
+        0,             // SPcod: code-block style
+        1,             // SPcod: transform = 5-3 reversible (Table A.20)
     ];
     push_segment(&mut out, MARKER_COD, &cod_payload);
 
     // QCD (Tables A.27 – A.28): style 0 (no quantization), G guard
     // bits; one εb byte per sub-band in the §F.3.1 order (NLLL then
-    // per-level HL, LH, HH from the deepest level outward).
-    let mut qcd_payload = Vec::with_capacity(2 + 3 * nl as usize);
-    qcd_payload.push(GUARD_BITS << 5); // Sqcd: style 0 | guard bits
-    qcd_payload.push(PRECISION << 3); // εb(LL) = RI + 0
-    for _r in 1..=nl {
-        qcd_payload.push((PRECISION + 1) << 3); // HL: RI + 1
-        qcd_payload.push((PRECISION + 1) << 3); // LH: RI + 1
-        qcd_payload.push((PRECISION + 2) << 3); // HH: RI + 2
+    // per-level HL, LH, HH from the deepest level outward). `ri` is the
+    // component bit depth the exponents build on.
+    let quant_payload = |ri: u8| -> Vec<u8> {
+        let mut p = Vec::with_capacity(2 + 3 * nl as usize);
+        p.push(GUARD_BITS << 5); // Sqcd/Sqcc: style 0 | guard bits
+        p.push(ri << 3); // εb(LL) = RI + 0
+        for _r in 1..=nl {
+            p.push((ri + 1) << 3); // HL: RI + 1
+            p.push((ri + 1) << 3); // LH: RI + 1
+            p.push((ri + 2) << 3); // HH: RI + 2
+        }
+        p
+    };
+    push_segment(&mut out, MARKER_QCD, &quant_payload(PRECISION));
+    if use_rct {
+        // §G.2 / §A.6.5: the RCT chrominance components (1, 2) carry one
+        // extra bit of dynamic range — override their exponents with a
+        // main-header QCC each (`Main QCC > Main QCD`). Cqcc is one byte
+        // (Csiz = 3 < 257).
+        for c in 1u8..=2 {
+            let mut qcc_payload = vec![c];
+            qcc_payload.extend_from_slice(&quant_payload(PRECISION + 1));
+            push_segment(&mut out, crate::MARKER_QCC, &qcc_payload);
+        }
     }
-    push_segment(&mut out, MARKER_QCD, &qcd_payload);
 
     // SOT + SOD + tile body (§A.4.2): Psot spans SOT → end of body.
     let psot = 12u32 + 2 + tile_body.len() as u32;
@@ -623,5 +687,62 @@ mod tests {
         // Code-block exponents out of Table A.18 range.
         assert!(encode_j2k_lossless(&[&p], 4, 4, 1, (1, 4)).is_err());
         assert!(encode_j2k_lossless(&[&p], 4, 4, 1, (10, 10)).is_err());
+    }
+
+    // -- §G.2 reversible component transform (MCT = 1) ----------------
+
+    /// Encode three planes with the RCT, decode with this crate's
+    /// decoder, and assert bit-exact recovery.
+    fn roundtrip_rct(planes: &[&[u8]; 3], w: u32, h: u32, nl: u8, cb: (u8, u8)) -> usize {
+        let stream = encode_j2k_lossless_rct(planes, w, h, nl, cb).expect("encode rct");
+        let img = decode_j2k(&stream).expect("decode own rct stream");
+        assert_eq!(img.components.len(), 3);
+        for (ci, (comp, plane)) in img.components.iter().zip(planes.iter()).enumerate() {
+            let got: Vec<u8> = comp.samples.iter().map(|&s| s as u8).collect();
+            assert_eq!(&got[..], &plane[..], "comp {ci} samples (RCT)");
+        }
+        stream.len()
+    }
+
+    #[test]
+    fn lossless_rct_round_trips() {
+        let r = gradient(40, 32);
+        let g = gradient(40, 32);
+        let b = noise(40, 32, 0x0F0F_F0F0);
+        roundtrip_rct(&[&r, &g, &b], 40, 32, 2, (4, 4));
+    }
+
+    #[test]
+    fn lossless_rct_odd_dims_extremes() {
+        // Saturated channels + odd dims: exercises the widened chroma
+        // budget (QCC RI + 1) and the RCT corner values.
+        let w = 19u32;
+        let h = 27u32;
+        let r = vec![255u8; (w * h) as usize];
+        let g = vec![0u8; (w * h) as usize];
+        let b: Vec<u8> = (0..w * h).map(|i| (i % 256) as u8).collect();
+        roundtrip_rct(&[&r, &g, &b], w, h, 3, (4, 4));
+    }
+
+    #[test]
+    fn rct_beats_independent_planes_on_correlated_rgb() {
+        // A natural-ish correlated image: all three channels share the
+        // same busy luminance (noise) while the channel *differences*
+        // are smooth. The RCT moves the noise into one luma component
+        // and leaves two near-flat chroma planes, so the MCT = 1 stream
+        // must be smaller than the three-independent-planes stream.
+        let w = 64u32;
+        let h = 64u32;
+        let luma = noise(w, h, 0x1122_3344);
+        let r: Vec<u8> = luma.iter().map(|&v| v.saturating_add(10)).collect();
+        let g = luma.clone();
+        let b: Vec<u8> = luma.iter().map(|&v| v.saturating_sub(30)).collect();
+        let rct_len = roundtrip_rct(&[&r, &g, &b], w, h, 3, (5, 5));
+        let plain = encode_j2k_lossless(&[&r, &g, &b], w, h, 3, (5, 5)).unwrap();
+        assert!(
+            rct_len < plain.len(),
+            "RCT stream ({rct_len} B) should beat independent planes ({} B)",
+            plain.len()
+        );
     }
 }

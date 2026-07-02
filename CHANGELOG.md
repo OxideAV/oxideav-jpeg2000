@@ -6,6 +6,25 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 382 (2026-07-02).** **Encoder RCT (`SGcod`
+  MCT = 1, T.800 §G.2) + independent black-box conformance.** New
+  `encode::encode_j2k_lossless_rct` runs the Equation G-3/G-4/G-5
+  forward reversible component transform between the DC level shift and
+  the 5-3 cascade; the chrominance components' extra bit of dynamic
+  range (§G.2) is signalled through main-header `QCC` markers whose
+  exponents build on `RI + 1` (resolved by the decoder's §A.6.5
+  `Main QCC over Main QCD` precedence). `encode_jpeg2000` now routes
+  3-component input through the RCT. Three new tests: bit-exact RCT
+  round-trips (correlated and saturated-extreme inputs, odd dims) and a
+  compression check that the MCT = 1 stream beats three independent
+  planes on correlated RGB. Separately, the encoder's output was
+  validated against an **independent black-box decoder** (opaque CLI,
+  no source consulted): six configurations — gray odd-dims NL = 3,
+  128×128 NL = 5, RGB 33×29 with 4×4 code-blocks, NL = 0, 61×47
+  noise, and the 45×38 RCT stream — all reconstruct **bit-identically**
+  to the original samples, independently confirming Part-1 conformance
+  of the marker syntax, packet headers, MQ codewords and coefficient
+  coding.
 * **Clean-room round 382 (2026-07-02).** **End-to-end lossless J2K
   *encoder* (`encode::encode_j2k_lossless` + a real `encode_jpeg2000`).**
   The encode-side subsystems built this round compose into a working

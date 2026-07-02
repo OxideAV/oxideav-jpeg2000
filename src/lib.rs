@@ -1911,9 +1911,10 @@ pub fn decode_jpeg2000(bytes: &[u8]) -> Result<Vec<u8>, Error> {
 /// (J2K), preserving the historical byte-vector signature.
 ///
 /// `pixels` is row-major interleaved with `pixels.len() / (width ·
-/// height)` components per pixel (1 = grayscale, 3 = RGB — encoded as
-/// independent planes, no MCT). The stream is reversible-5-3 lossless:
-/// decoding with [`decode_jpeg2000`] reproduces `pixels` bit-exactly.
+/// height)` components per pixel (1 = grayscale, 3 = RGB — encoded
+/// through the §G.2 reversible component transform, MCT = 1). The
+/// stream is reversible-5-3 lossless: decoding with
+/// [`decode_jpeg2000`] reproduces `pixels` bit-exactly.
 /// Uses 2 decomposition levels (clamped down for tiny images) and
 /// 64×64 code-blocks; use [`encode::encode_j2k_lossless`] directly for
 /// control over `NL` / code-block size.
@@ -1942,7 +1943,12 @@ pub fn encode_jpeg2000(pixels: &[u8], width: u32, height: u32) -> Result<Vec<u8>
     let plane_refs: Vec<&[u8]> = planes.iter().map(|p| p.as_slice()).collect();
     // NL = 2 unless the image is too small to decompose meaningfully.
     let nl = if width.min(height) >= 8 { 2 } else { 1 };
-    encode::encode_j2k_lossless(&plane_refs, width, height, nl, (6, 6))
+    if ncomp == 3 {
+        let rgb: &[&[u8]; 3] = plane_refs.as_slice().try_into().expect("three planes");
+        encode::encode_j2k_lossless_rct(rgb, width, height, nl, (6, 6))
+    } else {
+        encode::encode_j2k_lossless(&plane_refs, width, height, nl, (6, 6))
+    }
 }
 
 /// Codec registration — installs the J2K codestream decoder factory
