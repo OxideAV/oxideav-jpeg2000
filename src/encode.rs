@@ -160,6 +160,126 @@ fn forward_cascade(samples: Vec<i32>, width: usize, height: usize, nl: u8) -> Co
     ComponentBands { ll: cur, high }
 }
 
+/// §F.3.3 deinterleave for the real-valued 9-7 lattice, quantising each
+/// sub-band sample to its Equation E-1 signed integer on the way out:
+/// `qb = sign(y) · ⌊|y| / Δb⌋`, with the **uniform** step
+/// `Δb = 2^(Rb − εb) = 2^(−fine_bits)` that the `εb = Rb + fine_bits`
+/// exponent choice produces for every band (µb = 0).
+fn deinterleave_quantise(
+    a: &crate::dwt::Interleaved2D<f64>,
+    scale: f64,
+) -> (BandPlane, BandPlane, BandPlane, BandPlane) {
+    let (w, h) = (a.width, a.height);
+    let (llw, llh) = (w.div_ceil(2), h.div_ceil(2));
+    let (hw, hh) = (w / 2, h / 2);
+    let q = |y: f64| -> i32 {
+        let m = (y.abs() * scale).floor() as i32;
+        if y < 0.0 {
+            -m
+        } else {
+            m
+        }
+    };
+    let mut ll = vec![0i32; llw * llh];
+    let mut hl = vec![0i32; hw * llh];
+    let mut lh = vec![0i32; llw * hh];
+    let mut hhb = vec![0i32; hw * hh];
+    for v in 0..h {
+        for u in 0..w {
+            let s = q(a.data[v * w + u]);
+            match (u % 2, v % 2) {
+                (0, 0) => ll[(v / 2) * llw + u / 2] = s,
+                (1, 0) => hl[(v / 2) * hw + u / 2] = s,
+                (0, 1) => lh[(v / 2) * llw + u / 2] = s,
+                (1, 1) => hhb[(v / 2) * hw + u / 2] = s,
+                _ => unreachable!(),
+            }
+        }
+    }
+    (
+        BandPlane {
+            width: llw,
+            height: llh,
+            data: ll,
+        },
+        BandPlane {
+            width: hw,
+            height: llh,
+            data: hl,
+        },
+        BandPlane {
+            width: llw,
+            height: hh,
+            data: lh,
+        },
+        BandPlane {
+            width: hw,
+            height: hh,
+            data: hhb,
+        },
+    )
+}
+
+/// Run the `NL`-level §F.4 forward **9-7** cascade over one DC-shifted
+/// component plane, quantising every emitted sub-band per Annex E with
+/// the uniform `Δb = 2^(−fine_bits)` step. The recursion continues on
+/// the **unquantised** real LL (only the emitted bands quantise), so
+/// deeper levels see full precision.
+fn forward_cascade_9x7(
+    samples: Vec<f64>,
+    width: usize,
+    height: usize,
+    nl: u8,
+    fine_bits: u8,
+) -> ComponentBands {
+    let scale = f64::from(1u32 << fine_bits);
+    struct RealPlane {
+        width: usize,
+        height: usize,
+        data: Vec<f64>,
+    }
+    let mut cur = RealPlane {
+        width,
+        height,
+        data: samples,
+    };
+    let mut high = Vec::with_capacity(nl as usize);
+    for _lev in 1..=nl {
+        let a = crate::dwt::sd_2d_9x7(cur.data, cur.width, cur.height, 0, 0)
+            .expect("analysis dims match by construction");
+        let (_llq, hl, lh, hh) = deinterleave_quantise(&a, scale);
+        // Real-valued LL for the next level (even/even lattice sites).
+        let (llw, llh) = (a.width.div_ceil(2), a.height.div_ceil(2));
+        let mut ll = vec![0f64; llw * llh];
+        for v in 0..llh {
+            for u in 0..llw {
+                ll[v * llw + u] = a.data[(2 * v) * a.width + 2 * u];
+            }
+        }
+        high.push([hl, lh, hh]);
+        cur = RealPlane {
+            width: llw,
+            height: llh,
+            data: ll,
+        };
+    }
+    // Quantise the final LL.
+    let q = |y: f64| -> i32 {
+        let m = (y.abs() * scale).floor() as i32;
+        if y < 0.0 {
+            -m
+        } else {
+            m
+        }
+    };
+    let ll = BandPlane {
+        width: cur.width,
+        height: cur.height,
+        data: cur.data.iter().map(|&y| q(y)).collect(),
+    };
+    ComponentBands { ll, high }
+}
+
 /// One tier-1-encoded code-block ready for packet assembly.
 struct EncodedBlock {
     /// §B.10.5 zero-bit-plane count `P = Mb − planes`.
@@ -237,7 +357,59 @@ pub fn encode_j2k_lossless(
     nl: u8,
     cb_exp: (u8, u8),
 ) -> Result<Vec<u8>, Error> {
-    encode_impl(planes, width, height, nl, cb_exp, false)
+    encode_impl(
+        planes,
+        width,
+        height,
+        nl,
+        cb_exp,
+        EncodeKernel::Lossless5x3 { use_rct: false },
+    )
+}
+
+/// How the encoder transforms and quantises the sample planes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EncodeKernel {
+    /// Reversible 5-3, Table A.28 style 0 (no quantization) — lossless.
+    Lossless5x3 {
+        /// Apply the §G.2 forward RCT across components 0–2.
+        use_rct: bool,
+    },
+    /// Irreversible 9-7 with Annex E scalar-expounded quantisation
+    /// (Table A.28 style 2) — lossy. `fine_bits` sets the uniform step
+    /// `Δb = 2^(−fine_bits)` via `εb = Rb + fine_bits` (µb = 0): larger
+    /// is finer / nearer-lossless, `0` is a coarse `Δb = 1`.
+    Lossy9x7 { fine_bits: u8 },
+}
+
+/// Encode 8-bit unsigned component planes into a **lossy** Part-1 J2K
+/// codestream using the irreversible 9-7 kernel (T.800 §F.4.8.2) and
+/// Annex E scalar-expounded quantisation (Table A.28 style 2).
+///
+/// `fine_bits` (0..=8) sets the uniform quantisation step
+/// `Δb = 2^(−fine_bits)` through the exponent choice
+/// `εb = Rb + fine_bits` (µb = 0): `6` is near-lossless (decoded
+/// samples within ±1 of the input), `0` is a coarse `Δb = 1`. The other
+/// parameters match [`encode_j2k_lossless`].
+pub fn encode_j2k_lossy(
+    planes: &[&[u8]],
+    width: u32,
+    height: u32,
+    nl: u8,
+    cb_exp: (u8, u8),
+    fine_bits: u8,
+) -> Result<Vec<u8>, Error> {
+    if fine_bits > 8 {
+        return Err(Error::NotImplemented);
+    }
+    encode_impl(
+        planes,
+        width,
+        height,
+        nl,
+        cb_exp,
+        EncodeKernel::Lossy9x7 { fine_bits },
+    )
 }
 
 /// Encode exactly three 8-bit RGB planes into a **lossless** Part-1 J2K
@@ -258,7 +430,14 @@ pub fn encode_j2k_lossless_rct(
     nl: u8,
     cb_exp: (u8, u8),
 ) -> Result<Vec<u8>, Error> {
-    encode_impl(planes.as_slice(), width, height, nl, cb_exp, true)
+    encode_impl(
+        planes.as_slice(),
+        width,
+        height,
+        nl,
+        cb_exp,
+        EncodeKernel::Lossless5x3 { use_rct: true },
+    )
 }
 
 fn encode_impl(
@@ -267,9 +446,10 @@ fn encode_impl(
     height: u32,
     nl: u8,
     cb_exp: (u8, u8),
-    use_rct: bool,
+    kernel: EncodeKernel,
 ) -> Result<Vec<u8>, Error> {
     let (xcb, ycb) = cb_exp;
+    let use_rct = matches!(kernel, EncodeKernel::Lossless5x3 { use_rct: true });
     debug_assert!(!use_rct || planes.len() == 3);
     if planes.is_empty()
         || width == 0
@@ -315,22 +495,35 @@ fn encode_impl(
 
     // -- Forward transform per component ------------------------------
     // §G.1.2 DC level shift, then (optionally) the §G.2 forward RCT
-    // across components 0–2, then the per-component §F.4 cascade.
+    // across components 0–2, then the per-component §F.4 cascade —
+    // integer 5-3 for the lossless kernel, real-valued 9-7 with Annex E
+    // quantisation for the lossy kernel.
     let dc = 1i32 << (PRECISION - 1);
-    let mut shifted: Vec<Vec<i32>> = planes
-        .iter()
-        .map(|p| p.iter().map(|&s| s as i32 - dc).collect())
-        .collect();
-    if use_rct {
-        // Split into three disjoint &mut [i32] (MSRV-friendly).
-        let (head, tail) = shifted.split_at_mut(1);
-        let (mid, tail2) = tail.split_at_mut(1);
-        crate::mct::forward_rct(&mut head[0], &mut mid[0], &mut tail2[0])?;
-    }
-    let bands: Vec<ComponentBands> = shifted
-        .into_iter()
-        .map(|p| forward_cascade(p, width as usize, height as usize, nl))
-        .collect();
+    let bands: Vec<ComponentBands> = match kernel {
+        EncodeKernel::Lossless5x3 { .. } => {
+            let mut shifted: Vec<Vec<i32>> = planes
+                .iter()
+                .map(|p| p.iter().map(|&s| s as i32 - dc).collect())
+                .collect();
+            if use_rct {
+                // Split into three disjoint &mut [i32] (MSRV-friendly).
+                let (head, tail) = shifted.split_at_mut(1);
+                let (mid, tail2) = tail.split_at_mut(1);
+                crate::mct::forward_rct(&mut head[0], &mut mid[0], &mut tail2[0])?;
+            }
+            shifted
+                .into_iter()
+                .map(|p| forward_cascade(p, width as usize, height as usize, nl))
+                .collect()
+        }
+        EncodeKernel::Lossy9x7 { fine_bits } => planes
+            .iter()
+            .map(|p| {
+                let shifted: Vec<f64> = p.iter().map(|&s| f64::from(s) - f64::from(dc)).collect();
+                forward_cascade_9x7(shifted, width as usize, height as usize, nl, fine_bits)
+            })
+            .collect(),
+    };
 
     // -- Geometry (shared with the decoder) ---------------------------
     let tile = derive_tile_geometry(&siz, 0)?;
@@ -392,7 +585,13 @@ fn encode_impl(
                     } else {
                         u32::from(PRECISION)
                     };
-                    let eps = ri + u32::from(band_gain(psb.orientation));
+                    // εb = Rb (+ fine_bits on the lossy path, where the
+                    // exponent excess sets the Equation E-3 step).
+                    let fine = match kernel {
+                        EncodeKernel::Lossless5x3 { .. } => 0,
+                        EncodeKernel::Lossy9x7 { fine_bits } => u32::from(fine_bits),
+                    };
+                    let eps = ri + u32::from(band_gain(psb.orientation)) + fine;
                     let mb = u32::from(GUARD_BITS) + eps - 1;
                     for (bi, cb) in psb.code_blocks.iter().enumerate() {
                         let (bw, bh) = (cb.width() as usize, cb.height() as usize);
@@ -506,33 +705,60 @@ fn encode_impl(
 
     // COD (Tables A.13 – A.21): Scod = 0 (no precincts / SOP / EPH),
     // LRCP, 1 layer, MCT per `use_rct` (Table A.17), NL levels,
-    // code-block exponents − 2, style 0, 5-3 reversible.
+    // code-block exponents − 2, style 0, and the Table A.20 kernel byte
+    // (1 = 5-3 reversible, 0 = 9-7 irreversible).
+    let transform_byte = match kernel {
+        EncodeKernel::Lossless5x3 { .. } => 1u8,
+        EncodeKernel::Lossy9x7 { .. } => 0u8,
+    };
     let cod_payload = [
         0u8, // Scod
         0,   // SGcod: progression = LRCP
         0,
-        1,             // SGcod: layers = 1
-        use_rct as u8, // SGcod: MCT (Table A.17)
-        nl,            // SPcod: NL
-        xcb - 2,       // SPcod: xcb − 2
-        ycb - 2,       // SPcod: ycb − 2
-        0,             // SPcod: code-block style
-        1,             // SPcod: transform = 5-3 reversible (Table A.20)
+        1,              // SGcod: layers = 1
+        use_rct as u8,  // SGcod: MCT (Table A.17)
+        nl,             // SPcod: NL
+        xcb - 2,        // SPcod: xcb − 2
+        ycb - 2,        // SPcod: ycb − 2
+        0,              // SPcod: code-block style
+        transform_byte, // SPcod: transform (Table A.20)
     ];
     push_segment(&mut out, MARKER_COD, &cod_payload);
 
-    // QCD (Tables A.27 – A.28): style 0 (no quantization), G guard
-    // bits; one εb byte per sub-band in the §F.3.1 order (NLLL then
-    // per-level HL, LH, HH from the deepest level outward). `ri` is the
-    // component bit depth the exponents build on.
+    // QCD (Tables A.27 – A.28), one entry per sub-band in the §F.3.1
+    // order (NLLL then per-level HL, LH, HH from the deepest level
+    // outward). `ri` is the component bit depth the exponents build on.
+    //
+    // * Lossless: style 0 (no quantization) — one byte per band,
+    //   `εb = RI + gain` in the top 5 bits.
+    // * Lossy: style 2 (scalar expounded) — two bytes per band,
+    //   `εb = Rb + fine_bits` in the top 5 bits, µb = 0 (Table A.30),
+    //   giving the uniform Equation E-3 step `Δb = 2^(−fine_bits)`.
     let quant_payload = |ri: u8| -> Vec<u8> {
-        let mut p = Vec::with_capacity(2 + 3 * nl as usize);
-        p.push(GUARD_BITS << 5); // Sqcd/Sqcc: style 0 | guard bits
-        p.push(ri << 3); // εb(LL) = RI + 0
-        for _r in 1..=nl {
-            p.push((ri + 1) << 3); // HL: RI + 1
-            p.push((ri + 1) << 3); // LH: RI + 1
-            p.push((ri + 2) << 3); // HH: RI + 2
+        let mut p = Vec::new();
+        match kernel {
+            EncodeKernel::Lossless5x3 { .. } => {
+                p.push(GUARD_BITS << 5); // style 0 | guard bits
+                p.push(ri << 3); // εb(LL) = RI + 0
+                for _r in 1..=nl {
+                    p.push((ri + 1) << 3); // HL: RI + 1
+                    p.push((ri + 1) << 3); // LH: RI + 1
+                    p.push((ri + 2) << 3); // HH: RI + 2
+                }
+            }
+            EncodeKernel::Lossy9x7 { fine_bits } => {
+                p.push((GUARD_BITS << 5) | 2); // style 2 | guard bits
+                let word = |gain: u8| -> [u8; 2] {
+                    let eps = u16::from(ri + gain + fine_bits);
+                    (eps << 11).to_be_bytes()
+                };
+                p.extend_from_slice(&word(0)); // LL
+                for _r in 1..=nl {
+                    p.extend_from_slice(&word(1)); // HL
+                    p.extend_from_slice(&word(1)); // LH
+                    p.extend_from_slice(&word(2)); // HH
+                }
+            }
         }
         p
     };
@@ -744,5 +970,82 @@ mod tests {
             "RCT stream ({rct_len} B) should beat independent planes ({} B)",
             plain.len()
         );
+    }
+
+    // -- 9-7 lossy path (Annex E scalar-expounded quantisation) --------
+
+    /// Encode lossy, decode with this crate's decoder, and return the
+    /// maximum absolute per-sample error plus the stream length.
+    fn lossy_roundtrip(
+        planes: &[&[u8]],
+        w: u32,
+        h: u32,
+        nl: u8,
+        cb: (u8, u8),
+        fine_bits: u8,
+    ) -> (u32, usize) {
+        let stream = encode_j2k_lossy(planes, w, h, nl, cb, fine_bits).expect("encode lossy");
+        let img = decode_j2k(&stream).expect("decode own lossy stream");
+        assert_eq!(img.components.len(), planes.len());
+        let mut max_err = 0u32;
+        for (comp, plane) in img.components.iter().zip(planes) {
+            for (&got, &want) in comp.samples.iter().zip(plane.iter()) {
+                let err = (got - i32::from(want)).unsigned_abs();
+                max_err = max_err.max(err);
+            }
+        }
+        (max_err, stream.len())
+    }
+
+    #[test]
+    fn lossy_9x7_near_lossless_within_one() {
+        // fine_bits = 6 (Δb = 1/64): the quantisation error is far below
+        // one sample step, so the decoded plane is within ±1 everywhere.
+        let p = gradient(48, 40);
+        let (max_err, _) = lossy_roundtrip(&[&p], 48, 40, 3, (4, 4), 6);
+        assert!(max_err <= 1, "near-lossless error {max_err} > 1");
+    }
+
+    #[test]
+    fn lossy_9x7_noise_bounded_error() {
+        // Noise at fine_bits = 6 stays within ±1 too (the 9-7 float
+        // pipeline is exact to well below half a step at Δb = 1/64).
+        let p = noise(33, 27, 0x7777_AAAA);
+        let (max_err, _) = lossy_roundtrip(&[&p], 33, 27, 2, (4, 4), 6);
+        assert!(max_err <= 1, "noise error {max_err} > 1");
+    }
+
+    #[test]
+    fn lossy_9x7_coarse_step_compresses_harder() {
+        // Δb = 1 (fine_bits = 0) is a coarse quantiser: the stream must
+        // be much smaller than the near-lossless one and the error still
+        // modest (a few sample steps).
+        let p = noise(64, 64, 0x0DDB_A115);
+        let (err_fine, len_fine) = lossy_roundtrip(&[&p], 64, 64, 2, (5, 5), 6);
+        let (err_coarse, len_coarse) = lossy_roundtrip(&[&p], 64, 64, 2, (5, 5), 0);
+        assert!(err_fine <= 1);
+        assert!(
+            len_coarse < len_fine,
+            "coarse ({len_coarse} B) should be smaller than fine ({len_fine} B)"
+        );
+        assert!(
+            err_coarse <= 8,
+            "coarse-step error {err_coarse} out of expected range"
+        );
+    }
+
+    #[test]
+    fn lossy_9x7_rgb_components() {
+        let r = gradient(25, 31);
+        let g = noise(25, 31, 0x5151_5151);
+        let b = vec![64u8; 25 * 31];
+        let (max_err, _) = lossy_roundtrip(&[&r, &g, &b], 25, 31, 2, (4, 4), 6);
+        assert!(max_err <= 1, "rgb lossy error {max_err} > 1");
+    }
+
+    #[test]
+    fn lossy_rejects_out_of_range_fine_bits() {
+        let p = vec![0u8; 16];
+        assert!(encode_j2k_lossy(&[&p], 4, 4, 1, (4, 4), 9).is_err());
     }
 }

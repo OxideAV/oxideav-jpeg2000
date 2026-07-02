@@ -6,6 +6,22 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 382 (2026-07-02).** **Lossy 9-7 encoder path
+  (`encode::encode_j2k_lossy`, Annex E scalar-expounded
+  quantisation).** The encoder gained the irreversible kernel: the §F.4
+  forward 9-7 cascade (real-valued recursion on the unquantised LL, so
+  deeper levels keep full precision) with Equation E-1 quantisation
+  `qb = sign · ⌊|y| / Δb⌋` on every emitted band. A `fine_bits`
+  parameter (0..=8) sets the uniform step `Δb = 2^(−fine_bits)` through
+  the exponent choice `εb = Rb + fine_bits` (µb = 0, Equation E-3); the
+  QCD is written Table A.28 style 2 (16-bit `(εb, µb)` words per band)
+  and the COD Table A.20 kernel byte flips to 9-7. Five tests decode
+  the lossy streams through this crate's decoder: `fine_bits = 6` is
+  near-lossless (max sample error ≤ 1 on gradients, noise, and RGB),
+  the coarse `Δb = 1` step compresses markedly harder with bounded
+  error, and out-of-range `fine_bits` is rejected. Black-box check: an
+  opaque independent decoder's output for a lossy stream matches this
+  crate's decode of the same stream **byte-identically**.
 * **Clean-room round 382 (2026-07-02).** **Encoder RCT (`SGcod`
   MCT = 1, T.800 §G.2) + independent black-box conformance.** New
   `encode::encode_j2k_lossless_rct` runs the Equation G-3/G-4/G-5
