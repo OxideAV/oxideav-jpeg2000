@@ -1403,6 +1403,445 @@ pub fn walk_packet_headers_separate(
 }
 
 // ---------------------------------------------------------------------------
+// Packet-header ENCODER — the §B.10 write side.
+// ---------------------------------------------------------------------------
+//
+// The encode-side mirrors of the reader above, used by the encoder path:
+// a bit-stuffing writer (§B.10.1), a tag-tree encoder (§B.10.2) whose bit
+// output the `TagTree` decoder reproduces exactly, the Table B.4
+// coding-passes codeword writer (§B.10.6), the Lblock segment-length
+// writer (§B.10.7.1), and `encode_packet_header` composing them in the
+// §B.10.8 master order (single-codeword-segment / `SegmentSplit::Single`
+// layout, no SOP / EPH framing — the caller wraps the output if needed).
+
+/// Bit-stuffed packet-header **writer** — the §B.10.1 inverse of
+/// [`PacketBitReader`]. Bits are packed MSB-first; after any produced
+/// byte equals `0xFF`, a zero stuff bit is inserted at the MSB of the
+/// following byte. `finish` pads the final partial byte with zeros
+/// (honouring the stuff rule) and returns the buffer.
+#[derive(Debug, Clone, Default)]
+pub struct PacketBitWriter {
+    out: Vec<u8>,
+    /// Bits accumulated into the current byte (MSB-first).
+    cur: u8,
+    /// Number of bits currently held in `cur` (0..8, where a fresh byte
+    /// following a `0xFF` starts at 1 — the stuff bit — not 0).
+    bits_used: u8,
+}
+
+impl PacketBitWriter {
+    /// Fresh writer with an empty output buffer.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append one bit (`0` or `1`).
+    pub fn write_bit(&mut self, bit: u8) {
+        if self.bits_used == 0 && self.out.last() == Some(&0xFF) {
+            // §B.10.1 stuff: the byte after a 0xFF starts with a zero bit.
+            self.cur = 0;
+            self.bits_used = 1;
+        }
+        self.cur = (self.cur << 1) | (bit & 1);
+        self.bits_used += 1;
+        if self.bits_used == 8 {
+            self.out.push(self.cur);
+            self.cur = 0;
+            self.bits_used = 0;
+        }
+    }
+
+    /// Append the low `n` bits of `v`, most significant first.
+    pub fn write_bits(&mut self, v: u32, n: u8) {
+        for i in (0..n).rev() {
+            self.write_bit(((v >> i) & 1) as u8);
+        }
+    }
+
+    /// Pad the final partial byte with zero bits to the byte boundary
+    /// (§B.10.1 — a packet header is a whole number of bytes) and return
+    /// the buffer. A trailing `0xFF` cannot arise from zero padding, so
+    /// the §B.10.1 "packet header shall not end with 0xFF" rule holds.
+    pub fn finish(mut self) -> Vec<u8> {
+        if self.bits_used > 0 {
+            self.cur <<= 8 - self.bits_used;
+            self.out.push(self.cur);
+        }
+        self.out
+    }
+}
+
+/// Tag-tree **encoder** (T.800 §B.10.2) — the write-side mirror of
+/// [`TagTree`].
+///
+/// Construction takes the full leaf-value grid up front; each internal
+/// node's value is the minimum of its (up to four) children per §B.10.2.
+/// `encode_below_threshold` / `encode_value` then emit exactly the bits
+/// the decoder's `decode_below_threshold` / `decode_value` will consume,
+/// carrying the same per-node committed state across calls so repeated /
+/// interleaved queries stay in lock-step with the reader.
+#[derive(Debug, Clone)]
+pub struct TagTreeEncoder {
+    width: u32,
+    height: u32,
+    /// Actual node values, root level first (same layout as
+    /// [`TagTree::levels`]).
+    values: Vec<Vec<u32>>,
+    /// Per-node `(reached, committed)` write state mirroring the
+    /// decoder's `(value, fully_decoded)`.
+    state: Vec<Vec<(u32, bool)>>,
+}
+
+impl TagTreeEncoder {
+    /// Build the encoder over a `width × height` leaf grid whose values
+    /// are `leaves[y * width + x]`.
+    ///
+    /// Panics if `leaves.len() != width * height` or the grid is empty.
+    pub fn new(width: u32, height: u32, leaves: &[u32]) -> Self {
+        assert!(width > 0 && height > 0, "tag tree must be non-empty");
+        assert_eq!(leaves.len(), (width as usize) * (height as usize));
+        // Build the per-level dimensions leaf-first, then compute each
+        // coarser level as the min of its children.
+        let mut dims: Vec<(u32, u32)> = Vec::new();
+        let mut w = width;
+        let mut h = height;
+        dims.push((w, h));
+        while w > 1 || h > 1 {
+            w = w.div_ceil(2);
+            h = h.div_ceil(2);
+            dims.push((w, h));
+        }
+        let mut values_leaf_first: Vec<Vec<u32>> = Vec::with_capacity(dims.len());
+        values_leaf_first.push(leaves.to_vec());
+        for lev in 1..dims.len() {
+            let (cw, ch) = dims[lev];
+            let (fw, fh) = dims[lev - 1];
+            let finer = &values_leaf_first[lev - 1];
+            let mut coarse = vec![u32::MAX; (cw as usize) * (ch as usize)];
+            for fy in 0..fh {
+                for fx in 0..fw {
+                    let ci = ((fy / 2) as usize) * (cw as usize) + (fx / 2) as usize;
+                    let v = finer[(fy as usize) * (fw as usize) + fx as usize];
+                    if v < coarse[ci] {
+                        coarse[ci] = v;
+                    }
+                }
+            }
+            values_leaf_first.push(coarse);
+        }
+        values_leaf_first.reverse(); // root-first, matching TagTree.
+        let state = values_leaf_first
+            .iter()
+            .map(|lvl| vec![(0u32, false); lvl.len()])
+            .collect();
+        TagTreeEncoder {
+            width,
+            height,
+            values: values_leaf_first,
+            state,
+        }
+    }
+
+    fn level_width(&self, level: usize) -> u32 {
+        let depth = self.values.len();
+        let shift = (depth - 1 - level) as u32;
+        let mut w = self.width;
+        for _ in 0..shift {
+            w = w.div_ceil(2);
+        }
+        w
+    }
+
+    /// Emit the bits that let the decoder answer "is leaf `(x, y)` below
+    /// `threshold`?" — the write-side mirror of
+    /// [`TagTree::decode_below_threshold`]. Walks root → leaf; at each
+    /// node emits `0` while the running lower bound is below both the
+    /// node's actual value and the threshold, and `1` when the bound
+    /// reaches the actual value (committing it). Stops early once the
+    /// bound reaches the threshold uncommitted (the decoder then knows
+    /// `value ≥ threshold`).
+    pub fn encode_below_threshold(
+        &mut self,
+        x: u32,
+        y: u32,
+        threshold: u32,
+        writer: &mut PacketBitWriter,
+    ) {
+        assert!(x < self.width && y < self.height);
+        let depth = self.values.len();
+        let mut value_above: u32 = 0;
+        for level in 0..depth {
+            let shift = (depth - 1 - level) as u32;
+            let lw = self.level_width(level);
+            let node_idx = ((y >> shift) as usize) * (lw as usize) + (x >> shift) as usize;
+            let actual = self.values[level][node_idx];
+            let (mut v, mut committed) = self.state[level][node_idx];
+            if v < value_above {
+                v = value_above;
+            }
+            while !committed && v < threshold {
+                if v < actual {
+                    writer.write_bit(0);
+                    v += 1;
+                } else {
+                    writer.write_bit(1);
+                    committed = true;
+                }
+            }
+            self.state[level][node_idx] = (v, committed);
+            if !committed {
+                return; // bound reached threshold; decoder infers ≥.
+            }
+            value_above = v;
+        }
+    }
+
+    /// Emit the bits that commit leaf `(x, y)`'s exact value — the
+    /// write-side mirror of [`TagTree::decode_value`].
+    pub fn encode_value(&mut self, x: u32, y: u32, writer: &mut PacketBitWriter) {
+        assert!(x < self.width && y < self.height);
+        let depth = self.values.len();
+        let mut value_above: u32 = 0;
+        for level in 0..depth {
+            let shift = (depth - 1 - level) as u32;
+            let lw = self.level_width(level);
+            let node_idx = ((y >> shift) as usize) * (lw as usize) + (x >> shift) as usize;
+            let actual = self.values[level][node_idx];
+            let (mut v, mut committed) = self.state[level][node_idx];
+            if v < value_above {
+                v = value_above;
+            }
+            while !committed {
+                if v < actual {
+                    writer.write_bit(0);
+                    v += 1;
+                } else {
+                    writer.write_bit(1);
+                    committed = true;
+                }
+            }
+            self.state[level][node_idx] = (v, committed);
+            value_above = v;
+        }
+    }
+}
+
+/// Encode the number of coding passes per T.800 §B.10.6 / Table B.4 —
+/// the inverse of [`decode_coding_passes`]. `passes` must be in
+/// `1..=164`; out-of-range values are a caller bug and panic.
+pub fn encode_coding_passes(passes: u32, writer: &mut PacketBitWriter) {
+    match passes {
+        1 => writer.write_bit(0),
+        2 => writer.write_bits(0b10, 2),
+        3 => writer.write_bits(0b1100, 4),
+        4 => writer.write_bits(0b1101, 4),
+        5 => writer.write_bits(0b1110, 4),
+        6..=36 => {
+            writer.write_bits(0b1111, 4);
+            writer.write_bits(passes - 6, 5);
+        }
+        37..=164 => {
+            writer.write_bits(0b1111, 4);
+            writer.write_bits(31, 5);
+            writer.write_bits(passes - 37, 7);
+        }
+        _ => panic!("coding passes {passes} outside Table B.4 range 1..=164"),
+    }
+}
+
+/// Encode one §B.10.7.1 codeword-segment length, choosing the minimal
+/// `Lblock` increase so `length` fits in
+/// `Lblock + floor(log2 passes_in_segment)` bits — the inverse of
+/// [`decode_segment_length`]. Emits `k` one-bits + a terminating zero
+/// (the increase-Lblock prefix) followed by the big-endian length field,
+/// and updates `state` exactly as the reader will.
+pub fn encode_segment_length(
+    state: &mut LblockState,
+    passes_in_segment: u32,
+    length: u32,
+    writer: &mut PacketBitWriter,
+) {
+    let extra = if passes_in_segment <= 1 {
+        0
+    } else {
+        passes_in_segment.ilog2()
+    };
+    // Minimal bit-width that represents `length` (at least 1).
+    let needed = if length == 0 {
+        1
+    } else {
+        32 - length.leading_zeros()
+    };
+    let k = needed.saturating_sub(state.lblock + extra);
+    for _ in 0..k {
+        writer.write_bit(1);
+    }
+    writer.write_bit(0);
+    state.lblock += k;
+    writer.write_bits(length, (state.lblock + extra) as u8);
+}
+
+/// One code-block's contribution to a packet, on the **encode** side —
+/// the write-side counterpart of [`CodeBlockContribution`]. Blocks are
+/// listed in the §B.10.8 order (per sub-band, raster within the
+/// sub-band); a block that contributes nothing this layer sets
+/// `included: false`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeBlockPlan {
+    /// Whether this packet includes data from this code-block.
+    pub included: bool,
+    /// The §B.10.5 number of zero (missing) most-significant bit-planes
+    /// `P` for this code-block. Read from the plan only on the block's
+    /// **first** inclusion (it seeds the zero-bitplane tag tree for the
+    /// whole precinct up front, so it must be present — even on plans
+    /// whose first inclusion happens in a later layer).
+    pub zero_bit_planes: u32,
+    /// Number of coding passes contributed in this packet (§B.10.6).
+    /// Must be ≥ 1 when `included`.
+    pub coding_passes: u32,
+    /// Byte length of the single codeword segment contributed
+    /// (§B.10.7.1, `SegmentSplit::Single` layout).
+    pub segment_length: u32,
+}
+
+/// Per-precinct **encoder** state carried across the packets (layers)
+/// of one precinct — the write-side counterpart of [`PrecinctState`].
+///
+/// Unlike the decoder (which grows its tag trees lazily), the encoder
+/// must know every code-block's inclusion layer and zero-bitplane count
+/// up front — the §B.10.2 tag-tree minima depend on the whole grid.
+/// Build it once per precinct via [`PrecinctEncoderState::new`], then
+/// call [`encode_packet_header`] once per layer in order.
+#[derive(Debug, Clone)]
+pub struct PrecinctEncoderState {
+    /// Per-sub-band: inclusion tag-tree encoder (leaf = first inclusion
+    /// layer), zero-bitplane tag-tree encoder (leaf = `P`), per-block
+    /// already-included flags and Lblock state.
+    sub_bands: Vec<SubBandEncoderState>,
+}
+
+#[derive(Debug, Clone)]
+struct SubBandEncoderState {
+    geometry: SubBandGeometry,
+    inclusion_tree: TagTreeEncoder,
+    zero_bitplane_tree: TagTreeEncoder,
+    already_included: Vec<bool>,
+    lblock: Vec<LblockState>,
+}
+
+/// One sub-band's encoder-side leaf data for
+/// [`PrecinctEncoderState::new`]: the code-block grid geometry, the
+/// per-block first-inclusion layers (§B.10.4 inclusion tag-tree leaves)
+/// and the per-block zero-bitplane counts `P` (§B.10.5 tree leaves),
+/// both in raster order.
+pub type SubBandEncoderPlan = (SubBandGeometry, Vec<u32>, Vec<u32>);
+
+impl PrecinctEncoderState {
+    /// Build the per-precinct encoder state.
+    ///
+    /// `sub_bands` gives, per sub-band in packet order: the code-block
+    /// grid geometry, the per-block **first inclusion layer** (leaf
+    /// values for the §B.10.4 inclusion tag tree; use a value ≥ the
+    /// total layer count for a block never included), and the per-block
+    /// zero-bitplane count `P` (leaves for the §B.10.5 tree), both in
+    /// raster order.
+    ///
+    /// Panics if a leaf slice's length disagrees with its geometry.
+    pub fn new(sub_bands: &[SubBandEncoderPlan]) -> Self {
+        let sb = sub_bands
+            .iter()
+            .map(|(geom, first_layer, zbp)| {
+                let n = (geom.width as usize) * (geom.height as usize);
+                assert_eq!(first_layer.len(), n);
+                assert_eq!(zbp.len(), n);
+                SubBandEncoderState {
+                    geometry: *geom,
+                    inclusion_tree: TagTreeEncoder::new(geom.width, geom.height, first_layer),
+                    zero_bitplane_tree: TagTreeEncoder::new(geom.width, geom.height, zbp),
+                    already_included: vec![false; n],
+                    lblock: vec![LblockState::default(); n],
+                }
+            })
+            .collect();
+        PrecinctEncoderState { sub_bands: sb }
+    }
+}
+
+/// Encode one packet header (T.800 §B.10.8, `SegmentSplit::Single`
+/// layout, no SOP / EPH framing) — the write-side counterpart of
+/// [`decode_packet_header`].
+///
+/// `layer` is the packet's 0-based layer index; `plans` lists one
+/// [`CodeBlockPlan`] per code-block in the §B.10.8 order (each sub-band
+/// of `state`, raster order within the sub-band). An all-`included:
+/// false` plan list produces the §B.10.3 one-bit empty-packet header.
+/// Returns the byte-aligned header; the caller appends each included
+/// block's codeword-segment bytes (in the same order) as the packet
+/// body.
+///
+/// Panics if `plans.len()` disagrees with the state's total code-block
+/// count.
+pub fn encode_packet_header(
+    state: &mut PrecinctEncoderState,
+    layer: u16,
+    plans: &[CodeBlockPlan],
+) -> Vec<u8> {
+    let total: usize = state
+        .sub_bands
+        .iter()
+        .map(|s| (s.geometry.width as usize) * (s.geometry.height as usize))
+        .sum();
+    assert_eq!(plans.len(), total, "one plan per code-block required");
+
+    let mut writer = PacketBitWriter::new();
+    if plans.iter().all(|p| !p.included) {
+        // §B.10.3: empty packet — a single 0 bit, then byte-align.
+        writer.write_bit(0);
+        return writer.finish();
+    }
+    writer.write_bit(1);
+
+    let mut plan_idx = 0usize;
+    for sb in &mut state.sub_bands {
+        if sb.geometry.width == 0 || sb.geometry.height == 0 {
+            continue;
+        }
+        for y in 0..sb.geometry.height {
+            for x in 0..sb.geometry.width {
+                let plan = &plans[plan_idx];
+                plan_idx += 1;
+                let idx = (y as usize) * (sb.geometry.width as usize) + (x as usize);
+                if sb.already_included[idx] {
+                    // §B.10.4: one bit — included this layer or not.
+                    writer.write_bit(plan.included as u8);
+                } else {
+                    // §B.10.4: inclusion tag tree at threshold layer+1.
+                    sb.inclusion_tree
+                        .encode_below_threshold(x, y, (layer as u32) + 1, &mut writer);
+                    if plan.included {
+                        // §B.10.5: first inclusion — commit the
+                        // zero-bitplane leaf value.
+                        sb.zero_bitplane_tree.encode_value(x, y, &mut writer);
+                    }
+                }
+                if !plan.included {
+                    continue;
+                }
+                sb.already_included[idx] = true;
+                encode_coding_passes(plan.coding_passes, &mut writer);
+                encode_segment_length(
+                    &mut sb.lblock[idx],
+                    plan.coding_passes,
+                    plan.segment_length,
+                    &mut writer,
+                );
+            }
+        }
+    }
+    writer.finish()
+}
+
+// ---------------------------------------------------------------------------
 // Tests — synthetic bit-stuffed buffers built from T.800 §B.10.
 // ---------------------------------------------------------------------------
 
@@ -2447,5 +2886,307 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, Error::InvalidPacketHeader);
+    }
+
+    // -- §B.10 packet-header encoder round-trip ------------------------
+
+    #[test]
+    fn bit_writer_round_trips_through_bit_reader() {
+        // Random bits through the stuffing writer then the stuffing
+        // reader must be identity — including forced 0xFF runs.
+        let mut state = 0x1234_5678u32;
+        // A long run of 1s early to force 0xFF bytes + stuff bits.
+        let mut bits = vec![1u8; 64];
+        for _ in 0..500 {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            bits.push(((state >> 17) & 1) as u8);
+        }
+        let mut w = PacketBitWriter::new();
+        for &b in &bits {
+            w.write_bit(b);
+        }
+        let bytes = w.finish();
+        let mut r = PacketBitReader::new(&bytes);
+        for (i, &b) in bits.iter().enumerate() {
+            assert_eq!(r.read_bit().unwrap(), b, "bit {i}");
+        }
+    }
+
+    #[test]
+    fn coding_passes_codeword_round_trips() {
+        for passes in 1..=164u32 {
+            let mut w = PacketBitWriter::new();
+            encode_coding_passes(passes, &mut w);
+            let bytes = w.finish();
+            let mut r = PacketBitReader::new(&bytes);
+            assert_eq!(decode_coding_passes(&mut r).unwrap(), passes);
+        }
+    }
+
+    #[test]
+    fn segment_length_round_trips_with_lblock_growth() {
+        // A sequence of (passes, length) pairs across one code-block:
+        // encoder and decoder Lblock must stay in lock-step, including
+        // increases and the floor(log2 passes) widening.
+        let seq: &[(u32, u32)] = &[
+            (1, 5),      // fits in initial Lblock=3
+            (1, 200),    // needs 8 bits → k=5 increase
+            (3, 900),    // widened by floor(log2 3)=1
+            (7, 65_000), // deep growth
+            (2, 1),      // small after growth (no shrink)
+        ];
+        let mut enc_state = LblockState::default();
+        let mut w = PacketBitWriter::new();
+        for &(p, len) in seq {
+            encode_segment_length(&mut enc_state, p, len, &mut w);
+        }
+        let bytes = w.finish();
+        let mut dec_state = LblockState::default();
+        let mut r = PacketBitReader::new(&bytes);
+        for &(p, len) in seq {
+            assert_eq!(
+                decode_segment_length(&mut dec_state, p, &mut r).unwrap(),
+                len
+            );
+        }
+        assert_eq!(enc_state, dec_state);
+    }
+
+    #[test]
+    fn tag_tree_encoder_round_trips_values() {
+        // Full-value commits (the §B.10.5 zero-bitplane read) across a
+        // 3×2 grid: the decoder must recover every leaf exactly, in the
+        // same interleaved order.
+        let leaves = [3u32, 0, 5, 2, 7, 1];
+        let mut enc = TagTreeEncoder::new(3, 2, &leaves);
+        let mut w = PacketBitWriter::new();
+        for y in 0..2 {
+            for x in 0..3 {
+                enc.encode_value(x, y, &mut w);
+            }
+        }
+        let bytes = w.finish();
+        let mut dec = TagTree::new(3, 2);
+        let mut r = PacketBitReader::new(&bytes);
+        for y in 0..2 {
+            for x in 0..3 {
+                assert_eq!(
+                    dec.decode_value(x, y, &mut r).unwrap(),
+                    leaves[(y * 3 + x) as usize],
+                    "leaf ({x},{y})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tag_tree_encoder_round_trips_thresholds() {
+        // Layered threshold queries (the §B.10.4 inclusion pattern):
+        // interleave sub-threshold queries across layers and leaves, and
+        // assert the decoder's answers match the ground truth.
+        let leaves = [0u32, 2, 1, 3];
+        let mut enc = TagTreeEncoder::new(2, 2, &leaves);
+        let mut w = PacketBitWriter::new();
+        let mut expect = Vec::new();
+        for threshold in 1..=4u32 {
+            for y in 0..2 {
+                for x in 0..2 {
+                    enc.encode_below_threshold(x, y, threshold, &mut w);
+                    expect.push(leaves[(y * 2 + x) as usize] < threshold);
+                }
+            }
+        }
+        let bytes = w.finish();
+        let mut dec = TagTree::new(2, 2);
+        let mut r = PacketBitReader::new(&bytes);
+        let mut i = 0;
+        for threshold in 1..=4u32 {
+            for y in 0..2 {
+                for x in 0..2 {
+                    assert_eq!(
+                        dec.decode_below_threshold(x, y, threshold, &mut r).unwrap(),
+                        expect[i],
+                        "query {i} (x={x} y={y} t={threshold})"
+                    );
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn packet_header_encoder_round_trips_single_layer() {
+        // One packet, one sub-band, 2×2 code-blocks, all included in
+        // layer 0 with distinct P / passes / lengths.
+        let geom = SubBandGeometry {
+            width: 2,
+            height: 2,
+        };
+        let first_layer = vec![0u32; 4];
+        let zbp = vec![2u32, 0, 3, 1];
+        let plans: Vec<CodeBlockPlan> = (0..4)
+            .map(|i| CodeBlockPlan {
+                included: true,
+                zero_bit_planes: zbp[i],
+                coding_passes: (i as u32 % 3) + 1,
+                segment_length: 10 + 40 * i as u32,
+            })
+            .collect();
+        let mut enc_state = PrecinctEncoderState::new(&[(geom, first_layer, zbp.clone())]);
+        let header_bytes = encode_packet_header(&mut enc_state, 0, &plans);
+
+        let geometry = PacketGeometry {
+            sub_bands: vec![geom],
+            layer: 0,
+        };
+        let mut dec_state = PrecinctState::new();
+        let hdr = decode_packet_header(
+            &header_bytes,
+            &geometry,
+            &mut dec_state,
+            SopEphMode::None,
+            SegmentSplit::Single,
+        )
+        .unwrap();
+        assert!(hdr.non_zero_length);
+        assert_eq!(hdr.contributions.len(), 4);
+        for (i, c) in hdr.contributions.iter().enumerate() {
+            assert!(c.included, "block {i}");
+            assert_eq!(c.zero_bit_planes, Some(zbp[i]), "P block {i}");
+            assert_eq!(c.coding_passes, plans[i].coding_passes, "passes {i}");
+            assert_eq!(c.segment_lengths, vec![plans[i].segment_length]);
+        }
+        assert_eq!(hdr.bytes_consumed, header_bytes.len());
+    }
+
+    #[test]
+    fn packet_header_encoder_round_trips_multi_layer_staggered() {
+        // Three layers over a 2×1 + 2×2 (two sub-band) precinct with
+        // staggered first-inclusion layers and per-layer inclusion gaps —
+        // the decoder must track inclusion trees, P-on-first-inclusion,
+        // Lblock growth, and the already-included one-bit path.
+        let g0 = SubBandGeometry {
+            width: 2,
+            height: 1,
+        };
+        let g1 = SubBandGeometry {
+            width: 2,
+            height: 2,
+        };
+        // First inclusion layers per block (raster, sub-band order).
+        let fl0 = vec![0u32, 1];
+        let fl1 = vec![1u32, 0, 2, 3]; // block 3 of band 1 never included (< 3 layers)
+        let zbp0 = vec![1u32, 0];
+        let zbp1 = vec![0u32, 2, 1, 0];
+        let mut enc_state = PrecinctEncoderState::new(&[
+            (g0, fl0.clone(), zbp0.clone()),
+            (g1, fl1.clone(), zbp1.clone()),
+        ]);
+
+        // Per-layer plans: a block is included from its first layer on,
+        // except band-1 block (0,1) [index 2] skips layer 3's range (we
+        // only run 3 layers so first_layer 3 = never included).
+        let all_fl = [fl0.clone(), fl1.clone()].concat();
+        let all_zbp = [zbp0.clone(), zbp1.clone()].concat();
+        let mut headers = Vec::new();
+        // (included, first-inclusion P, passes, segment length).
+        type BlockTruth = (bool, Option<u32>, u32, u32);
+        let mut truth: Vec<Vec<BlockTruth>> = Vec::new();
+        for layer in 0..3u16 {
+            let mut plans = Vec::new();
+            let mut layer_truth = Vec::new();
+            for i in 0..6usize {
+                let included = all_fl[i] <= layer as u32;
+                let first_time = all_fl[i] == layer as u32;
+                let passes = if included {
+                    1 + (i as u32 + layer as u32) % 4
+                } else {
+                    0
+                };
+                let seg = if included {
+                    5 + 13 * i as u32 + 100 * layer as u32
+                } else {
+                    0
+                };
+                plans.push(CodeBlockPlan {
+                    included,
+                    zero_bit_planes: all_zbp[i],
+                    coding_passes: passes,
+                    segment_length: seg,
+                });
+                layer_truth.push((
+                    included,
+                    if first_time { Some(all_zbp[i]) } else { None },
+                    passes,
+                    seg,
+                ));
+            }
+            headers.push(encode_packet_header(&mut enc_state, layer, &plans));
+            truth.push(layer_truth);
+        }
+
+        // Decode all three layers against one running precinct state.
+        let mut dec_state = PrecinctState::new();
+        for layer in 0..3usize {
+            let geometry = PacketGeometry {
+                sub_bands: vec![g0, g1],
+                layer: layer as u16,
+            };
+            let hdr = decode_packet_header(
+                &headers[layer],
+                &geometry,
+                &mut dec_state,
+                SopEphMode::None,
+                SegmentSplit::Single,
+            )
+            .unwrap();
+            assert_eq!(hdr.contributions.len(), 6, "layer {layer}");
+            for (i, c) in hdr.contributions.iter().enumerate() {
+                let (included, p, passes, seg) = truth[layer][i];
+                assert_eq!(c.included, included, "layer {layer} block {i}");
+                assert_eq!(c.zero_bit_planes, p, "layer {layer} block {i} P");
+                assert_eq!(c.coding_passes, passes, "layer {layer} block {i}");
+                if included {
+                    assert_eq!(c.segment_lengths, vec![seg], "layer {layer} block {i}");
+                } else {
+                    assert!(c.segment_lengths.is_empty());
+                }
+            }
+            assert_eq!(hdr.bytes_consumed, headers[layer].len(), "layer {layer}");
+        }
+    }
+
+    #[test]
+    fn packet_header_encoder_empty_packet() {
+        // An all-excluded plan list emits the §B.10.3 one-byte empty
+        // packet header, and the decoder reads it back as empty.
+        let geom = SubBandGeometry {
+            width: 1,
+            height: 1,
+        };
+        let mut enc_state = PrecinctEncoderState::new(&[(geom, vec![5u32], vec![0u32])]);
+        let plans = vec![CodeBlockPlan {
+            included: false,
+            zero_bit_planes: 0,
+            coding_passes: 0,
+            segment_length: 0,
+        }];
+        let bytes = encode_packet_header(&mut enc_state, 0, &plans);
+        assert_eq!(bytes.len(), 1);
+        let geometry = PacketGeometry {
+            sub_bands: vec![geom],
+            layer: 0,
+        };
+        let mut dec_state = PrecinctState::new();
+        let hdr = decode_packet_header(
+            &bytes,
+            &geometry,
+            &mut dec_state,
+            SopEphMode::None,
+            SegmentSplit::Single,
+        )
+        .unwrap();
+        assert!(!hdr.non_zero_length);
+        assert!(hdr.contributions.is_empty());
     }
 }

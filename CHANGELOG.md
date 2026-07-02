@@ -6,6 +6,28 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 382 (2026-07-02).** **Tier-2 packet-header
+  *writer* (T.800 §B.10, encode side).** The `packet` module gained the
+  write-side mirrors of its reader: `PacketBitWriter` (the §B.10.1
+  bit-stuffing writer — zero stuff bit after every produced `0xFF`,
+  zero-padded byte alignment), `TagTreeEncoder` (§B.10.2 — node minima
+  computed from the full leaf grid, `encode_below_threshold` /
+  `encode_value` emitting exactly the bits `TagTree`'s decode methods
+  consume, with per-node committed state carried across interleaved
+  queries), `encode_coding_passes` (§B.10.6 / Table B.4, all four
+  codeword ranges 1..=164), `encode_segment_length` (§B.10.7.1 —
+  minimal increase-`Lblock` prefix chosen so the length fits the
+  `Lblock + ⌊log2 passes⌋` field, state updated in lock-step with the
+  reader), and `encode_packet_header` composing them in the §B.10.8
+  master order over a `PrecinctEncoderState` (inclusion layers and
+  zero-bitplane counts seeded up front, `SegmentSplit::Single` layout,
+  §B.10.3 empty-packet header for an all-excluded layer). Seven
+  round-trip tests decode every encoded artefact back through the
+  existing reader: stuffed bit streams (forced `0xFF` runs), all 164
+  coding-pass codewords, `Lblock` growth sequences, tag-tree value and
+  staggered threshold queries, a single-layer 2×2 packet, a 3-layer
+  two-sub-band precinct with staggered first inclusions and gaps, and
+  the empty packet.
 * **Clean-room round 382 (2026-07-02).** **Forward (analysis) DWT
   (T.800 §F.4).** The `dwt` module gained the encode-side counterparts
   of its inverse transforms: `fdwt_1d_5x3` / `fdwt_1d_9x7` (1-D analysis
