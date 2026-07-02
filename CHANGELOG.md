@@ -6,6 +6,18 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 382 (2026-07-02).** **Forward (analysis) DWT
+  (T.800 §F.4).** The `dwt` module gained the encode-side counterparts
+  of its inverse transforms: `fdwt_1d_5x3` / `fdwt_1d_9x7` (1-D analysis
+  filters), `hor_sd` / `ver_sd` row / column drivers, and `sd_2d_5x3` /
+  `sd_2d_9x7` single-level 2-D analysis. Each reverses its §F.3
+  synthesis sibling's lifting steps (reversed order, inverted signs /
+  K-scaling) over a PSEO-reflected working buffer, making the pair exact
+  inverses in the interior — **bit-exact** for the integer 5-3 kernel and
+  to floating-point round-off for the 9-7 kernel. Validated by four
+  round-trip tests (1-D and full-image 2-D, both kernels) that analyse a
+  random signal / image and reconstruct it through the existing inverse
+  path across origin parities and odd dimensions.
 * **Clean-room round 382 (2026-07-02).** **Tier-1 EBCOT *forward*
   coding passes (T.800 Annex D §D.3).** `CodeBlock` gained the encode
   counterparts of its three AC decode passes —

@@ -41,12 +41,14 @@
 //!   six-step lifting of Equation F-7 with the parameters
 //!   `(α, β, γ, δ, K)` of Table F.4.
 //!
+//! The §F.4 **forward (analysis) DWT** is now covered too — the
+//! `fdwt_1d_5x3` / `fdwt_1d_9x7` 1-D filters, the `hor_sd` / `ver_sd`
+//! row / column drivers, and the `sd_2d_5x3` / `sd_2d_9x7` single-level
+//! 2-D analysis, each the exact algebraic inverse of its §F.3 synthesis
+//! sibling (bit-exact for 5-3, to floating-point round-off for 9-7).
+//!
 //! ## What this module does NOT cover
 //!
-//! * **The forward (encoder) DWT.** §F.4 specifies the informative
-//!   forward procedure; the decoder doesn't need it. A follow-up
-//!   round can mirror this surface with an `fdwt_*` family if /
-//!   when the encoder path is wired up.
 //! * **MCT.** The multi-component transform (Annex G) is a separate
 //!   later round.
 //! * **Bit-depth de-scaling.** Annex G's reverse DC-level shift
@@ -668,6 +670,261 @@ pub fn sr_2d_9x7(
     let mut a = interleave_2d_f64(ll, ll_dims, hl, hl_dims, lh, lh_dims, hh, hh_dims)?;
     hor_sr_9x7(&mut a, i0)?;
     ver_sr_9x7(&mut a, j0)?;
+    Ok(a)
+}
+
+// =====================================================================
+// §F.4 — The forward (analysis) DWT.
+// =====================================================================
+//
+// The §F.4 forward transform is the exact algebraic inverse of the §F.3
+// synthesis above: it takes image samples and produces the interleaved
+// sub-band coefficients that the §F.3 1D_SR / 2D_SR path reconstructs.
+// Each forward 1-D filter reverses its synthesis sibling's lifting steps
+// (reversed order, each step's sign / scale inverted). The symmetric
+// signal extension (PSEO, Equation F-4) is identical on both sides, so
+// the two are exact inverses in the interior (bit-exact for the integer
+// 5-3 kernel; to floating-point round-off for the 9-7 kernel). The
+// implementation materialises a PSEO-reflected working buffer wide enough
+// that every in-range output sees only correct reflected inputs, applies
+// the reversed lifting in place, then copies the in-range results out.
+
+/// §F.4 length-one short-circuit, 5-3 reversible (forward direction).
+///
+/// The inverse of [`length_one_5x3`]: a lone even-origin sample passes
+/// through, a lone odd-origin sample doubles (so the synthesis `Y / 2`
+/// recovers it).
+fn length_one_fwd_5x3(x_i0: i32, i0: i32) -> i32 {
+    if i0.rem_euclid(2) == 0 {
+        x_i0
+    } else {
+        2 * x_i0
+    }
+}
+
+/// §F.4 forward 1-D 5-3 reversible analysis filter.
+///
+/// Takes the samples `x[i0..il]` and writes the interleaved sub-band
+/// coefficients `y[i0..il]` (even absolute index → low-pass, odd → high-
+/// pass), the exact integer inverse of [`idwt_1d_5x3`].
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidMarkerLength`] on a length mismatch or an
+/// empty / inverted range.
+pub fn fdwt_1d_5x3(x: &[i32], y: &mut [i32], i0: i32, il: i32) -> Result<(), Error> {
+    let len = (il - i0) as usize;
+    if x.len() != len || y.len() != len || i0 >= il {
+        return Err(Error::InvalidMarkerLength);
+    }
+    if len == 1 {
+        y[0] = length_one_fwd_5x3(x[0], i0);
+        return Ok(());
+    }
+    let margin: i32 = 4;
+    let ext_len = (len as i32 + 2 * margin) as usize;
+    let mut buf = vec![0_i32; ext_len];
+    for (j, slot) in buf.iter_mut().enumerate() {
+        let i = j as i32 + i0 - margin;
+        *slot = x[(pseo(i, i0, il) - i0) as usize];
+    }
+    let slot = |i: i32| -> usize { (i - i0 + margin) as usize };
+    // High-pass (odd absolute index): the inverse of Equation F-6.
+    //   Y(2n+1) = X(2n+1) - ⌊ (X(2n) + X(2n+2)) / 2 ⌋
+    for i in (i0 - margin + 1)..=(il + margin - 2) {
+        if i.rem_euclid(2) == 1 {
+            buf[slot(i)] -= div_floor(buf[slot(i - 1)] + buf[slot(i + 1)], 2);
+        }
+    }
+    // Low-pass (even absolute index): the inverse of Equation F-5.
+    //   Y(2n) = X(2n) + ⌊ (Y(2n-1) + Y(2n+1) + 2) / 4 ⌋
+    for i in (i0 - margin + 2)..=(il + margin - 3) {
+        if i.rem_euclid(2) == 0 {
+            buf[slot(i)] += div_floor(buf[slot(i - 1)] + buf[slot(i + 1)] + 2, 4);
+        }
+    }
+    for (k, out) in y.iter_mut().enumerate() {
+        *out = buf[slot(i0 + k as i32)];
+    }
+    Ok(())
+}
+
+/// §F.4 length-one short-circuit, 9-7 irreversible (forward direction).
+fn length_one_fwd_9x7(x_i0: f64, i0: i32) -> f64 {
+    if i0.rem_euclid(2) == 0 {
+        x_i0
+    } else {
+        2.0 * x_i0
+    }
+}
+
+/// §F.4 forward 1-D 9-7 irreversible analysis filter (real-valued).
+///
+/// Takes the samples `x[i0..il]` and writes the interleaved sub-band
+/// coefficients `y[i0..il]`, the inverse (to floating-point round-off) of
+/// [`idwt_1d_9x7`]: the four §F.3.8.2 lifting steps are undone in reverse
+/// order (α, β, γ, δ signs flipped) and the K / 1/K scaling inverted.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidMarkerLength`] on a length mismatch or an
+/// empty / inverted range.
+pub fn fdwt_1d_9x7(x: &[f64], y: &mut [f64], i0: i32, il: i32) -> Result<(), Error> {
+    let len = (il - i0) as usize;
+    if x.len() != len || y.len() != len || i0 >= il {
+        return Err(Error::InvalidMarkerLength);
+    }
+    if len == 1 {
+        y[0] = length_one_fwd_9x7(x[0], i0);
+        return Ok(());
+    }
+    let margin: i32 = 8;
+    let ext_len = (len as i32 + 2 * margin) as usize;
+    let mut buf = vec![0.0_f64; ext_len];
+    for (j, slot) in buf.iter_mut().enumerate() {
+        let i = j as i32 + i0 - margin;
+        *slot = x[(pseo(i, i0, il) - i0) as usize];
+    }
+    let slot = |i: i32| -> usize { (i - i0 + margin) as usize };
+    // Reverse of STEP6 (odd -= α·(even nb)) → odd += α·(even nb).
+    for i in (i0 - margin + 1)..=(il + margin - 2) {
+        if i.rem_euclid(2) == 1 {
+            buf[slot(i)] += ALPHA_9X7 * (buf[slot(i - 1)] + buf[slot(i + 1)]);
+        }
+    }
+    // Reverse of STEP5 (even -= β·(odd nb)) → even += β·(odd nb).
+    for i in (i0 - margin + 2)..=(il + margin - 3) {
+        if i.rem_euclid(2) == 0 {
+            buf[slot(i)] += BETA_9X7 * (buf[slot(i - 1)] + buf[slot(i + 1)]);
+        }
+    }
+    // Reverse of STEP4 (odd -= γ·(even nb)) → odd += γ·(even nb).
+    for i in (i0 - margin + 3)..=(il + margin - 4) {
+        if i.rem_euclid(2) == 1 {
+            buf[slot(i)] += GAMMA_9X7 * (buf[slot(i - 1)] + buf[slot(i + 1)]);
+        }
+    }
+    // Reverse of STEP3 (even -= δ·(odd nb)) → even += δ·(odd nb).
+    for i in (i0 - margin + 4)..=(il + margin - 5) {
+        if i.rem_euclid(2) == 0 {
+            buf[slot(i)] += DELTA_9X7 * (buf[slot(i - 1)] + buf[slot(i + 1)]);
+        }
+    }
+    // Reverse of STEP2 (odd ·= 1/K) → odd ·= K, and STEP1 (even ·= K) →
+    // even ·= 1/K. Pointwise, so applied over the in-range outputs only.
+    for k in 0..len {
+        let i = i0 + k as i32;
+        if i.rem_euclid(2) == 1 {
+            y[k] = K_9X7 * buf[slot(i)];
+        } else {
+            y[k] = buf[slot(i)] / K_9X7;
+        }
+    }
+    Ok(())
+}
+
+/// §F.4 forward row filter (5-3): analyse every row of `a` in place.
+pub fn hor_sd_5x3(a: &mut Interleaved2D<i32>, i0: i32) -> Result<(), Error> {
+    let il = i0 + a.width as i32;
+    let mut tmp = vec![0_i32; a.width];
+    for v in 0..a.height {
+        let row_vec = a.data[v * a.width..(v + 1) * a.width].to_vec();
+        fdwt_1d_5x3(&row_vec, &mut tmp, i0, il)?;
+        a.data[v * a.width..(v + 1) * a.width].copy_from_slice(&tmp);
+    }
+    Ok(())
+}
+
+/// §F.4 forward column filter (5-3): analyse every column of `a` in place.
+pub fn ver_sd_5x3(a: &mut Interleaved2D<i32>, j0: i32) -> Result<(), Error> {
+    let jl = j0 + a.height as i32;
+    let mut col = vec![0_i32; a.height];
+    let mut out = vec![0_i32; a.height];
+    for u in 0..a.width {
+        for v in 0..a.height {
+            col[v] = a.data[v * a.width + u];
+        }
+        fdwt_1d_5x3(&col, &mut out, j0, jl)?;
+        for v in 0..a.height {
+            a.data[v * a.width + u] = out[v];
+        }
+    }
+    Ok(())
+}
+
+/// §F.4 forward row filter (9-7): analyse every row of `a` in place.
+pub fn hor_sd_9x7(a: &mut Interleaved2D<f64>, i0: i32) -> Result<(), Error> {
+    let il = i0 + a.width as i32;
+    let mut tmp = vec![0.0_f64; a.width];
+    for v in 0..a.height {
+        let row_vec = a.data[v * a.width..(v + 1) * a.width].to_vec();
+        fdwt_1d_9x7(&row_vec, &mut tmp, i0, il)?;
+        a.data[v * a.width..(v + 1) * a.width].copy_from_slice(&tmp);
+    }
+    Ok(())
+}
+
+/// §F.4 forward column filter (9-7): analyse every column of `a` in place.
+pub fn ver_sd_9x7(a: &mut Interleaved2D<f64>, j0: i32) -> Result<(), Error> {
+    let jl = j0 + a.height as i32;
+    let mut col = vec![0.0_f64; a.height];
+    let mut out = vec![0.0_f64; a.height];
+    for u in 0..a.width {
+        for v in 0..a.height {
+            col[v] = a.data[v * a.width + u];
+        }
+        fdwt_1d_9x7(&col, &mut out, j0, jl)?;
+        for v in 0..a.height {
+            a.data[v * a.width + u] = out[v];
+        }
+    }
+    Ok(())
+}
+
+/// §F.4 — one level of 2-D forward analysis (5-3), the inverse of
+/// [`sr_2d_5x3`]. Consumes the `width * height` sample grid and returns
+/// the interleaved sub-band lattice (`(2u, 2v)` low-low, `(2u+1, 2v)`
+/// high-low, etc.). Apply [`hor_sr_5x3`] + [`ver_sr_5x3`] to the result
+/// to reconstruct the samples.
+pub fn sd_2d_5x3(
+    samples: Vec<i32>,
+    width: usize,
+    height: usize,
+    i0: i32,
+    j0: i32,
+) -> Result<Interleaved2D<i32>, Error> {
+    if samples.len() != width * height {
+        return Err(Error::InvalidMarkerLength);
+    }
+    let mut a = Interleaved2D {
+        data: samples,
+        width,
+        height,
+    };
+    ver_sd_5x3(&mut a, j0)?;
+    hor_sd_5x3(&mut a, i0)?;
+    Ok(a)
+}
+
+/// §F.4 — `f64` 9-7 variant of [`sd_2d_5x3`], the inverse of
+/// [`sr_2d_9x7`].
+pub fn sd_2d_9x7(
+    samples: Vec<f64>,
+    width: usize,
+    height: usize,
+    i0: i32,
+    j0: i32,
+) -> Result<Interleaved2D<f64>, Error> {
+    if samples.len() != width * height {
+        return Err(Error::InvalidMarkerLength);
+    }
+    let mut a = Interleaved2D {
+        data: samples,
+        width,
+        height,
+    };
+    ver_sd_9x7(&mut a, j0)?;
+    hor_sd_9x7(&mut a, i0)?;
     Ok(a)
 }
 
@@ -1358,5 +1615,103 @@ mod tests {
             }
         }
         (ll, hl, lh, hh)
+    }
+
+    // -- §F.4 forward-DWT round-trip (analysis ∘ synthesis = id) ------
+
+    fn lcg(state: &mut u32) -> u32 {
+        *state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        *state
+    }
+
+    /// Forward 1-D 5-3 then inverse 1-D 5-3 must recover the samples
+    /// bit-exactly for any origin parity and length.
+    #[test]
+    fn fdwt_1d_5x3_round_trips() {
+        let mut state = 0x1357_9BDF_u32;
+        for &(i0, len) in &[
+            (0i32, 1usize),
+            (0, 2),
+            (1, 2),
+            (0, 7),
+            (1, 7),
+            (3, 16),
+            (2, 33),
+        ] {
+            let il = i0 + len as i32;
+            let x: Vec<i32> = (0..len)
+                .map(|_| (lcg(&mut state) % 512) as i32 - 256)
+                .collect();
+            let mut y = vec![0i32; len];
+            super::fdwt_1d_5x3(&x, &mut y, i0, il).unwrap();
+            let mut back = vec![0i32; len];
+            idwt_1d_5x3(&y, &mut back, i0, il).unwrap();
+            assert_eq!(back, x, "5-3 1D round-trip i0={i0} len={len}");
+        }
+    }
+
+    /// Forward 1-D 9-7 then inverse 1-D 9-7 recovers the samples to
+    /// floating-point round-off.
+    #[test]
+    fn fdwt_1d_9x7_round_trips() {
+        let mut state = 0x2468_ACE0_u32;
+        for &(i0, len) in &[(0i32, 2usize), (1, 2), (0, 8), (1, 9), (2, 17), (3, 32)] {
+            let il = i0 + len as i32;
+            let x: Vec<f64> = (0..len)
+                .map(|_| (lcg(&mut state) % 1000) as f64 - 500.0)
+                .collect();
+            let mut y = vec![0.0_f64; len];
+            fdwt_1d_9x7(&x, &mut y, i0, il).unwrap();
+            let mut back = vec![0.0_f64; len];
+            idwt_1d_9x7(&y, &mut back, i0, il).unwrap();
+            for (a, b) in back.iter().zip(&x) {
+                assert!(
+                    (a - b).abs() < 1e-6,
+                    "9-7 1D round-trip i0={i0} len={len}: {a} vs {b}"
+                );
+            }
+        }
+    }
+
+    /// Forward 2-D 5-3 then inverse (`hor_sr` + `ver_sr`) round-trips a
+    /// full image bit-exactly across origin parities and odd dimensions.
+    #[test]
+    fn sd_2d_5x3_round_trips() {
+        let mut state = 0xDEAD_C0DE_u32;
+        for &(w, h, i0, j0) in &[
+            (4usize, 4usize, 0i32, 0i32),
+            (5, 3, 1, 0),
+            (7, 6, 0, 1),
+            (8, 8, 1, 1),
+            (13, 11, 2, 3),
+        ] {
+            let samples: Vec<i32> = (0..w * h)
+                .map(|_| (lcg(&mut state) % 256) as i32 - 128)
+                .collect();
+            let a = sd_2d_5x3(samples.clone(), w, h, i0, j0).unwrap();
+            let mut b = a;
+            hor_sr_5x3(&mut b, i0).unwrap();
+            ver_sr_5x3(&mut b, j0).unwrap();
+            assert_eq!(b.data, samples, "5-3 2D round-trip {w}x{h} i0={i0} j0={j0}");
+        }
+    }
+
+    /// Forward 2-D 9-7 then inverse round-trips a full image to
+    /// floating-point round-off.
+    #[test]
+    fn sd_2d_9x7_round_trips() {
+        let mut state = 0xF00D_BABE_u32;
+        for &(w, h, i0, j0) in &[(4usize, 4usize, 0i32, 0i32), (6, 5, 1, 1), (9, 7, 2, 3)] {
+            let samples: Vec<f64> = (0..w * h)
+                .map(|_| (lcg(&mut state) % 256) as f64 - 128.0)
+                .collect();
+            let a = sd_2d_9x7(samples.clone(), w, h, i0, j0).unwrap();
+            let mut b = a;
+            hor_sr_9x7(&mut b, i0).unwrap();
+            ver_sr_9x7(&mut b, j0).unwrap();
+            for (p, q) in b.data.iter().zip(&samples) {
+                assert!((p - q).abs() < 1e-5, "9-7 2D round-trip: {p} vs {q}");
+            }
+        }
     }
 }
