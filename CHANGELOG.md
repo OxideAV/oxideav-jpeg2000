@@ -4,6 +4,50 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ## [Unreleased]
 
+## [0.0.15](https://github.com/OxideAV/oxideav-jpeg2000/compare/v0.0.14...v0.0.15) - 2026-07-02
+
+### Other
+
+- registry Encoder trait + README encoder section
+- lossy 9-7 encoder path (Annex E scalar-expounded quantisation)
+- encoder RCT (SGcod MCT=1, §G.2) + black-box conformance
+- end-to-end lossless J2K encoder (encode_j2k_lossless)
+- tier-2 packet-header writer (T.800 §B.10 encode side)
+- forward (analysis) DWT (T.800 §F.4)
+- tier-1 EBCOT forward coding passes (T.800 Annex D §D.3)
+- MQ arithmetic encoder (T.800 Annex C §C.2)
+- multi-precinct CPRL non-pow2 stress + PCRL rejection symmetry
+- mixed-kernel via tile-part header + refresh stale module doc
+- harden mixed-kernel interleave with a 3-component test
+- decode CPRL under non-power-of-two sub-sampling (§B.12.1.5)
+- decode mixed wavelet kernels per component (§A.6.2, MCT off)
+- broaden relocated-header e2e coverage (multi-precinct/layer/RGB)
+- end-to-end validation of relocated-header (PPT/PPM) decode
+- decode relocated packet headers (PPM, T.800 §A.7.4)
+- decode relocated packet headers (PPT, T.800 §A.7.5)
+- refresh Error::NotImplemented doc — POC/COC/QCC/RGN now honoured
+- README/CHANGELOG — round 357 POC + predictable-termination + Nsop
+- validate §A.8.1 SOP Nsop packet sequence number
+- §D.4.2 predictable-termination decode-time conformance check
+- wire §A.6.6 POC progression-order change into the decode path
+- HTJ2K multi-code-block fixtures + CxtVLC transcription audit
+- HTJ2K hardening tests + README/CHANGELOG for the T.814 decoder
+- wire HTJ2K decode end-to-end — CAP accept + SPcod bit-6 routing
+- HTJ2K (T.814) block decoder core — §7 cleanup + SigProp + MagRef
+- scope + lock the non-Maxshift RGN boundary (Part-2 scaling ROI)
+- §D.6 bypass — §D.4.1 0xFF fill for raw spans + 9-7 / multi-tile coverage
+- rustfmt — collapse §D.6 bypass segment-zip loop to one line
+- §D.6 selective arithmetic-coding bypass decode (Table A.19 Scod bit 0)
+- tile-part header overrides now honoured (§A.6.1–§A.6.5)
+- end-to-end tile-part header override injection (§A.6 / §A.4.2)
+- §A.6 tile-part header coding overrides (COD/COC/QCD/QCC/RGN)
+- main-header RGN implicit-ROI (Maxshift) decode (T.800 §A.6.3 / §H.1)
+- §A.6.2 main-header COC per-component coding-style override
+- §D.4.2 termination on each coding pass (Table A.19 Scod bit 2)
+- §C.3.6 / §D.4 reset-context-probabilities style bit (Table A.19 Scod bit 1)
+- §A.6.5 main-header QCC per-component quantization override
+- refresh to current status, drop per-round changelog cruft
+
 ### Added
 
 * **Clean-room round 382 (2026-07-02).** **Registry `Encoder` trait +
