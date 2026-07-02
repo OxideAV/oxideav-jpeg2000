@@ -21,11 +21,11 @@
 
 use oxideav_core::{
     CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecRegistry, ContainerRegistry,
-    Decoder, Error as CoreError, Frame, MediaType, Packet, PixelFormat, RuntimeContext, VideoFrame,
-    VideoPlane,
+    Decoder, Encoder, Error as CoreError, Frame, MediaType, Packet, PixelFormat, RuntimeContext,
+    TimeBase, VideoFrame, VideoPlane,
 };
 
-use crate::{decode_j2k, DecodedImage, Error};
+use crate::{decode_j2k, encode_jpeg2000, DecodedImage, Error};
 
 /// Stable identifier this crate registers under in the codec registry.
 pub const CODEC_ID_STR: &str = "jpeg2000";
@@ -163,7 +163,118 @@ impl Decoder for Jpeg2000Decoder {
     }
 }
 
-/// Register the JPEG 2000 decoder factory into a [`CodecRegistry`].
+/// Factory for the [`Encoder`] trait impl — installed in the codec
+/// registry alongside the decoder.
+pub fn make_encoder(params: &CodecParameters) -> oxideav_core::Result<Box<dyn Encoder>> {
+    Ok(Box::new(Jpeg2000Encoder::new(params.clone())))
+}
+
+/// JPEG 2000 [`Encoder`] trait impl — lossless reversible-5-3.
+///
+/// One-frame-in / one-packet-out: each `send_frame` carries one packed
+/// 8-bit [`Frame::Video`] (single interleaved plane, Gray8 or Rgb24 per
+/// the frame's plane shape) and the matching `receive_packet` returns a
+/// complete raw J2K codestream that decodes back bit-exactly.
+#[derive(Debug)]
+pub struct Jpeg2000Encoder {
+    params: CodecParameters,
+    pending: Option<Packet>,
+    eof: bool,
+}
+
+impl Jpeg2000Encoder {
+    /// Build an encoder. `params.width` / `params.height` must be set
+    /// (the packed plane shape is validated against them on each
+    /// frame); `pixel_format` may be Gray8 or Rgb24 and is otherwise
+    /// inferred from the plane stride.
+    pub fn new(params: CodecParameters) -> Self {
+        let mut p = params;
+        p.media_type = MediaType::Video;
+        p.codec_id = CodecId::new(CODEC_ID_STR);
+        Self {
+            params: p,
+            pending: None,
+            eof: false,
+        }
+    }
+}
+
+impl Encoder for Jpeg2000Encoder {
+    fn codec_id(&self) -> &CodecId {
+        &self.params.codec_id
+    }
+
+    fn output_params(&self) -> &CodecParameters {
+        &self.params
+    }
+
+    fn send_frame(&mut self, frame: &Frame) -> oxideav_core::Result<()> {
+        if self.pending.is_some() {
+            return Err(CoreError::other(
+                "oxideav-jpeg2000 encoder: receive_packet must be called before sending another frame",
+            ));
+        }
+        let Frame::Video(v) = frame else {
+            return Err(CoreError::unsupported(
+                "oxideav-jpeg2000 encoder: only video frames are supported",
+            ));
+        };
+        let (width, height) = match (self.params.width, self.params.height) {
+            (Some(w), Some(h)) if w > 0 && h > 0 => (w, h),
+            _ => {
+                return Err(CoreError::invalid(
+                    "oxideav-jpeg2000 encoder: CodecParameters width/height required",
+                ))
+            }
+        };
+        let plane = v.planes.first().ok_or_else(|| {
+            CoreError::invalid("oxideav-jpeg2000 encoder: video frame has no planes")
+        })?;
+        if v.planes.len() != 1 {
+            return Err(CoreError::unsupported(
+                "oxideav-jpeg2000 encoder: expected one packed interleaved plane",
+            ));
+        }
+        // Infer the interleaved component count from the stride.
+        let ncomp = (plane.stride / width as usize).max(1);
+        if plane.stride != ncomp * width as usize
+            || plane.data.len() != plane.stride * height as usize
+            || !(ncomp == 1 || ncomp == 3)
+        {
+            return Err(CoreError::unsupported(
+                "oxideav-jpeg2000 encoder: plane must be packed Gray8 or Rgb24 at the declared size",
+            ));
+        }
+        let bytes = encode_jpeg2000(&plane.data, width, height)?;
+        self.params.pixel_format = Some(if ncomp == 1 {
+            PixelFormat::Gray8
+        } else {
+            PixelFormat::Rgb24
+        });
+        let mut pkt = Packet::new(0, TimeBase::new(1, 1), bytes);
+        pkt.pts = v.pts;
+        pkt.dts = v.pts;
+        pkt.flags.keyframe = true; // intra-only
+        self.pending = Some(pkt);
+        Ok(())
+    }
+
+    fn receive_packet(&mut self) -> oxideav_core::Result<Packet> {
+        match self.pending.take() {
+            Some(pkt) => Ok(pkt),
+            None if self.eof => Err(CoreError::Eof),
+            None => Err(CoreError::NeedMore),
+        }
+    }
+
+    fn flush(&mut self) -> oxideav_core::Result<()> {
+        self.eof = true;
+        Ok(())
+    }
+}
+
+/// Register the JPEG 2000 decoder + encoder factories into a
+/// [`CodecRegistry`].
 pub fn register_codecs(reg: &mut CodecRegistry) {
     let caps = CodecCapabilities::video("jpeg2000_sw")
         .with_intra_only(true)
@@ -176,7 +287,8 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
     reg.register(
         CodecInfo::new(CodecId::new(CODEC_ID_STR))
             .capabilities(caps)
-            .decoder(make_decoder),
+            .decoder(make_decoder)
+            .encoder(make_encoder),
     );
 }
 
@@ -207,7 +319,10 @@ mod tests {
             ctx.codecs.has_decoder(&id),
             "jpeg2000 decoder factory not installed via RuntimeContext"
         );
-        assert!(!ctx.codecs.has_encoder(&id));
+        assert!(
+            ctx.codecs.has_encoder(&id),
+            "jpeg2000 encoder factory not installed via RuntimeContext"
+        );
         assert_eq!(
             ctx.containers.container_for_extension("j2k"),
             Some(CODEC_ID_STR)
@@ -216,5 +331,41 @@ mod tests {
             ctx.containers.container_for_extension("j2c"),
             Some(CODEC_ID_STR)
         );
+    }
+
+    #[test]
+    fn encoder_round_trips_through_decoder() {
+        // Drive the Encoder trait impl with a packed Rgb24 frame, then
+        // feed the produced packet to the Decoder trait impl and assert
+        // the pixels round-trip bit-exactly (the lossless 5-3 path).
+        let (w, h) = (10u32, 7u32);
+        let ncomp = 3usize;
+        let data: Vec<u8> = (0..(w * h) as usize * ncomp)
+            .map(|i| (i * 37 % 256) as u8)
+            .collect();
+        let mut params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        params.width = Some(w);
+        params.height = Some(h);
+        let mut enc = make_encoder(&params).expect("encoder factory");
+        let frame = Frame::Video(VideoFrame {
+            pts: Some(42),
+            planes: vec![VideoPlane {
+                stride: w as usize * ncomp,
+                data: data.clone(),
+            }],
+        });
+        enc.send_frame(&frame).expect("send_frame");
+        let pkt = enc.receive_packet().expect("receive_packet");
+        assert!(pkt.flags.keyframe);
+        assert_eq!(pkt.pts, Some(42));
+
+        let mut dec =
+            make_decoder(&CodecParameters::video(CodecId::new(CODEC_ID_STR))).expect("factory");
+        dec.send_packet(&pkt).expect("send_packet");
+        let Frame::Video(out) = dec.receive_frame().expect("receive_frame") else {
+            panic!("expected a video frame");
+        };
+        assert_eq!(out.planes.len(), 1);
+        assert_eq!(out.planes[0].data, data, "registry round-trip pixels");
     }
 }

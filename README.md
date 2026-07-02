@@ -1,6 +1,7 @@
 # oxideav-jpeg2000
 
-Pure-Rust JPEG 2000 (J2K codestream + JP2 file format) decoder for the
+Pure-Rust JPEG 2000 (J2K codestream + JP2 file format) decoder **and
+encoder** for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
 Written from scratch against the ITU-T T.800 / ISO-IEC 15444-1 standard
 documents under `docs/image/jpeg2000/` only.
@@ -181,6 +182,50 @@ What is implemented:
   needs a clean-room per-quad MagSgn/VLC bit-position reference trace
   (see the docs-gap note below).
 
+## Encoder
+
+The crate carries a full **encode** path built from the same clean-room
+spec surface, round-trip-validated against this crate's own decoder and
+independently confirmed conformant by an opaque black-box decoder
+(seven configurations reconstruct **bit-identically**):
+
+- **MQ arithmetic encoder** (Annex C §C.2) — INITENC / ENCODE
+  (CODEMPS / CODELPS with the conditional exchange) / RENORME / BYTEOUT
+  bit-stuffing + carry handling / FLUSH, the exact inverse of the §C.3
+  decoder (validated over pseudo-random multi-context decision streams).
+- **Tier-1 forward coding passes** (Annex D §D.3) — encode-side
+  significance-propagation, magnitude-refinement, and cleanup passes
+  (incl. the Table D.5 run-length mode and the §D.3.2 sign subroutine),
+  sharing the decoder's scan order and context formation so the
+  progressive state stays in lock-step by construction.
+- **Forward DWT** (§F.4) — 1-D + 2-D 5-3 (bit-exact inverse pair) and
+  9-7 (round-off-exact) analysis over the same PSEO extension.
+- **Tier-2 packet-header writer** (§B.10) — bit-stuffing writer,
+  tag-tree encoder, Table B.4 coding-passes codewords, minimal-`Lblock`
+  segment lengths, and the §B.10.8 packet-header composer with
+  §B.10.3 empty packets.
+- **Codestream assembly** — `SOC` / `SIZ` / `COD` / `QCD` / `QCC` /
+  `SOT` / `SOD` / `EOC` in the §A.3 order; geometry and packet order are
+  derived from the same `geometry` / `progression` code the decoder
+  uses. Single tile, single layer, LRCP, maximum precincts.
+- **Lossless** (`encode_j2k_lossless`) — reversible 5-3, Table A.28
+  style 0, `εb = RI + gain` (Table E.1); decodes back **bit-exactly**.
+  Optional §G.2 **RCT** (`encode_j2k_lossless_rct`, `SGcod` MCT = 1)
+  with the chroma dynamic-range bit signalled via per-component `QCC`.
+- **Lossy** (`encode_j2k_lossy`) — irreversible 9-7 with Annex E
+  scalar-expounded quantisation (Table A.28 style 2); a `fine_bits`
+  knob sets the uniform Equation E-3 step `Δb = 2^(−fine_bits)`
+  (`6` ≈ near-lossless ±1, `0` = coarse `Δb = 1`).
+- The `oxideav-core` registry installs the **`Encoder` trait** impl
+  alongside the decoder (`make_encoder`), and the historical
+  `encode_jpeg2000(pixels, w, h)` byte-vector entry point encodes 1-
+  (gray) and 3-component (RGB via RCT) interleaved 8-bit input.
+
+Not yet on the encode side: multiple layers / tiles / precincts,
+rate control, progression orders beyond LRCP, the §D.6 bypass /
+§D.4.2 termination styles on encode, ICT, sub-sampling, >8-bit input,
+and HTJ2K encoding.
+
 ### Not yet implemented
 
 These surface a clean `Error::NotImplemented` rather than mis-decoding:
@@ -229,19 +274,26 @@ let container  = oxideav_jpeg2000::jp2::parse_jp2(bytes)?;
 # Ok::<(), oxideav_jpeg2000::Error>(())
 ```
 
-The crate also registers a software decoder through the standard
-`oxideav-core` registry path.
+Decoding: `decode_j2k` (planar) / `decode_jpeg2000` (interleaved bytes).
+Encoding: `encode::encode_j2k_lossless` / `encode_j2k_lossless_rct` /
+`encode_j2k_lossy`, or the historical `encode_jpeg2000(pixels, w, h)`.
+
+The crate also registers a software decoder **and encoder** through the
+standard `oxideav-core` registry path.
 
 ## Clean-room provenance
 
 Every module was written from the T.800 / ISO-IEC 15444-1 standards
 documents under `docs/image/jpeg2000/` only — the codestream and JP2
-syntax (Annex A + Annex I), tier-2 packet headers (§B.10), tile /
-sub-band / precinct / code-block geometry (§B.2 – §B.9), the MQ
-arithmetic decoder (Annex C), coefficient bit modelling (Annex D), and
-progression orders (§B.12). PDF figures are transcribed to integer
-operations from the accompanying prose. No external JPEG 2000
-implementation is read or wrapped.
+syntax (Annex A + Annex I), tier-2 packet headers (§B.10, both read and
+write sides), tile / sub-band / precinct / code-block geometry
+(§B.2 – §B.9), the MQ arithmetic coder (Annex C, decoder §C.3 and
+encoder §C.2), coefficient bit modelling (Annex D, decode and forward
+passes), the wavelet transforms (Annex F, synthesis and §F.4 analysis),
+quantisation (Annex E), component transforms (Annex G), and progression
+orders (§B.12). PDF figures are transcribed to integer operations from
+the accompanying prose. No external JPEG 2000 implementation is read or
+wrapped; opaque CLI codecs are used strictly as black-box validators.
 
 ## License
 

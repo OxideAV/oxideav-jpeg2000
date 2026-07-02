@@ -6,6 +6,15 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 382 (2026-07-02).** **Registry `Encoder` trait +
+  README refresh.** The `oxideav-core` registry integration now installs
+  an `Encoder` factory (`registry::make_encoder` /
+  `Jpeg2000Encoder`) alongside the decoder: one packed 8-bit Gray8 /
+  Rgb24 `Frame::Video` in, one lossless raw J2K codestream `Packet`
+  out (intra-only, keyframe-flagged). A registry-level test round-trips
+  a frame through the `Encoder` and `Decoder` trait impls bit-exactly.
+  The crate README gained an **Encoder** section documenting the full
+  encode surface and its validation.
 * **Clean-room round 382 (2026-07-02).** **Lossy 9-7 encoder path
   (`encode::encode_j2k_lossy`, Annex E scalar-expounded
   quantisation).** The encoder gained the irreversible kernel: the §F.4
