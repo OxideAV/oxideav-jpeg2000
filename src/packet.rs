@@ -1496,10 +1496,21 @@ impl TagTreeEncoder {
     /// Build the encoder over a `width × height` leaf grid whose values
     /// are `leaves[y * width + x]`.
     ///
-    /// Panics if `leaves.len() != width * height` or the grid is empty.
+    /// A zero-dimension grid yields an empty tree (mirroring
+    /// [`TagTree::new`]); its encode methods must not be called — the
+    /// §B.10.8 walk skips empty sub-bands, matching the reader.
+    ///
+    /// Panics if `leaves.len() != width * height`.
     pub fn new(width: u32, height: u32, leaves: &[u32]) -> Self {
-        assert!(width > 0 && height > 0, "tag tree must be non-empty");
         assert_eq!(leaves.len(), (width as usize) * (height as usize));
+        if width == 0 || height == 0 {
+            return TagTreeEncoder {
+                width,
+                height,
+                values: Vec::new(),
+                state: Vec::new(),
+            };
+        }
         // Build the per-level dimensions leaf-first, then compute each
         // coarser level as the min of its children.
         let mut dims: Vec<(u32, u32)> = Vec::new();

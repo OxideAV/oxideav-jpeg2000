@@ -91,10 +91,12 @@
 //! consumes. The other four §B.12 progression orders (RLCP / RPCL /
 //! PCRL / CPRL) land in later rounds.
 //!
-//! Full codestream-body decoding (wavelet inverse transform,
-//! dequantisation, MCT) and any encoder path are **not** implemented yet
-//! — [`decode_jpeg2000`] and [`encode_jpeg2000`] both return
-//! [`Error::NotImplemented`].
+//! Full codestream-body decoding (tier-1 / tier-2 entropy decoding,
+//! dequantisation, the inverse DWT and MCT) is wired end-to-end in the
+//! [`decode`] module ([`decode_jpeg2000`] / [`decode_j2k`]), and the
+//! [`encode`] module provides a **lossless** reversible-5-3 encoder
+//! ([`encode_jpeg2000`] / [`encode::encode_j2k_lossless`]) whose output
+//! round-trips bit-exactly through the decoder.
 //!
 //! ## Clean-room provenance
 //!
@@ -115,6 +117,7 @@
 pub mod decode;
 pub mod dequant;
 pub mod dwt;
+pub mod encode;
 pub mod geometry;
 pub mod ht;
 pub(crate) mod ht_tables;
@@ -189,13 +192,14 @@ pub const MARKER_COM: u16 = 0xFF64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     /// The codestream needs a coding tool the decode wiring does not
-    /// handle yet (e.g. `PPM` / `PPT` packed packet headers, a
-    /// non-Maxshift / Part-2 `RGN` style, or a `COC` whose Table A.19
-    /// code-block-**style** byte diverges from the `COD`) — or the
-    /// encoder entry point, which is not implemented at all. The
-    /// `COC` / `QCC` / `RGN` / `POC` overrides, all five §B.12.1
-    /// progression orders, and the §A.6.6 progression order change *are*
-    /// honoured. See [`decode`] for the supported surface.
+    /// handle yet (e.g. a non-Maxshift / Part-2 `RGN` style, or a `COC`
+    /// whose Table A.19 code-block-**style** byte diverges from the
+    /// `COD`) — or the encoder was asked for a layout outside its
+    /// lossless-5-3 surface (see [`encode::encode_j2k_lossless`]). The
+    /// `COC` / `QCC` / `RGN` / `POC` overrides, `PPM` / `PPT` relocated
+    /// headers, all five §B.12.1 progression orders, and the §A.6.6
+    /// progression order change *are* honoured on the decode side. See
+    /// [`decode`] for the supported surface.
     NotImplemented,
     /// The codestream did not start with the SOC marker (T.800 §A.4.1).
     MissingSoc,
@@ -1903,11 +1907,42 @@ pub fn decode_jpeg2000(bytes: &[u8]) -> Result<Vec<u8>, Error> {
     Ok(out)
 }
 
-/// Encode raw samples into a JPEG 2000 codestream (J2K).
+/// Encode raw 8-bit samples into a **lossless** JPEG 2000 codestream
+/// (J2K), preserving the historical byte-vector signature.
 ///
-/// **Not yet implemented.** Returns [`Error::NotImplemented`].
-pub fn encode_jpeg2000(_pixels: &[u8], _width: u32, _height: u32) -> Result<Vec<u8>, Error> {
-    Err(Error::NotImplemented)
+/// `pixels` is row-major interleaved with `pixels.len() / (width ·
+/// height)` components per pixel (1 = grayscale, 3 = RGB — encoded as
+/// independent planes, no MCT). The stream is reversible-5-3 lossless:
+/// decoding with [`decode_jpeg2000`] reproduces `pixels` bit-exactly.
+/// Uses 2 decomposition levels (clamped down for tiny images) and
+/// 64×64 code-blocks; use [`encode::encode_j2k_lossless`] directly for
+/// control over `NL` / code-block size.
+///
+/// A `pixels` length that is not a 1× or 3× multiple of
+/// `width * height` (or a zero dimension) returns
+/// [`Error::NotImplemented`].
+pub fn encode_jpeg2000(pixels: &[u8], width: u32, height: u32) -> Result<Vec<u8>, Error> {
+    let n = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or(Error::InvalidMarkerLength)?;
+    if n == 0 || pixels.len() % n != 0 {
+        return Err(Error::NotImplemented);
+    }
+    let ncomp = pixels.len() / n;
+    if ncomp != 1 && ncomp != 3 {
+        return Err(Error::NotImplemented);
+    }
+    // De-interleave into planes.
+    let mut planes: Vec<Vec<u8>> = vec![vec![0u8; n]; ncomp];
+    for (i, chunk) in pixels.chunks_exact(ncomp).enumerate() {
+        for (ci, &s) in chunk.iter().enumerate() {
+            planes[ci][i] = s;
+        }
+    }
+    let plane_refs: Vec<&[u8]> = planes.iter().map(|p| p.as_slice()).collect();
+    // NL = 2 unless the image is too small to decompose meaningfully.
+    let nl = if width.min(height) >= 8 { 2 } else { 1 };
+    encode::encode_j2k_lossless(&plane_refs, width, height, nl, (6, 6))
 }
 
 /// Codec registration — installs the J2K codestream decoder factory
@@ -2187,13 +2222,19 @@ mod tests {
     }
 
     #[test]
-    fn decode_rejects_truncated_input_and_encode_is_unimplemented() {
+    fn decode_rejects_truncated_input_and_encode_round_trips() {
         // A bare SOC with no SIZ behind it is a malformed codestream —
         // the end-to-end decode path must surface a parse error (the
         // happy path is exercised in tests/decode_e2e.rs against the
         // committed fixtures).
         assert_eq!(decode_jpeg2000(&[0xFF, 0x4F]), Err(Error::MissingSiz));
-        assert_eq!(encode_jpeg2000(&[0u8; 4], 2, 2), Err(Error::NotImplemented));
+        // The historical byte-vector encode entry point produces a real
+        // lossless codestream that decodes back bit-exactly.
+        let pixels = [10u8, 200, 30, 128];
+        let stream = encode_jpeg2000(&pixels, 2, 2).expect("encode");
+        assert_eq!(decode_jpeg2000(&stream).expect("decode"), pixels.to_vec());
+        // A pixel buffer that is neither 1 nor 3 planes is rejected.
+        assert_eq!(encode_jpeg2000(&[0u8; 8], 2, 2), Err(Error::NotImplemented));
     }
 
     // -----------------------------------------------------------------------

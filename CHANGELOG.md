@@ -6,6 +6,30 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 382 (2026-07-02).** **End-to-end lossless J2K
+  *encoder* (`encode::encode_j2k_lossless` + a real `encode_jpeg2000`).**
+  The encode-side subsystems built this round compose into a working
+  Part-1 encoder: §G.1.2 forward DC level shift → §F.4 forward 5-3 DWT
+  cascade → Annex D tier-1 forward passes (one §C.3 codeword segment per
+  code-block, full §D.3 schedule, `P = Mb − planes`,
+  `passes = 3·planes − 2`) → §B.10 packet headers → Annex A markers
+  (`SOC` / `SIZ` / `COD` / `QCD` / `SOT` / `SOD` / `EOC`) in the §A.3
+  order. Output is a single-tile, single-layer, LRCP,
+  maximum-precinct, no-MCT, reversible-5-3, no-quantization (Table A.28
+  style 0) codestream; the tile / precinct / code-block layout is
+  derived from the same `geometry` functions the decoder uses and
+  packets are emitted by `progression::lrcp_packet_order`, so encoder
+  and decoder agree by construction. The `SPqcd` exponents follow
+  `εb = RI + gain_b` (Table E.1) with `G = 2` guard bits. The public
+  `encode_jpeg2000` byte-vector entry point now encodes 1- and
+  3-component interleaved 8-bit input losslessly (previously
+  `Error::NotImplemented`). Validated by ten **bit-exact round-trip**
+  tests through this crate's own decoder: NL = 0–3, odd dimensions,
+  multi-code-block noise, hard step edges, flat images (all-empty
+  packets), RGB planes, 1×1 / 2×3 degenerate geometries, and 4×4
+  minimum code-blocks. `TagTreeEncoder` now tolerates empty sub-band
+  grids (mirroring `TagTree::new`), and the historical "encode is
+  unimplemented" test was rewritten as an encode round-trip.
 * **Clean-room round 382 (2026-07-02).** **Tier-2 packet-header
   *writer* (T.800 §B.10, encode side).** The `packet` module gained the
   write-side mirrors of its reader: `PacketBitWriter` (the §B.10.1
