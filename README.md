@@ -250,6 +250,35 @@ it):
     transformed and coded independently into its own tile-part —
     including odd-anchored tiles (absolute-parity lifting) and tiny
     tiles whose deeper levels go empty.
+  - **Multiple tile-parts per tile** (§A.4.2, `TPsot > 0`): a
+    `TilePartSplit` cuts each tile's packet sequence into
+    `TPsot`-indexed tile-parts wherever the resolution / layer /
+    component axis changes along the emission order (each part with
+    its own `SOT` + `SOD`; `Nsop` numbering continues across a tile's
+    parts; `TNsot > 255` rejected).
+  - **SOP / EPH packet framing** (§A.8.1 / §A.8.2, `Scod` bits 1 / 2):
+    6-byte `SOP` segments with per-tile `Nsop` numbering and/or the
+    2-byte `EPH` after every packet header, composing with layers,
+    styles, tiles, and rate control (the PCRD budget binds on the
+    framed length).
+  - **POC emission** (§A.6.6 / Table A.32): progression-order-change
+    entries carried in a main-header `POC` and emitted through the
+    decoder's own §B.12.2 volume walk (layer cursors included), with
+    full-coverage validation so no packet is silently dropped.
+  - **Component sub-sampling** (§B.2, SIZ `XRsiz` / `YRsiz` 1..=255
+    per component): planes on their own component grids, per-tile
+    Equation B-12 tile-component regions, the §B.12.1.3–.5
+    position-order projections, and the RPCL / PCRL power-of-two
+    gate; 4:2:0 / 4:2:2 / asymmetric layouts round-trip bit-exactly.
+  - **Per-component `COC` / `QCC` overrides** (§A.6.2 / §A.6.5):
+    per-component `NL` / code-block size / precinct partition /
+    wavelet kernel (mixed 5-3 / 9-7 siblings when the MCT is off),
+    with a `QCC` emitted whenever the implied quantisation table
+    diverges (unified with the RCT chroma `QCC`).
+- **>8-bit input** (`encode_j2k_u16`) — any Table A.11 unsigned depth
+  up to 16 bits through the whole pipeline (both kernels, both MCT
+  pairings, sub-sampling, framing); 9/12/16-bit lossless round-trips
+  are bit-exact and the lossy `Δb` error bound is depth-independent.
 - **Lossless** (`encode_j2k_lossless`) — reversible 5-3, Table A.28
   style 0, `εb = RI + gain` (Table E.1); decodes back **bit-exactly**.
   Optional §G.2 **RCT** (`encode_j2k_lossless_rct`, `SGcod` MCT = 1)
@@ -264,10 +293,19 @@ it):
   `encode_jpeg2000(pixels, w, h)` byte-vector entry point encodes 1-
   (gray) and 3-component (RGB via RCT) interleaved 8-bit input.
 
-Not yet on the encode side: component sub-sampling, >8-bit input,
-SOP / EPH framing, POC emission, multiple tile-parts per tile
-(`TPsot > 0`), PPM / PPT relocation, per-component `COC` / `QCC`
-overrides, ROI, and HTJ2K encoding.
+The **HTJ2K forward block coder** (T.814) has its §7.3 cleanup-pass
+encoder in place (`htenc::encode_ht_cleanup_segment`): the three §7.1
+bit-stream writers (MagSgn / MEL / VLC with their stuffing rules and
+the backward VLC byte layout), the §7.3.3 adaptive MEL run-length
+encoder, Annex C CxtVLC entry selection (the tables form a covering
+code over the sample values' `U_q − 1` bit pattern), §7.3.6 U-VLC
+residuals with the §7.3.4 quad-pair interleave, and §7.3.8 MagSgn
+emission — round-trip-validated against this crate's independently
+written HT decoder up to 64×64 blocks and 28-bit magnitudes.
+Codestream-level HT emission (`CAP` + `SPcod` bit 6) is not wired yet.
+
+Not yet on the encode side: PPM / PPT relocation, ROI, HT SigProp /
+MagRef refinement passes, and HTJ2K codestream assembly.
 
 ### Not yet implemented
 
