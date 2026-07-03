@@ -733,6 +733,38 @@ pub enum TilePartSplit {
     ByComponent,
 }
 
+/// One component's §A.6.2 / §A.6.5 override of the tile-wide COD /
+/// QCD coding parameters, signalled through a main-header `COC`
+/// (Table A.23) and — whenever the quantisation table it implies
+/// differs from the QCD's — a main-header `QCC` (Table A.31).
+///
+/// `None` fields inherit the [`EncodeParams`] value. The Table A.19
+/// code-block **style** byte stays tile-wide (the crate's decoder
+/// rejects a COC whose style diverges from the COD, so the encoder
+/// never emits one); the wavelet kernel *may* differ per component
+/// when no MCT is signalled (the §G.2 / §G.3 transforms pair with one
+/// kernel across components 0–2, so kernel overrides under
+/// [`EncodeParams::mct`] must match the tile-wide kernel).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComponentOverride {
+    /// Component index (`Ccoc` / `Cqcc`) this override applies to.
+    pub component: u16,
+    /// Per-component `NL` (Table A.15, `0..=32`).
+    pub decomposition_levels: Option<u8>,
+    /// Per-component code-block exponents (Table A.18 ranges).
+    pub code_block_exp: Option<(u8, u8)>,
+    /// Per-component precinct partition: `Some(bytes)` with
+    /// `NL_c + 1` Table A.21 bytes selects a user-defined partition
+    /// (`Scoc` bit 0 set), `Some(vec![])` forces maximum precincts
+    /// for this component (overriding a tile-wide partition), `None`
+    /// inherits the tile-wide setting (which requires the component's
+    /// `NL` to match the tile-wide `NL` when a tile-wide partition is
+    /// signalled, since the byte-per-resolution list must fit).
+    pub precincts: Option<Vec<u8>>,
+    /// Per-component wavelet kernel + quantisation family.
+    pub kernel: Option<EncodeKernel>,
+}
+
 /// Structured encoder parameters — the T.800 §A.6.1 COD fields the
 /// encoder honours, with spec-shaped defaults.
 ///
@@ -845,6 +877,11 @@ pub struct EncodeParams {
     /// leaves packets unemitted is rejected rather than silently
     /// dropping coded data. Default empty (no `POC`).
     pub poc: Vec<PocProgression>,
+    /// §A.6.2 / §A.6.5 per-component overrides of `NL` / code-block
+    /// size / precincts / kernel, emitted as main-header `COC` (+
+    /// `QCC` where the quantisation table changes) marker segments.
+    /// At most one entry per component. Default empty.
+    pub component_overrides: Vec<ComponentOverride>,
 }
 
 impl Default for EncodeParams {
@@ -866,6 +903,7 @@ impl Default for EncodeParams {
             sub_sampling: Vec::new(),
             tile_parts: TilePartSplit::Single,
             poc: Vec::new(),
+            component_overrides: Vec::new(),
         }
     }
 }
@@ -1168,6 +1206,87 @@ fn encode_core(
             return Err(Error::NotImplemented);
         }
     }
+    // §A.6.2 / §A.6.5 per-component effective coding parameters: the
+    // COD/QCD values with any ComponentOverride applied. Every check
+    // the tile-wide parameters pass is applied per component.
+    struct CompParams {
+        nl: u8,
+        xcb: u8,
+        ycb: u8,
+        kernel: EncodeKernel,
+        precincts: Vec<u8>,
+        overridden: bool,
+    }
+    let mut comp_params: Vec<CompParams> = (0..planes.len())
+        .map(|_| CompParams {
+            nl,
+            xcb,
+            ycb,
+            kernel,
+            precincts: params.precincts.clone(),
+            overridden: false,
+        })
+        .collect();
+    for ov in &params.component_overrides {
+        let ci = ov.component as usize;
+        let Some(cp) = comp_params.get_mut(ci) else {
+            return Err(Error::NotImplemented);
+        };
+        if cp.overridden {
+            // §A.6.2: no more than one COC per component per header.
+            return Err(Error::NotImplemented);
+        }
+        cp.overridden = true;
+        if let Some(n) = ov.decomposition_levels {
+            if n > 32 {
+                return Err(Error::NotImplemented);
+            }
+            cp.nl = n;
+        }
+        if let Some((cx, cy)) = ov.code_block_exp {
+            if !(2..=10).contains(&cx) || !(2..=10).contains(&cy) || cx + cy > 12 {
+                return Err(Error::NotImplemented);
+            }
+            cp.xcb = cx;
+            cp.ycb = cy;
+        }
+        if let Some(k) = ov.kernel {
+            // Table A.17: the §G.2 / §G.3 MCT pairs one kernel across
+            // components 0–2 — a diverging per-component kernel is
+            // only legal without an MCT.
+            if mct && k != kernel {
+                return Err(Error::NotImplemented);
+            }
+            if let EncodeKernel::Lossy9x7 { fine_bits } = k {
+                if fine_bits > 8 {
+                    return Err(Error::NotImplemented);
+                }
+            }
+            cp.kernel = k;
+        }
+        match &ov.precincts {
+            Some(p) => cp.precincts = p.clone(),
+            None => {
+                // Inheriting a tile-wide partition requires the byte-
+                // per-resolution list to fit this component's NL.
+                if !cp.precincts.is_empty() && cp.nl != nl {
+                    return Err(Error::NotImplemented);
+                }
+            }
+        }
+        // Table A.21 shape on the effective partition.
+        if !cp.precincts.is_empty() {
+            if cp.precincts.len() != cp.nl as usize + 1 {
+                return Err(Error::NotImplemented);
+            }
+            for &b in &cp.precincts[1..] {
+                if b & 0x0F == 0 || (b >> 4) & 0x0F == 0 {
+                    return Err(Error::NotImplemented);
+                }
+            }
+        }
+    }
+
     let separation = |ci: usize| -> (u32, u32) {
         params
             .sub_sampling
@@ -1249,58 +1368,91 @@ fn encode_core(
                 }
                 out
             };
-            Ok(match kernel {
-                EncodeKernel::Lossless5x3 => {
-                    let mut shifted: Vec<Vec<i32>> = (0..planes.len()).map(extract).collect();
-                    if use_rct {
-                        // Split into three disjoint &mut [i32].
-                        let (head, tail) = shifted.split_at_mut(1);
-                        let (mid, tail2) = tail.split_at_mut(1);
-                        crate::mct::forward_rct(&mut head[0], &mut mid[0], &mut tail2[0])?;
+            if mct {
+                // Table A.17: the MCT couples components 0–2 on one
+                // kernel (validated above); per-component NL still
+                // applies to each cascade.
+                return Ok(match kernel {
+                    EncodeKernel::Lossless5x3 => {
+                        let mut shifted: Vec<Vec<i32>> = (0..planes.len()).map(extract).collect();
+                        if use_rct {
+                            // Split into three disjoint &mut [i32].
+                            let (head, tail) = shifted.split_at_mut(1);
+                            let (mid, tail2) = tail.split_at_mut(1);
+                            crate::mct::forward_rct(&mut head[0], &mut mid[0], &mut tail2[0])?;
+                        }
+                        shifted
+                            .into_iter()
+                            .enumerate()
+                            .map(|(ci, p)| {
+                                let tc = &tile.components[ci];
+                                forward_cascade(
+                                    p,
+                                    tc.tcx0,
+                                    tc.tcy0,
+                                    tc.width() as usize,
+                                    tc.height() as usize,
+                                    comp_params[ci].nl,
+                                )
+                            })
+                            .collect()
                     }
-                    shifted
-                        .into_iter()
-                        .enumerate()
-                        .map(|(ci, p)| {
-                            let tc = &tile.components[ci];
-                            forward_cascade(
-                                p,
-                                tc.tcx0,
-                                tc.tcy0,
-                                tc.width() as usize,
-                                tc.height() as usize,
-                                nl,
-                            )
-                        })
-                        .collect()
-                }
-                EncodeKernel::Lossy9x7 { fine_bits } => {
-                    let mut shifted: Vec<Vec<f64>> = (0..planes.len())
-                        .map(|ci| extract(ci).into_iter().map(f64::from).collect())
-                        .collect();
-                    if use_ict {
-                        let (head, tail) = shifted.split_at_mut(1);
-                        let (mid, tail2) = tail.split_at_mut(1);
-                        crate::mct::forward_ict_f64(&mut head[0], &mut mid[0], &mut tail2[0])?;
+                    EncodeKernel::Lossy9x7 { fine_bits } => {
+                        let mut shifted: Vec<Vec<f64>> = (0..planes.len())
+                            .map(|ci| extract(ci).into_iter().map(f64::from).collect())
+                            .collect();
+                        if use_ict {
+                            let (head, tail) = shifted.split_at_mut(1);
+                            let (mid, tail2) = tail.split_at_mut(1);
+                            crate::mct::forward_ict_f64(&mut head[0], &mut mid[0], &mut tail2[0])?;
+                        }
+                        shifted
+                            .into_iter()
+                            .enumerate()
+                            .map(|(ci, p)| {
+                                let tc = &tile.components[ci];
+                                forward_cascade_9x7(
+                                    p,
+                                    tc.tcx0,
+                                    tc.tcy0,
+                                    tc.width() as usize,
+                                    tc.height() as usize,
+                                    comp_params[ci].nl,
+                                    fine_bits,
+                                )
+                            })
+                            .collect()
                     }
-                    shifted
-                        .into_iter()
-                        .enumerate()
-                        .map(|(ci, p)| {
-                            let tc = &tile.components[ci];
-                            forward_cascade_9x7(
-                                p,
-                                tc.tcx0,
-                                tc.tcy0,
-                                tc.width() as usize,
-                                tc.height() as usize,
-                                nl,
-                                fine_bits,
-                            )
-                        })
-                        .collect()
-                }
-            })
+                });
+            }
+            // No MCT: each component runs its own §A.6.2 kernel + NL
+            // independently (a COC may give siblings different
+            // kernels).
+            Ok((0..planes.len())
+                .map(|ci| {
+                    let cp = &comp_params[ci];
+                    let tc = &tile.components[ci];
+                    match cp.kernel {
+                        EncodeKernel::Lossless5x3 => forward_cascade(
+                            extract(ci),
+                            tc.tcx0,
+                            tc.tcy0,
+                            tc.width() as usize,
+                            tc.height() as usize,
+                            cp.nl,
+                        ),
+                        EncodeKernel::Lossy9x7 { fine_bits } => forward_cascade_9x7(
+                            extract(ci).into_iter().map(f64::from).collect(),
+                            tc.tcx0,
+                            tc.tcy0,
+                            tc.width() as usize,
+                            tc.height() as usize,
+                            cp.nl,
+                            fine_bits,
+                        ),
+                    }
+                })
+                .collect())
         };
 
     // -- Tier-1: encode every code-block, keyed (tile, comp, r, k) -----
@@ -1334,15 +1486,17 @@ fn encode_core(
         let levels_per_comp: Vec<_> = tile
             .components
             .iter()
-            .map(|tc| derive_resolution_levels(*tc, nl))
+            .enumerate()
+            .map(|(ci, tc)| derive_resolution_levels(*tc, comp_params[ci].nl))
             .collect();
         let mut precincts_per_comp_res: Vec<Vec<u32>> = Vec::with_capacity(planes.len());
         let mut position_infos: Vec<ComponentPositionInfo> = Vec::with_capacity(planes.len());
         for (ci, levels) in levels_per_comp.iter().enumerate() {
+            let cp = &comp_params[ci];
             let mut precincts_at_r = Vec::with_capacity(levels.len());
             let mut res_layouts = Vec::with_capacity(levels.len());
             for level in levels {
-                let pp = precinct_exponents_at(&params.precincts, level.r);
+                let pp = precinct_exponents_at(&cp.precincts, level.r);
                 let partition = derive_precinct_partition(level, pp);
                 let num_precincts = partition.num_precincts() as u32;
                 precincts_at_r.push(num_precincts);
@@ -1360,7 +1514,7 @@ fn encode_core(
                     ppy: pp.ppy,
                 });
                 for k in 0..num_precincts {
-                    let pcb = derive_precinct_code_blocks(level, pp, xcb, ycb, k)?;
+                    let pcb = derive_precinct_code_blocks(level, pp, cp.xcb, cp.ycb, k)?;
                     let mut sub_bands: Vec<(SubBandGeometry, Vec<u32>)> = Vec::new();
                     let mut blocks: Vec<Option<EncodedBlock>> = Vec::new();
                     for psb in &pcb.sub_bands {
@@ -1374,7 +1528,7 @@ fn encode_core(
                         let plane: &BandPlane = if level.r == 0 {
                             &bands[ci].ll
                         } else {
-                            let lev = (nl - level.r + 1) as usize; // nb = NL − r + 1
+                            let lev = (cp.nl - level.r + 1) as usize; // nb = NL − r + 1
                             let oi = match psb.orientation {
                                 SubBandOrientation::HL => 0,
                                 SubBandOrientation::LH => 1,
@@ -1392,7 +1546,7 @@ fn encode_core(
                         };
                         // εb = Rb (+ fine_bits on the lossy path, where the
                         // exponent excess sets the Equation E-3 step).
-                        let fine = match kernel {
+                        let fine = match cp.kernel {
                             EncodeKernel::Lossless5x3 => 0,
                             EncodeKernel::Lossy9x7 { fine_bits } => u32::from(fine_bits),
                         };
@@ -1401,8 +1555,8 @@ fn encode_core(
                         // J.13.4.1 rate-distortion weight of this band.
                         let weight = if rate_control {
                             band_synthesis_weight(
-                                matches!(kernel, EncodeKernel::Lossless5x3),
-                                nl,
+                                matches!(cp.kernel, EncodeKernel::Lossless5x3),
+                                cp.nl,
                                 level.r,
                                 psb.orientation,
                             )
@@ -1471,7 +1625,7 @@ fn encode_core(
             precincts_per_comp_res.push(precincts_at_r);
             let (xr, yr) = separation(ci);
             position_infos.push(ComponentPositionInfo {
-                num_decomposition_levels: nl,
+                num_decomposition_levels: cp.nl,
                 xrsiz: xr as u8,
                 yrsiz: yr as u8,
                 resolutions: res_layouts,
@@ -1479,8 +1633,9 @@ fn encode_core(
         }
         let prog_info: Vec<ComponentProgressionInfo> = precincts_per_comp_res
             .iter()
-            .map(|pr| ComponentProgressionInfo {
-                num_decomposition_levels: nl,
+            .enumerate()
+            .map(|(ci, pr)| ComponentProgressionInfo {
+                num_decomposition_levels: comp_params[ci].nl,
                 precincts_per_resolution: pr.clone(),
             })
             .collect();
@@ -1870,6 +2025,33 @@ fn encode_core(
         cod_payload.extend_from_slice(&params.precincts); // Table A.21
         push_segment(&mut out, MARKER_COD, &cod_payload);
 
+        // COC (Table A.23) per overridden component: Ccoc (one byte
+        // when Csiz < 257, two otherwise), Scoc bit 0 = per-component
+        // user-defined precincts, then SPcoc — NL, code-block
+        // exponents − 2, the tile-wide Table A.19 style byte (never
+        // diverging from the COD), the Table A.20 kernel byte, and the
+        // Table A.21 precinct bytes when Scoc bit 0 is set.
+        for ov in &params.component_overrides {
+            let cp = &comp_params[ov.component as usize];
+            let mut coc_payload = Vec::with_capacity(8 + cp.precincts.len());
+            if planes.len() >= 257 {
+                coc_payload.extend_from_slice(&ov.component.to_be_bytes());
+            } else {
+                coc_payload.push(ov.component as u8);
+            }
+            coc_payload.push(u8::from(!cp.precincts.is_empty())); // Scoc
+            coc_payload.push(cp.nl);
+            coc_payload.push(cp.xcb - 2);
+            coc_payload.push(cp.ycb - 2);
+            coc_payload.push(u8::from(params.bypass) | (u8::from(params.terminate_all) << 2));
+            coc_payload.push(match cp.kernel {
+                EncodeKernel::Lossless5x3 => 1u8,
+                EncodeKernel::Lossy9x7 { .. } => 0u8,
+            });
+            coc_payload.extend_from_slice(&cp.precincts);
+            push_segment(&mut out, crate::MARKER_COC, &coc_payload);
+        }
+
         // QCD (Tables A.27 – A.28), one entry per sub-band in the
         // §F.3.1 order (NLLL then per-level HL, LH, HH from the deepest
         // level outward). `ri` is the component bit depth the exponents
@@ -1881,13 +2063,13 @@ fn encode_core(
         //   `εb = Rb + fine_bits` in the top 5 bits, µb = 0
         //   (Table A.30), giving the uniform Equation E-3 step
         //   `Δb = 2^(−fine_bits)`.
-        let quant_payload = |ri: u8| -> Vec<u8> {
+        let quant_payload = |ri: u8, q_nl: u8, q_kernel: EncodeKernel| -> Vec<u8> {
             let mut p = Vec::new();
-            match kernel {
+            match q_kernel {
                 EncodeKernel::Lossless5x3 => {
                     p.push(GUARD_BITS << 5); // style 0 | guard bits
                     p.push(ri << 3); // εb(LL) = RI + 0
-                    for _r in 1..=nl {
+                    for _r in 1..=q_nl {
                         p.push((ri + 1) << 3); // HL: RI + 1
                         p.push((ri + 1) << 3); // LH: RI + 1
                         p.push((ri + 2) << 3); // HH: RI + 2
@@ -1900,7 +2082,7 @@ fn encode_core(
                         (eps << 11).to_be_bytes()
                     };
                     p.extend_from_slice(&word(0)); // LL
-                    for _r in 1..=nl {
+                    for _r in 1..=q_nl {
                         p.extend_from_slice(&word(1)); // HL
                         p.extend_from_slice(&word(1)); // LH
                         p.extend_from_slice(&word(2)); // HH
@@ -1909,17 +2091,32 @@ fn encode_core(
             }
             p
         };
-        push_segment(&mut out, MARKER_QCD, &quant_payload(precision));
-        if use_rct {
-            // §G.2 / §A.6.5: the RCT chrominance components (1, 2)
-            // carry one extra bit of dynamic range — override their
-            // exponents with a main-header QCC each (`Main QCC > Main
-            // QCD`). Cqcc is one byte (Csiz = 3 < 257).
-            for c in 1u8..=2 {
-                let mut qcc_payload = vec![c];
-                qcc_payload.extend_from_slice(&quant_payload(precision + 1));
-                push_segment(&mut out, crate::MARKER_QCC, &qcc_payload);
+        push_segment(&mut out, MARKER_QCD, &quant_payload(precision, nl, kernel));
+        // QCC (Table A.31, `Main QCC > Main QCD` per §A.6.5) for every
+        // component whose quantisation table differs from the QCD's:
+        // the §G.2 RCT chrominance components carry one extra bit of
+        // dynamic range in their exponents, and a COC that changes a
+        // component's NL (band count) or kernel (style + exponents)
+        // changes its table too.
+        for (ci, cp) in comp_params.iter().enumerate() {
+            // §G.2: RCT chrominance dynamic range grows by one bit.
+            let ri = if use_rct && ci > 0 {
+                precision + 1
+            } else {
+                precision
+            };
+            let needs_qcc = ri != precision || cp.nl != nl || cp.kernel != kernel;
+            if !needs_qcc {
+                continue;
             }
+            let mut qcc_payload = Vec::new();
+            if planes.len() >= 257 {
+                qcc_payload.extend_from_slice(&(ci as u16).to_be_bytes());
+            } else {
+                qcc_payload.push(ci as u8);
+            }
+            qcc_payload.extend_from_slice(&quant_payload(ri, cp.nl, cp.kernel));
+            push_segment(&mut out, crate::MARKER_QCC, &qcc_payload);
         }
 
         // POC (§A.6.6, Table A.32): one entry per progression-order
@@ -4073,6 +4270,241 @@ mod tests {
             ..base
         };
         assert!(encode_j2k(&[&p], 16, 16, &bad4).is_err());
+    }
+
+    // -- §A.6.2 / §A.6.5 per-component COC / QCC overrides on encode ----
+
+    fn ov(component: u16) -> ComponentOverride {
+        ComponentOverride {
+            component,
+            decomposition_levels: None,
+            code_block_exp: None,
+            precincts: None,
+            kernel: None,
+        }
+    }
+
+    #[test]
+    fn override_nl_per_component_round_trips() {
+        // Component 1 decomposes 1 level against a tile-wide NL = 3;
+        // its COC carries NL and its QCC the shorter band list.
+        let a = noise(40, 32, 0xC0C0_0001);
+        let b = noise(40, 32, 0xC0C0_0002);
+        let params = EncodeParams {
+            decomposition_levels: 3,
+            code_block_exp: (4, 4),
+            component_overrides: vec![ComponentOverride {
+                decomposition_levels: Some(1),
+                ..ov(1)
+            }],
+            ..EncodeParams::default()
+        };
+        let stream = roundtrip_params(&[&a, &b], 40, 32, &params);
+        let cs = crate::parse_codestream(&stream).expect("parse");
+        let cocs = crate::collect_main_header_coc(&stream, cs.header.bytes_consumed, 2)
+            .expect("collect coc");
+        assert_eq!(cocs.len(), 1);
+        assert_eq!(cocs[0].component_index, 1);
+        assert_eq!(cocs[0].decomposition_levels, 1);
+        let qccs = crate::collect_main_header_qcc(&stream, cs.header.bytes_consumed, 2)
+            .expect("collect qcc");
+        assert_eq!(qccs.len(), 1, "NL change implies a QCC band-list change");
+    }
+
+    #[test]
+    fn override_code_block_size_round_trips() {
+        let a = noise(48, 32, 0xC0C0_0003);
+        let b = noise(48, 32, 0xC0C0_0004);
+        let params = EncodeParams {
+            decomposition_levels: 2,
+            code_block_exp: (5, 5),
+            component_overrides: vec![ComponentOverride {
+                code_block_exp: Some((2, 3)),
+                ..ov(0)
+            }],
+            ..EncodeParams::default()
+        };
+        let stream = roundtrip_params(&[&a, &b], 48, 32, &params);
+        let cs = crate::parse_codestream(&stream).expect("parse");
+        let cocs = crate::collect_main_header_coc(&stream, cs.header.bytes_consumed, 2)
+            .expect("collect coc");
+        assert_eq!(cocs[0].code_block_width_exp, 0, "xcb − 2 on the wire");
+        assert_eq!(cocs[0].code_block_height_exp, 1);
+        let qccs = crate::collect_main_header_qcc(&stream, cs.header.bytes_consumed, 2)
+            .expect("collect qcc");
+        assert!(qccs.is_empty(), "code-block size alone changes no QCC");
+    }
+
+    #[test]
+    fn override_precincts_per_component_round_trips() {
+        // Tile-wide partition, component 1 opts into a different one
+        // and component 2 forces maximum precincts (Some(vec![])).
+        let a = noise(64, 48, 0xC0C0_0005);
+        let b = noise(64, 48, 0xC0C0_0006);
+        let c = noise(64, 48, 0xC0C0_0007);
+        let params = EncodeParams {
+            decomposition_levels: 2,
+            code_block_exp: (2, 2),
+            precincts: vec![0x22, 0x33, 0x33],
+            component_overrides: vec![
+                ComponentOverride {
+                    precincts: Some(vec![0x33, 0x44, 0x44]),
+                    ..ov(1)
+                },
+                ComponentOverride {
+                    precincts: Some(Vec::new()),
+                    ..ov(2)
+                },
+            ],
+            ..EncodeParams::default()
+        };
+        roundtrip_params(&[&a, &b, &c], 64, 48, &params);
+    }
+
+    #[test]
+    fn override_mixed_kernels_no_mct() {
+        // Component 0 stays reversible 5-3 (bit-exact), component 1
+        // codes through the 9-7 with Annex E quantisation (±1 at
+        // fine_bits = 6) — different kernels per component, MCT off.
+        let a = noise(40, 40, 0xC0C0_0008);
+        let b = noise(40, 40, 0xC0C0_0009);
+        let params = EncodeParams {
+            decomposition_levels: 2,
+            code_block_exp: (4, 4),
+            component_overrides: vec![ComponentOverride {
+                kernel: Some(EncodeKernel::Lossy9x7 { fine_bits: 6 }),
+                ..ov(1)
+            }],
+            ..EncodeParams::default()
+        };
+        let stream = encode_j2k(&[&a, &b], 40, 40, &params).expect("encode");
+        let img = decode_j2k(&stream).expect("decode");
+        let got0: Vec<u8> = img.components[0].samples.iter().map(|&s| s as u8).collect();
+        assert_eq!(got0, a, "5-3 component stays bit-exact");
+        let max_err = img.components[1]
+            .samples
+            .iter()
+            .zip(b.iter())
+            .map(|(&got, &want)| (got - i32::from(want)).unsigned_abs())
+            .max()
+            .unwrap();
+        assert!(max_err <= 1, "9-7 component within step bound: {max_err}");
+        // Wire shape: the COC flips the Table A.20 kernel byte and a
+        // QCC switches component 1 to the scalar-expounded style.
+        let cs = crate::parse_codestream(&stream).expect("parse");
+        let cocs = crate::collect_main_header_coc(&stream, cs.header.bytes_consumed, 2)
+            .expect("collect coc");
+        assert_eq!(cocs[0].transform, crate::WaveletTransform::Irreversible9x7);
+        let qccs = crate::collect_main_header_qcc(&stream, cs.header.bytes_consumed, 2)
+            .expect("collect qcc");
+        assert_eq!(qccs.len(), 1);
+    }
+
+    #[test]
+    fn override_composes_with_stack() {
+        // NL + cb + kernel overrides across 4 tiles, 2 layers, SOP/EPH,
+        // sub-sampled component, RLCP.
+        let w = 48u32;
+        let h = 32u32;
+        let a = noise(w, h, 0xC0C0_000A);
+        let b = noise(24, 16, 0xC0C0_000B);
+        let params = EncodeParams {
+            decomposition_levels: 2,
+            code_block_exp: (4, 4),
+            progression: crate::ProgressionOrder::Rlcp,
+            layers: 2,
+            tile_size: Some((24, 16)),
+            sub_sampling: vec![(1, 1), (2, 2)],
+            sop: true,
+            eph: true,
+            component_overrides: vec![ComponentOverride {
+                decomposition_levels: Some(1),
+                code_block_exp: Some((3, 3)),
+                ..ov(1)
+            }],
+            ..EncodeParams::default()
+        };
+        roundtrip_subsampled(&[&a, &b], w, h, &params);
+    }
+
+    #[test]
+    fn override_with_rct_composes() {
+        // §G.2 RCT plus an NL override on component 2: the chroma QCC
+        // must carry both the +1 dynamic-range exponents *and* the
+        // overridden band count.
+        let w = 32u32;
+        let h = 24u32;
+        let r = noise(w, h, 0xC0C0_000C);
+        let g: Vec<u8> = r.iter().map(|&v| v.wrapping_add(7)).collect();
+        let b: Vec<u8> = r.iter().map(|&v| v ^ 0x21).collect();
+        let params = EncodeParams {
+            decomposition_levels: 3,
+            code_block_exp: (4, 4),
+            mct: true,
+            component_overrides: vec![ComponentOverride {
+                decomposition_levels: Some(1),
+                ..ov(2)
+            }],
+            ..EncodeParams::default()
+        };
+        let stream = roundtrip_params(&[&r, &g, &b], w, h, &params);
+        let cs = crate::parse_codestream(&stream).expect("parse");
+        let qccs = crate::collect_main_header_qcc(&stream, cs.header.bytes_consumed, 3)
+            .expect("collect qcc");
+        // Components 1 and 2 (RCT chroma), component 2 with 1 level.
+        assert_eq!(qccs.len(), 2);
+    }
+
+    #[test]
+    fn override_validation() {
+        let p = vec![0u8; 16 * 16];
+        let base = EncodeParams {
+            decomposition_levels: 2,
+            code_block_exp: (4, 4),
+            ..EncodeParams::default()
+        };
+        // Component index out of range.
+        let bad1 = EncodeParams {
+            component_overrides: vec![ov(1)],
+            ..base.clone()
+        };
+        assert!(encode_j2k(&[&p], 16, 16, &bad1).is_err());
+        // Two overrides for one component.
+        let bad2 = EncodeParams {
+            component_overrides: vec![ov(0), ov(0)],
+            ..base.clone()
+        };
+        assert!(encode_j2k(&[&p], 16, 16, &bad2).is_err());
+        // Kernel override diverging under MCT.
+        let bad3 = EncodeParams {
+            mct: true,
+            component_overrides: vec![ComponentOverride {
+                kernel: Some(EncodeKernel::Lossy9x7 { fine_bits: 6 }),
+                ..ov(1)
+            }],
+            ..base.clone()
+        };
+        assert!(encode_j2k(&[&p, &p, &p], 16, 16, &bad3).is_err());
+        // NL override with an inherited tile-wide partition that no
+        // longer fits the component's NL + 1 byte count.
+        let bad4 = EncodeParams {
+            precincts: vec![0x22, 0x33, 0x33],
+            component_overrides: vec![ComponentOverride {
+                decomposition_levels: Some(1),
+                ..ov(0)
+            }],
+            ..base.clone()
+        };
+        assert!(encode_j2k(&[&p], 16, 16, &bad4).is_err());
+        // Override precincts of the wrong length for the effective NL.
+        let bad5 = EncodeParams {
+            component_overrides: vec![ComponentOverride {
+                precincts: Some(vec![0x33, 0x33]),
+                ..ov(0)
+            }],
+            ..base
+        };
+        assert!(encode_j2k(&[&p], 16, 16, &bad5).is_err());
     }
 
     #[test]
