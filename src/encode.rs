@@ -390,24 +390,36 @@ fn band_synthesis_weight(reversible: bool, nl: u8, r: u8, orientation: SubBandOr
 /// for the block's sub-band. Returns `None` for an all-zero block (not
 /// included in any packet).
 ///
-/// When `pass_rates` is `true` the returned block also carries the
-/// Annex J.13.4 truncation-point rates `R^n` — for each pass `n`
-/// (1-based) the byte length a §C.2.9-terminated segment covering
-/// passes `1..=n` would have, obtained by flushing a snapshot of the
-/// encoder state at that pass boundary. Multi-layer assembly cuts the
-/// final segment at these lengths, so a decoder that stops after an
-/// intermediate layer holds (almost exactly) the terminated prefix the
-/// snapshot would have produced.
+/// What [`encode_code_block`] captures at each pass boundary, plus an
+/// optional cap on the coded pass count (used by the PCRD re-encode to
+/// terminate exactly at a truncation point).
+#[derive(Debug, Clone, Copy, Default)]
+struct PassCapture {
+    /// Record the Annex J.13.4 truncation-point rates `R^n` — for each
+    /// pass `n` (1-based) the byte length a §C.2.9-terminated segment
+    /// covering passes `1..=n` would have, obtained by flushing a
+    /// snapshot of the encoder state at that pass boundary. Multi-layer
+    /// assembly cuts the final segment at these lengths, so a decoder
+    /// that stops after an intermediate layer holds (almost exactly)
+    /// the terminated prefix the snapshot would have produced.
+    rates: bool,
+    /// Record the Annex J.13.4 per-pass distortions `D^n`.
+    dist: bool,
+    /// Encode only the first `n` passes of the §D.3 schedule.
+    max_passes: Option<u32>,
+}
+
 fn encode_code_block(
     orientation: SubBandOrientation,
     width: usize,
     height: usize,
     targets: &[Coefficient],
     mb: u32,
-    pass_rates: bool,
-    pass_dist: bool,
-    max_passes: Option<u32>,
+    capture: PassCapture,
 ) -> Result<Option<EncodedBlock>, Error> {
+    let pass_rates = capture.rates;
+    let pass_dist = capture.dist;
+    let max_passes = capture.max_passes;
     let maxmag = targets.iter().map(|c| c.magnitude).max().unwrap_or(0);
     if maxmag == 0 {
         return Ok(None);
@@ -1016,9 +1028,11 @@ pub fn encode_j2k(
                             bh,
                             &targets,
                             mb,
-                            want_rates,
-                            rate_control,
-                            None,
+                            PassCapture {
+                                rates: want_rates,
+                                dist: rate_control,
+                                max_passes: None,
+                            },
                         )?;
                         if let Some(enc) = &mut enc {
                             zbp[bi] = enc.zero_bit_planes;
@@ -1137,8 +1151,18 @@ pub fn encode_j2k(
                     // truncation pass — same emitted bytes, exact tail.
                     let (o, bw, bh, tg, mb) =
                         enc.reencode.as_ref().expect("rate control keeps context");
-                    let re = encode_code_block(*o, *bw, *bh, tg, *mb, false, false, Some(n_eff))?
-                        .expect("non-empty block re-encodes");
+                    let re = encode_code_block(
+                        *o,
+                        *bw,
+                        *bh,
+                        tg,
+                        *mb,
+                        PassCapture {
+                            max_passes: Some(n_eff),
+                            ..PassCapture::default()
+                        },
+                    )?
+                    .expect("non-empty block re-encodes");
                     debug_assert_eq!(re.bytes.len() as u32, enc.pass_rates[n_eff as usize - 1]);
                     re.bytes
                 } else {
@@ -1435,7 +1459,7 @@ pub fn encode_j2k(
             })
             .collect()
     };
-    if !(max_slope > 0.0) || !min_slope.is_finite() {
+    if max_slope <= 0.0 || !min_slope.is_finite() {
         // Nothing coded anywhere — the minimal stream is the answer.
         return assemble(Some(&vec![0; num_blocks]), true);
     }
