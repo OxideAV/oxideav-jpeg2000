@@ -6,6 +6,29 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 385 (2026-07-03).** **PCRD rate control
+  (`EncodeParams::target_bytes`, T.800 Annex J.13.3 / J.13.4).**
+  Tier-1 now also records per-pass distortions `D^n` under the
+  §E.1.1.2 midpoint-reconstruction model (per-coefficient uncertainty
+  from the completed-plane counts), weighted per J.13.4.1 by the
+  sub-band synthesis-waveform L2 norm — computed by running an impulse
+  through this crate's own 1-D synthesis (`idwt_1d_9x7`, and a
+  linearised §F.4.4 5-3) level by level. Each block's monotone-slope
+  truncation set `N_i` is built per the J.13.3 algorithm from the
+  `(R^n, D^n)` points, and the Equation J-13 Lagrangian threshold λ is
+  bisected (in log space, exact assembled length per probe) to the
+  largest stream not exceeding the budget; truncated blocks are then
+  re-encoded so the emitted codeword segment is exactly
+  §C.2.9-terminated (same length as the recorded `R^n` — asserted).
+  Composes with quality layers (the split divides the retained
+  passes). A budget under the marker + empty-packet floor yields the
+  smallest legal stream. Five tests: budget met within the J.13.3
+  residual (observed ≤ 5 bytes), MSE monotone in budget, generous
+  budget bit-identical to the unconstrained stream, tiny-budget
+  minimal stream, layers + 9-7 composition. Black-box: 40% and 70%
+  budget streams decode through an opaque independent decoder
+  **byte-identically** to this crate's decode (MSE 168 → 4.1).
+
 * **Clean-room round 385 (2026-07-03).** **Quality layers on encode
   (`EncodeParams::layers`, T.800 §B.10 + Annex J.13.2 guidance).**
   Tier-1 now captures the Annex J.13.4 per-pass truncation rates `R^n`

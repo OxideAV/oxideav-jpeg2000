@@ -642,6 +642,14 @@ impl CodeBlock {
         self.zero_bit_planes
     }
 
+    /// Raw per-coefficient completed-plane counts (the iterated half of
+    /// the §D.2.1 `Nb(u, v)`, raster order). The encoder's Annex J.13.4
+    /// distortion estimate reads these between forward coding passes to
+    /// derive each coefficient's midpoint-reconstruction uncertainty.
+    pub(crate) fn decoded_bits_raw(&self) -> &[u32] {
+        &self.decoded_bits
+    }
+
     /// The full per-coefficient §D.2.1 `Nb(u, v)` for reconstruction:
     /// `P + decoded_bits(u, v)` when the §D.3 passes were tracked on
     /// this block, or the supplied `uniform_fallback` when they were
