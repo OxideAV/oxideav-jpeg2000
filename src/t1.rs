@@ -367,6 +367,62 @@ impl<'a> RawBitReader<'a> {
     }
 }
 
+/// §D.6 raw (lazy) bit **writer** — the encode-side mirror of
+/// [`RawBitReader`]. Payload bits are packed MSB-first; after a
+/// produced `0xFF` byte the next byte's most-significant bit is the
+/// stuff bit (forced `0`), so only seven payload bits land in it —
+/// exactly the rule the reader undoes.
+#[derive(Debug, Clone, Default)]
+pub struct RawBitWriter {
+    out: Vec<u8>,
+    /// Bits accumulated into the pending byte (MSB-first).
+    current: u8,
+    /// Number of payload+stuff bits already placed in `current`.
+    filled: u8,
+}
+
+impl RawBitWriter {
+    /// Fresh writer with an empty output buffer.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn start_byte_if_needed(&mut self) {
+        if self.filled == 0 && self.out.last() == Some(&0xFF) {
+            // §D.6 stuff bit: the byte following a 0xFF starts with a
+            // forced 0 in its most-significant position.
+            self.filled = 1;
+        }
+    }
+
+    /// Append one payload bit.
+    pub fn write_bit(&mut self, bit: u8) {
+        self.start_byte_if_needed();
+        self.current |= (bit & 1) << (7 - self.filled);
+        self.filled += 1;
+        if self.filled == 8 {
+            self.out.push(self.current);
+            self.current = 0;
+            self.filled = 0;
+        }
+    }
+
+    /// Terminate the raw codeword segment: zero-pad the pending byte to
+    /// a boundary and return the bytes. A terminated segment never ends
+    /// on `0xFF` (which could emulate a marker prefix against the byte
+    /// that follows it in the packet body) — a trailing `0x00` is
+    /// appended in that corner.
+    pub fn finish(mut self) -> Vec<u8> {
+        if self.filled > 0 {
+            self.out.push(self.current);
+        }
+        if self.out.last() == Some(&0xFF) {
+            self.out.push(0x00);
+        }
+        self.out
+    }
+}
+
 /// Initialise an Annex D context array to the Table D.7 reset states.
 ///
 /// Per Table D.7 every context starts at Table C.2 index 0 / MPS 0
@@ -1138,6 +1194,98 @@ impl CodeBlock {
                     );
                     let bit = ((targets[idx].magnitude >> bitplane) & 1) as u8;
                     encoder.encode(&mut ctx[REFINEMENT_CTX_OFFSET + label as usize], bit);
+                    let mut updated = coef;
+                    if bit == 1 {
+                        updated.magnitude |= weight;
+                    }
+                    updated.already_refined = true;
+                    self.coefficients[idx] = updated;
+                    self.decoded_bits[idx] += 1;
+                }
+            }
+            v0 += 4;
+        }
+    }
+
+    /// Encode one §D.6 **raw-mode** significance-propagation pass — the
+    /// forward counterpart of [`Self::significance_propagation_pass_raw`]:
+    /// same scan and Table D.1 context gate as the AC pass, but the
+    /// magnitude bit and (Equation D-2, no XOR redirection) sign bit go
+    /// straight to a [`RawBitWriter`].
+    pub fn significance_propagation_encode_raw(
+        &mut self,
+        bitplane: u32,
+        targets: &[Coefficient],
+        raw: &mut RawBitWriter,
+    ) {
+        for flag in &mut self.newly_significant {
+            *flag = false;
+        }
+        for flag in &mut self.sp_visited {
+            *flag = false;
+        }
+        let weight: u32 = 1u32 << bitplane;
+        let mut v0 = 0usize;
+        while v0 < self.height {
+            let stripe_h = core::cmp::min(4, self.height - v0);
+            for u in 0..self.width {
+                for dv in 0..stripe_h {
+                    let v = v0 + dv;
+                    let idx = u + v * self.width;
+                    if self.coefficients[idx].sigma {
+                        continue;
+                    }
+                    let label = significance_context_label(
+                        self.orientation,
+                        self.neighbours_in_stripe(u, v, v0, stripe_h),
+                    );
+                    if label == 0 {
+                        continue;
+                    }
+                    let bit = ((targets[idx].magnitude >> bitplane) & 1) as u8;
+                    raw.write_bit(bit);
+                    self.sp_visited[idx] = true;
+                    self.decoded_bits[idx] += 1;
+                    if bit == 1 {
+                        // §D.6 Equation D-2: the sign is one raw bit.
+                        raw.write_bit(targets[idx].sign as u8);
+                        let mut updated = self.coefficients[idx];
+                        updated.magnitude |= weight;
+                        updated.sigma = true;
+                        updated.sign = targets[idx].sign;
+                        self.coefficients[idx] = updated;
+                        self.newly_significant[idx] = true;
+                    }
+                }
+            }
+            v0 += 4;
+        }
+    }
+
+    /// Encode one §D.6 **raw-mode** magnitude-refinement pass — the
+    /// forward counterpart of [`Self::magnitude_refinement_pass_raw`]:
+    /// one raw bit per already-significant coefficient (Table D.4
+    /// contexts play no role in raw mode).
+    pub fn magnitude_refinement_encode_raw(
+        &mut self,
+        bitplane: u32,
+        targets: &[Coefficient],
+        raw: &mut RawBitWriter,
+    ) {
+        let weight: u32 = 1u32 << bitplane;
+        let mut v0 = 0usize;
+        while v0 < self.height {
+            let stripe_h = core::cmp::min(4, self.height - v0);
+            for u in 0..self.width {
+                for dv in 0..stripe_h {
+                    let v = v0 + dv;
+                    let idx = u + v * self.width;
+                    let coef = self.coefficients[idx];
+                    if !coef.sigma || self.newly_significant[idx] {
+                        continue;
+                    }
+                    let bit = ((targets[idx].magnitude >> bitplane) & 1) as u8;
+                    raw.write_bit(bit);
                     let mut updated = coef;
                     if bit == 1 {
                         updated.magnitude |= weight;

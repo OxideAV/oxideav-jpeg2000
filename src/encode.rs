@@ -487,6 +487,12 @@ struct PassCapture {
     dist: bool,
     /// Encode only the first `n` passes of the §D.3 schedule.
     max_passes: Option<u32>,
+    /// §D.6 selective arithmetic-coding bypass (Table A.19 bit 0): the
+    /// SP / MR passes from absolute pass index 10 write raw bits and
+    /// segments terminate per Table D.9.
+    bypass: bool,
+    /// §D.4.2 termination on each coding pass (Table A.19 bit 2).
+    terminate_all: bool,
 }
 
 fn encode_code_block(
@@ -519,7 +525,7 @@ fn encode_code_block(
         return Ok(None);
     }
     let mut enc_block = CodeBlock::new(orientation, width, height);
-    let mut encoder = MqEncoder::new();
+    let encoder = MqEncoder::new();
     let mut ctx = reset_contexts();
     let mut rates: Vec<u32> = Vec::new();
     let mut dists: Vec<f64> = Vec::new();
@@ -551,45 +557,80 @@ fn encode_code_block(
         }
         d
     };
-    let mut coded = 0u32;
-    // One §D.3 schedule step bookkeeping: snapshot the J.13.4 rate and
-    // distortion at every pass boundary.
-    macro_rules! after_pass {
-        () => {{
-            coded += 1;
-            if pass_rates {
-                rates.push(encoder.clone().flush().len() as u32);
-            }
-            if pass_dist {
-                dists.push(dist_of(&enc_block));
-            }
-            coded == limit
-        }};
+    // The coding sink. With the §D.6 selective-AC-bypass style the
+    // SP / MR passes from absolute pass index 10 write raw (lazy) bits
+    // and segment terminations follow Table D.9; with the §D.4.2
+    // "termination on each coding pass" style every pass is its own
+    // terminated segment. The Annex D contexts persist across segment
+    // boundaries (only the coder terminates and restarts) — exactly the
+    // model the decoder's tier-1 driver applies.
+    enum Sink {
+        Mq(MqEncoder),
+        Raw(crate::t1::RawBitWriter),
     }
-    'schedule: {
-        enc_block.cleanup_encode(top, targets, &mut encoder, &mut ctx);
-        if after_pass!() {
-            break 'schedule;
+    let styled = capture.bypass || capture.terminate_all;
+    let mut sink = Sink::Mq(encoder);
+    let mut committed: Vec<u8> = Vec::new();
+    let mut coded = 0u32;
+    for i in 0..limit {
+        // Plane and §D.3 role of absolute pass i: pass 0 is the first
+        // cleanup on the top plane; then SP / MR / cleanup triples.
+        let p = top - i.div_ceil(3);
+        let raw = capture.bypass && crate::packet::bypass_pass_is_raw(i);
+        match (&mut sink, raw) {
+            (Sink::Mq(e), false) => {
+                if i == 0 || (i - 1) % 3 == 2 {
+                    enc_block.cleanup_encode(p, targets, e, &mut ctx);
+                } else if (i - 1) % 3 == 0 {
+                    enc_block.significance_propagation_encode(p, targets, e, &mut ctx);
+                } else {
+                    enc_block.magnitude_refinement_encode(p, targets, e, &mut ctx);
+                }
+            }
+            (Sink::Raw(w), true) => {
+                if (i - 1) % 3 == 0 {
+                    enc_block.significance_propagation_encode_raw(p, targets, w);
+                } else {
+                    enc_block.magnitude_refinement_encode_raw(p, targets, w);
+                }
+            }
+            _ => unreachable!("sink type switches only at terminated boundaries"),
         }
-        for p in (0..top).rev() {
-            enc_block.significance_propagation_encode(p, targets, &mut encoder, &mut ctx);
-            if after_pass!() {
-                break 'schedule;
-            }
-            enc_block.magnitude_refinement_encode(p, targets, &mut encoder, &mut ctx);
-            if after_pass!() {
-                break 'schedule;
-            }
-            enc_block.cleanup_encode(p, targets, &mut encoder, &mut ctx);
-            if after_pass!() {
-                break 'schedule;
+        coded += 1;
+        if pass_rates {
+            let pending = match &sink {
+                Sink::Mq(e) => e.clone().flush().len(),
+                Sink::Raw(w) => w.clone().finish().len(),
+            };
+            rates.push((committed.len() + pending) as u32);
+        }
+        if pass_dist {
+            dists.push(dist_of(&enc_block));
+        }
+        if coded == limit {
+            break;
+        }
+        if styled && crate::packet::bypass_pass_terminated(i, capture.terminate_all) {
+            // Terminate the current codeword segment and open the sink
+            // the next pass needs (Table D.9 / §D.4.2).
+            let old = std::mem::replace(&mut sink, Sink::Mq(MqEncoder::new()));
+            committed.extend_from_slice(&match old {
+                Sink::Mq(e) => e.flush(),
+                Sink::Raw(w) => w.finish(),
+            });
+            if capture.bypass && crate::packet::bypass_pass_is_raw(i + 1) {
+                sink = Sink::Raw(crate::t1::RawBitWriter::new());
             }
         }
     }
     debug_assert_eq!(coded, limit);
-    let bytes = encoder.flush();
+    let mut bytes = committed;
+    bytes.extend_from_slice(&match sink {
+        Sink::Mq(e) => e.flush(),
+        Sink::Raw(w) => w.finish(),
+    });
     if pass_rates {
-        // The last snapshot and the final flush share the same encoder
+        // The last snapshot and the final flush share the same coder
         // state, so they agree; pin it exactly regardless.
         *rates.last_mut().expect("at least one pass") = bytes.len() as u32;
     }
@@ -731,6 +772,17 @@ pub struct EncodeParams {
     /// raster tile order. `None` (the default) encodes one image-sized
     /// tile.
     pub tile_size: Option<(u32, u32)>,
+    /// §D.6 selective arithmetic-coding bypass (Table A.19 code-block
+    /// style bit 0): from bit-plane 5 onward the SP / MR passes emit
+    /// raw (lazy) bits and the code-block carves into the Table D.9
+    /// AC + raw codeword segments. Default `false`.
+    pub bypass: bool,
+    /// §D.4.2 termination on each coding pass (Table A.19 code-block
+    /// style bit 2): every pass is flushed into its own terminated
+    /// codeword segment (composing with `bypass` per the §D.6 prose),
+    /// which makes every layer / rate-control cut land on an exactly
+    /// terminated boundary. Default `false`.
+    pub terminate_all: bool,
 }
 
 impl Default for EncodeParams {
@@ -745,6 +797,8 @@ impl Default for EncodeParams {
             layers: 1,
             target_bytes: None,
             tile_size: None,
+            bypass: false,
+            terminate_all: false,
         }
     }
 }
@@ -1019,7 +1073,10 @@ pub fn encode_j2k(
     use std::collections::BTreeMap;
     let layer_count = params.layers;
     let rate_control = params.target_bytes.is_some();
-    let want_rates = layer_count > 1 || rate_control;
+    // Per-pass rates are needed to split layers, to rate-control, and —
+    // with a termination style — to size each terminated codeword
+    // segment (§B.10.7.2).
+    let want_rates = layer_count > 1 || rate_control || params.bypass || params.terminate_all;
     let mut packets: BTreeMap<(u32, u16, u8, u32), PrecinctRaw> = BTreeMap::new();
     let mut num_blocks = 0usize;
     // Deepest coded depth across all code-blocks (zero-bit-planes plus
@@ -1143,6 +1200,8 @@ pub fn encode_j2k(
                                     rates: want_rates,
                                     dist: rate_control,
                                     max_passes: None,
+                                    bypass: params.bypass,
+                                    terminate_all: params.terminate_all,
                                 },
                             )?;
                             if let Some(enc) = &mut enc {
@@ -1221,10 +1280,13 @@ pub fn encode_j2k(
         let l = u64::from(depth) * u64::from(layer_count) / (u64::from(max_depth) + 1);
         (l as u16).min(layer_count - 1)
     };
+    /// One layer's share of a code-block: passes contributed, byte
+    /// range of the chunk, and the §B.10.7 codeword-segment list
+    /// `(passes, bytes)` the packet header signals for that chunk.
+    type LayerShare = (u32, std::ops::Range<usize>, Vec<(u32, u32)>);
     struct LayeredBlock {
         zero_bit_planes: u32,
-        /// Per layer: passes contributed + byte range of the segment.
-        per_layer: Vec<(u32, std::ops::Range<usize>)>,
+        per_layer: Vec<LayerShare>,
         bytes: Vec<u8>,
     }
     struct PrecinctLayered {
@@ -1279,6 +1341,8 @@ pub fn encode_j2k(
                         *mb,
                         PassCapture {
                             max_passes: Some(n_eff),
+                            bypass: params.bypass,
+                            terminate_all: params.terminate_all,
                             ..PassCapture::default()
                         },
                     )?
@@ -1290,31 +1354,89 @@ pub fn encode_j2k(
                     enc.bytes[..cut].to_vec()
                 };
                 let total = seg.len();
+                // Cumulative byte boundary after each pass (index 0 is
+                // the segment start), clamped monotone with the final
+                // boundary pinned to the real segment length. Every
+                // chunk cut and every signalled §B.10.7 segment length
+                // derives from this one table, so they stay consistent.
+                let mut cum_r = Vec::with_capacity(n_eff as usize + 1);
+                cum_r.push(0usize);
+                for n in 1..=n_eff as usize {
+                    let r = if n == n_eff as usize || enc.pass_rates.is_empty() {
+                        total
+                    } else {
+                        (enc.pass_rates[n - 1] as usize).clamp(cum_r[n - 1], total)
+                    };
+                    cum_r.push(r);
+                }
                 // Count this block's passes per layer.
                 let mut counts = vec![0u32; layer_count as usize];
                 for i in 0..n_eff {
                     let depth = enc.zero_bit_planes + i.div_ceil(3);
                     counts[layer_of_depth(depth) as usize] += 1;
                 }
-                // Cut the segment at the per-pass truncation rates.
+                // §D.6 bypass without full termination: every layer
+                // contribution's final pass is a codeword-segment end on
+                // the reader's Table D.9 span model, so a layer boundary
+                // may only land where the coder actually terminated.
+                // Snap each boundary down to the nearest terminated
+                // pass (or the block start); the displaced passes move
+                // to the following layer.
+                if params.bypass && !params.terminate_all && layer_count > 1 {
+                    let valid = |c: u32| -> bool {
+                        c == 0 || c == n_eff || crate::packet::bypass_pass_terminated(c - 1, false)
+                    };
+                    let mut cum_b = 0u32;
+                    let mut prev_b = 0u32;
+                    for l in 0..counts.len() - 1 {
+                        cum_b += counts[l];
+                        let mut b = cum_b.min(n_eff);
+                        while !valid(b) && b > prev_b {
+                            b -= 1;
+                        }
+                        let b = b.max(prev_b);
+                        counts[l] = b - prev_b;
+                        prev_b = b;
+                        cum_b = b;
+                    }
+                    *counts.last_mut().expect("layer_count >= 1") = n_eff - prev_b;
+                }
+                // Cut the segment at the per-pass truncation rates and
+                // derive each chunk's codeword-segment list: one §B.10.7
+                // length for the plain single-segment layout, or the
+                // Table D.9 / §D.4.2 spans when a termination style is
+                // signalled (span boundaries land on the terminated
+                // passes, where `cum_r` is exact by construction).
+                let styled = params.bypass || params.terminate_all;
                 let mut per_layer = Vec::with_capacity(layer_count as usize);
                 let mut cum = 0u32;
-                let mut prev = 0usize;
                 let mut first = None;
                 for (l, &p) in counts.iter().enumerate() {
                     if p > 0 && first.is_none() {
                         first = Some(l);
                     }
+                    let start = cum;
                     cum += p;
-                    let end = if p == 0 {
-                        prev
-                    } else if cum == n_eff {
-                        total
-                    } else {
-                        (enc.pass_rates[cum as usize - 1] as usize).clamp(prev, total)
-                    };
-                    per_layer.push((p, prev..end));
-                    prev = end;
+                    let (b0, b1) = (cum_r[start as usize], cum_r[cum as usize]);
+                    let mut segs: Vec<(u32, u32)> = Vec::new();
+                    if p > 0 {
+                        if styled {
+                            let spans =
+                                crate::packet::bypass_segment_spans(start, p, params.terminate_all);
+                            let mut at = start;
+                            for (span_passes, _raw) in spans {
+                                let e = at + span_passes;
+                                segs.push((
+                                    span_passes,
+                                    (cum_r[e as usize] - cum_r[at as usize]) as u32,
+                                ));
+                                at = e;
+                            }
+                        } else {
+                            segs.push((p, (b1 - b0) as u32));
+                        }
+                    }
+                    per_layer.push((p, b0..b1, segs));
                 }
                 first_layers[sb_idx][bi] = first.expect("n_eff > 0 has a first layer") as u32;
                 blocks.push(Some(LayeredBlock {
@@ -1356,23 +1478,23 @@ pub fn encode_j2k(
                             included: false,
                             zero_bit_planes: 0,
                             coding_passes: 0,
-                            segment_length: 0,
+                            segments: Vec::new(),
                         }),
                         Some(lb) => {
-                            let (p, range) = &lb.per_layer[desc.layer as usize];
+                            let (p, range, segs) = &lb.per_layer[desc.layer as usize];
                             if *p == 0 {
                                 plans.push(CodeBlockPlan {
                                     included: false,
                                     zero_bit_planes: lb.zero_bit_planes,
                                     coding_passes: 0,
-                                    segment_length: 0,
+                                    segments: Vec::new(),
                                 });
                             } else {
                                 plans.push(CodeBlockPlan {
                                     included: true,
                                     zero_bit_planes: lb.zero_bit_planes,
                                     coding_passes: *p,
-                                    segment_length: range.len() as u32,
+                                    segments: segs.clone(),
                                 });
                                 body.extend_from_slice(&lb.bytes[range.clone()]);
                             }
@@ -1437,8 +1559,11 @@ pub fn encode_j2k(
             nl,                         // SPcod: NL
             xcb - 2,                    // SPcod: xcb − 2
             ycb - 2,                    // SPcod: ycb − 2
-            0,                          // SPcod: code-block style
-            transform_byte,             // SPcod: transform (Table A.20)
+            // SPcod code-block style (Table A.19): bit 0 = §D.6
+            // selective AC bypass, bit 2 = §D.4.2 termination on each
+            // coding pass.
+            u8::from(params.bypass) | (u8::from(params.terminate_all) << 2),
+            transform_byte, // SPcod: transform (Table A.20)
         ];
         cod_payload.extend_from_slice(&params.precincts); // Table A.21
         push_segment(&mut out, MARKER_COD, &cod_payload);
@@ -2349,6 +2474,139 @@ mod tests {
             ..EncodeParams::default()
         };
         assert!(encode_j2k(&[&p], 4, 4, &params).is_err());
+    }
+
+    // -- §D.6 bypass + §D.4.2 termination styles on encode ---------------
+
+    #[test]
+    fn terminate_each_pass_round_trips() {
+        // Table A.19 bit 2: every pass its own terminated segment; the
+        // packet header signals one length per pass (§B.10.7.2).
+        let p = noise(48, 40, 0x7E57_7E57);
+        let params = EncodeParams {
+            decomposition_levels: 2,
+            code_block_exp: (4, 4),
+            terminate_all: true,
+            ..EncodeParams::default()
+        };
+        let stream = roundtrip_params(&[&p], 48, 40, &params);
+        let header = crate::parse_j2k_header(&stream).expect("header");
+        assert!(header
+            .cod
+            .code_block_style_flags()
+            .termination_on_each_coding_pass());
+        // Per-pass termination costs bytes vs the single-segment stream.
+        let plain = encode_j2k(
+            &[&p],
+            48,
+            40,
+            &EncodeParams {
+                decomposition_levels: 2,
+                code_block_exp: (4, 4),
+                ..EncodeParams::default()
+            },
+        )
+        .unwrap();
+        assert!(stream.len() > plain.len());
+    }
+
+    #[test]
+    fn bypass_round_trips_lossless_and_lossy() {
+        // Table A.19 bit 0: noise codes ~9-10 planes per block, so the
+        // raw region (absolute pass 10 onward) is well exercised on the
+        // SP / MR passes while cleanups stay AC.
+        let p = noise(48, 48, 0xB1FA_55E5);
+        for kernel in [
+            EncodeKernel::Lossless5x3,
+            EncodeKernel::Lossy9x7 { fine_bits: 6 },
+        ] {
+            let params = EncodeParams {
+                decomposition_levels: 2,
+                code_block_exp: (4, 4),
+                kernel,
+                bypass: true,
+                ..EncodeParams::default()
+            };
+            let stream = encode_j2k(&[&p], 48, 48, &params).expect("encode");
+            let header = crate::parse_j2k_header(&stream).expect("header");
+            assert!(header
+                .cod
+                .code_block_style_flags()
+                .selective_arithmetic_coding_bypass());
+            let img = decode_j2k(&stream).expect("decode bypass stream");
+            let max_err = img.components[0]
+                .samples
+                .iter()
+                .zip(p.iter())
+                .map(|(&got, &want)| (got - i32::from(want)).unsigned_abs())
+                .max()
+                .unwrap();
+            match kernel {
+                EncodeKernel::Lossless5x3 => assert_eq!(max_err, 0, "bypass lossless"),
+                EncodeKernel::Lossy9x7 { .. } => {
+                    assert!(max_err <= 1, "bypass lossy error {max_err}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bypass_composes_with_terminate_all() {
+        // §D.6 prose: with bit 2 set every pass terminates, including
+        // both raw passes.
+        let p = noise(40, 32, 0xC0DE_C0DE);
+        let params = EncodeParams {
+            decomposition_levels: 1,
+            code_block_exp: (4, 4),
+            bypass: true,
+            terminate_all: true,
+            ..EncodeParams::default()
+        };
+        roundtrip_params(&[&p], 40, 32, &params);
+    }
+
+    #[test]
+    fn bypass_with_layers_and_tiles_round_trips() {
+        // Layer cuts land after cleanup passes — terminated boundaries
+        // in the bypass region — across a 2x2 tile grid.
+        let p = noise(64, 64, 0x600D_600D);
+        let params = EncodeParams {
+            decomposition_levels: 2,
+            code_block_exp: (4, 4),
+            bypass: true,
+            layers: 3,
+            tile_size: Some((32, 32)),
+            ..EncodeParams::default()
+        };
+        roundtrip_params(&[&p], 64, 64, &params);
+    }
+
+    #[test]
+    fn terminate_all_with_rate_control() {
+        // Termination styles compose with PCRD truncation (every
+        // boundary is exactly terminated).
+        let p = noise(64, 48, 0x0FF5_0FF5);
+        let base = EncodeParams {
+            decomposition_levels: 2,
+            code_block_exp: (4, 4),
+            terminate_all: true,
+            ..EncodeParams::default()
+        };
+        let full = encode_j2k(&[&p], 64, 48, &base).unwrap();
+        let target = full.len() * 6 / 10;
+        let rc = encode_j2k(
+            &[&p],
+            64,
+            48,
+            &EncodeParams {
+                target_bytes: Some(target),
+                ..base
+            },
+        )
+        .unwrap();
+        assert!(rc.len() <= target);
+        let img = decode_j2k(&rc).expect("decode");
+        assert_eq!(img.components[0].samples.len(), 64 * 48);
     }
 
     // -- Annex J.13.3 PCRD rate control ---------------------------------

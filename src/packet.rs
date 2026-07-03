@@ -1692,6 +1692,58 @@ pub fn encode_segment_length(
     writer.write_bits(length, (state.lblock + extra) as u8);
 }
 
+/// Encode the §B.10.7 codeword-segment length sequence of one
+/// code-block contribution — the write-side counterpart of the
+/// [`SegmentSplit`]-driven reads in [`decode_packet_header`].
+///
+/// `segments` lists `(passes_in_segment, byte_length)` per codeword
+/// segment in coding order: one entry for the [`SegmentSplit::Single`]
+/// layout, one per pass for [`SegmentSplit::PerPass`], and one per
+/// Table D.9 span for [`SegmentSplit::Bypass`] (the caller derives the
+/// spans with the same rule the reader uses). Per §B.10.7.2 the
+/// increase-`Lblock` prefix is signalled **once** before the first
+/// length, with `k` chosen minimal so *every* length fits its
+/// `Lblock + ⌊log2 passes⌋` field; the reader's per-length prefix reads
+/// then see "no further increase" zero bits, which
+/// [`decode_segment_length`] / the multi-segment reads consume
+/// transparently... except that the reader reads the prefix only once
+/// too, so the writer emits exactly one prefix. `state` updates in
+/// lock-step with the reader.
+pub fn encode_segment_lengths(
+    state: &mut LblockState,
+    segments: &[(u32, u32)],
+    writer: &mut PacketBitWriter,
+) {
+    let width_extra = |p: u32| -> u32 {
+        if p <= 1 {
+            0
+        } else {
+            p.ilog2()
+        }
+    };
+    // Minimal k so every length fits (and no field exceeds 32 bits).
+    let mut k = 0u32;
+    for &(p, len) in segments {
+        let needed = if len == 0 {
+            1
+        } else {
+            32 - len.leading_zeros()
+        };
+        let have = state.lblock + width_extra(p);
+        if needed > have + k {
+            k = needed - have;
+        }
+    }
+    for _ in 0..k {
+        writer.write_bit(1);
+    }
+    writer.write_bit(0);
+    state.lblock += k;
+    for &(p, len) in segments {
+        writer.write_bits(len, (state.lblock + width_extra(p)) as u8);
+    }
+}
+
 /// One code-block's contribution to a packet, on the **encode** side —
 /// the write-side counterpart of [`CodeBlockContribution`]. Blocks are
 /// listed in the §B.10.8 order (per sub-band, raster within the
@@ -1710,9 +1762,13 @@ pub struct CodeBlockPlan {
     /// Number of coding passes contributed in this packet (§B.10.6).
     /// Must be ≥ 1 when `included`.
     pub coding_passes: u32,
-    /// Byte length of the single codeword segment contributed
-    /// (§B.10.7.1, `SegmentSplit::Single` layout).
-    pub segment_length: u32,
+    /// The contribution's codeword segments, `(passes_in_segment,
+    /// byte_length)` in coding order (§B.10.7): a single entry spanning
+    /// all `coding_passes` under [`SegmentSplit::Single`], one entry
+    /// per pass under [`SegmentSplit::PerPass`], one per Table D.9 span
+    /// under [`SegmentSplit::Bypass`]. The pass counts must sum to
+    /// `coding_passes`.
+    pub segments: Vec<(u32, u32)>,
 }
 
 /// Per-precinct **encoder** state carried across the packets (layers)
@@ -1840,12 +1896,7 @@ pub fn encode_packet_header(
                 }
                 sb.already_included[idx] = true;
                 encode_coding_passes(plan.coding_passes, &mut writer);
-                encode_segment_length(
-                    &mut sb.lblock[idx],
-                    plan.coding_passes,
-                    plan.segment_length,
-                    &mut writer,
-                );
+                encode_segment_lengths(&mut sb.lblock[idx], &plan.segments, &mut writer);
             }
         }
     }
@@ -3040,7 +3091,7 @@ mod tests {
                 included: true,
                 zero_bit_planes: zbp[i],
                 coding_passes: (i as u32 % 3) + 1,
-                segment_length: 10 + 40 * i as u32,
+                segments: vec![((i as u32 % 3) + 1, 10 + 40 * i as u32)],
             })
             .collect();
         let mut enc_state = PrecinctEncoderState::new(&[(geom, first_layer, zbp.clone())]);
@@ -3065,7 +3116,7 @@ mod tests {
             assert!(c.included, "block {i}");
             assert_eq!(c.zero_bit_planes, Some(zbp[i]), "P block {i}");
             assert_eq!(c.coding_passes, plans[i].coding_passes, "passes {i}");
-            assert_eq!(c.segment_lengths, vec![plans[i].segment_length]);
+            assert_eq!(c.segment_lengths, vec![plans[i].segments[0].1]);
         }
         assert_eq!(hdr.bytes_consumed, header_bytes.len());
     }
@@ -3123,7 +3174,11 @@ mod tests {
                     included,
                     zero_bit_planes: all_zbp[i],
                     coding_passes: passes,
-                    segment_length: seg,
+                    segments: if included {
+                        vec![(passes, seg)]
+                    } else {
+                        Vec::new()
+                    },
                 });
                 layer_truth.push((
                     included,
@@ -3180,7 +3235,7 @@ mod tests {
             included: false,
             zero_bit_planes: 0,
             coding_passes: 0,
-            segment_length: 0,
+            segments: Vec::new(),
         }];
         let bytes = encode_packet_header(&mut enc_state, 0, &plans);
         assert_eq!(bytes.len(), 1);

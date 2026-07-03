@@ -6,6 +6,30 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 385 (2026-07-03).** **§D.6 selective AC bypass +
+  §D.4.2 termination-on-each-pass on encode** (`EncodeParams::bypass` /
+  `terminate_all`, Table A.19 bits 0 / 2). Tier-1 gained a segmented
+  scheduler: with a termination style each codeword segment is flushed
+  where Table D.9 / §D.4.2 terminate, and with bypass the SP / MR
+  passes from absolute pass 10 write through a new §D.6 `RawBitWriter`
+  (stuff bit after every 0xFF, zero-padded termination that never ends
+  on 0xFF) via new raw-mode forward SP / MR passes, while cleanups
+  stay MQ and the Annex D contexts persist across all segment
+  boundaries. The tier-2 writer generalised to the §B.10.7.2
+  multi-segment length sequence (`CodeBlockPlan::segments` +
+  `encode_segment_lengths`: one increase-Lblock prefix sized so every
+  length fits its `Lblock + ⌊log2 passes⌋` field), and each layer
+  contribution's segment list derives from one per-pass cumulative
+  boundary table so chunks and signalled lengths always agree. Layer
+  boundaries under bypass snap to terminated passes (the reader's
+  Table D.9 span model makes every contribution end a segment end).
+  Composes with layers, tiles and PCRD. Five tests: terminate-all
+  (with per-pass overhead check), bypass lossless + 9-7, bypass x
+  terminate-all, bypass x layers x tiles, terminate-all x rate
+  control. Black-box: terminate-all, bypass, bypass+terminate-all and
+  3-layer-bypass streams all decode through an opaque independent
+  decoder **byte-identically** to this crate's decode.
+
 * **Clean-room round 385 (2026-07-03).** **Multi-tile encode
   (`EncodeParams::tile_size`, T.800 §B.3) + two decoder fixes the new
   geometry exposed.** The encoder now partitions the image into an
