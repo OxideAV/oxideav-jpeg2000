@@ -17,16 +17,19 @@
 //!   `SOD`, `EOC`) assembled in the §A.3 codestream order.
 //!
 //! The produced codestream is a Part-1 J2K stream: single tile at the
-//! reference-grid origin, one quality layer, LRCP progression, maximum
-//! precincts (`PPx = PPy = 15`), no MCT, the reversible 5-3 kernel, and
-//! the "no quantization" style (T.800 Table A.28 style 0) — i.e. fully
-//! **lossless**: decoding reproduces the input samples bit-exactly.
+//! reference-grid origin, one quality layer, any of the five §B.12.1
+//! progression orders ([`EncodeParams::progression`]), maximum
+//! precincts (`PPx = PPy = 15`), optional Table A.17 MCT, and either
+//! the reversible 5-3 kernel with the "no quantization" style (T.800
+//! Table A.28 style 0 — fully **lossless**: decoding reproduces the
+//! input samples bit-exactly) or the irreversible 9-7 kernel with
+//! Annex E scalar-expounded quantisation.
 //!
 //! The geometry (tile / resolution-level / precinct / code-block
 //! enumeration) is obtained from the same [`crate::geometry`] functions
 //! the decoder uses, so the encoder's packet layout agrees with the
-//! decoder's walk by construction; packets are emitted in the order
-//! [`crate::progression::lrcp_packet_order`] enumerates them.
+//! decoder's walk by construction; packets are emitted in the order the
+//! [`crate::progression`] drivers enumerate them.
 //!
 //! ## Quantisation exponents
 //!
@@ -56,11 +59,14 @@ use crate::mqenc::MqEncoder;
 use crate::packet::{
     encode_packet_header, CodeBlockPlan, PrecinctEncoderState, SubBandEncoderPlan, SubBandGeometry,
 };
-use crate::progression::{lrcp_packet_order, ComponentProgressionInfo};
+use crate::progression::{
+    cprl_packet_order, lrcp_packet_order, pcrl_packet_order, rlcp_packet_order, rpcl_packet_order,
+    ComponentPositionInfo, ComponentProgressionInfo, ResolutionPrecinctLayout,
+};
 use crate::t1::{reset_contexts, CodeBlock, Coefficient};
 use crate::{
-    Error, Siz, SizComponent, MARKER_COD, MARKER_EOC, MARKER_QCD, MARKER_SIZ, MARKER_SOC,
-    MARKER_SOD, MARKER_SOT,
+    Error, ProgressionOrder, Siz, SizComponent, MARKER_COD, MARKER_EOC, MARKER_QCD, MARKER_SIZ,
+    MARKER_SOC, MARKER_SOD, MARKER_SOT,
 };
 
 /// Guard-bit count `G` signalled in `Sqcd` (Table A.28) and used in the
@@ -357,27 +363,72 @@ pub fn encode_j2k_lossless(
     nl: u8,
     cb_exp: (u8, u8),
 ) -> Result<Vec<u8>, Error> {
-    encode_impl(
+    encode_j2k(
         planes,
         width,
         height,
-        nl,
-        cb_exp,
-        EncodeKernel::Lossless5x3,
-        false,
+        &EncodeParams {
+            decomposition_levels: nl,
+            code_block_exp: cb_exp,
+            ..EncodeParams::default()
+        },
     )
 }
 
 /// How the encoder transforms and quantises the sample planes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EncodeKernel {
+pub enum EncodeKernel {
     /// Reversible 5-3, Table A.28 style 0 (no quantization) — lossless.
     Lossless5x3,
     /// Irreversible 9-7 with Annex E scalar-expounded quantisation
     /// (Table A.28 style 2) — lossy. `fine_bits` sets the uniform step
     /// `Δb = 2^(−fine_bits)` via `εb = Rb + fine_bits` (µb = 0): larger
-    /// is finer / nearer-lossless, `0` is a coarse `Δb = 1`.
-    Lossy9x7 { fine_bits: u8 },
+    /// is finer / nearer-lossless (0..=8), `0` is a coarse `Δb = 1`.
+    Lossy9x7 {
+        /// Uniform quantisation-step fineness: `Δb = 2^(−fine_bits)`.
+        fine_bits: u8,
+    },
+}
+
+/// Structured encoder parameters — the T.800 §A.6.1 COD fields the
+/// encoder honours, with spec-shaped defaults.
+///
+/// Build one with [`EncodeParams::default`] and override the fields of
+/// interest, then call [`encode_j2k`]. The convenience wrappers
+/// ([`encode_j2k_lossless`], [`encode_j2k_lossless_rct`],
+/// [`encode_j2k_lossy`], [`encode_j2k_lossy_ict`]) construct one
+/// internally.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncodeParams {
+    /// `NL` — wavelet decomposition levels (SPcod, Table A.15;
+    /// `0..=32`). Default `3`.
+    pub decomposition_levels: u8,
+    /// `(xcb, ycb)` — real code-block exponents (Table A.18: each
+    /// `2..=10`, sum ≤ 12). Default `(6, 6)` (64×64 code-blocks).
+    pub code_block_exp: (u8, u8),
+    /// Wavelet kernel + quantisation family (Table A.20 / Table A.28).
+    /// Default [`EncodeKernel::Lossless5x3`].
+    pub kernel: EncodeKernel,
+    /// `SGcod` multiple-component-transformation flag (Table A.17):
+    /// pairs the §G.2 RCT with the 5-3 kernel and the §G.3.1 ICT with
+    /// the 9-7 kernel, across components 0–2 (requires exactly three
+    /// planes). Default `false`.
+    pub mct: bool,
+    /// `SGcod` progression order (Table A.16) the tile's packets are
+    /// emitted in — any of the five §B.12.1 orders. Default LRCP.
+    pub progression: ProgressionOrder,
+}
+
+impl Default for EncodeParams {
+    fn default() -> Self {
+        EncodeParams {
+            decomposition_levels: 3,
+            code_block_exp: (6, 6),
+            kernel: EncodeKernel::Lossless5x3,
+            mct: false,
+            progression: ProgressionOrder::Lrcp,
+        }
+    }
 }
 
 /// Encode 8-bit unsigned component planes into a **lossy** Part-1 J2K
@@ -397,17 +448,16 @@ pub fn encode_j2k_lossy(
     cb_exp: (u8, u8),
     fine_bits: u8,
 ) -> Result<Vec<u8>, Error> {
-    if fine_bits > 8 {
-        return Err(Error::NotImplemented);
-    }
-    encode_impl(
+    encode_j2k(
         planes,
         width,
         height,
-        nl,
-        cb_exp,
-        EncodeKernel::Lossy9x7 { fine_bits },
-        false,
+        &EncodeParams {
+            decomposition_levels: nl,
+            code_block_exp: cb_exp,
+            kernel: EncodeKernel::Lossy9x7 { fine_bits },
+            ..EncodeParams::default()
+        },
     )
 }
 
@@ -433,17 +483,17 @@ pub fn encode_j2k_lossy_ict(
     cb_exp: (u8, u8),
     fine_bits: u8,
 ) -> Result<Vec<u8>, Error> {
-    if fine_bits > 8 {
-        return Err(Error::NotImplemented);
-    }
-    encode_impl(
+    encode_j2k(
         planes.as_slice(),
         width,
         height,
-        nl,
-        cb_exp,
-        EncodeKernel::Lossy9x7 { fine_bits },
-        true,
+        &EncodeParams {
+            decomposition_levels: nl,
+            code_block_exp: cb_exp,
+            kernel: EncodeKernel::Lossy9x7 { fine_bits },
+            mct: true,
+            ..EncodeParams::default()
+        },
     )
 }
 
@@ -465,27 +515,38 @@ pub fn encode_j2k_lossless_rct(
     nl: u8,
     cb_exp: (u8, u8),
 ) -> Result<Vec<u8>, Error> {
-    encode_impl(
+    encode_j2k(
         planes.as_slice(),
         width,
         height,
-        nl,
-        cb_exp,
-        EncodeKernel::Lossless5x3,
-        true,
+        &EncodeParams {
+            decomposition_levels: nl,
+            code_block_exp: cb_exp,
+            mct: true,
+            ..EncodeParams::default()
+        },
     )
 }
 
-fn encode_impl(
+/// Encode 8-bit unsigned component planes (all `width × height`, 1:1
+/// sub-sampling) into a Part-1 J2K codestream per `params`.
+///
+/// * `planes` — one row-major `width * height` sample plane per
+///   component (1..=16384 components; every plane the same size).
+///
+/// With the (default) reversible 5-3 kernel the output decodes back
+/// **bit-exactly**; the 9-7 kernel quantises per Annex E. See
+/// [`EncodeParams`] for the coding-style knobs.
+pub fn encode_j2k(
     planes: &[&[u8]],
     width: u32,
     height: u32,
-    nl: u8,
-    cb_exp: (u8, u8),
-    kernel: EncodeKernel,
-    mct: bool,
+    params: &EncodeParams,
 ) -> Result<Vec<u8>, Error> {
-    let (xcb, ycb) = cb_exp;
+    let nl = params.decomposition_levels;
+    let (xcb, ycb) = params.code_block_exp;
+    let kernel = params.kernel;
+    let mct = params.mct;
     // Table A.17: MCT = 1 pairs the §G.2 RCT with the 5-3 kernel and
     // the §G.3.1 ICT with the 9-7 kernel, always across components 0–2.
     let use_rct = mct && matches!(kernel, EncodeKernel::Lossless5x3);
@@ -493,6 +554,20 @@ fn encode_impl(
     if mct && planes.len() != 3 {
         return Err(Error::NotImplemented);
     }
+    if let EncodeKernel::Lossy9x7 { fine_bits } = kernel {
+        if fine_bits > 8 {
+            return Err(Error::NotImplemented);
+        }
+    }
+    // Table A.16: only the five defined §B.12.1 orders are encodable.
+    let progression_byte: u8 = match params.progression {
+        ProgressionOrder::Lrcp => 0x00,
+        ProgressionOrder::Rlcp => 0x01,
+        ProgressionOrder::Rpcl => 0x02,
+        ProgressionOrder::Pcrl => 0x03,
+        ProgressionOrder::Cprl => 0x04,
+        ProgressionOrder::Reserved(_) => return Err(Error::NotImplemented),
+    };
     if planes.is_empty()
         || width == 0
         || height == 0
@@ -595,14 +670,32 @@ fn encode_impl(
     use std::collections::BTreeMap;
     let mut packets: BTreeMap<(u16, u8, u32), PacketData> = BTreeMap::new();
     let mut precincts_per_comp_res: Vec<Vec<u32>> = Vec::with_capacity(planes.len());
+    // Parallel per-component input for the position-keyed (RPCL / PCRL /
+    // CPRL) §B.12.1.3–5 orders: the precinct grids plus the §B.6
+    // reference-grid corner mapping those orders sort visits by.
+    let mut position_infos: Vec<ComponentPositionInfo> = Vec::with_capacity(planes.len());
 
     for (ci, levels) in levels_per_comp.iter().enumerate() {
         let mut precincts_at_r = Vec::with_capacity(levels.len());
+        let mut res_layouts = Vec::with_capacity(levels.len());
         for level in levels {
             let pp = precinct_exponents_at(&[], level.r);
             let partition = derive_precinct_partition(level, pp);
             let num_precincts = partition.num_precincts() as u32;
             precincts_at_r.push(num_precincts);
+            // §B.6: the precinct partition anchors at (0, 0) on the
+            // reduced-resolution domain with step 2^PP; the level's
+            // left/top edge falls in anchor cell floor(trx0 / 2^PPx).
+            res_layouts.push(ResolutionPrecinctLayout {
+                num_wide: partition.num_wide,
+                num_high: partition.num_high,
+                anchor_x: level.trx0 >> pp.ppx,
+                anchor_y: level.try0 >> pp.ppy,
+                trx0: level.trx0,
+                try0: level.try0,
+                ppx: pp.ppx,
+                ppy: pp.ppy,
+            });
             for k in 0..num_precincts {
                 let pcb = derive_precinct_code_blocks(level, pp, xcb, ycb, k)?;
                 let mut sub_band_plans: Vec<SubBandEncoderPlan> = Vec::new();
@@ -704,9 +797,15 @@ fn encode_impl(
             }
         }
         precincts_per_comp_res.push(precincts_at_r);
+        position_infos.push(ComponentPositionInfo {
+            num_decomposition_levels: nl,
+            xrsiz: 1,
+            yrsiz: 1,
+            resolutions: res_layouts,
+        });
     }
 
-    // -- Tier-2: emit packets in LRCP order ----------------------------
+    // -- Tier-2: emit packets in the §B.12.1 order the COD signals -----
     let prog_info: Vec<ComponentProgressionInfo> = precincts_per_comp_res
         .iter()
         .map(|pr| ComponentProgressionInfo {
@@ -714,7 +813,14 @@ fn encode_impl(
             precincts_per_resolution: pr.clone(),
         })
         .collect();
-    let order = lrcp_packet_order(1, &prog_info)?;
+    let order = match params.progression {
+        ProgressionOrder::Lrcp => lrcp_packet_order(1, &prog_info)?,
+        ProgressionOrder::Rlcp => rlcp_packet_order(1, &prog_info)?,
+        ProgressionOrder::Rpcl => rpcl_packet_order(1, &position_infos)?,
+        ProgressionOrder::Pcrl => pcrl_packet_order(1, &position_infos)?,
+        ProgressionOrder::Cprl => cprl_packet_order(1, &position_infos)?,
+        ProgressionOrder::Reserved(_) => return Err(Error::NotImplemented),
+    };
     let mut tile_body: Vec<u8> = Vec::new();
     for desc in &order {
         let pd = packets
@@ -763,8 +869,8 @@ fn encode_impl(
         EncodeKernel::Lossy9x7 { .. } => 0u8,
     };
     let cod_payload = [
-        0u8, // Scod
-        0,   // SGcod: progression = LRCP
+        0u8,              // Scod
+        progression_byte, // SGcod: progression (Table A.16)
         0,
         1,              // SGcod: layers = 1
         mct as u8,      // SGcod: MCT (Table A.17)
@@ -1098,6 +1204,105 @@ mod tests {
     fn lossy_rejects_out_of_range_fine_bits() {
         let p = vec![0u8; 16];
         assert!(encode_j2k_lossy(&[&p], 4, 4, 1, (4, 4), 9).is_err());
+    }
+
+    // -- §B.12.1 progression orders on encode ---------------------------
+
+    /// Encode `planes` in the given progression order (lossless 5-3),
+    /// decode with this crate's decoder, assert bit-exact recovery and
+    /// the signalled SGcod progression, and return the stream.
+    fn roundtrip_order(
+        planes: &[&[u8]],
+        w: u32,
+        h: u32,
+        nl: u8,
+        order: crate::ProgressionOrder,
+    ) -> Vec<u8> {
+        let stream = encode_j2k(
+            planes,
+            w,
+            h,
+            &EncodeParams {
+                decomposition_levels: nl,
+                code_block_exp: (4, 4),
+                progression: order,
+                ..EncodeParams::default()
+            },
+        )
+        .expect("encode");
+        let header = crate::parse_j2k_header(&stream).expect("own header parses");
+        assert_eq!(header.cod.progression, order, "SGcod progression");
+        let img = decode_j2k(&stream).expect("decode own stream");
+        for (ci, (comp, plane)) in img.components.iter().zip(planes).enumerate() {
+            let got: Vec<u8> = comp.samples.iter().map(|&s| s as u8).collect();
+            assert_eq!(&got[..], &plane[..], "comp {ci} samples ({order:?})");
+        }
+        stream
+    }
+
+    #[test]
+    fn all_five_progression_orders_round_trip() {
+        // Multi-resolution RGB: with several resolution levels and three
+        // components every §B.12.1 order produces a distinct packet
+        // sequence, and each must decode bit-exactly.
+        let w = 40u32;
+        let h = 28u32;
+        let r = gradient(w, h);
+        let g = noise(w, h, 0x1357_9BDF);
+        let b: Vec<u8> = gradient(w, h).iter().map(|&v| 255 - v).collect();
+        let planes: [&[u8]; 3] = [&r, &g, &b];
+        use crate::ProgressionOrder::*;
+        let streams: Vec<Vec<u8>> = [Lrcp, Rlcp, Rpcl, Pcrl, Cprl]
+            .into_iter()
+            .map(|o| roundtrip_order(&planes, w, h, 3, o))
+            .collect();
+        // All five orders carry the same packets, merely reordered: the
+        // stream lengths must agree.
+        for i in 0..streams.len() {
+            for j in (i + 1)..streams.len() {
+                assert_eq!(
+                    streams[i].len(),
+                    streams[j].len(),
+                    "same packets, reordered"
+                );
+            }
+        }
+        // With one layer and one precinct per resolution the
+        // resolution-major orders (LRCP / RLCP / RPCL) coincide, but the
+        // §B.12.1.4–5 position/component-major orders walk the packets
+        // component-first — PCRL must differ from LRCP past the COD.
+        assert_ne!(streams[0][60..], streams[3][60..], "PCRL reorders packets");
+    }
+
+    #[test]
+    fn progression_orders_round_trip_odd_dims_gray() {
+        // Odd dimensions push distinct trx0/try0 anchors into the
+        // position-keyed corner projection.
+        let p = noise(37, 23, 0xACE1_ACE1);
+        for o in [
+            crate::ProgressionOrder::Rpcl,
+            crate::ProgressionOrder::Pcrl,
+            crate::ProgressionOrder::Cprl,
+        ] {
+            roundtrip_order(&[&p], 37, 23, 2, o);
+        }
+    }
+
+    #[test]
+    fn reserved_progression_is_rejected() {
+        let p = vec![0u8; 16];
+        let r = encode_j2k(
+            &[&p],
+            4,
+            4,
+            &EncodeParams {
+                decomposition_levels: 1,
+                code_block_exp: (4, 4),
+                progression: crate::ProgressionOrder::Reserved(9),
+                ..EncodeParams::default()
+            },
+        );
+        assert!(r.is_err());
     }
 
     // -- §G.3.1 irreversible component transform (MCT = 1, 9-7) --------

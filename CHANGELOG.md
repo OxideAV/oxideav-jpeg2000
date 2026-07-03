@@ -6,6 +6,24 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 385 (2026-07-03).** **Structured `EncodeParams` +
+  all five §B.12.1 progression orders on encode.** New public
+  `encode::EncodeParams` (decomposition levels, code-block exponents,
+  kernel, MCT, progression) with spec-shaped defaults and a general
+  `encode::encode_j2k` entry point; the four historical wrappers now
+  build one internally and `EncodeKernel` is public. The encoder emits
+  the tile's packets in any of LRCP / RLCP / RPCL / PCRL / CPRL
+  (Table A.16), reusing the decoder's `progression` drivers — the
+  position-keyed orders get the same §B.6 `ResolutionPrecinctLayout`
+  corner projection the decoder builds — and signals the order in
+  `SGcod`. A `Reserved` progression is rejected. Tests: all five orders
+  round-trip a 3-component multi-resolution image bit-exactly (equal
+  stream lengths, component-major orders demonstrably reorder packets),
+  the position-keyed orders round-trip odd-dimension anchors, and the
+  reject path. Black-box: RLCP / RPCL / PCRL / CPRL streams all decode
+  through an opaque independent decoder **byte-identically** to this
+  crate's own decode.
+
 * **Clean-room round 385 (2026-07-03).** **Encoder ICT (`SGcod`
   MCT = 1 with the 9-7 kernel, T.800 §G.3.1).** New
   `encode::encode_j2k_lossy_ict` runs the Equation G-9/G-10/G-11
