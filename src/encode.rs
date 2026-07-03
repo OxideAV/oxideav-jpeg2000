@@ -295,18 +295,32 @@ struct EncodedBlock {
     coding_passes: u32,
     /// The single §C.3 codeword segment.
     bytes: Vec<u8>,
+    /// Annex J.13.4 per-pass truncation rates `R^n` (byte length of a
+    /// terminated segment covering passes `1..=n`), one entry per pass;
+    /// empty when the caller did not request them (single layer).
+    pass_rates: Vec<u32>,
 }
 
 /// Tier-1 encode one code-block's coefficients through the full §D.3
 /// schedule into one codeword segment. `mb` is the Equation E-2 budget
 /// for the block's sub-band. Returns `None` for an all-zero block (not
 /// included in any packet).
+///
+/// When `pass_rates` is `true` the returned block also carries the
+/// Annex J.13.4 truncation-point rates `R^n` — for each pass `n`
+/// (1-based) the byte length a §C.2.9-terminated segment covering
+/// passes `1..=n` would have, obtained by flushing a snapshot of the
+/// encoder state at that pass boundary. Multi-layer assembly cuts the
+/// final segment at these lengths, so a decoder that stops after an
+/// intermediate layer holds (almost exactly) the terminated prefix the
+/// snapshot would have produced.
 fn encode_code_block(
     orientation: SubBandOrientation,
     width: usize,
     height: usize,
     targets: &[Coefficient],
     mb: u32,
+    pass_rates: bool,
 ) -> Result<Option<EncodedBlock>, Error> {
     let maxmag = targets.iter().map(|c| c.magnitude).max().unwrap_or(0);
     if maxmag == 0 {
@@ -324,16 +338,33 @@ fn encode_code_block(
     let mut enc_block = CodeBlock::new(orientation, width, height);
     let mut encoder = MqEncoder::new();
     let mut ctx = reset_contexts();
+    let mut rates: Vec<u32> = Vec::new();
+    let snapshot = |encoder: &MqEncoder, rates: &mut Vec<u32>| {
+        if pass_rates {
+            rates.push(encoder.clone().flush().len() as u32);
+        }
+    };
     enc_block.cleanup_encode(top, targets, &mut encoder, &mut ctx);
+    snapshot(&encoder, &mut rates);
     for p in (0..top).rev() {
         enc_block.significance_propagation_encode(p, targets, &mut encoder, &mut ctx);
+        snapshot(&encoder, &mut rates);
         enc_block.magnitude_refinement_encode(p, targets, &mut encoder, &mut ctx);
+        snapshot(&encoder, &mut rates);
         enc_block.cleanup_encode(p, targets, &mut encoder, &mut ctx);
+        snapshot(&encoder, &mut rates);
+    }
+    let bytes = encoder.flush();
+    if pass_rates {
+        // The last snapshot and the final flush share the same encoder
+        // state, so they agree; pin it exactly regardless.
+        *rates.last_mut().expect("at least one pass") = bytes.len() as u32;
     }
     Ok(Some(EncodedBlock {
         zero_bit_planes: mb - planes,
         coding_passes: 3 * planes - 2,
-        bytes: encoder.flush(),
+        bytes,
+        pass_rates: rates,
     }))
 }
 
@@ -425,6 +456,14 @@ pub struct EncodeParams {
     /// default) selects maximum precincts (`PPx = PPy = 15`,
     /// `Scod` bit clear).
     pub precincts: Vec<u8>,
+    /// `SGcod` number of quality layers `L` (Table A.14, `1..=65535`).
+    /// Each code-block's coding passes are distributed across the
+    /// layers by coded depth (most-significant bit-planes first), and
+    /// its single codeword segment is cut at the Annex J.13.4 per-pass
+    /// truncation rates, so discarding trailing layers degrades the
+    /// image gracefully (SNR scalability, J.13.2) while decoding every
+    /// layer reproduces the single-layer result exactly. Default `1`.
+    pub layers: u16,
 }
 
 impl Default for EncodeParams {
@@ -436,6 +475,7 @@ impl Default for EncodeParams {
             mct: false,
             progression: ProgressionOrder::Lrcp,
             precincts: Vec::new(),
+            layers: 1,
         }
     }
 }
@@ -587,6 +627,10 @@ pub fn encode_j2k(
     {
         return Err(Error::NotImplemented);
     }
+    // Table A.14: at least one quality layer.
+    if params.layers == 0 {
+        return Err(Error::NotImplemented);
+    }
     // Table A.21: when user-defined precincts are signalled the COD
     // carries exactly NL + 1 bytes, and a zero PPx / PPy nibble is only
     // permitted at the lowest resolution level (r = 0).
@@ -682,15 +726,21 @@ pub fn encode_j2k(
         .collect();
 
     // -- Tier-1: encode every code-block, keyed (comp, r, precinct) ---
-    // Per packet (comp, r, k): the per-sub-band encoder plans and the
-    // per-block plan + body bytes in §B.10.8 order.
-    struct PacketData {
-        sub_band_plans: Vec<SubBandEncoderPlan>,
-        plans: Vec<CodeBlockPlan>,
-        body: Vec<u8>,
+    // Per precinct (comp, r, k): the per-sub-band code-block grids +
+    // zero-bit-plane leaves, and the encoded blocks in §B.10.8 order
+    // (`None` = empty grid cell or all-zero block, never included).
+    struct PrecinctRaw {
+        sub_bands: Vec<(SubBandGeometry, Vec<u32>)>,
+        blocks: Vec<Option<EncodedBlock>>,
     }
     use std::collections::BTreeMap;
-    let mut packets: BTreeMap<(u16, u8, u32), PacketData> = BTreeMap::new();
+    let layer_count = params.layers;
+    let want_rates = layer_count > 1;
+    let mut packets: BTreeMap<(u16, u8, u32), PrecinctRaw> = BTreeMap::new();
+    // Deepest coded depth across all code-blocks (zero-bit-planes plus
+    // coded plane ordinal) — the J.13.2-style layer split aligns layer
+    // boundaries on this global bit-plane depth scale.
+    let mut max_depth = 0u32;
     let mut precincts_per_comp_res: Vec<Vec<u32>> = Vec::with_capacity(planes.len());
     // Parallel per-component input for the position-keyed (RPCL / PCRL /
     // CPRL) §B.12.1.3–5 orders: the precinct grids plus the §B.6
@@ -720,16 +770,14 @@ pub fn encode_j2k(
             });
             for k in 0..num_precincts {
                 let pcb = derive_precinct_code_blocks(level, pp, xcb, ycb, k)?;
-                let mut sub_band_plans: Vec<SubBandEncoderPlan> = Vec::new();
-                let mut plans: Vec<CodeBlockPlan> = Vec::new();
-                let mut body: Vec<u8> = Vec::new();
+                let mut sub_bands: Vec<(SubBandGeometry, Vec<u32>)> = Vec::new();
+                let mut blocks: Vec<Option<EncodedBlock>> = Vec::new();
                 for psb in &pcb.sub_bands {
                     let geom = SubBandGeometry {
                         width: psb.grid_wide,
                         height: psb.grid_high,
                     };
                     let nblocks = (psb.grid_wide as usize) * (psb.grid_high as usize);
-                    let mut first_layer = vec![1u32; nblocks]; // 1 = never (single layer)
                     let mut zbp = vec![0u32; nblocks];
                     // Sub-band plane for (ci, r, orientation).
                     let plane: &BandPlane = if level.r == 0 {
@@ -762,12 +810,7 @@ pub fn encode_j2k(
                     for (bi, cb) in psb.code_blocks.iter().enumerate() {
                         let (bw, bh) = (cb.width() as usize, cb.height() as usize);
                         if bw == 0 || bh == 0 {
-                            plans.push(CodeBlockPlan {
-                                included: false,
-                                zero_bit_planes: 0,
-                                coding_passes: 0,
-                                segment_length: 0,
-                            });
+                            blocks.push(None);
                             continue;
                         }
                         // Extract the block's coefficients from the band
@@ -784,38 +827,20 @@ pub fn encode_j2k(
                                 });
                             }
                         }
-                        match encode_code_block(psb.orientation, bw, bh, &targets, mb)? {
-                            Some(enc) => {
-                                first_layer[bi] = 0;
-                                zbp[bi] = enc.zero_bit_planes;
-                                plans.push(CodeBlockPlan {
-                                    included: true,
-                                    zero_bit_planes: enc.zero_bit_planes,
-                                    coding_passes: enc.coding_passes,
-                                    segment_length: enc.bytes.len() as u32,
-                                });
-                                body.extend_from_slice(&enc.bytes);
-                            }
-                            None => {
-                                plans.push(CodeBlockPlan {
-                                    included: false,
-                                    zero_bit_planes: 0,
-                                    coding_passes: 0,
-                                    segment_length: 0,
-                                });
-                            }
+                        let enc =
+                            encode_code_block(psb.orientation, bw, bh, &targets, mb, want_rates)?;
+                        if let Some(enc) = &enc {
+                            zbp[bi] = enc.zero_bit_planes;
+                            // Depth of the block's final pass on the
+                            // global bit-plane scale.
+                            max_depth =
+                                max_depth.max(enc.zero_bit_planes + (enc.coding_passes + 1) / 3);
                         }
+                        blocks.push(enc);
                     }
-                    sub_band_plans.push((geom, first_layer, zbp));
+                    sub_bands.push((geom, zbp));
                 }
-                packets.insert(
-                    (ci as u16, level.r, k),
-                    PacketData {
-                        sub_band_plans,
-                        plans,
-                        body,
-                    },
-                );
+                packets.insert((ci as u16, level.r, k), PrecinctRaw { sub_bands, blocks });
             }
         }
         precincts_per_comp_res.push(precincts_at_r);
@@ -827,6 +852,103 @@ pub fn encode_j2k(
         });
     }
 
+    // -- Layer split (T.800 §B.10.7.1 + Annex J.13.2 guidance) ---------
+    // Each code-block's consecutive coding passes are distributed over
+    // the L layers by their coded depth `P + plane-ordinal`: pass i
+    // covers depth `P + ⌈i / 3⌉` (pass 0 is the first cleanup, then
+    // SP / MR / cleanup triples per plane, §D.3), and depth d lands in
+    // layer ⌊d · L / (D + 1)⌋ where D is the deepest coded depth in the
+    // tile. Most-significant planes therefore populate the early
+    // layers across every code-block, giving the J.13.2 SNR-scalable
+    // shape. The block's single codeword segment is cut at the
+    // Annex J.13.4 truncation rates R^n captured during tier-1.
+    let layer_of_depth = |depth: u32| -> u16 {
+        let l = u64::from(depth) * u64::from(layer_count) / (u64::from(max_depth) + 1);
+        (l as u16).min(layer_count - 1)
+    };
+    struct LayeredBlock {
+        zero_bit_planes: u32,
+        /// Per layer: passes contributed + byte range of the segment.
+        per_layer: Vec<(u32, std::ops::Range<usize>)>,
+        bytes: Vec<u8>,
+    }
+    struct PrecinctLayered {
+        state: PrecinctEncoderState,
+        blocks: Vec<Option<LayeredBlock>>,
+    }
+    let mut assembled: BTreeMap<(u16, u8, u32), PrecinctLayered> = BTreeMap::new();
+    for (key, raw) in packets {
+        let mut blocks: Vec<Option<LayeredBlock>> = Vec::with_capacity(raw.blocks.len());
+        // Per-sub-band first-inclusion layers for the §B.10.4 tag trees.
+        let mut first_layers: Vec<Vec<u32>> = raw
+            .sub_bands
+            .iter()
+            .map(|(geom, _)| {
+                vec![u32::from(layer_count); (geom.width as usize) * (geom.height as usize)]
+            })
+            .collect();
+        let mut sb_idx = 0usize;
+        let mut in_band = 0usize;
+        for enc in raw.blocks {
+            while in_band >= first_layers[sb_idx].len() {
+                sb_idx += 1;
+                in_band = 0;
+            }
+            let bi = in_band;
+            in_band += 1;
+            let Some(enc) = enc else {
+                blocks.push(None);
+                continue;
+            };
+            let total = enc.bytes.len();
+            // Count this block's passes per layer.
+            let mut counts = vec![0u32; layer_count as usize];
+            for i in 0..enc.coding_passes {
+                let depth = enc.zero_bit_planes + i.div_ceil(3);
+                counts[layer_of_depth(depth) as usize] += 1;
+            }
+            // Cut the segment at the per-pass truncation rates.
+            let mut per_layer = Vec::with_capacity(layer_count as usize);
+            let mut cum = 0u32;
+            let mut prev = 0usize;
+            let mut first = None;
+            for (l, &p) in counts.iter().enumerate() {
+                if p > 0 && first.is_none() {
+                    first = Some(l);
+                }
+                cum += p;
+                let end = if p == 0 {
+                    prev
+                } else if cum == enc.coding_passes {
+                    total
+                } else {
+                    (enc.pass_rates[cum as usize - 1] as usize).clamp(prev, total)
+                };
+                per_layer.push((p, prev..end));
+                prev = end;
+            }
+            first_layers[sb_idx][bi] = first.expect("encoded block has passes") as u32;
+            blocks.push(Some(LayeredBlock {
+                zero_bit_planes: enc.zero_bit_planes,
+                per_layer,
+                bytes: enc.bytes,
+            }));
+        }
+        let sub_band_plans: Vec<SubBandEncoderPlan> = raw
+            .sub_bands
+            .into_iter()
+            .zip(first_layers)
+            .map(|((geom, zbp), fl)| (geom, fl, zbp))
+            .collect();
+        assembled.insert(
+            key,
+            PrecinctLayered {
+                state: PrecinctEncoderState::new(&sub_band_plans),
+                blocks,
+            },
+        );
+    }
+
     // -- Tier-2: emit packets in the §B.12.1 order the COD signals -----
     let prog_info: Vec<ComponentProgressionInfo> = precincts_per_comp_res
         .iter()
@@ -836,23 +958,52 @@ pub fn encode_j2k(
         })
         .collect();
     let order = match params.progression {
-        ProgressionOrder::Lrcp => lrcp_packet_order(1, &prog_info)?,
-        ProgressionOrder::Rlcp => rlcp_packet_order(1, &prog_info)?,
-        ProgressionOrder::Rpcl => rpcl_packet_order(1, &position_infos)?,
-        ProgressionOrder::Pcrl => pcrl_packet_order(1, &position_infos)?,
-        ProgressionOrder::Cprl => cprl_packet_order(1, &position_infos)?,
+        ProgressionOrder::Lrcp => lrcp_packet_order(layer_count, &prog_info)?,
+        ProgressionOrder::Rlcp => rlcp_packet_order(layer_count, &prog_info)?,
+        ProgressionOrder::Rpcl => rpcl_packet_order(layer_count, &position_infos)?,
+        ProgressionOrder::Pcrl => pcrl_packet_order(layer_count, &position_infos)?,
+        ProgressionOrder::Cprl => cprl_packet_order(layer_count, &position_infos)?,
         ProgressionOrder::Reserved(_) => return Err(Error::NotImplemented),
     };
     let mut tile_body: Vec<u8> = Vec::new();
     for desc in &order {
-        let pd = packets
-            .get(&(desc.component, desc.resolution, desc.precinct))
+        let pa = assembled
+            .get_mut(&(desc.component, desc.resolution, desc.precinct))
             .ok_or(Error::InvalidPacketHeader)?;
-        // Single layer → fresh per-precinct encoder state per packet.
-        let mut state = PrecinctEncoderState::new(&pd.sub_band_plans);
-        let header = encode_packet_header(&mut state, 0, &pd.plans);
+        let mut plans: Vec<CodeBlockPlan> = Vec::with_capacity(pa.blocks.len());
+        let mut body: Vec<u8> = Vec::new();
+        for b in &pa.blocks {
+            match b {
+                None => plans.push(CodeBlockPlan {
+                    included: false,
+                    zero_bit_planes: 0,
+                    coding_passes: 0,
+                    segment_length: 0,
+                }),
+                Some(lb) => {
+                    let (p, range) = &lb.per_layer[desc.layer as usize];
+                    if *p == 0 {
+                        plans.push(CodeBlockPlan {
+                            included: false,
+                            zero_bit_planes: lb.zero_bit_planes,
+                            coding_passes: 0,
+                            segment_length: 0,
+                        });
+                    } else {
+                        plans.push(CodeBlockPlan {
+                            included: true,
+                            zero_bit_planes: lb.zero_bit_planes,
+                            coding_passes: *p,
+                            segment_length: range.len() as u32,
+                        });
+                        body.extend_from_slice(&lb.bytes[range.clone()]);
+                    }
+                }
+            }
+        }
+        let header = encode_packet_header(&mut pa.state, desc.layer, &plans);
         tile_body.extend_from_slice(&header);
-        tile_body.extend_from_slice(&pd.body);
+        tile_body.extend_from_slice(&body);
     }
 
     // -- Markers --------------------------------------------------------
@@ -898,16 +1049,16 @@ pub fn encode_j2k(
         0x01
     };
     let mut cod_payload = vec![
-        scod,             // Scod
-        progression_byte, // SGcod: progression (Table A.16)
-        0,
-        1,              // SGcod: layers = 1
-        mct as u8,      // SGcod: MCT (Table A.17)
-        nl,             // SPcod: NL
-        xcb - 2,        // SPcod: xcb − 2
-        ycb - 2,        // SPcod: ycb − 2
-        0,              // SPcod: code-block style
-        transform_byte, // SPcod: transform (Table A.20)
+        scod,                       // Scod
+        progression_byte,           // SGcod: progression (Table A.16)
+        (layer_count >> 8) as u8,   // SGcod: layers (16-bit BE)
+        (layer_count & 0xFF) as u8, // SGcod: layers, low byte
+        mct as u8,                  // SGcod: MCT (Table A.17)
+        nl,                         // SPcod: NL
+        xcb - 2,                    // SPcod: xcb − 2
+        ycb - 2,                    // SPcod: ycb − 2
+        0,                          // SPcod: code-block style
+        transform_byte,             // SPcod: transform (Table A.20)
     ];
     cod_payload.extend_from_slice(&params.precincts); // Table A.21
     push_segment(&mut out, MARKER_COD, &cod_payload);
@@ -1452,6 +1603,153 @@ mod tests {
             ..EncodeParams::default()
         };
         assert!(encode_j2k(&[&p], 16, 16, &ok_zero).is_ok());
+    }
+
+    // -- §B.10 quality layers on encode (J.13.2-guided split) -----------
+
+    #[test]
+    fn multi_layer_lossless_round_trips() {
+        // 3 layers over noisy content: every code-block's passes split
+        // across layers at the J.13.4 truncation rates; decoding all
+        // layers must remain bit-exact.
+        let p = noise(64, 48, 0xD1CE_D1CE);
+        let params = EncodeParams {
+            decomposition_levels: 2,
+            code_block_exp: (4, 4),
+            layers: 3,
+            ..EncodeParams::default()
+        };
+        let stream = roundtrip_params(&[&p], 64, 48, &params);
+        let header = crate::parse_j2k_header(&stream).expect("header");
+        assert_eq!(header.cod.layers, 3);
+    }
+
+    #[test]
+    fn multi_layer_lossy_round_trips() {
+        let p = noise(48, 40, 0xFEED_F00D);
+        let params = EncodeParams {
+            decomposition_levels: 2,
+            code_block_exp: (4, 4),
+            kernel: EncodeKernel::Lossy9x7 { fine_bits: 6 },
+            layers: 4,
+            ..EncodeParams::default()
+        };
+        let stream = encode_j2k(&[&p], 48, 40, &params).expect("encode");
+        let img = decode_j2k(&stream).expect("decode");
+        let max_err = img.components[0]
+            .samples
+            .iter()
+            .zip(p.iter())
+            .map(|(&got, &want)| (got - i32::from(want)).unsigned_abs())
+            .max()
+            .unwrap();
+        assert!(max_err <= 1, "multi-layer lossy error {max_err} > 1");
+    }
+
+    #[test]
+    fn multi_layer_multi_precinct_position_orders() {
+        // Layers × precincts × the position-keyed orders: the §B.12.1
+        // drivers interleave layers into the sweep and the per-precinct
+        // tag-tree state must persist across the layer packets.
+        let w = 48u32;
+        let h = 32u32;
+        let r = gradient(w, h);
+        let g = noise(w, h, 0x5EED_5EED);
+        let b: Vec<u8> = gradient(w, h).iter().map(|&v| v ^ 0xA5).collect();
+        let planes: [&[u8]; 3] = [&r, &g, &b];
+        for o in [
+            crate::ProgressionOrder::Lrcp,
+            crate::ProgressionOrder::Rpcl,
+            crate::ProgressionOrder::Cprl,
+        ] {
+            let params = EncodeParams {
+                decomposition_levels: 2,
+                code_block_exp: (2, 2),
+                progression: o,
+                precincts: vec![0x22, 0x33, 0x44],
+                layers: 3,
+                ..EncodeParams::default()
+            };
+            roundtrip_params(&planes, w, h, &params);
+        }
+    }
+
+    #[test]
+    fn more_layers_than_coded_depths() {
+        // A smooth gradient codes few bit-planes; with 8 layers several
+        // layers receive no passes anywhere (empty packets) and blocks
+        // skip layers between contributions.
+        let p = gradient(32, 32);
+        let params = EncodeParams {
+            decomposition_levels: 1,
+            code_block_exp: (4, 4),
+            layers: 8,
+            ..EncodeParams::default()
+        };
+        roundtrip_params(&[&p], 32, 32, &params);
+    }
+
+    #[test]
+    fn multi_layer_flat_image_all_empty() {
+        // Flat mid-grey: every packet of every layer is empty.
+        let p = vec![128u8; 24 * 24];
+        let params = EncodeParams {
+            decomposition_levels: 2,
+            code_block_exp: (4, 4),
+            layers: 4,
+            ..EncodeParams::default()
+        };
+        roundtrip_params(&[&p], 24, 24, &params);
+    }
+
+    #[test]
+    fn multi_layer_overhead_is_modest() {
+        // Splitting into layers adds only packet-header overhead: the
+        // 4-layer stream must stay within a few percent (plus a fixed
+        // floor) of the single-layer stream.
+        let p = noise(64, 64, 0x1234_4321);
+        let single = encode_j2k(
+            &[&p],
+            64,
+            64,
+            &EncodeParams {
+                decomposition_levels: 2,
+                code_block_exp: (4, 4),
+                ..EncodeParams::default()
+            },
+        )
+        .unwrap();
+        let layered = encode_j2k(
+            &[&p],
+            64,
+            64,
+            &EncodeParams {
+                decomposition_levels: 2,
+                code_block_exp: (4, 4),
+                layers: 4,
+                ..EncodeParams::default()
+            },
+        )
+        .unwrap();
+        assert!(layered.len() > single.len(), "layer headers cost bytes");
+        assert!(
+            layered.len() < single.len() + single.len() / 10 + 256,
+            "4-layer overhead too large: {} vs {}",
+            layered.len(),
+            single.len()
+        );
+    }
+
+    #[test]
+    fn zero_layers_rejected() {
+        let p = vec![0u8; 16];
+        let params = EncodeParams {
+            decomposition_levels: 1,
+            code_block_exp: (2, 2),
+            layers: 0,
+            ..EncodeParams::default()
+        };
+        assert!(encode_j2k(&[&p], 4, 4, &params).is_err());
     }
 
     // -- §G.3.1 irreversible component transform (MCT = 1, 9-7) --------

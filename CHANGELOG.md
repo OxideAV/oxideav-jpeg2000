@@ -6,6 +6,29 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 385 (2026-07-03).** **Quality layers on encode
+  (`EncodeParams::layers`, T.800 §B.10 + Annex J.13.2 guidance).**
+  Tier-1 now captures the Annex J.13.4 per-pass truncation rates `R^n`
+  (byte length a §C.2.9-terminated segment covering passes `1..=n`
+  would have, via encoder-state snapshots), and each code-block's
+  passes are distributed over the `L` layers by coded depth
+  `P + ⌈i/3⌉` on a global bit-plane scale — most-significant planes
+  fill the early layers across all blocks (the J.13.2 SNR-scalable
+  shape) and the block's single codeword segment is cut at the
+  captured rates. The per-precinct `PrecinctEncoderState` (inclusion /
+  zero-bit-plane tag trees, Lblock) now persists across the layer
+  packets, first inclusions land in the right §B.10.4 tag-tree layer
+  (including blocks that skip layers between contributions), and all
+  five §B.12.1 orders interleave `L > 1`. Seven tests: lossless / 9-7
+  / multi-precinct-position-order / more-layers-than-depths /
+  all-empty-flat round-trips (all bit-exact through every layer),
+  modest-overhead, and the `L = 0` reject. Black-box: 4-layer lossless
+  and 9-7 streams decode **byte-identically** through an opaque
+  independent decoder, and its layer-limited decodes improve
+  monotonically (MSE 4373 → 50.0 → 1.3 → exact lossless;
+  329 → 0.75 → 0.00 lossy), independently confirming the truncation
+  cuts are decodable SNR-progressive prefixes.
+
 * **Clean-room round 385 (2026-07-03).** **User-defined precinct
   partitions on encode (T.800 §B.6 / Table A.21).**
   `EncodeParams::precincts` takes one `PPy | PPx` nibble byte per
