@@ -1161,9 +1161,9 @@ pub enum SegmentSplit {
 }
 
 /// Marker code — SOP (Start of packet, T.800 §A.8.1, `0xFF91`).
-const MARKER_SOP: u16 = 0xFF91;
+pub(crate) const MARKER_SOP: u16 = 0xFF91;
 /// Marker code — EPH (End of packet header, T.800 §A.8.2, `0xFF92`).
-const MARKER_EPH: u16 = 0xFF92;
+pub(crate) const MARKER_EPH: u16 = 0xFF92;
 
 /// If the next 2 bytes are an SOP marker, consume the whole SOP
 /// segment (marker + Lsop=4 + Nsop=2 bytes = 6 bytes total per T.800

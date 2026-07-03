@@ -783,6 +783,15 @@ pub struct EncodeParams {
     /// which makes every layer / rate-control cut land on an exactly
     /// terminated boundary. Default `false`.
     pub terminate_all: bool,
+    /// §A.8.1 SOP packet framing (`Scod` bit 1, Table A.13): every
+    /// packet is preceded by a 6-byte `SOP` marker segment carrying the
+    /// packet's sequence number `Nsop` (zero-based per coded tile,
+    /// incremented per packet, rolling over at 65 536). Default `false`.
+    pub sop: bool,
+    /// §A.8.2 EPH framing (`Scod` bit 2, Table A.13): every packet
+    /// header is postpended with the 2-byte `EPH` marker. Default
+    /// `false`.
+    pub eph: bool,
 }
 
 impl Default for EncodeParams {
@@ -799,6 +808,8 @@ impl Default for EncodeParams {
             tile_size: None,
             bypass: false,
             terminate_all: false,
+            sop: false,
+            eph: false,
         }
     }
 }
@@ -1466,6 +1477,9 @@ pub fn encode_j2k(
         let mut tile_bodies: Vec<Vec<u8>> = Vec::with_capacity(orders.len());
         for (t, order) in orders.iter().enumerate() {
             let mut tile_body: Vec<u8> = Vec::new();
+            // §A.8.1 Nsop: zero-based per coded tile, +1 per packet,
+            // rolling over at 65 536.
+            let mut nsop = 0u16;
             for desc in order {
                 let pa = assembled
                     .get_mut(&(t as u32, desc.component, desc.resolution, desc.precinct))
@@ -1502,7 +1516,18 @@ pub fn encode_j2k(
                     }
                 }
                 let header = encode_packet_header(&mut pa.state, desc.layer, &plans);
+                if params.sop {
+                    // §A.8.1 / Table A.40: SOP, Lsop = 4, Nsop.
+                    tile_body.extend_from_slice(&crate::packet::MARKER_SOP.to_be_bytes());
+                    tile_body.extend_from_slice(&4u16.to_be_bytes());
+                    tile_body.extend_from_slice(&nsop.to_be_bytes());
+                }
+                nsop = nsop.wrapping_add(1);
                 tile_body.extend_from_slice(&header);
+                if params.eph {
+                    // §A.8.2: EPH immediately after the packet header.
+                    tile_body.extend_from_slice(&crate::packet::MARKER_EPH.to_be_bytes());
+                }
                 tile_body.extend_from_slice(&body);
             }
             tile_bodies.push(tile_body);
@@ -1536,8 +1561,9 @@ pub fn encode_j2k(
         push_segment(&mut out, MARKER_SIZ, &siz_payload);
 
         // COD (Tables A.13 – A.21): Scod bit 0 flags user-defined
-        // precincts (whose Table A.21 bytes then trail SPcod), no
-        // SOP / EPH, the signalled progression, the layer count, MCT
+        // precincts (whose Table A.21 bytes then trail SPcod), bits
+        // 1 / 2 the SOP / EPH framing, the signalled progression, the
+        // layer count, MCT
         // per Table A.17, NL levels, code-block exponents − 2, style 0,
         // and the Table A.20 kernel byte (1 = 5-3 reversible, 0 = 9-7
         // irreversible).
@@ -1545,11 +1571,11 @@ pub fn encode_j2k(
             EncodeKernel::Lossless5x3 => 1u8,
             EncodeKernel::Lossy9x7 { .. } => 0u8,
         };
-        let scod = if params.precincts.is_empty() {
-            0u8
-        } else {
-            0x01
-        };
+        // Scod (Table A.13): bit 0 = user-defined precincts, bit 1 =
+        // §A.8.1 SOP markers allowed, bit 2 = §A.8.2 EPH markers used.
+        let scod = u8::from(!params.precincts.is_empty())
+            | (u8::from(params.sop) << 1)
+            | (u8::from(params.eph) << 2);
         let mut cod_payload = vec![
             scod,                       // Scod
             progression_byte,           // SGcod: progression (Table A.16)
@@ -2844,5 +2870,162 @@ mod tests {
             header.cod.transform,
             crate::WaveletTransform::Irreversible9x7
         );
+    }
+
+    // -- §A.8.1 SOP / §A.8.2 EPH packet framing on encode ---------------
+
+    /// Count `Nsop`-consecutive SOP segments in a stream's tile bodies
+    /// (crude scan: SOP has a fixed shape, `FF 91 00 04 nn nn`).
+    fn count_sops(stream: &[u8]) -> usize {
+        stream
+            .windows(4)
+            .filter(|w| w[0] == 0xFF && w[1] == 0x91 && w[2] == 0x00 && w[3] == 0x04)
+            .count()
+    }
+
+    #[test]
+    fn sop_framing_round_trips_and_numbers_packets() {
+        // NL = 2, single component, LRCP → NL + 1 = 3 packets. Every
+        // packet gets a 6-byte SOP with sequential Nsop.
+        let p = noise(32, 24, 0x5011_5011);
+        let params = EncodeParams {
+            decomposition_levels: 2,
+            code_block_exp: (4, 4),
+            sop: true,
+            ..EncodeParams::default()
+        };
+        let stream = roundtrip_params(&[&p], 32, 24, &params);
+        let header = crate::parse_j2k_header(&stream).expect("header");
+        assert!(header.cod.sop_marker_allowed, "Scod bit 1");
+        assert!(!header.cod.eph_marker_used);
+        assert_eq!(count_sops(&stream), 3, "one SOP per packet");
+        // The three Nsop values are 0, 1, 2 in stream order.
+        let nsops: Vec<u16> = stream
+            .windows(6)
+            .filter(|w| w[0] == 0xFF && w[1] == 0x91 && w[2] == 0x00 && w[3] == 0x04)
+            .map(|w| u16::from_be_bytes([w[4], w[5]]))
+            .collect();
+        assert_eq!(nsops, vec![0, 1, 2]);
+        // The plain stream is exactly 6 bytes per packet smaller.
+        let plain = roundtrip_params(
+            &[&p],
+            32,
+            24,
+            &EncodeParams {
+                sop: false,
+                ..params
+            },
+        );
+        assert_eq!(stream.len(), plain.len() + 3 * 6);
+    }
+
+    #[test]
+    fn eph_framing_round_trips() {
+        let p = noise(32, 24, 0xE9E9_0101);
+        let params = EncodeParams {
+            decomposition_levels: 1,
+            code_block_exp: (4, 4),
+            eph: true,
+            ..EncodeParams::default()
+        };
+        let stream = roundtrip_params(&[&p], 32, 24, &params);
+        let header = crate::parse_j2k_header(&stream).expect("header");
+        assert!(header.cod.eph_marker_used, "Scod bit 2");
+        assert!(!header.cod.sop_marker_allowed);
+        // 2 packets → exactly 2 EPH markers more than the plain stream.
+        let plain = roundtrip_params(
+            &[&p],
+            32,
+            24,
+            &EncodeParams {
+                eph: false,
+                ..params
+            },
+        );
+        assert_eq!(stream.len(), plain.len() + 2 * 2);
+    }
+
+    #[test]
+    fn sop_eph_with_layers_precincts_and_tiles() {
+        // Both framings together across 4 tiles, 3 layers, and a real
+        // precinct partition — Nsop restarts at 0 in every tile and the
+        // walker (SopAndEph mode) must resynchronise on each marker.
+        let w = 48u32;
+        let h = 32u32;
+        let p = noise(w, h, 0xF00D_F00D);
+        let params = EncodeParams {
+            decomposition_levels: 1,
+            code_block_exp: (3, 3),
+            precincts: vec![0x33, 0x44],
+            layers: 3,
+            tile_size: Some((24, 16)),
+            sop: true,
+            eph: true,
+            ..EncodeParams::default()
+        };
+        let stream = roundtrip_params(&[&p], w, h, &params);
+        let nsops: Vec<u16> = stream
+            .windows(6)
+            .filter(|w| w[0] == 0xFF && w[1] == 0x91 && w[2] == 0x00 && w[3] == 0x04)
+            .map(|w| u16::from_be_bytes([w[4], w[5]]))
+            .collect();
+        // 4 tiles × (2 resolutions summed precincts) × 3 layers packets;
+        // each tile's sequence restarts at zero and increments by one.
+        assert_eq!(nsops.iter().filter(|&&n| n == 0).count(), 4);
+        let mut per_tile_max = Vec::new();
+        let mut cur = None::<u16>;
+        for n in &nsops {
+            match cur {
+                Some(prev) if *n == prev + 1 => cur = Some(*n),
+                Some(prev) => {
+                    assert_eq!(*n, 0, "Nsop restarts per tile");
+                    per_tile_max.push(prev);
+                    cur = Some(0);
+                }
+                None => {
+                    assert_eq!(*n, 0);
+                    cur = Some(0);
+                }
+            }
+        }
+        per_tile_max.push(cur.expect("some packets"));
+        assert_eq!(per_tile_max.len(), 4, "four tiles");
+    }
+
+    #[test]
+    fn sop_eph_with_bypass_styles_round_trips() {
+        // Framing composes with the §D.6 / §D.4.2 styled segments.
+        let p = noise(40, 40, 0xBEEF_0808);
+        for (bypass, term) in [(true, false), (false, true), (true, true)] {
+            let params = EncodeParams {
+                decomposition_levels: 2,
+                code_block_exp: (4, 4),
+                bypass,
+                terminate_all: term,
+                sop: true,
+                eph: true,
+                ..EncodeParams::default()
+            };
+            roundtrip_params(&[&p], 40, 40, &params);
+        }
+    }
+
+    #[test]
+    fn sop_eph_with_rate_control_round_trips() {
+        // PCRD accounts the 6 + 2 framing bytes per packet: the budget
+        // still binds on the framed stream.
+        let p = noise(64, 64, 0x7777_1234);
+        let params = EncodeParams {
+            decomposition_levels: 2,
+            code_block_exp: (4, 4),
+            kernel: EncodeKernel::Lossy9x7 { fine_bits: 6 },
+            target_bytes: Some(1500),
+            sop: true,
+            eph: true,
+            ..EncodeParams::default()
+        };
+        let stream = encode_j2k(&[&p], 64, 64, &params).expect("encode");
+        assert!(stream.len() <= 1500, "budget binds: {} B", stream.len());
+        decode_j2k(&stream).expect("decode rate-controlled framed stream");
     }
 }
