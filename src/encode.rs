@@ -911,6 +911,30 @@ pub fn encode_j2k_lossless_rct(
     )
 }
 
+/// One input sample plane — 8-bit or 16-bit unsigned storage.
+#[derive(Clone, Copy)]
+enum SamplePlane<'a> {
+    U8(&'a [u8]),
+    U16(&'a [u16]),
+}
+
+impl SamplePlane<'_> {
+    fn len(&self) -> usize {
+        match self {
+            SamplePlane::U8(p) => p.len(),
+            SamplePlane::U16(p) => p.len(),
+        }
+    }
+
+    #[inline]
+    fn get(&self, i: usize) -> i32 {
+        match self {
+            SamplePlane::U8(p) => i32::from(p[i]),
+            SamplePlane::U16(p) => i32::from(p[i]),
+        }
+    }
+}
+
 /// Encode 8-bit unsigned component planes (all `width × height`, 1:1
 /// sub-sampling) into a Part-1 J2K codestream per `params`.
 ///
@@ -924,6 +948,53 @@ pub fn encode_j2k(
     planes: &[&[u8]],
     width: u32,
     height: u32,
+    params: &EncodeParams,
+) -> Result<Vec<u8>, Error> {
+    let wrapped: Vec<SamplePlane> = planes.iter().map(|p| SamplePlane::U8(p)).collect();
+    encode_core(&wrapped, width, height, 8, params)
+}
+
+/// Encode **1- to 16-bit** unsigned component planes (u16 storage, all
+/// `width × height`, 1:1 sub-sampling) into a Part-1 J2K codestream per
+/// `params`.
+///
+/// `precision_bits` is the `Ssiz` bit depth shared by every component
+/// (Table A.11, here `1..=16`); every sample must fit it
+/// (`< 2^precision_bits`) or [`Error::InvalidSamplePrecision`] is
+/// returned. Both kernels work at any depth: the reversible 5-3
+/// round-trips bit-exactly, the 9-7 applies the Annex E step
+/// `Δb = 2^(−fine_bits)` to the wider dynamic range unchanged (the
+/// `SPqcd` exponents `εb = Rb + gain + fine_bits` stay within the
+/// 5-bit Table A.28 field). The Table A.17 MCT pairings (§G.2 RCT /
+/// §G.3.1 ICT via [`EncodeParams::mct`]) compose with deep input —
+/// the RCT chrominance `QCC` exponents build on `precision_bits + 1`.
+pub fn encode_j2k_u16(
+    planes: &[&[u16]],
+    width: u32,
+    height: u32,
+    precision_bits: u8,
+    params: &EncodeParams,
+) -> Result<Vec<u8>, Error> {
+    if !(1..=16).contains(&precision_bits) {
+        return Err(Error::InvalidSamplePrecision);
+    }
+    for p in planes {
+        if p.iter().any(|&s| u32::from(s) >> precision_bits != 0) {
+            return Err(Error::InvalidSamplePrecision);
+        }
+    }
+    let wrapped: Vec<SamplePlane> = planes.iter().map(|p| SamplePlane::U16(p)).collect();
+    encode_core(&wrapped, width, height, precision_bits, params)
+}
+
+/// The shared encode pipeline over type-erased sample planes. See
+/// [`encode_j2k`] / [`encode_j2k_u16`] for the public contracts;
+/// `precision` is the unsigned `Ssiz` bit depth every plane shares.
+fn encode_core(
+    planes: &[SamplePlane<'_>],
+    width: u32,
+    height: u32,
+    precision: u8,
     params: &EncodeParams,
 ) -> Result<Vec<u8>, Error> {
     let nl = params.decomposition_levels;
@@ -986,7 +1057,7 @@ pub fn encode_j2k(
             return Err(Error::InvalidMarkerLength);
         }
     }
-    const PRECISION: u8 = 8;
+    debug_assert!((1..=16).contains(&precision));
 
     // -- SIZ model (drives both the marker bytes and the geometry) ----
     let (tile_w, tile_h) = params.tile_size.unwrap_or((width, height));
@@ -1006,7 +1077,7 @@ pub fn encode_j2k(
         components: planes
             .iter()
             .map(|_| SizComponent {
-                precision_bits: PRECISION,
+                precision_bits: precision,
                 is_signed: false,
                 h_separation: 1,
                 v_separation: 1,
@@ -1027,23 +1098,23 @@ pub fn encode_j2k(
     // quantisation for the lossy kernel. Each tile transforms
     // independently over its own reference-grid region (§B.3), with the
     // absolute tile corner driving the lifting parity.
-    let dc = 1i32 << (PRECISION - 1);
+    let dc = 1i32 << (precision - 1);
     let transform_tile =
         |tx0: u32, ty0: u32, tx1: u32, ty1: u32| -> Result<Vec<ComponentBands>, Error> {
             let (tw, th) = ((tx1 - tx0) as usize, (ty1 - ty0) as usize);
-            let extract = |p: &[u8]| -> Vec<i32> {
+            let extract = |p: &SamplePlane<'_>| -> Vec<i32> {
                 let mut out = Vec::with_capacity(tw * th);
                 for y in ty0..ty1 {
                     let row = (y as usize) * (width as usize);
                     for x in tx0..tx1 {
-                        out.push(i32::from(p[row + x as usize]) - dc);
+                        out.push(p.get(row + x as usize) - dc);
                     }
                 }
                 out
             };
             Ok(match kernel {
                 EncodeKernel::Lossless5x3 => {
-                    let mut shifted: Vec<Vec<i32>> = planes.iter().map(|p| extract(p)).collect();
+                    let mut shifted: Vec<Vec<i32>> = planes.iter().map(&extract).collect();
                     if use_rct {
                         // Split into three disjoint &mut [i32].
                         let (head, tail) = shifted.split_at_mut(1);
@@ -1156,9 +1227,9 @@ pub fn encode_j2k(
                         // §G.2: RCT chrominance carries one extra bit of
                         // dynamic range, signalled via this component's QCC.
                         let ri = if use_rct && ci > 0 {
-                            u32::from(PRECISION) + 1
+                            u32::from(precision) + 1
                         } else {
-                            u32::from(PRECISION)
+                            u32::from(precision)
                         };
                         // εb = Rb (+ fine_bits on the lossy path, where the
                         // exponent excess sets the Equation E-3 step).
@@ -1633,7 +1704,7 @@ pub fn encode_j2k(
             }
             p
         };
-        push_segment(&mut out, MARKER_QCD, &quant_payload(PRECISION));
+        push_segment(&mut out, MARKER_QCD, &quant_payload(precision));
         if use_rct {
             // §G.2 / §A.6.5: the RCT chrominance components (1, 2)
             // carry one extra bit of dynamic range — override their
@@ -1641,7 +1712,7 @@ pub fn encode_j2k(
             // QCD`). Cqcc is one byte (Csiz = 3 < 257).
             for c in 1u8..=2 {
                 let mut qcc_payload = vec![c];
-                qcc_payload.extend_from_slice(&quant_payload(PRECISION + 1));
+                qcc_payload.extend_from_slice(&quant_payload(precision + 1));
                 push_segment(&mut out, crate::MARKER_QCC, &qcc_payload);
             }
         }
@@ -3008,6 +3079,193 @@ mod tests {
             };
             roundtrip_params(&[&p], 40, 40, &params);
         }
+    }
+
+    // -- >8-bit input (encode_j2k_u16, Table A.11 Ssiz depths) ----------
+
+    fn noise16(w: u32, h: u32, bits: u8, seed: u32) -> Vec<u16> {
+        let mut s = seed;
+        (0..w * h)
+            .map(|_| (lcg(&mut s) >> 10) as u16 & ((1u32 << bits) - 1) as u16)
+            .collect()
+    }
+
+    /// Encode u16 planes at `bits`, decode, assert bit-exact + depth.
+    fn roundtrip_u16(
+        planes: &[&[u16]],
+        w: u32,
+        h: u32,
+        bits: u8,
+        params: &EncodeParams,
+    ) -> Vec<u8> {
+        let stream = encode_j2k_u16(planes, w, h, bits, params).expect("encode");
+        let img = decode_j2k(&stream).expect("decode own stream");
+        assert_eq!(img.components.len(), planes.len());
+        for (ci, (comp, plane)) in img.components.iter().zip(planes).enumerate() {
+            assert_eq!(comp.precision_bits, bits, "comp {ci} Ssiz");
+            let got: Vec<u16> = comp.samples.iter().map(|&s| s as u16).collect();
+            assert_eq!(&got[..], &plane[..], "comp {ci} samples");
+        }
+        stream
+    }
+
+    #[test]
+    fn deep_lossless_12_and_16_bit_round_trip() {
+        for bits in [9u8, 12, 16] {
+            let p = noise16(33, 27, bits, 0x1000 + u32::from(bits));
+            roundtrip_u16(
+                &[&p],
+                33,
+                27,
+                bits,
+                &EncodeParams {
+                    decomposition_levels: 3,
+                    code_block_exp: (4, 4),
+                    ..EncodeParams::default()
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn deep_lossless_extremes_hit_full_range() {
+        // Saturated 16-bit step edge: the deepest coefficient magnitudes
+        // the εb = RI + gain budget must still represent (Mb headroom).
+        let w = 32u32;
+        let h = 16u32;
+        let p: Vec<u16> = (0..w * h)
+            .map(|i| if (i % w) < w / 2 { 0 } else { 0xFFFF })
+            .collect();
+        roundtrip_u16(&[&p], w, h, 16, &EncodeParams::default());
+    }
+
+    #[test]
+    fn deep_rct_16_bit_round_trips_and_signals_qcc() {
+        // §G.2 RCT over 16-bit RGB: chroma QCC exponents build on 17.
+        let w = 24u32;
+        let h = 20u32;
+        let r = noise16(w, h, 16, 0xAAAA_0001);
+        let g: Vec<u16> = r.iter().map(|&v| v.wrapping_add(500)).collect();
+        let b: Vec<u16> = r.iter().map(|&v| v ^ 0x0123).collect();
+        let stream = roundtrip_u16(
+            &[&r, &g, &b],
+            w,
+            h,
+            16,
+            &EncodeParams {
+                decomposition_levels: 2,
+                code_block_exp: (4, 4),
+                mct: true,
+                ..EncodeParams::default()
+            },
+        );
+        let header = crate::parse_j2k_header(&stream).expect("header");
+        assert_eq!(header.cod.multi_component_transform, 1);
+    }
+
+    #[test]
+    fn deep_lossy_12_bit_step_bound_holds() {
+        // 9-7 at fine_bits = 6 keeps the same absolute step Δb = 1/64
+        // regardless of depth → the reconstruction error stays within
+        // ±1 sample units on 12-bit input too.
+        let w = 40u32;
+        let h = 32u32;
+        let p = noise16(w, h, 12, 0xD00D_1212);
+        let params = EncodeParams {
+            decomposition_levels: 2,
+            code_block_exp: (4, 4),
+            kernel: EncodeKernel::Lossy9x7 { fine_bits: 6 },
+            ..EncodeParams::default()
+        };
+        let stream = encode_j2k_u16(&[&p], w, h, 12, &params).expect("encode");
+        let img = decode_j2k(&stream).expect("decode");
+        assert_eq!(img.components[0].precision_bits, 12);
+        let max_err = img.components[0]
+            .samples
+            .iter()
+            .zip(p.iter())
+            .map(|(&got, &want)| (got - i32::from(want)).unsigned_abs())
+            .max()
+            .unwrap();
+        assert!(max_err <= 1, "12-bit lossy error {max_err} > 1");
+    }
+
+    #[test]
+    fn deep_ict_16_bit_near_lossless() {
+        // §G.3.1 ICT over 16-bit RGB at Δb = 1/64.
+        let w = 32u32;
+        let h = 24u32;
+        let y = noise16(w, h, 16, 0x1C70_C7C7);
+        let r: Vec<u16> = y.iter().map(|&v| v.saturating_add(900)).collect();
+        let g = y.clone();
+        let b: Vec<u16> = y.iter().map(|&v| v.saturating_sub(1200)).collect();
+        let params = EncodeParams {
+            decomposition_levels: 2,
+            code_block_exp: (4, 4),
+            kernel: EncodeKernel::Lossy9x7 { fine_bits: 6 },
+            mct: true,
+            ..EncodeParams::default()
+        };
+        let stream = encode_j2k_u16(&[&r, &g, &b], w, h, 16, &params).expect("encode");
+        let img = decode_j2k(&stream).expect("decode");
+        for (comp, plane) in img.components.iter().zip([&r, &g, &b]) {
+            let max_err = comp
+                .samples
+                .iter()
+                .zip(plane.iter())
+                .map(|(&got, &want)| (got - i32::from(want)).unsigned_abs())
+                .max()
+                .unwrap();
+            assert!(max_err <= 2, "16-bit ICT error {max_err} > 2");
+        }
+    }
+
+    #[test]
+    fn deep_input_composes_with_layers_tiles_and_framing() {
+        // The full wire-shape stack at 12 bits: multi-tile, 2 layers,
+        // SOP + EPH, RPCL.
+        let w = 40u32;
+        let h = 24u32;
+        let p = noise16(w, h, 12, 0xFEED_0C0C);
+        roundtrip_u16(
+            &[&p],
+            w,
+            h,
+            12,
+            &EncodeParams {
+                decomposition_levels: 1,
+                code_block_exp: (3, 3),
+                progression: crate::ProgressionOrder::Rpcl,
+                layers: 2,
+                tile_size: Some((20, 24)),
+                sop: true,
+                eph: true,
+                ..EncodeParams::default()
+            },
+        );
+    }
+
+    #[test]
+    fn deep_input_validation() {
+        let p = vec![0u16; 16];
+        // Depth outside 1..=16.
+        assert!(matches!(
+            encode_j2k_u16(&[&p], 4, 4, 0, &EncodeParams::default()),
+            Err(Error::InvalidSamplePrecision)
+        ));
+        assert!(matches!(
+            encode_j2k_u16(&[&p], 4, 4, 17, &EncodeParams::default()),
+            Err(Error::InvalidSamplePrecision)
+        ));
+        // A sample that does not fit the declared depth.
+        let too_big = vec![1u16 << 12; 16];
+        assert!(matches!(
+            encode_j2k_u16(&[&too_big], 4, 4, 12, &EncodeParams::default()),
+            Err(Error::InvalidSamplePrecision)
+        ));
+        // Exactly at the depth limit is fine.
+        let at_limit = vec![(1u16 << 12) - 1; 16];
+        assert!(encode_j2k_u16(&[&at_limit], 4, 4, 12, &EncodeParams::default()).is_ok());
     }
 
     #[test]
