@@ -1,5 +1,7 @@
 # oxideav-jpeg2000
 
+[![CI](https://github.com/OxideAV/oxideav-jpeg2000/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-jpeg2000/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-jpeg2000.svg)](https://crates.io/crates/oxideav-jpeg2000) [![docs.rs](https://docs.rs/oxideav-jpeg2000/badge.svg)](https://docs.rs/oxideav-jpeg2000) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Pure-Rust JPEG 2000 (J2K codestream + JP2 file format) decoder **and
 encoder** for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
