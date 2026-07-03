@@ -792,6 +792,17 @@ pub struct EncodeParams {
     /// header is postpended with the 2-byte `EPH` marker. Default
     /// `false`.
     pub eph: bool,
+    /// Per-component `(XRsiz, YRsiz)` sub-sampling factors (SIZ Table
+    /// A.11, each `1..=255`). **Empty** (the default) means 1:1 for
+    /// every component; otherwise exactly one pair per plane, and each
+    /// plane must then hold `⌈Xsiz/XRsiz⌉ × ⌈Ysiz/YRsiz⌉` samples
+    /// (§B.2 component-grid extent at zero image offset). Each tile
+    /// codes the §B.3 Equation B-12 tile-component region
+    /// `⌈tx0/XRsiz⌉..⌈tx1/XRsiz⌉ × ⌈ty0/YRsiz⌉..⌈ty1/YRsiz⌉`. When
+    /// [`EncodeParams::mct`] is set, components 0–2 must share the
+    /// same factors (§G.2 / §G.3: "the same separation on the
+    /// reference grid").
+    pub sub_sampling: Vec<(u8, u8)>,
 }
 
 impl Default for EncodeParams {
@@ -810,6 +821,7 @@ impl Default for EncodeParams {
             terminate_all: false,
             sop: false,
             eph: false,
+            sub_sampling: Vec::new(),
         }
     }
 }
@@ -1049,10 +1061,36 @@ fn encode_core(
             }
         }
     }
-    let n = (width as usize)
-        .checked_mul(height as usize)
-        .ok_or(Error::InvalidMarkerLength)?;
-    for p in planes {
+    // Table A.11 sub-sampling factors: empty = all 1:1, otherwise one
+    // (XRsiz, YRsiz) pair per component, each factor 1..=255. §G.2 /
+    // §G.3: the MCT input components share the same separation.
+    if !params.sub_sampling.is_empty() {
+        if params.sub_sampling.len() != planes.len() {
+            return Err(Error::NotImplemented);
+        }
+        if params.sub_sampling.iter().any(|&(x, y)| x == 0 || y == 0) {
+            return Err(Error::NotImplemented);
+        }
+        if mct
+            && (params.sub_sampling[0] != params.sub_sampling[1]
+                || params.sub_sampling[0] != params.sub_sampling[2])
+        {
+            return Err(Error::NotImplemented);
+        }
+    }
+    let separation = |ci: usize| -> (u32, u32) {
+        params
+            .sub_sampling
+            .get(ci)
+            .map_or((1, 1), |&(x, y)| (u32::from(x), u32::from(y)))
+    };
+    // §B.2: at zero image offset, component ci's plane spans
+    // ceil(Xsiz / XRsiz) × ceil(Ysiz / YRsiz) samples.
+    for (ci, p) in planes.iter().enumerate() {
+        let (xr, yr) = separation(ci);
+        let n = (width.div_ceil(xr) as usize)
+            .checked_mul(height.div_ceil(yr) as usize)
+            .ok_or(Error::InvalidMarkerLength)?;
         if p.len() != n {
             return Err(Error::InvalidMarkerLength);
         }
@@ -1074,13 +1112,15 @@ fn encode_core(
         tile_height: tile_h,
         tile_x_offset: 0,
         tile_y_offset: 0,
-        components: planes
-            .iter()
-            .map(|_| SizComponent {
-                precision_bits: precision,
-                is_signed: false,
-                h_separation: 1,
-                v_separation: 1,
+        components: (0..planes.len())
+            .map(|ci| {
+                let (xr, yr) = separation(ci);
+                SizComponent {
+                    precision_bits: precision,
+                    is_signed: false,
+                    h_separation: xr as u8,
+                    v_separation: yr as u8,
+                }
             })
             .collect(),
     };
@@ -1100,13 +1140,20 @@ fn encode_core(
     // absolute tile corner driving the lifting parity.
     let dc = 1i32 << (precision - 1);
     let transform_tile =
-        |tx0: u32, ty0: u32, tx1: u32, ty1: u32| -> Result<Vec<ComponentBands>, Error> {
-            let (tw, th) = ((tx1 - tx0) as usize, (ty1 - ty0) as usize);
-            let extract = |p: &SamplePlane<'_>| -> Vec<i32> {
-                let mut out = Vec::with_capacity(tw * th);
-                for y in ty0..ty1 {
-                    let row = (y as usize) * (width as usize);
-                    for x in tx0..tx1 {
+        |tile: &crate::geometry::TileGeometry| -> Result<Vec<ComponentBands>, Error> {
+            // §B.3 Equation B-12: component ci codes the tile-component
+            // region ⌈tx0/XRsiz⌉..⌈tx1/XRsiz⌉ × ⌈ty0/YRsiz⌉..⌈ty1/YRsiz⌉
+            // on its own (sub-sampled) component grid; the absolute
+            // tile-component corner drives the §F.4 lifting parity.
+            let extract = |ci: usize| -> Vec<i32> {
+                let tc = &tile.components[ci];
+                let (xr, _yr) = separation(ci);
+                let cw = width.div_ceil(xr) as usize;
+                let p = &planes[ci];
+                let mut out = Vec::with_capacity((tc.width() as usize) * (tc.height() as usize));
+                for y in tc.tcy0..tc.tcy1 {
+                    let row = (y as usize) * cw;
+                    for x in tc.tcx0..tc.tcx1 {
                         out.push(p.get(row + x as usize) - dc);
                     }
                 }
@@ -1114,7 +1161,7 @@ fn encode_core(
             };
             Ok(match kernel {
                 EncodeKernel::Lossless5x3 => {
-                    let mut shifted: Vec<Vec<i32>> = planes.iter().map(&extract).collect();
+                    let mut shifted: Vec<Vec<i32>> = (0..planes.len()).map(extract).collect();
                     if use_rct {
                         // Split into three disjoint &mut [i32].
                         let (head, tail) = shifted.split_at_mut(1);
@@ -1123,13 +1170,23 @@ fn encode_core(
                     }
                     shifted
                         .into_iter()
-                        .map(|p| forward_cascade(p, tx0, ty0, tw, th, nl))
+                        .enumerate()
+                        .map(|(ci, p)| {
+                            let tc = &tile.components[ci];
+                            forward_cascade(
+                                p,
+                                tc.tcx0,
+                                tc.tcy0,
+                                tc.width() as usize,
+                                tc.height() as usize,
+                                nl,
+                            )
+                        })
                         .collect()
                 }
                 EncodeKernel::Lossy9x7 { fine_bits } => {
-                    let mut shifted: Vec<Vec<f64>> = planes
-                        .iter()
-                        .map(|p| extract(p).into_iter().map(f64::from).collect())
+                    let mut shifted: Vec<Vec<f64>> = (0..planes.len())
+                        .map(|ci| extract(ci).into_iter().map(f64::from).collect())
                         .collect();
                     if use_ict {
                         let (head, tail) = shifted.split_at_mut(1);
@@ -1138,7 +1195,19 @@ fn encode_core(
                     }
                     shifted
                         .into_iter()
-                        .map(|p| forward_cascade_9x7(p, tx0, ty0, tw, th, nl, fine_bits))
+                        .enumerate()
+                        .map(|(ci, p)| {
+                            let tc = &tile.components[ci];
+                            forward_cascade_9x7(
+                                p,
+                                tc.tcx0,
+                                tc.tcy0,
+                                tc.width() as usize,
+                                tc.height() as usize,
+                                nl,
+                                fine_bits,
+                            )
+                        })
                         .collect()
                 }
             })
@@ -1171,7 +1240,7 @@ fn encode_core(
 
     for t in 0..num_tiles {
         let tile = derive_tile_geometry(&siz, t)?;
-        let bands = transform_tile(tile.tx0, tile.ty0, tile.tx1, tile.ty1)?;
+        let bands = transform_tile(&tile)?;
         let levels_per_comp: Vec<_> = tile
             .components
             .iter()
@@ -1310,10 +1379,11 @@ fn encode_core(
                 }
             }
             precincts_per_comp_res.push(precincts_at_r);
+            let (xr, yr) = separation(ci);
             position_infos.push(ComponentPositionInfo {
                 num_decomposition_levels: nl,
-                xrsiz: 1,
-                yrsiz: 1,
+                xrsiz: xr as u8,
+                yrsiz: yr as u8,
                 resolutions: res_layouts,
             });
         }
@@ -3243,6 +3313,251 @@ mod tests {
                 ..EncodeParams::default()
             },
         );
+    }
+
+    // -- §B.2 component sub-sampling on encode (SIZ XRsiz / YRsiz) ------
+
+    /// Encode sub-sampled planes, decode, assert bit-exact per plane
+    /// with the expected §B.2 sub-sampled dimensions.
+    fn roundtrip_subsampled(planes: &[&[u8]], w: u32, h: u32, params: &EncodeParams) -> Vec<u8> {
+        let stream = encode_j2k(planes, w, h, params).expect("encode");
+        let img = decode_j2k(&stream).expect("decode own stream");
+        assert_eq!(img.components.len(), planes.len());
+        for (ci, (comp, plane)) in img.components.iter().zip(planes).enumerate() {
+            let (xr, yr) = params.sub_sampling.get(ci).copied().unwrap_or((1, 1));
+            assert_eq!(comp.width, w.div_ceil(u32::from(xr)), "comp {ci} width");
+            assert_eq!(comp.height, h.div_ceil(u32::from(yr)), "comp {ci} height");
+            let got: Vec<u8> = comp.samples.iter().map(|&s| s as u8).collect();
+            assert_eq!(&got[..], &plane[..], "comp {ci} samples");
+        }
+        stream
+    }
+
+    #[test]
+    fn subsampled_420_round_trips() {
+        // Y at 1:1, Cb/Cr at 2:2 (the 4:2:0 layout), odd dims so the
+        // ceil grid extents differ from w/2 × h/2.
+        let w = 37u32;
+        let h = 23u32;
+        let y = noise(w, h, 0x0420_0420);
+        let cw = w.div_ceil(2);
+        let ch = h.div_ceil(2);
+        let cb = noise(cw, ch, 0x0420_0001);
+        let cr = gradient(cw, ch);
+        let stream = roundtrip_subsampled(
+            &[&y, &cb, &cr],
+            w,
+            h,
+            &EncodeParams {
+                decomposition_levels: 2,
+                code_block_exp: (4, 4),
+                sub_sampling: vec![(1, 1), (2, 2), (2, 2)],
+                ..EncodeParams::default()
+            },
+        );
+        // Wire shape: the SIZ carries the separations.
+        let header = crate::parse_j2k_header(&stream).expect("header");
+        assert_eq!(header.siz.components[0].h_separation, 1);
+        assert_eq!(header.siz.components[1].h_separation, 2);
+        assert_eq!(header.siz.components[2].v_separation, 2);
+    }
+
+    #[test]
+    fn subsampled_422_and_asymmetric_round_trip() {
+        let w = 41u32;
+        let h = 19u32;
+        // 4:2:2 (x only) plus a deliberately weird (3, 1) third plane.
+        let a = noise(w, h, 0x0422_0422);
+        let b = noise(w.div_ceil(2), h, 0x0422_0002);
+        let c = noise(w.div_ceil(3), h, 0x0422_0003);
+        roundtrip_subsampled(
+            &[&a, &b, &c],
+            w,
+            h,
+            &EncodeParams {
+                decomposition_levels: 3,
+                code_block_exp: (3, 3),
+                sub_sampling: vec![(1, 1), (2, 1), (3, 1)],
+                ..EncodeParams::default()
+            },
+        );
+    }
+
+    #[test]
+    fn subsampled_multi_tile_round_trips() {
+        // Tile edges at reference-grid 20 / 40: with XRsiz = 2 the §B.3
+        // Equation B-12 tile-component regions split at ceil boundaries
+        // (10, 20) on the component grid, and odd tile corners give
+        // every lifting-parity combination.
+        let w = 50u32;
+        let h = 30u32;
+        let y = noise(w, h, 0x7117_2233);
+        let c = noise(w.div_ceil(2), h.div_ceil(2), 0x7117_4455);
+        roundtrip_subsampled(
+            &[&y, &c],
+            w,
+            h,
+            &EncodeParams {
+                decomposition_levels: 1,
+                code_block_exp: (3, 3),
+                tile_size: Some((20, 16)),
+                sub_sampling: vec![(1, 1), (2, 2)],
+                ..EncodeParams::default()
+            },
+        );
+    }
+
+    #[test]
+    fn subsampled_position_orders_round_trip() {
+        // RPCL / PCRL / CPRL key packet positions off XRsiz·2^(...)
+        // multiples (§B.12.1.3–.5) — the separation must flow into the
+        // position computation on encode exactly as the decoder walks
+        // it.
+        let w = 32u32;
+        let h = 32u32;
+        let y = noise(w, h, 0x9051_1111);
+        let c = noise(16, 16, 0x9051_2222);
+        use crate::ProgressionOrder::*;
+        for o in [Rpcl, Pcrl, Cprl] {
+            roundtrip_subsampled(
+                &[&y, &c],
+                w,
+                h,
+                &EncodeParams {
+                    decomposition_levels: 2,
+                    code_block_exp: (3, 3),
+                    progression: o,
+                    precincts: vec![0x22, 0x33, 0x33],
+                    sub_sampling: vec![(1, 1), (2, 2)],
+                    ..EncodeParams::default()
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn subsampled_lossy_step_bound_holds() {
+        let w = 36u32;
+        let h = 28u32;
+        let y = noise(w, h, 0x1055_1055);
+        let c = noise(18, 14, 0x1055_0002);
+        let params = EncodeParams {
+            decomposition_levels: 2,
+            code_block_exp: (4, 4),
+            kernel: EncodeKernel::Lossy9x7 { fine_bits: 6 },
+            sub_sampling: vec![(1, 1), (2, 2)],
+            ..EncodeParams::default()
+        };
+        let stream = encode_j2k(&[&y, &c], w, h, &params).expect("encode");
+        let img = decode_j2k(&stream).expect("decode");
+        for (comp, plane) in img.components.iter().zip([&y, &c]) {
+            let max_err = comp
+                .samples
+                .iter()
+                .zip(plane.iter())
+                .map(|(&got, &want)| (got - i32::from(want)).unsigned_abs())
+                .max()
+                .unwrap();
+            assert!(max_err <= 1, "sub-sampled lossy error {max_err} > 1");
+        }
+    }
+
+    #[test]
+    fn subsampled_16_bit_round_trips() {
+        // Sub-sampling composes with the deep-input path.
+        let w = 25u32;
+        let h = 17u32;
+        let y = noise16(w, h, 12, 0x1216_0001);
+        let c = noise16(13, 9, 12, 0x1216_0002);
+        let params = EncodeParams {
+            decomposition_levels: 2,
+            code_block_exp: (4, 4),
+            sub_sampling: vec![(1, 1), (2, 2)],
+            ..EncodeParams::default()
+        };
+        let stream = encode_j2k_u16(&[&y, &c], w, h, 12, &params).expect("encode");
+        let img = decode_j2k(&stream).expect("decode");
+        for (ci, (comp, plane)) in img.components.iter().zip([&y, &c]).enumerate() {
+            let got: Vec<u16> = comp.samples.iter().map(|&s| s as u16).collect();
+            assert_eq!(&got[..], &plane[..], "comp {ci} samples");
+        }
+    }
+
+    #[test]
+    fn subsampled_mct_shared_factors_round_trips() {
+        // §G.2: the RCT inputs share their separation — all three at
+        // (2, 2) is legal and co-located.
+        let w = 30u32;
+        let h = 22u32;
+        let cw = 15u32;
+        let ch = 11u32;
+        let r = noise(cw, ch, 0x2222_0001);
+        let g: Vec<u8> = r.iter().map(|&v| v.wrapping_add(9)).collect();
+        let b: Vec<u8> = r.iter().map(|&v| v ^ 0x33).collect();
+        roundtrip_subsampled(
+            &[&r, &g, &b],
+            w,
+            h,
+            &EncodeParams {
+                decomposition_levels: 2,
+                code_block_exp: (4, 4),
+                mct: true,
+                sub_sampling: vec![(2, 2), (2, 2), (2, 2)],
+                ..EncodeParams::default()
+            },
+        );
+    }
+
+    #[test]
+    fn subsampled_validation() {
+        let y = vec![0u8; 16 * 16];
+        let c = vec![0u8; 8 * 8];
+        // Wrong pair count.
+        assert!(encode_j2k(
+            &[&y, &c],
+            16,
+            16,
+            &EncodeParams {
+                sub_sampling: vec![(1, 1)],
+                ..EncodeParams::default()
+            }
+        )
+        .is_err());
+        // Zero factor.
+        assert!(encode_j2k(
+            &[&y, &c],
+            16,
+            16,
+            &EncodeParams {
+                sub_sampling: vec![(1, 1), (0, 2)],
+                ..EncodeParams::default()
+            }
+        )
+        .is_err());
+        // Plane size must match the sub-sampled extent.
+        assert!(encode_j2k(
+            &[&y, &y],
+            16,
+            16,
+            &EncodeParams {
+                sub_sampling: vec![(1, 1), (2, 2)],
+                ..EncodeParams::default()
+            }
+        )
+        .is_err());
+        // MCT requires shared factors across components 0-2.
+        let g = vec![0u8; 16 * 16];
+        assert!(encode_j2k(
+            &[&y, &g, &c],
+            16,
+            16,
+            &EncodeParams {
+                mct: true,
+                sub_sampling: vec![(1, 1), (1, 1), (2, 2)],
+                ..EncodeParams::default()
+            }
+        )
+        .is_err());
     }
 
     #[test]

@@ -940,17 +940,6 @@ pub fn reconstruct_tile_components_5x3_multi(
     if components.len() != descriptors.len() {
         return Err(Error::InvalidMarkerLength);
     }
-    // §G "same separation on the reference grid": every component
-    // realised onto the same per-tile grid carries the same sample
-    // count. Validate up-front so a length mismatch on a late
-    // component does not surface only after the RCT has mutated
-    // (0, 1, 2).
-    let len = components[0].len();
-    for c in components.iter() {
-        if c.len() != len {
-            return Err(Error::InvalidMarkerLength);
-        }
-    }
     for d in descriptors {
         if d.precision_bits == 0 || d.precision_bits > 31 {
             return Err(Error::InvalidSamplePrecision);
@@ -967,6 +956,18 @@ pub fn reconstruct_tile_components_5x3_multi(
             // with fewer than three components.
             if components.len() < 3 {
                 return Err(Error::InvalidComponentCount);
+            }
+            // §G.2 "same separation on the reference grid": the three
+            // transform inputs carry the same sample count. Validate
+            // up-front so a length mismatch does not surface only
+            // after the RCT has mutated (0, 1, 2). Components outside
+            // the transform (and every component under
+            // `InverseMctMode::None`, where §G.1.2 is purely
+            // per-component) may be sub-sampled differently and are
+            // free to differ in length.
+            let len = components[0].len();
+            if components[1].len() != len || components[2].len() != len {
+                return Err(Error::InvalidMarkerLength);
             }
             // §G.2 prologue "same separation and bit-depth" — checked
             // on the three transform inputs only. The index-≥3
@@ -1307,19 +1308,11 @@ pub fn reconstruct_tile_components_9x7_multi(
     if components.len() != outputs.len() || components.len() != descriptors.len() {
         return Err(Error::InvalidMarkerLength);
     }
-    // §G "same separation on the reference grid": every component
-    // realised onto the same per-tile grid carries the same sample
-    // count, and each output slot must match. Validate up-front so a
-    // length mismatch on a late component does not surface only after
-    // the ICT has mutated (0, 1, 2).
-    let len = components[0].len();
-    for c in components.iter() {
-        if c.len() != len {
-            return Err(Error::InvalidMarkerLength);
-        }
-    }
-    for o in outputs.iter() {
-        if o.len() != len {
+    // Each output slot must match its component's sample count
+    // (per-component pairing; sub-sampled siblings may differ from
+    // one another).
+    for (c, o) in components.iter().zip(outputs.iter()) {
+        if o.len() != c.len() {
             return Err(Error::InvalidMarkerLength);
         }
     }
@@ -1339,6 +1332,18 @@ pub fn reconstruct_tile_components_9x7_multi(
             // with fewer than three components.
             if components.len() < 3 {
                 return Err(Error::InvalidComponentCount);
+            }
+            // §G.3 "same separation on the reference grid": the three
+            // transform inputs carry the same sample count. Validate
+            // up-front so a length mismatch does not surface only
+            // after the ICT has mutated (0, 1, 2). Components outside
+            // the transform (and every component under
+            // `InverseMctMode::None`, where §G.1.2 is purely
+            // per-component) may be sub-sampled differently and are
+            // free to differ in length.
+            let len = components[0].len();
+            if components[1].len() != len || components[2].len() != len {
+                return Err(Error::InvalidMarkerLength);
             }
             // §G.3 prologue "same separation and bit-depth" — checked
             // on the three transform inputs only. The index-≥3
