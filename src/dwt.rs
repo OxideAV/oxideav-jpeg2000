@@ -401,12 +401,18 @@ pub fn idwt_1d_9x7(y: &[f64], x: &mut [f64], i0: i32, il: i32) -> Result<(), Err
 /// sample-grid lattice.
 ///
 /// The input sub-bands are passed in scan order with `(width,
-/// height)` dimensions; the output is a 2D `i32` (or `f64`) array
-/// of dimensions `(ll.0 + hl.0, ll.1 + lh.1)` whose `(2u, 2v)`
-/// position carries `aLL(u, v)`, `(2u+1, 2v)` carries `aHL(u, v)`,
-/// `(2u, 2v+1)` carries `aLH(u, v)`, and `(2u+1, 2v+1)` carries
-/// `aHH(u, v)`. The `(out_w, out_h)` total dimensions follow §B.5
-/// (sum of low-pass and high-pass widths / heights).
+/// height)` dimensions; the output is a 2D `i32` (or `f64`) array of
+/// dimensions `(ll.0 + hl.0, ll.1 + lh.1)`. Per §F.3.3 the low-pass
+/// coefficients occupy the **even absolute** lattice positions and
+/// the high-pass the odd ones, so the output array — anchored at the
+/// resolution level's `(i0, j0)` origin (§B.5 / Equation B-14, the
+/// same origin the §F.3.4–5 filters receive) — places `aLL(u, v)` at
+/// relative `(2u + (i0 & 1), 2v + (j0 & 1))`, `aHL` at
+/// `(2u + 1 − (i0 & 1), 2v + (j0 & 1))`, and so on: for an
+/// even-anchored level `LL` lands on `(2u, 2v)` exactly as the
+/// classical layout, while an odd anchor (a tile away from the
+/// reference-grid origin) shifts the lattice by one so the absolute
+/// parity is preserved.
 ///
 /// # Errors
 ///
@@ -424,6 +430,8 @@ pub fn interleave_2d_i32(
     lh_dims: (usize, usize),
     hh: &[i32],
     hh_dims: (usize, usize),
+    i0: i32,
+    j0: i32,
 ) -> Result<Interleaved2D<i32>, Error> {
     let out_w = ll_dims.0 + hl_dims.0;
     let out_h = ll_dims.1 + lh_dims.1;
@@ -435,25 +443,32 @@ pub fn interleave_2d_i32(
     {
         return Err(Error::InvalidMarkerLength);
     }
+    // Relative offset of the first low-pass column/row: 0 for an even
+    // anchor, 1 for an odd one (2·⌈i0/2⌉ − i0). The high-pass offset is
+    // its complement.
+    let lo_x = (i0 & 1) as usize;
+    let hi_x = 1 - lo_x;
+    let lo_y = (j0 & 1) as usize;
+    let hi_y = 1 - lo_y;
     let mut data = vec![0_i32; out_w * out_h];
     for v in 0..ll_dims.1 {
         for u in 0..ll_dims.0 {
-            data[2 * v * out_w + 2 * u] = ll[v * ll_dims.0 + u];
+            data[(2 * v + lo_y) * out_w + 2 * u + lo_x] = ll[v * ll_dims.0 + u];
         }
     }
     for v in 0..hl_dims.1 {
         for u in 0..hl_dims.0 {
-            data[2 * v * out_w + 2 * u + 1] = hl[v * hl_dims.0 + u];
+            data[(2 * v + lo_y) * out_w + 2 * u + hi_x] = hl[v * hl_dims.0 + u];
         }
     }
     for v in 0..lh_dims.1 {
         for u in 0..lh_dims.0 {
-            data[(2 * v + 1) * out_w + 2 * u] = lh[v * lh_dims.0 + u];
+            data[(2 * v + hi_y) * out_w + 2 * u + lo_x] = lh[v * lh_dims.0 + u];
         }
     }
     for v in 0..hh_dims.1 {
         for u in 0..hh_dims.0 {
-            data[(2 * v + 1) * out_w + 2 * u + 1] = hh[v * hh_dims.0 + u];
+            data[(2 * v + hi_y) * out_w + 2 * u + hi_x] = hh[v * hh_dims.0 + u];
         }
     }
     Ok(Interleaved2D {
@@ -475,6 +490,8 @@ pub fn interleave_2d_f64(
     lh_dims: (usize, usize),
     hh: &[f64],
     hh_dims: (usize, usize),
+    i0: i32,
+    j0: i32,
 ) -> Result<Interleaved2D<f64>, Error> {
     let out_w = ll_dims.0 + hl_dims.0;
     let out_h = ll_dims.1 + lh_dims.1;
@@ -486,25 +503,29 @@ pub fn interleave_2d_f64(
     {
         return Err(Error::InvalidMarkerLength);
     }
+    let lo_x = (i0 & 1) as usize;
+    let hi_x = 1 - lo_x;
+    let lo_y = (j0 & 1) as usize;
+    let hi_y = 1 - lo_y;
     let mut data = vec![0.0_f64; out_w * out_h];
     for v in 0..ll_dims.1 {
         for u in 0..ll_dims.0 {
-            data[2 * v * out_w + 2 * u] = ll[v * ll_dims.0 + u];
+            data[(2 * v + lo_y) * out_w + 2 * u + lo_x] = ll[v * ll_dims.0 + u];
         }
     }
     for v in 0..hl_dims.1 {
         for u in 0..hl_dims.0 {
-            data[2 * v * out_w + 2 * u + 1] = hl[v * hl_dims.0 + u];
+            data[(2 * v + lo_y) * out_w + 2 * u + hi_x] = hl[v * hl_dims.0 + u];
         }
     }
     for v in 0..lh_dims.1 {
         for u in 0..lh_dims.0 {
-            data[(2 * v + 1) * out_w + 2 * u] = lh[v * lh_dims.0 + u];
+            data[(2 * v + hi_y) * out_w + 2 * u + lo_x] = lh[v * lh_dims.0 + u];
         }
     }
     for v in 0..hh_dims.1 {
         for u in 0..hh_dims.0 {
-            data[(2 * v + 1) * out_w + 2 * u + 1] = hh[v * hh_dims.0 + u];
+            data[(2 * v + hi_y) * out_w + 2 * u + hi_x] = hh[v * hh_dims.0 + u];
         }
     }
     Ok(Interleaved2D {
@@ -559,6 +580,11 @@ pub struct Interleaved2D<T> {
 /// next-coarser LL band's coordinate system). It controls the
 /// even / odd parity of the leftmost sample.
 pub fn hor_sr_5x3(a: &mut Interleaved2D<i32>, i0: i32) -> Result<(), Error> {
+    // §B.5 degenerate lattice (a deeper level of a tiny tile can be
+    // empty on one axis): nothing to filter.
+    if a.width == 0 || a.height == 0 {
+        return Ok(());
+    }
     let il = i0 + a.width as i32;
     let mut tmp = vec![0_i32; a.width];
     for v in 0..a.height {
@@ -575,6 +601,11 @@ pub fn hor_sr_5x3(a: &mut Interleaved2D<i32>, i0: i32) -> Result<(), Error> {
 /// role for column origin that `i0` plays for rows in
 /// [`hor_sr_5x3`].
 pub fn ver_sr_5x3(a: &mut Interleaved2D<i32>, j0: i32) -> Result<(), Error> {
+    // §B.5 degenerate lattice (a deeper level of a tiny tile can be
+    // empty on one axis): nothing to filter.
+    if a.width == 0 || a.height == 0 {
+        return Ok(());
+    }
     let jl = j0 + a.height as i32;
     let mut col = vec![0_i32; a.height];
     let mut out = vec![0_i32; a.height];
@@ -592,6 +623,11 @@ pub fn ver_sr_5x3(a: &mut Interleaved2D<i32>, j0: i32) -> Result<(), Error> {
 
 /// §F.3.4 — `f64` 9-7 irreversible row-wise inverse filter.
 pub fn hor_sr_9x7(a: &mut Interleaved2D<f64>, i0: i32) -> Result<(), Error> {
+    // §B.5 degenerate lattice (a deeper level of a tiny tile can be
+    // empty on one axis): nothing to filter.
+    if a.width == 0 || a.height == 0 {
+        return Ok(());
+    }
     let il = i0 + a.width as i32;
     let mut tmp = vec![0.0_f64; a.width];
     for v in 0..a.height {
@@ -605,6 +641,11 @@ pub fn hor_sr_9x7(a: &mut Interleaved2D<f64>, i0: i32) -> Result<(), Error> {
 
 /// §F.3.5 — `f64` 9-7 irreversible column-wise inverse filter.
 pub fn ver_sr_9x7(a: &mut Interleaved2D<f64>, j0: i32) -> Result<(), Error> {
+    // §B.5 degenerate lattice (a deeper level of a tiny tile can be
+    // empty on one axis): nothing to filter.
+    if a.width == 0 || a.height == 0 {
+        return Ok(());
+    }
     let jl = j0 + a.height as i32;
     let mut col = vec![0.0_f64; a.height];
     let mut out = vec![0.0_f64; a.height];
@@ -647,7 +688,7 @@ pub fn sr_2d_5x3(
     i0: i32,
     j0: i32,
 ) -> Result<Interleaved2D<i32>, Error> {
-    let mut a = interleave_2d_i32(ll, ll_dims, hl, hl_dims, lh, lh_dims, hh, hh_dims)?;
+    let mut a = interleave_2d_i32(ll, ll_dims, hl, hl_dims, lh, lh_dims, hh, hh_dims, i0, j0)?;
     hor_sr_5x3(&mut a, i0)?;
     ver_sr_5x3(&mut a, j0)?;
     Ok(a)
@@ -667,7 +708,7 @@ pub fn sr_2d_9x7(
     i0: i32,
     j0: i32,
 ) -> Result<Interleaved2D<f64>, Error> {
-    let mut a = interleave_2d_f64(ll, ll_dims, hl, hl_dims, lh, lh_dims, hh, hh_dims)?;
+    let mut a = interleave_2d_f64(ll, ll_dims, hl, hl_dims, lh, lh_dims, hh, hh_dims, i0, j0)?;
     hor_sr_9x7(&mut a, i0)?;
     ver_sr_9x7(&mut a, j0)?;
     Ok(a)
@@ -1356,7 +1397,8 @@ mod tests {
         let hl = vec![20_i32, 21, 22, 23];
         let lh = vec![30_i32, 31, 32, 33];
         let hh = vec![40_i32, 41, 42, 43];
-        let out = interleave_2d_i32(&ll, (2, 2), &hl, (2, 2), &lh, (2, 2), &hh, (2, 2)).unwrap();
+        let out =
+            interleave_2d_i32(&ll, (2, 2), &hl, (2, 2), &lh, (2, 2), &hh, (2, 2), 0, 0).unwrap();
         assert_eq!(out.width, 4);
         assert_eq!(out.height, 4);
         // Row 0: LL HL LL HL.
@@ -1375,8 +1417,8 @@ mod tests {
         let hl = vec![0_i32; 4];
         let lh = vec![0_i32; 6]; // wrong width → rejected.
         let hh = vec![0_i32; 4];
-        let err =
-            interleave_2d_i32(&ll, (2, 2), &hl, (2, 2), &lh, (3, 2), &hh, (2, 2)).unwrap_err();
+        let err = interleave_2d_i32(&ll, (2, 2), &hl, (2, 2), &lh, (3, 2), &hh, (2, 2), 0, 0)
+            .unwrap_err();
         assert!(matches!(err, Error::InvalidMarkerLength));
     }
 

@@ -6,6 +6,31 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 385 (2026-07-03).** **Multi-tile encode
+  (`EncodeParams::tile_size`, T.800 §B.3) + two decoder fixes the new
+  geometry exposed.** The encoder now partitions the image into an
+  `XTsiz × YTsiz` grid anchored at the reference-grid origin; each
+  tile extracts its sample region, runs its own DC shift / MCT / §F.4
+  cascade (the lifting parity and the Table B.1 band-corner splits now
+  follow the tile's **absolute** coordinates — `BandPlane` carries its
+  Equation B-15 corner, and `deinterleave` assigns lattice sites to
+  low/high bands by absolute parity), and lands in its own
+  `SOT`/`SOD` tile-part with raster `Isot`. Degenerate deeper levels
+  of tiny tiles (empty bands) are carried through the cascade.
+  Layers, PCRD rate control (hulls span all tiles), the progression
+  orders and the MCT all compose per tile. Decode-side fixes: (1)
+  `interleave_2d_i32/f64` now take the resolution level's `(i0, j0)`
+  origin and place the sub-bands by **absolute** §F.3.3 lattice
+  parity — the previous relative placement was only correct for
+  even-anchored levels, which every origin-anchored single-tile
+  stream is, so no committed fixture changes; (2) `hor_sr`/`ver_sr`
+  accept the zero-extent lattices empty deeper levels produce. Six
+  tests: 3×2 partial-edge grid, odd 7×5 anchors at NL = 3 (odd-parity
+  lifting + empty levels), tiles × RCT, tiles × 9-7 × layers,
+  tiles × rate control, zero tile size reject. Black-box: even-grid,
+  odd-anchor, and tiled-RCT streams all decode through an opaque
+  independent decoder **byte-identically** to this crate's decode.
+
 * **Clean-room round 385 (2026-07-03).** **PCRD rate control
   (`EncodeParams::target_bytes`, T.800 Annex J.13.3 / J.13.4).**
   Tier-1 now also records per-pass distortions `D^n` under the

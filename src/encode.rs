@@ -50,7 +50,7 @@
 //! transform, §G.1.2 level shift, Annex E quantisation. Validation is
 //! a round-trip through this crate's own independently-written decoder.
 
-use crate::dwt::{sd_2d_5x3, Interleaved2D};
+use crate::dwt::sd_2d_5x3;
 use crate::geometry::{
     derive_precinct_code_blocks, derive_precinct_partition, derive_resolution_levels,
     derive_tile_geometry, precinct_exponents_at, SubBandOrientation,
@@ -82,10 +82,13 @@ fn band_gain(orientation: SubBandOrientation) -> u8 {
     }
 }
 
-/// One sub-band's coefficient plane (absolute band coordinates start at
-/// zero for an origin-anchored image, so `data[u + v * width]` is band
-/// sample `(u, v)`).
+/// One sub-band's coefficient plane. `(x0, y0)` is the band's absolute
+/// corner (Table B.1 / Equation B-15 band coordinates — non-zero for
+/// tiles anchored away from the reference-grid origin), so band sample
+/// `(u, v)` lives at `data[(u - x0) + (v - y0) * width]`.
 struct BandPlane {
+    x0: u32,
+    y0: u32,
     width: usize,
     height: usize,
     data: Vec<i32>,
@@ -100,177 +103,171 @@ struct ComponentBands {
     high: Vec<[BandPlane; 3]>,
 }
 
-/// §F.3.3 deinterleave: split one analysis output lattice into its four
-/// sub-band planes (`LL` at `(2u, 2v)`, `HL` at `(2u+1, 2v)`, `LH` at
-/// `(2u, 2v+1)`, `HH` at `(2u+1, 2v+1)`).
-fn deinterleave(a: &Interleaved2D<i32>) -> (BandPlane, BandPlane, BandPlane, BandPlane) {
-    let (w, h) = (a.width, a.height);
-    let (llw, llh) = (w.div_ceil(2), h.div_ceil(2));
-    let (hw, hh) = (w / 2, h / 2);
+/// One analysis level's band corners over the tile-component region
+/// `[x0, x1) × [y0, y1)` (Table B.1 / Equation B-15 with `nb = 1`): the
+/// low-pass (even absolute lattice sites) band spans
+/// `[⌈x0/2⌉, ⌈x1/2⌉)` and the high-pass (odd sites) band
+/// `[⌊x0/2⌋, ⌊x1/2⌋)` on each axis.
+struct SplitCorners {
+    lx0: u32,
+    lx1: u32,
+    hx0: u32,
+    hx1: u32,
+    ly0: u32,
+    ly1: u32,
+    hy0: u32,
+    hy1: u32,
+}
+
+fn split_corners(x0: u32, y0: u32, x1: u32, y1: u32) -> SplitCorners {
+    SplitCorners {
+        lx0: x0.div_ceil(2),
+        lx1: x1.div_ceil(2),
+        hx0: x0 / 2,
+        hx1: x1 / 2,
+        ly0: y0.div_ceil(2),
+        ly1: y1.div_ceil(2),
+        hy0: y0 / 2,
+        hy1: y1 / 2,
+    }
+}
+
+impl SplitCorners {
+    fn plane(&self, high_x: bool, high_y: bool, data: Vec<i32>) -> BandPlane {
+        let (x0, x1) = if high_x {
+            (self.hx0, self.hx1)
+        } else {
+            (self.lx0, self.lx1)
+        };
+        let (y0, y1) = if high_y {
+            (self.hy0, self.hy1)
+        } else {
+            (self.ly0, self.ly1)
+        };
+        BandPlane {
+            x0,
+            y0,
+            width: (x1 - x0) as usize,
+            height: (y1 - y0) as usize,
+            data,
+        }
+    }
+}
+
+/// §F.3.3 deinterleave: split one analysis output lattice anchored at
+/// absolute `(x0, y0)` into its four sub-band planes — a lattice site
+/// with **even absolute** coordinate belongs to the low-pass band at
+/// index `a / 2`, an odd one to the high-pass band at `(a − 1) / 2`.
+/// `map` converts (and, on the 9-7 path, quantises) each sample.
+fn deinterleave_map<T: Copy>(
+    data: &[T],
+    w: usize,
+    h: usize,
+    x0: u32,
+    y0: u32,
+    map: impl Fn(T) -> i32,
+) -> (BandPlane, BandPlane, BandPlane, BandPlane) {
+    let c = split_corners(x0, y0, x0 + w as u32, y0 + h as u32);
+    let (llw, hw) = ((c.lx1 - c.lx0) as usize, (c.hx1 - c.hx0) as usize);
+    let (llh, hh) = ((c.ly1 - c.ly0) as usize, (c.hy1 - c.hy0) as usize);
     let mut ll = vec![0i32; llw * llh];
     let mut hl = vec![0i32; hw * llh];
     let mut lh = vec![0i32; llw * hh];
     let mut hhb = vec![0i32; hw * hh];
     for v in 0..h {
+        let ay = y0 + v as u32;
         for u in 0..w {
-            let s = a.data[v * w + u];
-            match (u % 2, v % 2) {
-                (0, 0) => ll[(v / 2) * llw + u / 2] = s,
-                (1, 0) => hl[(v / 2) * hw + u / 2] = s,
-                (0, 1) => lh[(v / 2) * llw + u / 2] = s,
-                (1, 1) => hhb[(v / 2) * hw + u / 2] = s,
+            let ax = x0 + u as u32;
+            let s = map(data[v * w + u]);
+            match (ax % 2, ay % 2) {
+                (0, 0) => ll[((ay / 2 - c.ly0) as usize) * llw + (ax / 2 - c.lx0) as usize] = s,
+                (1, 0) => hl[((ay / 2 - c.ly0) as usize) * hw + (ax / 2 - c.hx0) as usize] = s,
+                (0, 1) => lh[((ay / 2 - c.hy0) as usize) * llw + (ax / 2 - c.lx0) as usize] = s,
+                (1, 1) => hhb[((ay / 2 - c.hy0) as usize) * hw + (ax / 2 - c.hx0) as usize] = s,
                 _ => unreachable!(),
             }
         }
     }
     (
-        BandPlane {
-            width: llw,
-            height: llh,
-            data: ll,
-        },
-        BandPlane {
-            width: hw,
-            height: llh,
-            data: hl,
-        },
-        BandPlane {
-            width: llw,
-            height: hh,
-            data: lh,
-        },
-        BandPlane {
-            width: hw,
-            height: hh,
-            data: hhb,
-        },
+        c.plane(false, false, ll),
+        c.plane(true, false, hl),
+        c.plane(false, true, lh),
+        c.plane(true, true, hhb),
     )
 }
 
 /// Run the `NL`-level §F.4 forward 5-3 cascade over one DC-shifted
-/// component plane.
-fn forward_cascade(samples: Vec<i32>, width: usize, height: usize, nl: u8) -> ComponentBands {
+/// tile-component region anchored at absolute `(x0, y0)` (the §F.4
+/// lifting parity follows the absolute coordinates, so tiles anchored
+/// off the origin analyse exactly as the decoder's synthesis expects).
+fn forward_cascade(
+    samples: Vec<i32>,
+    x0: u32,
+    y0: u32,
+    width: usize,
+    height: usize,
+    nl: u8,
+) -> ComponentBands {
     let mut cur = BandPlane {
+        x0,
+        y0,
         width,
         height,
         data: samples,
     };
     let mut high = Vec::with_capacity(nl as usize);
     for _lev in 1..=nl {
-        let a = sd_2d_5x3(cur.data, cur.width, cur.height, 0, 0)
-            .expect("analysis dims match by construction");
-        let (ll, hl, lh, hh) = deinterleave(&a);
+        if cur.width == 0 || cur.height == 0 {
+            // §B.5 degenerate level (a tiny tile ran out of samples):
+            // every sub-band of this and deeper levels is empty, but
+            // the corners still follow the Table B.1 splits.
+            let c = split_corners(
+                cur.x0,
+                cur.y0,
+                cur.x0 + cur.width as u32,
+                cur.y0 + cur.height as u32,
+            );
+            high.push([
+                c.plane(true, false, Vec::new()),
+                c.plane(false, true, Vec::new()),
+                c.plane(true, true, Vec::new()),
+            ]);
+            cur = c.plane(false, false, Vec::new());
+            continue;
+        }
+        let a = sd_2d_5x3(
+            cur.data,
+            cur.width,
+            cur.height,
+            cur.x0 as i32,
+            cur.y0 as i32,
+        )
+        .expect("analysis dims match by construction");
+        let (ll, hl, lh, hh) = deinterleave_map(&a.data, a.width, a.height, cur.x0, cur.y0, |s| s);
         high.push([hl, lh, hh]);
         cur = ll;
     }
     ComponentBands { ll: cur, high }
 }
 
-/// §F.3.3 deinterleave for the real-valued 9-7 lattice, quantising each
-/// sub-band sample to its Equation E-1 signed integer on the way out:
-/// `qb = sign(y) · ⌊|y| / Δb⌋`, with the **uniform** step
-/// `Δb = 2^(Rb − εb) = 2^(−fine_bits)` that the `εb = Rb + fine_bits`
-/// exponent choice produces for every band (µb = 0).
-fn deinterleave_quantise(
-    a: &crate::dwt::Interleaved2D<f64>,
-    scale: f64,
-) -> (BandPlane, BandPlane, BandPlane, BandPlane) {
-    let (w, h) = (a.width, a.height);
-    let (llw, llh) = (w.div_ceil(2), h.div_ceil(2));
-    let (hw, hh) = (w / 2, h / 2);
-    let q = |y: f64| -> i32 {
-        let m = (y.abs() * scale).floor() as i32;
-        if y < 0.0 {
-            -m
-        } else {
-            m
-        }
-    };
-    let mut ll = vec![0i32; llw * llh];
-    let mut hl = vec![0i32; hw * llh];
-    let mut lh = vec![0i32; llw * hh];
-    let mut hhb = vec![0i32; hw * hh];
-    for v in 0..h {
-        for u in 0..w {
-            let s = q(a.data[v * w + u]);
-            match (u % 2, v % 2) {
-                (0, 0) => ll[(v / 2) * llw + u / 2] = s,
-                (1, 0) => hl[(v / 2) * hw + u / 2] = s,
-                (0, 1) => lh[(v / 2) * llw + u / 2] = s,
-                (1, 1) => hhb[(v / 2) * hw + u / 2] = s,
-                _ => unreachable!(),
-            }
-        }
-    }
-    (
-        BandPlane {
-            width: llw,
-            height: llh,
-            data: ll,
-        },
-        BandPlane {
-            width: hw,
-            height: llh,
-            data: hl,
-        },
-        BandPlane {
-            width: llw,
-            height: hh,
-            data: lh,
-        },
-        BandPlane {
-            width: hw,
-            height: hh,
-            data: hhb,
-        },
-    )
-}
-
 /// Run the `NL`-level §F.4 forward **9-7** cascade over one DC-shifted
-/// component plane, quantising every emitted sub-band per Annex E with
-/// the uniform `Δb = 2^(−fine_bits)` step. The recursion continues on
-/// the **unquantised** real LL (only the emitted bands quantise), so
-/// deeper levels see full precision.
+/// tile-component region anchored at absolute `(x0, y0)`, quantising
+/// every emitted sub-band per Annex E with the uniform
+/// `Δb = 2^(−fine_bits)` step (Equation E-1
+/// `qb = sign(y) · ⌊|y| / Δb⌋`). The recursion continues on the
+/// **unquantised** real LL (only the emitted bands quantise), so deeper
+/// levels see full precision.
 fn forward_cascade_9x7(
     samples: Vec<f64>,
+    x0: u32,
+    y0: u32,
     width: usize,
     height: usize,
     nl: u8,
     fine_bits: u8,
 ) -> ComponentBands {
     let scale = f64::from(1u32 << fine_bits);
-    struct RealPlane {
-        width: usize,
-        height: usize,
-        data: Vec<f64>,
-    }
-    let mut cur = RealPlane {
-        width,
-        height,
-        data: samples,
-    };
-    let mut high = Vec::with_capacity(nl as usize);
-    for _lev in 1..=nl {
-        let a = crate::dwt::sd_2d_9x7(cur.data, cur.width, cur.height, 0, 0)
-            .expect("analysis dims match by construction");
-        let (_llq, hl, lh, hh) = deinterleave_quantise(&a, scale);
-        // Real-valued LL for the next level (even/even lattice sites).
-        let (llw, llh) = (a.width.div_ceil(2), a.height.div_ceil(2));
-        let mut ll = vec![0f64; llw * llh];
-        for v in 0..llh {
-            for u in 0..llw {
-                ll[v * llw + u] = a.data[(2 * v) * a.width + 2 * u];
-            }
-        }
-        high.push([hl, lh, hh]);
-        cur = RealPlane {
-            width: llw,
-            height: llh,
-            data: ll,
-        };
-    }
-    // Quantise the final LL.
-    let q = |y: f64| -> i32 {
+    let q = move |y: f64| -> i32 {
         let m = (y.abs() * scale).floor() as i32;
         if y < 0.0 {
             -m
@@ -278,7 +275,90 @@ fn forward_cascade_9x7(
             m
         }
     };
+    struct RealPlane {
+        x0: u32,
+        y0: u32,
+        width: usize,
+        height: usize,
+        data: Vec<f64>,
+    }
+    let mut cur = RealPlane {
+        x0,
+        y0,
+        width,
+        height,
+        data: samples,
+    };
+    let mut high = Vec::with_capacity(nl as usize);
+    for _lev in 1..=nl {
+        if cur.width == 0 || cur.height == 0 {
+            // §B.5 degenerate level — same handling as the 5-3 path.
+            let c = split_corners(
+                cur.x0,
+                cur.y0,
+                cur.x0 + cur.width as u32,
+                cur.y0 + cur.height as u32,
+            );
+            high.push([
+                c.plane(true, false, Vec::new()),
+                c.plane(false, true, Vec::new()),
+                c.plane(true, true, Vec::new()),
+            ]);
+            cur = RealPlane {
+                x0: c.lx0,
+                y0: c.ly0,
+                width: (c.lx1 - c.lx0) as usize,
+                height: (c.ly1 - c.ly0) as usize,
+                data: Vec::new(),
+            };
+            continue;
+        }
+        let a = crate::dwt::sd_2d_9x7(
+            cur.data,
+            cur.width,
+            cur.height,
+            cur.x0 as i32,
+            cur.y0 as i32,
+        )
+        .expect("analysis dims match by construction");
+        let (_llq, hl, lh, hh) = deinterleave_map(&a.data, a.width, a.height, cur.x0, cur.y0, q);
+        // Real-valued LL for the next level (even absolute lattice
+        // sites on both axes).
+        let c = split_corners(
+            cur.x0,
+            cur.y0,
+            cur.x0 + a.width as u32,
+            cur.y0 + a.height as u32,
+        );
+        let (llw, llh) = ((c.lx1 - c.lx0) as usize, (c.ly1 - c.ly0) as usize);
+        let mut ll = vec![0f64; llw * llh];
+        for v in 0..a.height {
+            let ay = cur.y0 + v as u32;
+            if ay % 2 != 0 {
+                continue;
+            }
+            for u in 0..a.width {
+                let ax = cur.x0 + u as u32;
+                if ax % 2 != 0 {
+                    continue;
+                }
+                ll[((ay / 2 - c.ly0) as usize) * llw + (ax / 2 - c.lx0) as usize] =
+                    a.data[v * a.width + u];
+            }
+        }
+        high.push([hl, lh, hh]);
+        cur = RealPlane {
+            x0: c.lx0,
+            y0: c.ly0,
+            width: llw,
+            height: llh,
+            data: ll,
+        };
+    }
+    // Quantise the final LL.
     let ll = BandPlane {
+        x0: cur.x0,
+        y0: cur.y0,
         width: cur.width,
         height: cur.height,
         data: cur.data.iter().map(|&y| q(y)).collect(),
@@ -645,6 +725,12 @@ pub struct EncodeParams {
     /// effort). Composes with `layers` (the layer split then divides
     /// the *retained* passes). Default `None` (no rate control).
     pub target_bytes: Option<usize>,
+    /// Tile grid `(XTsiz, YTsiz)` anchored at the reference-grid origin
+    /// (T.800 §B.3 / Table A.9). Each tile transforms and codes
+    /// independently and lands in its own `SOT`/`SOD` tile-part, in
+    /// raster tile order. `None` (the default) encodes one image-sized
+    /// tile.
+    pub tile_size: Option<(u32, u32)>,
 }
 
 impl Default for EncodeParams {
@@ -658,6 +744,7 @@ impl Default for EncodeParams {
             precincts: Vec::new(),
             layers: 1,
             target_bytes: None,
+            tile_size: None,
         }
     }
 }
@@ -837,14 +924,18 @@ pub fn encode_j2k(
     const PRECISION: u8 = 8;
 
     // -- SIZ model (drives both the marker bytes and the geometry) ----
+    let (tile_w, tile_h) = params.tile_size.unwrap_or((width, height));
+    if tile_w == 0 || tile_h == 0 {
+        return Err(Error::NotImplemented);
+    }
     let siz = Siz {
         rsiz: 0,
         x_size: width,
         y_size: height,
         x_offset: 0,
         y_offset: 0,
-        tile_width: width,
-        tile_height: height,
+        tile_width: tile_w,
+        tile_height: tile_h,
         tile_x_offset: 0,
         tile_y_offset: 0,
         components: planes
@@ -857,60 +948,70 @@ pub fn encode_j2k(
             })
             .collect(),
     };
+    let num_tiles = width.div_ceil(tile_w) * height.div_ceil(tile_h);
+    if num_tiles > u32::from(u16::MAX) {
+        // Isot is a 16-bit field (Table A.6).
+        return Err(Error::NotImplemented);
+    }
 
-    // -- Forward transform per component ------------------------------
+    // -- Forward transform of one tile ---------------------------------
     // §G.1.2 DC level shift, then (optionally) the Table A.17 forward
     // MCT across components 0–2 (§G.2 RCT with the 5-3 kernel, §G.3.1
     // ICT with the 9-7 kernel), then the per-component §F.4 cascade —
     // integer 5-3 for the lossless kernel, real-valued 9-7 with Annex E
-    // quantisation for the lossy kernel.
+    // quantisation for the lossy kernel. Each tile transforms
+    // independently over its own reference-grid region (§B.3), with the
+    // absolute tile corner driving the lifting parity.
     let dc = 1i32 << (PRECISION - 1);
-    let bands: Vec<ComponentBands> = match kernel {
-        EncodeKernel::Lossless5x3 => {
-            let mut shifted: Vec<Vec<i32>> = planes
-                .iter()
-                .map(|p| p.iter().map(|&s| s as i32 - dc).collect())
-                .collect();
-            if use_rct {
-                // Split into three disjoint &mut [i32] (MSRV-friendly).
-                let (head, tail) = shifted.split_at_mut(1);
-                let (mid, tail2) = tail.split_at_mut(1);
-                crate::mct::forward_rct(&mut head[0], &mut mid[0], &mut tail2[0])?;
-            }
-            shifted
-                .into_iter()
-                .map(|p| forward_cascade(p, width as usize, height as usize, nl))
-                .collect()
-        }
-        EncodeKernel::Lossy9x7 { fine_bits } => {
-            let mut shifted: Vec<Vec<f64>> = planes
-                .iter()
-                .map(|p| p.iter().map(|&s| f64::from(s) - f64::from(dc)).collect())
-                .collect();
-            if use_ict {
-                let (head, tail) = shifted.split_at_mut(1);
-                let (mid, tail2) = tail.split_at_mut(1);
-                crate::mct::forward_ict_f64(&mut head[0], &mut mid[0], &mut tail2[0])?;
-            }
-            shifted
-                .into_iter()
-                .map(|p| forward_cascade_9x7(p, width as usize, height as usize, nl, fine_bits))
-                .collect()
-        }
-    };
+    let transform_tile =
+        |tx0: u32, ty0: u32, tx1: u32, ty1: u32| -> Result<Vec<ComponentBands>, Error> {
+            let (tw, th) = ((tx1 - tx0) as usize, (ty1 - ty0) as usize);
+            let extract = |p: &[u8]| -> Vec<i32> {
+                let mut out = Vec::with_capacity(tw * th);
+                for y in ty0..ty1 {
+                    let row = (y as usize) * (width as usize);
+                    for x in tx0..tx1 {
+                        out.push(i32::from(p[row + x as usize]) - dc);
+                    }
+                }
+                out
+            };
+            Ok(match kernel {
+                EncodeKernel::Lossless5x3 => {
+                    let mut shifted: Vec<Vec<i32>> = planes.iter().map(|p| extract(p)).collect();
+                    if use_rct {
+                        // Split into three disjoint &mut [i32].
+                        let (head, tail) = shifted.split_at_mut(1);
+                        let (mid, tail2) = tail.split_at_mut(1);
+                        crate::mct::forward_rct(&mut head[0], &mut mid[0], &mut tail2[0])?;
+                    }
+                    shifted
+                        .into_iter()
+                        .map(|p| forward_cascade(p, tx0, ty0, tw, th, nl))
+                        .collect()
+                }
+                EncodeKernel::Lossy9x7 { fine_bits } => {
+                    let mut shifted: Vec<Vec<f64>> = planes
+                        .iter()
+                        .map(|p| extract(p).into_iter().map(f64::from).collect())
+                        .collect();
+                    if use_ict {
+                        let (head, tail) = shifted.split_at_mut(1);
+                        let (mid, tail2) = tail.split_at_mut(1);
+                        crate::mct::forward_ict_f64(&mut head[0], &mut mid[0], &mut tail2[0])?;
+                    }
+                    shifted
+                        .into_iter()
+                        .map(|p| forward_cascade_9x7(p, tx0, ty0, tw, th, nl, fine_bits))
+                        .collect()
+                }
+            })
+        };
 
-    // -- Geometry (shared with the decoder) ---------------------------
-    let tile = derive_tile_geometry(&siz, 0)?;
-    let levels_per_comp: Vec<_> = tile
-        .components
-        .iter()
-        .map(|tc| derive_resolution_levels(*tc, nl))
-        .collect();
-
-    // -- Tier-1: encode every code-block, keyed (comp, r, precinct) ---
-    // Per precinct (comp, r, k): the per-sub-band code-block grids +
-    // zero-bit-plane leaves, and the encoded blocks in §B.10.8 order
-    // (`None` = empty grid cell or all-zero block, never included).
+    // -- Tier-1: encode every code-block, keyed (tile, comp, r, k) -----
+    // Per precinct: the per-sub-band code-block grids + zero-bit-plane
+    // leaves, and the encoded blocks in §B.10.8 order (`None` = empty
+    // grid cell or all-zero block, never included).
     struct PrecinctRaw {
         sub_bands: Vec<(SubBandGeometry, Vec<u32>)>,
         blocks: Vec<Option<EncodedBlock>>,
@@ -919,166 +1020,185 @@ pub fn encode_j2k(
     let layer_count = params.layers;
     let rate_control = params.target_bytes.is_some();
     let want_rates = layer_count > 1 || rate_control;
-    let mut packets: BTreeMap<(u16, u8, u32), PrecinctRaw> = BTreeMap::new();
+    let mut packets: BTreeMap<(u32, u16, u8, u32), PrecinctRaw> = BTreeMap::new();
     let mut num_blocks = 0usize;
     // Deepest coded depth across all code-blocks (zero-bit-planes plus
     // coded plane ordinal) — the J.13.2-style layer split aligns layer
     // boundaries on this global bit-plane depth scale.
     let mut max_depth = 0u32;
-    let mut precincts_per_comp_res: Vec<Vec<u32>> = Vec::with_capacity(planes.len());
-    // Parallel per-component input for the position-keyed (RPCL / PCRL /
-    // CPRL) §B.12.1.3–5 orders: the precinct grids plus the §B.6
-    // reference-grid corner mapping those orders sort visits by.
-    let mut position_infos: Vec<ComponentPositionInfo> = Vec::with_capacity(planes.len());
+    // Per tile: the §B.12 progression inputs.
+    let mut tile_prog: Vec<(Vec<ComponentProgressionInfo>, Vec<ComponentPositionInfo>)> =
+        Vec::with_capacity(num_tiles as usize);
 
-    for (ci, levels) in levels_per_comp.iter().enumerate() {
-        let mut precincts_at_r = Vec::with_capacity(levels.len());
-        let mut res_layouts = Vec::with_capacity(levels.len());
-        for level in levels {
-            let pp = precinct_exponents_at(&params.precincts, level.r);
-            let partition = derive_precinct_partition(level, pp);
-            let num_precincts = partition.num_precincts() as u32;
-            precincts_at_r.push(num_precincts);
-            // §B.6: the precinct partition anchors at (0, 0) on the
-            // reduced-resolution domain with step 2^PP; the level's
-            // left/top edge falls in anchor cell floor(trx0 / 2^PPx).
-            res_layouts.push(ResolutionPrecinctLayout {
-                num_wide: partition.num_wide,
-                num_high: partition.num_high,
-                anchor_x: level.trx0 >> pp.ppx,
-                anchor_y: level.try0 >> pp.ppy,
-                trx0: level.trx0,
-                try0: level.try0,
-                ppx: pp.ppx,
-                ppy: pp.ppy,
-            });
-            for k in 0..num_precincts {
-                let pcb = derive_precinct_code_blocks(level, pp, xcb, ycb, k)?;
-                let mut sub_bands: Vec<(SubBandGeometry, Vec<u32>)> = Vec::new();
-                let mut blocks: Vec<Option<EncodedBlock>> = Vec::new();
-                for psb in &pcb.sub_bands {
-                    let geom = SubBandGeometry {
-                        width: psb.grid_wide,
-                        height: psb.grid_high,
-                    };
-                    let nblocks = (psb.grid_wide as usize) * (psb.grid_high as usize);
-                    let mut zbp = vec![0u32; nblocks];
-                    // Sub-band plane for (ci, r, orientation).
-                    let plane: &BandPlane = if level.r == 0 {
-                        &bands[ci].ll
-                    } else {
-                        let lev = (nl - level.r + 1) as usize; // nb = NL − r + 1
-                        let oi = match psb.orientation {
-                            SubBandOrientation::HL => 0,
-                            SubBandOrientation::LH => 1,
-                            SubBandOrientation::HH => 2,
-                            SubBandOrientation::LL => return Err(Error::InvalidPacketHeader),
+    for t in 0..num_tiles {
+        let tile = derive_tile_geometry(&siz, t)?;
+        let bands = transform_tile(tile.tx0, tile.ty0, tile.tx1, tile.ty1)?;
+        let levels_per_comp: Vec<_> = tile
+            .components
+            .iter()
+            .map(|tc| derive_resolution_levels(*tc, nl))
+            .collect();
+        let mut precincts_per_comp_res: Vec<Vec<u32>> = Vec::with_capacity(planes.len());
+        let mut position_infos: Vec<ComponentPositionInfo> = Vec::with_capacity(planes.len());
+        for (ci, levels) in levels_per_comp.iter().enumerate() {
+            let mut precincts_at_r = Vec::with_capacity(levels.len());
+            let mut res_layouts = Vec::with_capacity(levels.len());
+            for level in levels {
+                let pp = precinct_exponents_at(&params.precincts, level.r);
+                let partition = derive_precinct_partition(level, pp);
+                let num_precincts = partition.num_precincts() as u32;
+                precincts_at_r.push(num_precincts);
+                // §B.6: the precinct partition anchors at (0, 0) on the
+                // reduced-resolution domain with step 2^PP; the level's
+                // left/top edge falls in anchor cell floor(trx0 / 2^PPx).
+                res_layouts.push(ResolutionPrecinctLayout {
+                    num_wide: partition.num_wide,
+                    num_high: partition.num_high,
+                    anchor_x: level.trx0 >> pp.ppx,
+                    anchor_y: level.try0 >> pp.ppy,
+                    trx0: level.trx0,
+                    try0: level.try0,
+                    ppx: pp.ppx,
+                    ppy: pp.ppy,
+                });
+                for k in 0..num_precincts {
+                    let pcb = derive_precinct_code_blocks(level, pp, xcb, ycb, k)?;
+                    let mut sub_bands: Vec<(SubBandGeometry, Vec<u32>)> = Vec::new();
+                    let mut blocks: Vec<Option<EncodedBlock>> = Vec::new();
+                    for psb in &pcb.sub_bands {
+                        let geom = SubBandGeometry {
+                            width: psb.grid_wide,
+                            height: psb.grid_high,
                         };
-                        &bands[ci].high[lev - 1][oi]
-                    };
-                    // §G.2: RCT chrominance carries one extra bit of
-                    // dynamic range, signalled via this component's QCC.
-                    let ri = if use_rct && ci > 0 {
-                        u32::from(PRECISION) + 1
-                    } else {
-                        u32::from(PRECISION)
-                    };
-                    // εb = Rb (+ fine_bits on the lossy path, where the
-                    // exponent excess sets the Equation E-3 step).
-                    let fine = match kernel {
-                        EncodeKernel::Lossless5x3 => 0,
-                        EncodeKernel::Lossy9x7 { fine_bits } => u32::from(fine_bits),
-                    };
-                    let eps = ri + u32::from(band_gain(psb.orientation)) + fine;
-                    let mb = u32::from(GUARD_BITS) + eps - 1;
-                    // J.13.4.1 rate-distortion weight of this band.
-                    let weight = if rate_control {
-                        band_synthesis_weight(
-                            matches!(kernel, EncodeKernel::Lossless5x3),
-                            nl,
-                            level.r,
-                            psb.orientation,
-                        )
-                    } else {
-                        1.0
-                    };
-                    for (bi, cb) in psb.code_blocks.iter().enumerate() {
-                        let (bw, bh) = (cb.width() as usize, cb.height() as usize);
-                        if bw == 0 || bh == 0 {
-                            blocks.push(None);
-                            continue;
-                        }
-                        // Extract the block's coefficients from the band
-                        // plane (absolute band coords; origin-0 image).
-                        let mut targets = Vec::with_capacity(bw * bh);
-                        for v in cb.y0..cb.y1 {
-                            for u in cb.x0..cb.x1 {
-                                let s = plane.data[(v as usize) * plane.width + u as usize];
-                                targets.push(Coefficient {
-                                    magnitude: s.unsigned_abs(),
-                                    sigma: false,
-                                    sign: s < 0,
-                                    already_refined: false,
-                                });
+                        let nblocks = (psb.grid_wide as usize) * (psb.grid_high as usize);
+                        let mut zbp = vec![0u32; nblocks];
+                        // Sub-band plane for (ci, r, orientation).
+                        let plane: &BandPlane = if level.r == 0 {
+                            &bands[ci].ll
+                        } else {
+                            let lev = (nl - level.r + 1) as usize; // nb = NL − r + 1
+                            let oi = match psb.orientation {
+                                SubBandOrientation::HL => 0,
+                                SubBandOrientation::LH => 1,
+                                SubBandOrientation::HH => 2,
+                                SubBandOrientation::LL => return Err(Error::InvalidPacketHeader),
+                            };
+                            &bands[ci].high[lev - 1][oi]
+                        };
+                        // §G.2: RCT chrominance carries one extra bit of
+                        // dynamic range, signalled via this component's QCC.
+                        let ri = if use_rct && ci > 0 {
+                            u32::from(PRECISION) + 1
+                        } else {
+                            u32::from(PRECISION)
+                        };
+                        // εb = Rb (+ fine_bits on the lossy path, where the
+                        // exponent excess sets the Equation E-3 step).
+                        let fine = match kernel {
+                            EncodeKernel::Lossless5x3 => 0,
+                            EncodeKernel::Lossy9x7 { fine_bits } => u32::from(fine_bits),
+                        };
+                        let eps = ri + u32::from(band_gain(psb.orientation)) + fine;
+                        let mb = u32::from(GUARD_BITS) + eps - 1;
+                        // J.13.4.1 rate-distortion weight of this band.
+                        let weight = if rate_control {
+                            band_synthesis_weight(
+                                matches!(kernel, EncodeKernel::Lossless5x3),
+                                nl,
+                                level.r,
+                                psb.orientation,
+                            )
+                        } else {
+                            1.0
+                        };
+                        for (bi, cb) in psb.code_blocks.iter().enumerate() {
+                            let (bw, bh) = (cb.width() as usize, cb.height() as usize);
+                            if bw == 0 || bh == 0 {
+                                blocks.push(None);
+                                continue;
                             }
-                        }
-                        let mut enc = encode_code_block(
-                            psb.orientation,
-                            bw,
-                            bh,
-                            &targets,
-                            mb,
-                            PassCapture {
-                                rates: want_rates,
-                                dist: rate_control,
-                                max_passes: None,
-                            },
-                        )?;
-                        if let Some(enc) = &mut enc {
-                            zbp[bi] = enc.zero_bit_planes;
-                            // Depth of the block's final pass on the
-                            // global bit-plane scale.
-                            max_depth =
-                                max_depth.max(enc.zero_bit_planes + (enc.coding_passes + 1) / 3);
-                            enc.weight = weight;
-                            enc.ordinal = num_blocks;
-                            num_blocks += 1;
-                            if rate_control {
-                                enc.reencode = Some((psb.orientation, bw, bh, targets, mb));
+                            // Extract the block's coefficients from the band
+                            // plane (absolute Table B.1 band coordinates,
+                            // offset by the plane's corner).
+                            let mut targets = Vec::with_capacity(bw * bh);
+                            for v in cb.y0..cb.y1 {
+                                for u in cb.x0..cb.x1 {
+                                    let s = plane.data[((v - plane.y0) as usize) * plane.width
+                                        + (u - plane.x0) as usize];
+                                    targets.push(Coefficient {
+                                        magnitude: s.unsigned_abs(),
+                                        sigma: false,
+                                        sign: s < 0,
+                                        already_refined: false,
+                                    });
+                                }
                             }
+                            let mut enc = encode_code_block(
+                                psb.orientation,
+                                bw,
+                                bh,
+                                &targets,
+                                mb,
+                                PassCapture {
+                                    rates: want_rates,
+                                    dist: rate_control,
+                                    max_passes: None,
+                                },
+                            )?;
+                            if let Some(enc) = &mut enc {
+                                zbp[bi] = enc.zero_bit_planes;
+                                // Depth of the block's final pass on the
+                                // global bit-plane scale.
+                                max_depth = max_depth
+                                    .max(enc.zero_bit_planes + (enc.coding_passes + 1) / 3);
+                                enc.weight = weight;
+                                enc.ordinal = num_blocks;
+                                num_blocks += 1;
+                                if rate_control {
+                                    enc.reencode = Some((psb.orientation, bw, bh, targets, mb));
+                                }
+                            }
+                            blocks.push(enc);
                         }
-                        blocks.push(enc);
+                        sub_bands.push((geom, zbp));
                     }
-                    sub_bands.push((geom, zbp));
+                    packets.insert(
+                        (t, ci as u16, level.r, k),
+                        PrecinctRaw { sub_bands, blocks },
+                    );
                 }
-                packets.insert((ci as u16, level.r, k), PrecinctRaw { sub_bands, blocks });
             }
+            precincts_per_comp_res.push(precincts_at_r);
+            position_infos.push(ComponentPositionInfo {
+                num_decomposition_levels: nl,
+                xrsiz: 1,
+                yrsiz: 1,
+                resolutions: res_layouts,
+            });
         }
-        precincts_per_comp_res.push(precincts_at_r);
-        position_infos.push(ComponentPositionInfo {
-            num_decomposition_levels: nl,
-            xrsiz: 1,
-            yrsiz: 1,
-            resolutions: res_layouts,
-        });
+        let prog_info: Vec<ComponentProgressionInfo> = precincts_per_comp_res
+            .iter()
+            .map(|pr| ComponentProgressionInfo {
+                num_decomposition_levels: nl,
+                precincts_per_resolution: pr.clone(),
+            })
+            .collect();
+        tile_prog.push((prog_info, position_infos));
     }
 
-    // -- Tier-2 packet order (computed once, reused per assembly) ------
-    let prog_info: Vec<ComponentProgressionInfo> = precincts_per_comp_res
-        .iter()
-        .map(|pr| ComponentProgressionInfo {
-            num_decomposition_levels: nl,
-            precincts_per_resolution: pr.clone(),
-        })
-        .collect();
-    let order = match params.progression {
-        ProgressionOrder::Lrcp => lrcp_packet_order(layer_count, &prog_info)?,
-        ProgressionOrder::Rlcp => rlcp_packet_order(layer_count, &prog_info)?,
-        ProgressionOrder::Rpcl => rpcl_packet_order(layer_count, &position_infos)?,
-        ProgressionOrder::Pcrl => pcrl_packet_order(layer_count, &position_infos)?,
-        ProgressionOrder::Cprl => cprl_packet_order(layer_count, &position_infos)?,
-        ProgressionOrder::Reserved(_) => return Err(Error::NotImplemented),
-    };
+    // -- Tier-2 packet orders (per tile; computed once) -----------------
+    let mut orders: Vec<Vec<crate::progression::PacketDescriptor>> =
+        Vec::with_capacity(num_tiles as usize);
+    for (prog_info, position_infos) in &tile_prog {
+        orders.push(match params.progression {
+            ProgressionOrder::Lrcp => lrcp_packet_order(layer_count, prog_info)?,
+            ProgressionOrder::Rlcp => rlcp_packet_order(layer_count, prog_info)?,
+            ProgressionOrder::Rpcl => rpcl_packet_order(layer_count, position_infos)?,
+            ProgressionOrder::Pcrl => pcrl_packet_order(layer_count, position_infos)?,
+            ProgressionOrder::Cprl => cprl_packet_order(layer_count, position_infos)?,
+            ProgressionOrder::Reserved(_) => return Err(Error::NotImplemented),
+        });
+    }
 
     // -- Assembly: layer split + tier-2 emission + markers -------------
     //
@@ -1112,7 +1232,7 @@ pub fn encode_j2k(
         blocks: Vec<Option<LayeredBlock>>,
     }
     let assemble = |trunc: Option<&[u32]>, exact: bool| -> Result<Vec<u8>, Error> {
-        let mut assembled: BTreeMap<(u16, u8, u32), PrecinctLayered> = BTreeMap::new();
+        let mut assembled: BTreeMap<(u32, u16, u8, u32), PrecinctLayered> = BTreeMap::new();
         for (key, raw) in &packets {
             let mut blocks: Vec<Option<LayeredBlock>> = Vec::with_capacity(raw.blocks.len());
             // Per-sub-band first-inclusion layers (§B.10.4 tag trees).
@@ -1219,46 +1339,51 @@ pub fn encode_j2k(
             );
         }
 
-        // Tier-2: emit packets in the §B.12.1 order the COD signals.
-        let mut tile_body: Vec<u8> = Vec::new();
-        for desc in &order {
-            let pa = assembled
-                .get_mut(&(desc.component, desc.resolution, desc.precinct))
-                .ok_or(Error::InvalidPacketHeader)?;
-            let mut plans: Vec<CodeBlockPlan> = Vec::with_capacity(pa.blocks.len());
-            let mut body: Vec<u8> = Vec::new();
-            for b in &pa.blocks {
-                match b {
-                    None => plans.push(CodeBlockPlan {
-                        included: false,
-                        zero_bit_planes: 0,
-                        coding_passes: 0,
-                        segment_length: 0,
-                    }),
-                    Some(lb) => {
-                        let (p, range) = &lb.per_layer[desc.layer as usize];
-                        if *p == 0 {
-                            plans.push(CodeBlockPlan {
-                                included: false,
-                                zero_bit_planes: lb.zero_bit_planes,
-                                coding_passes: 0,
-                                segment_length: 0,
-                            });
-                        } else {
-                            plans.push(CodeBlockPlan {
-                                included: true,
-                                zero_bit_planes: lb.zero_bit_planes,
-                                coding_passes: *p,
-                                segment_length: range.len() as u32,
-                            });
-                            body.extend_from_slice(&lb.bytes[range.clone()]);
+        // Tier-2: emit each tile's packets in the §B.12.1 order the COD
+        // signals; every tile gets its own body (own SOT tile-part).
+        let mut tile_bodies: Vec<Vec<u8>> = Vec::with_capacity(orders.len());
+        for (t, order) in orders.iter().enumerate() {
+            let mut tile_body: Vec<u8> = Vec::new();
+            for desc in order {
+                let pa = assembled
+                    .get_mut(&(t as u32, desc.component, desc.resolution, desc.precinct))
+                    .ok_or(Error::InvalidPacketHeader)?;
+                let mut plans: Vec<CodeBlockPlan> = Vec::with_capacity(pa.blocks.len());
+                let mut body: Vec<u8> = Vec::new();
+                for b in &pa.blocks {
+                    match b {
+                        None => plans.push(CodeBlockPlan {
+                            included: false,
+                            zero_bit_planes: 0,
+                            coding_passes: 0,
+                            segment_length: 0,
+                        }),
+                        Some(lb) => {
+                            let (p, range) = &lb.per_layer[desc.layer as usize];
+                            if *p == 0 {
+                                plans.push(CodeBlockPlan {
+                                    included: false,
+                                    zero_bit_planes: lb.zero_bit_planes,
+                                    coding_passes: 0,
+                                    segment_length: 0,
+                                });
+                            } else {
+                                plans.push(CodeBlockPlan {
+                                    included: true,
+                                    zero_bit_planes: lb.zero_bit_planes,
+                                    coding_passes: *p,
+                                    segment_length: range.len() as u32,
+                                });
+                                body.extend_from_slice(&lb.bytes[range.clone()]);
+                            }
                         }
                     }
                 }
+                let header = encode_packet_header(&mut pa.state, desc.layer, &plans);
+                tile_body.extend_from_slice(&header);
+                tile_body.extend_from_slice(&body);
             }
-            let header = encode_packet_header(&mut pa.state, desc.layer, &plans);
-            tile_body.extend_from_slice(&header);
-            tile_body.extend_from_slice(&body);
+            tile_bodies.push(tile_body);
         }
 
         // Markers.
@@ -1370,16 +1495,19 @@ pub fn encode_j2k(
             }
         }
 
-        // SOT + SOD + tile body (§A.4.2): Psot spans SOT → end of body.
-        let psot = 12u32 + 2 + tile_body.len() as u32;
-        let mut sot_payload = Vec::with_capacity(8);
-        sot_payload.extend_from_slice(&0u16.to_be_bytes()); // Isot
-        sot_payload.extend_from_slice(&psot.to_be_bytes());
-        sot_payload.push(0); // TPsot
-        sot_payload.push(1); // TNsot
-        push_segment(&mut out, MARKER_SOT, &sot_payload);
-        out.extend_from_slice(&MARKER_SOD.to_be_bytes());
-        out.extend_from_slice(&tile_body);
+        // SOT + SOD + tile body per tile (§A.4.2): each tile is one
+        // tile-part, Psot spans SOT → end of its body.
+        for (t, tile_body) in tile_bodies.iter().enumerate() {
+            let psot = 12u32 + 2 + tile_body.len() as u32;
+            let mut sot_payload = Vec::with_capacity(8);
+            sot_payload.extend_from_slice(&(t as u16).to_be_bytes()); // Isot
+            sot_payload.extend_from_slice(&psot.to_be_bytes());
+            sot_payload.push(0); // TPsot
+            sot_payload.push(1); // TNsot
+            push_segment(&mut out, MARKER_SOT, &sot_payload);
+            out.extend_from_slice(&MARKER_SOD.to_be_bytes());
+            out.extend_from_slice(tile_body);
+        }
 
         out.extend_from_slice(&MARKER_EOC.to_be_bytes());
         Ok(out)
@@ -2103,6 +2231,121 @@ mod tests {
             decomposition_levels: 1,
             code_block_exp: (2, 2),
             layers: 0,
+            ..EncodeParams::default()
+        };
+        assert!(encode_j2k(&[&p], 4, 4, &params).is_err());
+    }
+
+    // -- §B.3 multi-tile encode ------------------------------------------
+
+    #[test]
+    fn multi_tile_lossless_round_trips() {
+        // A 3×2 tile grid (last column/row partial) over noise: every
+        // tile transforms and codes independently; decode is bit-exact.
+        let p = noise(50, 34, 0x71E5_71E5);
+        let params = EncodeParams {
+            decomposition_levels: 2,
+            code_block_exp: (3, 3),
+            tile_size: Some((20, 17)),
+            ..EncodeParams::default()
+        };
+        let stream = roundtrip_params(&[&p], 50, 34, &params);
+        let header = crate::parse_j2k_header(&stream).expect("header");
+        assert_eq!(header.siz.tile_width, 20);
+        assert_eq!(header.siz.tile_height, 17);
+    }
+
+    #[test]
+    fn multi_tile_odd_anchor_parity() {
+        // Odd tile dimensions put interior tiles at odd reference-grid
+        // corners, exercising the §F.4 lifting parity and the
+        // Table B.1 band-corner splits away from the origin.
+        let p = noise(23, 19, 0x0DDF_00D5);
+        let params = EncodeParams {
+            decomposition_levels: 3,
+            code_block_exp: (2, 2),
+            tile_size: Some((7, 5)),
+            ..EncodeParams::default()
+        };
+        roundtrip_params(&[&p], 23, 19, &params);
+    }
+
+    #[test]
+    fn multi_tile_rgb_rct_round_trips() {
+        // Tiles × the §G.2 RCT (per-tile component transform).
+        let w = 40u32;
+        let h = 24u32;
+        let r = gradient(w, h);
+        let g = noise(w, h, 0x1234_ABCD);
+        let b: Vec<u8> = gradient(w, h).iter().map(|&v| 255 - v).collect();
+        let params = EncodeParams {
+            decomposition_levels: 2,
+            code_block_exp: (3, 3),
+            mct: true,
+            tile_size: Some((16, 16)),
+            ..EncodeParams::default()
+        };
+        roundtrip_params(&[&r, &g, &b], w, h, &params);
+    }
+
+    #[test]
+    fn multi_tile_lossy_layers_round_trip() {
+        // Tiles × 9-7 × quality layers.
+        let p = noise(48, 48, 0x9876_5432);
+        let params = EncodeParams {
+            decomposition_levels: 2,
+            code_block_exp: (3, 3),
+            kernel: EncodeKernel::Lossy9x7 { fine_bits: 6 },
+            layers: 3,
+            tile_size: Some((32, 32)),
+            ..EncodeParams::default()
+        };
+        let stream = encode_j2k(&[&p], 48, 48, &params).expect("encode");
+        let img = decode_j2k(&stream).expect("decode");
+        let max_err = img.components[0]
+            .samples
+            .iter()
+            .zip(p.iter())
+            .map(|(&got, &want)| (got - i32::from(want)).unsigned_abs())
+            .max()
+            .unwrap();
+        assert!(max_err <= 1, "multi-tile lossy error {max_err} > 1");
+    }
+
+    #[test]
+    fn multi_tile_rate_control_meets_budget() {
+        // PCRD across tiles: the hulls span all tiles' code-blocks.
+        let p = noise(64, 48, 0x1029_3847);
+        let base = EncodeParams {
+            decomposition_levels: 2,
+            code_block_exp: (3, 3),
+            tile_size: Some((32, 24)),
+            ..EncodeParams::default()
+        };
+        let full = encode_j2k(&[&p], 64, 48, &base).unwrap();
+        let target = full.len() * 6 / 10;
+        let rc = encode_j2k(
+            &[&p],
+            64,
+            48,
+            &EncodeParams {
+                target_bytes: Some(target),
+                ..base
+            },
+        )
+        .unwrap();
+        assert!(rc.len() <= target, "budget {target}, got {}", rc.len());
+        let img = decode_j2k(&rc).expect("decode");
+        assert_eq!(img.components[0].samples.len(), 64 * 48);
+    }
+
+    #[test]
+    fn zero_tile_size_rejected() {
+        let p = vec![0u8; 16];
+        let params = EncodeParams {
+            decomposition_levels: 1,
+            code_block_exp: (2, 2),
+            tile_size: Some((0, 8)),
             ..EncodeParams::default()
         };
         assert!(encode_j2k(&[&p], 4, 4, &params).is_err());
