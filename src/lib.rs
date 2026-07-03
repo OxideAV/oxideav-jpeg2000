@@ -121,6 +121,7 @@ pub mod encode;
 pub mod geometry;
 pub mod ht;
 pub(crate) mod ht_tables;
+pub mod htenc;
 pub mod jp2;
 pub mod mct;
 pub mod mq;

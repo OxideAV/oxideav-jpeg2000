@@ -47,7 +47,7 @@ mod tables {
 use tables::{CxtVlcEntry, CXT_VLC_TABLE_0, CXT_VLC_TABLE_1};
 
 /// T.814 Table 2 — MEL exponent table `MEL_E[k]`, `k` in `0..=12`.
-const MEL_E: [u8; 13] = [0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 4, 5];
+pub(crate) const MEL_E: [u8; 13] = [0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 4, 5];
 
 // ---------------------------------------------------------------------------
 // §7.1.2 — MagSgn bit-stream recovery (forward, little-endian, 0xFF-stuffed)
@@ -420,7 +420,7 @@ fn decode_u_extension(vlc: &mut VlcReader, u_sfx: u32) -> Result<u32, Error> {
 
 /// `E_n = min{E ∈ ℕ | (2μ − 1) < 2^E}` (§7.3.2). `E(0) = 0`, `E(1) = 1`,
 /// `E(2) = 2`, `E(3..=4) = 3`, … per Table 1.
-fn magnitude_exponent(mu: u32) -> u32 {
+pub(crate) fn magnitude_exponent(mu: u32) -> u32 {
     if mu == 0 {
         return 0;
     }
@@ -435,17 +435,17 @@ fn magnitude_exponent(mu: u32) -> u32 {
 
 /// Per-quad decoded state accumulated through the cleanup pass.
 #[derive(Clone, Copy, Default)]
-struct QuadState {
+pub(crate) struct QuadState {
     /// Significance pattern ρ_q (4-bit).
-    rho: u8,
+    pub(crate) rho: u8,
     /// EMB known-bit pattern ε̄ᵏ_q (4-bit).
-    e_k: u8,
+    pub(crate) e_k: u8,
     /// EMB known-1 pattern ε̄¹_q (4-bit).
-    e_1: u8,
+    pub(crate) e_1: u8,
     /// Unsigned residual u_q.
-    u_q: u32,
+    pub(crate) u_q: u32,
     /// Exponent bound U_q.
-    u_big: u32,
+    pub(crate) u_big: u32,
 }
 
 /// Working grid for the cleanup pass, indexed by quad scan order.
@@ -453,27 +453,27 @@ struct QuadState {
 /// Sample location `n = 4q + j` maps to sub-band coordinates
 /// `(x, y) = (2·qx + (j>>1), 2·qy + (j&1))` where `(qx, qy)` is the
 /// quad's column/row in the `QW × QH` quad array (§7.2).
-struct HtGrid {
+pub(crate) struct HtGrid {
     /// Code-block width / height in samples.
-    wblk: usize,
-    hblk: usize,
+    pub(crate) wblk: usize,
+    pub(crate) hblk: usize,
     /// Quad-array width / height.
-    qw: usize,
-    qh: usize,
+    pub(crate) qw: usize,
+    pub(crate) qh: usize,
     /// Per-sample magnitude μ_n (raster `x + y*wblk`).
-    mu: Vec<u32>,
+    pub(crate) mu: Vec<u32>,
     /// Per-sample sign s_n (`true` ≡ negative).
-    sign: Vec<bool>,
+    pub(crate) sign: Vec<bool>,
     /// Per-sample significance σ_n.
-    sigma: Vec<bool>,
+    pub(crate) sigma: Vec<bool>,
     /// Per-sample magnitude exponent E_n (cached for predictor reuse).
-    exp: Vec<u32>,
+    pub(crate) exp: Vec<u32>,
     /// Per-quad decoded state.
-    quads: Vec<QuadState>,
+    pub(crate) quads: Vec<QuadState>,
 }
 
 impl HtGrid {
-    fn new(wblk: usize, hblk: usize) -> Self {
+    pub(crate) fn new(wblk: usize, hblk: usize) -> Self {
         let qw = wblk.div_ceil(2);
         let qh = hblk.div_ceil(2);
         Self {
@@ -491,7 +491,7 @@ impl HtGrid {
 
     /// `(x, y)` sub-band coordinates of sample `n = 4q + j`, or `None`
     /// if the sample lies in the odd-dimension pad region.
-    fn coord(&self, q: usize, j: usize) -> Option<(usize, usize)> {
+    pub(crate) fn coord(&self, q: usize, j: usize) -> Option<(usize, usize)> {
         let qx = q % self.qw;
         let qy = q / self.qw;
         let x = 2 * qx + (j >> 1);
@@ -525,7 +525,7 @@ impl HtGrid {
 ///
 /// First quad row (`q < QW`) uses Formula (1) over `(σˢʷ, σʷ, σˢᶠ, σᶠ)`;
 /// other rows use Formula (2) over the previous-row neighbourhood.
-fn quad_context(grid: &HtGrid, q: usize) -> u8 {
+pub(crate) fn quad_context(grid: &HtGrid, q: usize) -> u8 {
     let qw = grid.qw;
     if q < qw {
         // First line-pair. Neighbours are samples of the previous quad
@@ -578,7 +578,7 @@ fn quad_context(grid: &HtGrid, q: usize) -> u8 {
 ///
 /// First quad row: κ_q = 1. Otherwise κ_q is derived from the maximum
 /// of four previous-line exponents, modulated by γ_q (Formula 5/6).
-fn exponent_predictor(grid: &HtGrid, q: usize, rho: u8) -> u32 {
+pub(crate) fn exponent_predictor(grid: &HtGrid, q: usize, rho: u8) -> u32 {
     let qw = grid.qw;
     if q < qw {
         return 1;
@@ -715,7 +715,7 @@ fn decode_sig_emb(
 
 /// Set σ_n for the four samples of quad `q` from its significance
 /// pattern ρ_q.
-fn apply_sig_pattern(grid: &mut HtGrid, q: usize, rho: u8) {
+pub(crate) fn apply_sig_pattern(grid: &mut HtGrid, q: usize, rho: u8) {
     for j in 0..4 {
         if rho & (1 << j) != 0 {
             if let Some((x, y)) = grid.coord(q, j) {
