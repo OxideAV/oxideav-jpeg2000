@@ -6,6 +6,22 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 385 (2026-07-03).** **User-defined precinct
+  partitions on encode (T.800 §B.6 / Table A.21).**
+  `EncodeParams::precincts` takes one `PPy | PPx` nibble byte per
+  resolution level; the encoder signals `Scod` bit 0, appends the
+  Table A.21 bytes after `SPcod`, derives the §B.6 partition and the
+  §B.7 precinct-capped code-block grid through the decoder-shared
+  `geometry` calls, and emits one packet per precinct per resolution —
+  which makes the position-keyed progression orders genuinely
+  interleave. Table A.21 shape faults (byte count ≠ NL + 1, zero
+  nibble above r = 0) are rejected. Tests: multi-precinct lossless and
+  lossy (9-7) round-trips, all five orders over a 3-component
+  multi-precinct image (RPCL demonstrably reorders vs LRCP), and the
+  validation reject/accept paths. Black-box: multi-precinct LRCP /
+  RPCL / PCRL streams decode through an opaque independent decoder
+  **byte-identically** to this crate's own decode.
+
 * **Clean-room round 385 (2026-07-03).** **Structured `EncodeParams` +
   all five §B.12.1 progression orders on encode.** New public
   `encode::EncodeParams` (decomposition levels, code-block exponents,

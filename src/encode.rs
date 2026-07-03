@@ -417,6 +417,14 @@ pub struct EncodeParams {
     /// `SGcod` progression order (Table A.16) the tile's packets are
     /// emitted in — any of the five §B.12.1 orders. Default LRCP.
     pub progression: ProgressionOrder,
+    /// User-defined precinct partition (T.800 Table A.21, `Scod` low
+    /// bit): one byte per resolution level `r = 0..=NL` in order, low
+    /// nibble `PPx`, high nibble `PPy` (the §B.6 partition at `r > 0`
+    /// spans `2^(PPx−1)` sub-band samples, so `0` nibbles are only
+    /// legal at `r = 0` per the Table A.21 note). **Empty** (the
+    /// default) selects maximum precincts (`PPx = PPy = 15`,
+    /// `Scod` bit clear).
+    pub precincts: Vec<u8>,
 }
 
 impl Default for EncodeParams {
@@ -427,6 +435,7 @@ impl Default for EncodeParams {
             kernel: EncodeKernel::Lossless5x3,
             mct: false,
             progression: ProgressionOrder::Lrcp,
+            precincts: Vec::new(),
         }
     }
 }
@@ -578,6 +587,19 @@ pub fn encode_j2k(
     {
         return Err(Error::NotImplemented);
     }
+    // Table A.21: when user-defined precincts are signalled the COD
+    // carries exactly NL + 1 bytes, and a zero PPx / PPy nibble is only
+    // permitted at the lowest resolution level (r = 0).
+    if !params.precincts.is_empty() {
+        if params.precincts.len() != nl as usize + 1 {
+            return Err(Error::NotImplemented);
+        }
+        for &b in &params.precincts[1..] {
+            if b & 0x0F == 0 || (b >> 4) & 0x0F == 0 {
+                return Err(Error::NotImplemented);
+            }
+        }
+    }
     let n = (width as usize)
         .checked_mul(height as usize)
         .ok_or(Error::InvalidMarkerLength)?;
@@ -679,7 +701,7 @@ pub fn encode_j2k(
         let mut precincts_at_r = Vec::with_capacity(levels.len());
         let mut res_layouts = Vec::with_capacity(levels.len());
         for level in levels {
-            let pp = precinct_exponents_at(&[], level.r);
+            let pp = precinct_exponents_at(&params.precincts, level.r);
             let partition = derive_precinct_partition(level, pp);
             let num_precincts = partition.num_precincts() as u32;
             precincts_at_r.push(num_precincts);
@@ -860,16 +882,23 @@ pub fn encode_j2k(
     }
     push_segment(&mut out, MARKER_SIZ, &siz_payload);
 
-    // COD (Tables A.13 – A.21): Scod = 0 (no precincts / SOP / EPH),
-    // LRCP, 1 layer, MCT per `use_rct` (Table A.17), NL levels,
-    // code-block exponents − 2, style 0, and the Table A.20 kernel byte
-    // (1 = 5-3 reversible, 0 = 9-7 irreversible).
+    // COD (Tables A.13 – A.21): Scod bit 0 flags user-defined
+    // precincts (whose Table A.21 bytes then trail SPcod), no
+    // SOP / EPH, the signalled progression, 1 layer, MCT per Table
+    // A.17, NL levels, code-block exponents − 2, style 0, and the
+    // Table A.20 kernel byte (1 = 5-3 reversible, 0 = 9-7
+    // irreversible).
     let transform_byte = match kernel {
         EncodeKernel::Lossless5x3 => 1u8,
         EncodeKernel::Lossy9x7 { .. } => 0u8,
     };
-    let cod_payload = [
-        0u8,              // Scod
+    let scod = if params.precincts.is_empty() {
+        0u8
+    } else {
+        0x01
+    };
+    let mut cod_payload = vec![
+        scod,             // Scod
         progression_byte, // SGcod: progression (Table A.16)
         0,
         1,              // SGcod: layers = 1
@@ -880,6 +909,7 @@ pub fn encode_j2k(
         0,              // SPcod: code-block style
         transform_byte, // SPcod: transform (Table A.20)
     ];
+    cod_payload.extend_from_slice(&params.precincts); // Table A.21
     push_segment(&mut out, MARKER_COD, &cod_payload);
 
     // QCD (Tables A.27 – A.28), one entry per sub-band in the §F.3.1
@@ -1303,6 +1333,125 @@ mod tests {
             },
         );
         assert!(r.is_err());
+    }
+
+    // -- §B.6 user-defined precinct partitions on encode ---------------
+
+    /// Encode with `params`, decode with this crate's decoder, assert
+    /// bit-exact recovery, and return the stream.
+    fn roundtrip_params(planes: &[&[u8]], w: u32, h: u32, params: &EncodeParams) -> Vec<u8> {
+        let stream = encode_j2k(planes, w, h, params).expect("encode");
+        let img = decode_j2k(&stream).expect("decode own stream");
+        for (ci, (comp, plane)) in img.components.iter().zip(planes).enumerate() {
+            let got: Vec<u8> = comp.samples.iter().map(|&s| s as u8).collect();
+            assert_eq!(&got[..], &plane[..], "comp {ci} samples");
+        }
+        stream
+    }
+
+    #[test]
+    fn multi_precinct_lossless_round_trips() {
+        // 64×48, NL = 2, PP = (2, 3, 3): r = 0 partitions the 16×12 LL
+        // domain into 4×4 cells (4×3 = 12 precincts) and the higher
+        // levels split into effective 2^(3−1) = 4-sample precinct spans,
+        // so every resolution carries several packets.
+        let p = noise(64, 48, 0xFACE_FEED);
+        let params = EncodeParams {
+            decomposition_levels: 2,
+            code_block_exp: (2, 2),
+            precincts: vec![0x22, 0x33, 0x33],
+            ..EncodeParams::default()
+        };
+        let stream = roundtrip_params(&[&p], 64, 48, &params);
+        let header = crate::parse_j2k_header(&stream).expect("header");
+        assert!(header.cod.user_defined_precincts);
+        assert_eq!(header.cod.precincts, vec![0x22, 0x33, 0x33]);
+    }
+
+    #[test]
+    fn multi_precinct_position_orders_round_trip() {
+        // With several precincts per resolution the position-keyed
+        // orders genuinely interleave (resolution, component, corner):
+        // every order must still decode bit-exactly, and RPCL must now
+        // produce a different packet sequence from LRCP.
+        let w = 56u32;
+        let h = 40u32;
+        let r = gradient(w, h);
+        let g = noise(w, h, 0x00C0_FFEE);
+        let b: Vec<u8> = gradient(w, h).iter().map(|&v| v ^ 0x5A).collect();
+        let planes: [&[u8]; 3] = [&r, &g, &b];
+        use crate::ProgressionOrder::*;
+        let mut streams = Vec::new();
+        for o in [Lrcp, Rlcp, Rpcl, Pcrl, Cprl] {
+            let params = EncodeParams {
+                decomposition_levels: 2,
+                code_block_exp: (2, 2),
+                progression: o,
+                precincts: vec![0x22, 0x33, 0x44],
+                ..EncodeParams::default()
+            };
+            streams.push(roundtrip_params(&planes, w, h, &params));
+        }
+        for s in &streams[1..] {
+            assert_eq!(streams[0].len(), s.len(), "same packets, reordered");
+        }
+        assert_ne!(
+            streams[0][70..],
+            streams[2][70..],
+            "RPCL reorders multi-precinct packets"
+        );
+    }
+
+    #[test]
+    fn multi_precinct_lossy_round_trips() {
+        // The 9-7 path over a multi-precinct partition.
+        let p = noise(48, 48, 0x0BAD_CAFE);
+        let params = EncodeParams {
+            decomposition_levels: 2,
+            code_block_exp: (3, 3),
+            kernel: EncodeKernel::Lossy9x7 { fine_bits: 6 },
+            precincts: vec![0x33, 0x44, 0x44],
+            ..EncodeParams::default()
+        };
+        let stream = encode_j2k(&[&p], 48, 48, &params).expect("encode");
+        let img = decode_j2k(&stream).expect("decode");
+        let max_err = img.components[0]
+            .samples
+            .iter()
+            .zip(p.iter())
+            .map(|(&got, &want)| (got - i32::from(want)).unsigned_abs())
+            .max()
+            .unwrap();
+        assert!(max_err <= 1, "multi-precinct lossy error {max_err} > 1");
+    }
+
+    #[test]
+    fn precinct_validation_rejects_malformed() {
+        let p = vec![0u8; 16 * 16];
+        // Wrong byte count (NL + 1 = 3 required).
+        let bad_len = EncodeParams {
+            decomposition_levels: 2,
+            code_block_exp: (2, 2),
+            precincts: vec![0x33, 0x33],
+            ..EncodeParams::default()
+        };
+        assert!(encode_j2k(&[&p], 16, 16, &bad_len).is_err());
+        // Zero PPx nibble above r = 0 (Table A.21 note).
+        let bad_zero = EncodeParams {
+            decomposition_levels: 1,
+            code_block_exp: (2, 2),
+            precincts: vec![0x33, 0x30],
+            ..EncodeParams::default()
+        };
+        assert!(encode_j2k(&[&p], 16, 16, &bad_zero).is_err());
+        // A zero nibble at r = 0 alone is fine.
+        let ok_zero = EncodeParams {
+            decomposition_levels: 1,
+            code_block_exp: (2, 2),
+            precincts: vec![0x00, 0x33],
+            ..EncodeParams::default()
+        };
+        assert!(encode_j2k(&[&p], 16, 16, &ok_zero).is_ok());
     }
 
     // -- §G.3.1 irreversible component transform (MCT = 1, 9-7) --------
