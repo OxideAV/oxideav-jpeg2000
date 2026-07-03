@@ -6,6 +6,22 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+* **Clean-room round 385 (2026-07-03).** **Encoder ICT (`SGcod`
+  MCT = 1 with the 9-7 kernel, T.800 §G.3.1).** New
+  `encode::encode_j2k_lossy_ict` runs the Equation G-9/G-10/G-11
+  forward irreversible component transform (a new `f64` mirror of the
+  §G.3 transform in `mct`) between the DC level shift and the 9-7
+  cascade, pairing the MCT with the irreversible kernel per Table A.17.
+  Unlike the §G.2 RCT no widened chroma exponent is needed — the
+  G-10/G-11 rows keep the chrominance inside the luminance dynamic
+  range, so all three components share the QCD. Four tests: ±1
+  near-lossless round-trips (correlated RGB and saturated odd-dims
+  extremes), an ICT-beats-independent-planes compression check on
+  correlated input, and a wire-shape check (MCT byte + Table A.20
+  kernel byte). Black-box: an opaque independent decoder's output for
+  a 61×47 NL = 3 ICT stream matches this crate's decode of the same
+  stream **byte-identically** (pixel payload).
+
 * **Clean-room round 382 (2026-07-02).** **Registry `Encoder` trait +
   README refresh.** The `oxideav-core` registry integration now installs
   an `Encoder` factory (`registry::make_encoder` /

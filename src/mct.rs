@@ -394,6 +394,37 @@ pub fn forward_ict(c0: &mut [f32], c1: &mut [f32], c2: &mut [f32]) -> Result<(),
     Ok(())
 }
 
+/// Forward Irreversible Component Transform (ICT) — T.800 §G.3.1,
+/// `f64` variant for the encoder's real-valued 9-7 pipeline.
+///
+/// Same Equations G-9, G-10, G-11 as [`forward_ict`]; the encoder's
+/// forward 9-7 cascade carries `f64` planes (see
+/// [`crate::dwt::sd_2d_9x7`]), so the component transform is applied in
+/// the same width to avoid a precision round-trip. Per the §G.3
+/// closing paragraph no particular coefficient precision is required.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidMarkerLength`] if the three slices do not
+/// share a common length.
+pub fn forward_ict_f64(c0: &mut [f64], c1: &mut [f64], c2: &mut [f64]) -> Result<(), Error> {
+    if c0.len() != c1.len() || c1.len() != c2.len() {
+        return Err(Error::InvalidMarkerLength);
+    }
+    for i in 0..c0.len() {
+        let r = c0[i];
+        let g = c1[i];
+        let b = c2[i];
+        let y0 = 0.299 * r + 0.587 * g + 0.114 * b;
+        let y1 = -0.16875 * r - 0.331260 * g + 0.5 * b;
+        let y2 = 0.5 * r - 0.41869 * g - 0.08131 * b;
+        c0[i] = y0;
+        c1[i] = y1;
+        c2[i] = y2;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // §G.1 — DC level shifting.
 // ---------------------------------------------------------------------------

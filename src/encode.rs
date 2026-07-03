@@ -363,7 +363,8 @@ pub fn encode_j2k_lossless(
         height,
         nl,
         cb_exp,
-        EncodeKernel::Lossless5x3 { use_rct: false },
+        EncodeKernel::Lossless5x3,
+        false,
     )
 }
 
@@ -371,10 +372,7 @@ pub fn encode_j2k_lossless(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EncodeKernel {
     /// Reversible 5-3, Table A.28 style 0 (no quantization) — lossless.
-    Lossless5x3 {
-        /// Apply the §G.2 forward RCT across components 0–2.
-        use_rct: bool,
-    },
+    Lossless5x3,
     /// Irreversible 9-7 with Annex E scalar-expounded quantisation
     /// (Table A.28 style 2) — lossy. `fine_bits` sets the uniform step
     /// `Δb = 2^(−fine_bits)` via `εb = Rb + fine_bits` (µb = 0): larger
@@ -409,6 +407,43 @@ pub fn encode_j2k_lossy(
         nl,
         cb_exp,
         EncodeKernel::Lossy9x7 { fine_bits },
+        false,
+    )
+}
+
+/// Encode exactly three 8-bit RGB planes into a **lossy** Part-1 J2K
+/// codestream with the §G.3.1 **irreversible component transform**
+/// (ICT, `SGcod` MCT = 1 paired with the 9-7 kernel per Table A.17).
+///
+/// The DC level-shifted planes go through the Equation G-9/G-10/G-11
+/// forward ICT before each component's 9-7 cascade; the decoder's
+/// §G.3.2 inverse (Equations G-12 – G-14) restores RGB. Unlike the
+/// §G.2 RCT, the ICT chrominance components stay within the luminance
+/// dynamic range (the G-10/G-11 rows have unit ℓ1 gain on
+/// full-range input), so all three components share the QCD exponents.
+/// For correlated RGB the ICT concentrates signal energy into `Y0`
+/// and the stream is smaller than three independently coded planes at
+/// the same `fine_bits`. The other parameters match
+/// [`encode_j2k_lossy`].
+pub fn encode_j2k_lossy_ict(
+    planes: &[&[u8]; 3],
+    width: u32,
+    height: u32,
+    nl: u8,
+    cb_exp: (u8, u8),
+    fine_bits: u8,
+) -> Result<Vec<u8>, Error> {
+    if fine_bits > 8 {
+        return Err(Error::NotImplemented);
+    }
+    encode_impl(
+        planes.as_slice(),
+        width,
+        height,
+        nl,
+        cb_exp,
+        EncodeKernel::Lossy9x7 { fine_bits },
+        true,
     )
 }
 
@@ -436,7 +471,8 @@ pub fn encode_j2k_lossless_rct(
         height,
         nl,
         cb_exp,
-        EncodeKernel::Lossless5x3 { use_rct: true },
+        EncodeKernel::Lossless5x3,
+        true,
     )
 }
 
@@ -447,10 +483,16 @@ fn encode_impl(
     nl: u8,
     cb_exp: (u8, u8),
     kernel: EncodeKernel,
+    mct: bool,
 ) -> Result<Vec<u8>, Error> {
     let (xcb, ycb) = cb_exp;
-    let use_rct = matches!(kernel, EncodeKernel::Lossless5x3 { use_rct: true });
-    debug_assert!(!use_rct || planes.len() == 3);
+    // Table A.17: MCT = 1 pairs the §G.2 RCT with the 5-3 kernel and
+    // the §G.3.1 ICT with the 9-7 kernel, always across components 0–2.
+    let use_rct = mct && matches!(kernel, EncodeKernel::Lossless5x3);
+    let use_ict = mct && matches!(kernel, EncodeKernel::Lossy9x7 { .. });
+    if mct && planes.len() != 3 {
+        return Err(Error::NotImplemented);
+    }
     if planes.is_empty()
         || width == 0
         || height == 0
@@ -494,13 +536,14 @@ fn encode_impl(
     };
 
     // -- Forward transform per component ------------------------------
-    // §G.1.2 DC level shift, then (optionally) the §G.2 forward RCT
-    // across components 0–2, then the per-component §F.4 cascade —
+    // §G.1.2 DC level shift, then (optionally) the Table A.17 forward
+    // MCT across components 0–2 (§G.2 RCT with the 5-3 kernel, §G.3.1
+    // ICT with the 9-7 kernel), then the per-component §F.4 cascade —
     // integer 5-3 for the lossless kernel, real-valued 9-7 with Annex E
     // quantisation for the lossy kernel.
     let dc = 1i32 << (PRECISION - 1);
     let bands: Vec<ComponentBands> = match kernel {
-        EncodeKernel::Lossless5x3 { .. } => {
+        EncodeKernel::Lossless5x3 => {
             let mut shifted: Vec<Vec<i32>> = planes
                 .iter()
                 .map(|p| p.iter().map(|&s| s as i32 - dc).collect())
@@ -516,13 +559,21 @@ fn encode_impl(
                 .map(|p| forward_cascade(p, width as usize, height as usize, nl))
                 .collect()
         }
-        EncodeKernel::Lossy9x7 { fine_bits } => planes
-            .iter()
-            .map(|p| {
-                let shifted: Vec<f64> = p.iter().map(|&s| f64::from(s) - f64::from(dc)).collect();
-                forward_cascade_9x7(shifted, width as usize, height as usize, nl, fine_bits)
-            })
-            .collect(),
+        EncodeKernel::Lossy9x7 { fine_bits } => {
+            let mut shifted: Vec<Vec<f64>> = planes
+                .iter()
+                .map(|p| p.iter().map(|&s| f64::from(s) - f64::from(dc)).collect())
+                .collect();
+            if use_ict {
+                let (head, tail) = shifted.split_at_mut(1);
+                let (mid, tail2) = tail.split_at_mut(1);
+                crate::mct::forward_ict_f64(&mut head[0], &mut mid[0], &mut tail2[0])?;
+            }
+            shifted
+                .into_iter()
+                .map(|p| forward_cascade_9x7(p, width as usize, height as usize, nl, fine_bits))
+                .collect()
+        }
     };
 
     // -- Geometry (shared with the decoder) ---------------------------
@@ -588,7 +639,7 @@ fn encode_impl(
                     // εb = Rb (+ fine_bits on the lossy path, where the
                     // exponent excess sets the Equation E-3 step).
                     let fine = match kernel {
-                        EncodeKernel::Lossless5x3 { .. } => 0,
+                        EncodeKernel::Lossless5x3 => 0,
                         EncodeKernel::Lossy9x7 { fine_bits } => u32::from(fine_bits),
                     };
                     let eps = ri + u32::from(band_gain(psb.orientation)) + fine;
@@ -708,7 +759,7 @@ fn encode_impl(
     // code-block exponents − 2, style 0, and the Table A.20 kernel byte
     // (1 = 5-3 reversible, 0 = 9-7 irreversible).
     let transform_byte = match kernel {
-        EncodeKernel::Lossless5x3 { .. } => 1u8,
+        EncodeKernel::Lossless5x3 => 1u8,
         EncodeKernel::Lossy9x7 { .. } => 0u8,
     };
     let cod_payload = [
@@ -716,7 +767,7 @@ fn encode_impl(
         0,   // SGcod: progression = LRCP
         0,
         1,              // SGcod: layers = 1
-        use_rct as u8,  // SGcod: MCT (Table A.17)
+        mct as u8,      // SGcod: MCT (Table A.17)
         nl,             // SPcod: NL
         xcb - 2,        // SPcod: xcb − 2
         ycb - 2,        // SPcod: ycb − 2
@@ -737,7 +788,7 @@ fn encode_impl(
     let quant_payload = |ri: u8| -> Vec<u8> {
         let mut p = Vec::new();
         match kernel {
-            EncodeKernel::Lossless5x3 { .. } => {
+            EncodeKernel::Lossless5x3 => {
                 p.push(GUARD_BITS << 5); // style 0 | guard bits
                 p.push(ri << 3); // εb(LL) = RI + 0
                 for _r in 1..=nl {
@@ -1047,5 +1098,90 @@ mod tests {
     fn lossy_rejects_out_of_range_fine_bits() {
         let p = vec![0u8; 16];
         assert!(encode_j2k_lossy(&[&p], 4, 4, 1, (4, 4), 9).is_err());
+    }
+
+    // -- §G.3.1 irreversible component transform (MCT = 1, 9-7) --------
+
+    /// Encode three planes lossy with the ICT, decode with this crate's
+    /// decoder, and return (max abs error, stream length).
+    fn lossy_ict_roundtrip(
+        planes: &[&[u8]; 3],
+        w: u32,
+        h: u32,
+        nl: u8,
+        cb: (u8, u8),
+        fine_bits: u8,
+    ) -> (u32, usize) {
+        let stream = encode_j2k_lossy_ict(planes, w, h, nl, cb, fine_bits).expect("encode ict");
+        let img = decode_j2k(&stream).expect("decode own ict stream");
+        assert_eq!(img.components.len(), 3);
+        let mut max_err = 0u32;
+        for (comp, plane) in img.components.iter().zip(planes.iter()) {
+            for (&got, &want) in comp.samples.iter().zip(plane.iter()) {
+                max_err = max_err.max((got - i32::from(want)).unsigned_abs());
+            }
+        }
+        (max_err, stream.len())
+    }
+
+    #[test]
+    fn lossy_ict_near_lossless_within_one() {
+        // fine_bits = 6 (Δb = 1/64): the ICT rows have bounded gain, so
+        // the composed §G.3.1 → 9-7 → §G.3.2 error stays within ±1.
+        let r = gradient(48, 40);
+        let g = noise(48, 40, 0x2468_ACE0);
+        let b: Vec<u8> = gradient(48, 40).iter().map(|&v| 255 - v).collect();
+        let (max_err, _) = lossy_ict_roundtrip(&[&r, &g, &b], 48, 40, 3, (4, 4), 6);
+        assert!(max_err <= 1, "ict near-lossless error {max_err} > 1");
+    }
+
+    #[test]
+    fn lossy_ict_odd_dims_extremes() {
+        // Saturated channels + odd dims: the G-9..G-11 corner values
+        // (Y1 / Y2 at ±half range) with the PSEO parity paths.
+        let w = 19u32;
+        let h = 27u32;
+        let r = vec![255u8; (w * h) as usize];
+        let g = vec![0u8; (w * h) as usize];
+        let b: Vec<u8> = (0..w * h).map(|i| (i % 256) as u8).collect();
+        let (max_err, _) = lossy_ict_roundtrip(&[&r, &g, &b], w, h, 2, (4, 4), 6);
+        assert!(max_err <= 1, "ict extremes error {max_err} > 1");
+    }
+
+    #[test]
+    fn ict_beats_independent_planes_on_correlated_rgb() {
+        // Shared busy luminance, smooth channel differences: the ICT
+        // concentrates the noise into Y0 and leaves near-flat chroma,
+        // so the MCT = 1 stream must beat three independent planes at
+        // the same quantisation step.
+        let w = 64u32;
+        let h = 64u32;
+        let luma = noise(w, h, 0x9E37_79B9);
+        let r: Vec<u8> = luma.iter().map(|&v| v.saturating_add(12)).collect();
+        let g = luma.clone();
+        let b: Vec<u8> = luma.iter().map(|&v| v.saturating_sub(25)).collect();
+        let (err, ict_len) = lossy_ict_roundtrip(&[&r, &g, &b], w, h, 3, (5, 5), 4);
+        assert!(err <= 2, "ict correlated error {err} > 2");
+        let plain = encode_j2k_lossy(&[&r, &g, &b], w, h, 3, (5, 5), 4).unwrap();
+        assert!(
+            ict_len < plain.len(),
+            "ICT stream ({ict_len} B) should beat independent planes ({} B)",
+            plain.len()
+        );
+    }
+
+    #[test]
+    fn ict_signals_mct_and_9x7() {
+        // Wire shape: SGcod MCT = 1 and the Table A.20 9-7 kernel byte.
+        let r = gradient(16, 16);
+        let g = gradient(16, 16);
+        let b = gradient(16, 16);
+        let stream = encode_j2k_lossy_ict(&[&r, &g, &b], 16, 16, 1, (4, 4), 6).unwrap();
+        let header = crate::parse_j2k_header(&stream).expect("own header parses");
+        assert_eq!(header.cod.multi_component_transform, 1);
+        assert_eq!(
+            header.cod.transform,
+            crate::WaveletTransform::Irreversible9x7
+        );
     }
 }
