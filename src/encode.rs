@@ -60,13 +60,14 @@ use crate::packet::{
     encode_packet_header, CodeBlockPlan, PrecinctEncoderState, SubBandEncoderPlan, SubBandGeometry,
 };
 use crate::progression::{
-    cprl_packet_order, lrcp_packet_order, pcrl_packet_order, rlcp_packet_order, rpcl_packet_order,
-    ComponentPositionInfo, ComponentProgressionInfo, ResolutionPrecinctLayout,
+    cprl_packet_order, lrcp_packet_order, pcrl_packet_order, poc_volume_packet_order,
+    rlcp_packet_order, rpcl_packet_order, ComponentPositionInfo, ComponentProgressionInfo,
+    PocVolume, ResolutionPrecinctLayout,
 };
 use crate::t1::{reset_contexts, CodeBlock, Coefficient};
 use crate::{
-    Error, ProgressionOrder, Siz, SizComponent, MARKER_COD, MARKER_EOC, MARKER_QCD, MARKER_SIZ,
-    MARKER_SOC, MARKER_SOD, MARKER_SOT,
+    Error, PocProgression, ProgressionOrder, Siz, SizComponent, MARKER_COD, MARKER_EOC, MARKER_POC,
+    MARKER_QCD, MARKER_SIZ, MARKER_SOC, MARKER_SOD, MARKER_SOT,
 };
 
 /// Guard-bit count `G` signalled in `Sqcd` (Table A.28) and used in the
@@ -831,6 +832,19 @@ pub struct EncodeParams {
     /// splits into `TPsot`-indexed tile-parts. Default
     /// [`TilePartSplit::Single`].
     pub tile_parts: TilePartSplit,
+    /// §A.6.6 progression order changes: when non-empty, a main-header
+    /// `POC` marker segment (Table A.32) carries these entries and the
+    /// tile packets are emitted in the concatenated §B.12.2
+    /// progression-order volumes instead of the single `SGcod` order
+    /// (which remains signalled in the COD as the nominal default).
+    /// Every entry must satisfy the Table A.32 ranges
+    /// (`REpoc > RSpoc`, `CEpoc > CSpoc`, `LYEpoc >= 1`, a defined
+    /// `Ppoc`), and the volumes together must cover **every** packet of
+    /// every tile exactly once (the §B.12.2 cursor never repeats a
+    /// packet, so full coverage is checked by count) — a POC that
+    /// leaves packets unemitted is rejected rather than silently
+    /// dropping coded data. Default empty (no `POC`).
+    pub poc: Vec<PocProgression>,
 }
 
 impl Default for EncodeParams {
@@ -851,6 +865,7 @@ impl Default for EncodeParams {
             eph: false,
             sub_sampling: Vec::new(),
             tile_parts: TilePartSplit::Single,
+            poc: Vec::new(),
         }
     }
 }
@@ -1055,14 +1070,60 @@ fn encode_core(
         }
     }
     // Table A.16: only the five defined §B.12.1 orders are encodable.
-    let progression_byte: u8 = match params.progression {
-        ProgressionOrder::Lrcp => 0x00,
-        ProgressionOrder::Rlcp => 0x01,
-        ProgressionOrder::Rpcl => 0x02,
-        ProgressionOrder::Pcrl => 0x03,
-        ProgressionOrder::Cprl => 0x04,
-        ProgressionOrder::Reserved(_) => return Err(Error::NotImplemented),
+    let order_byte = |o: ProgressionOrder| -> Result<u8, Error> {
+        Ok(match o {
+            ProgressionOrder::Lrcp => 0x00,
+            ProgressionOrder::Rlcp => 0x01,
+            ProgressionOrder::Rpcl => 0x02,
+            ProgressionOrder::Pcrl => 0x03,
+            ProgressionOrder::Cprl => 0x04,
+            ProgressionOrder::Reserved(_) => return Err(Error::NotImplemented),
+        })
     };
+    let progression_byte: u8 = order_byte(params.progression)?;
+    // Table A.32 ranges for each §A.6.6 POC entry; the Ppoc byte must
+    // be a defined Table A.16 order.
+    for e in &params.poc {
+        order_byte(e.progression)?;
+        if e.resolution_end <= e.resolution_start
+            || e.resolution_end > 33
+            || e.component_end <= e.component_start
+            || e.layer_end == 0
+        {
+            return Err(Error::NotImplemented);
+        }
+        // CSpoc / CEpoc field width: one byte (CEpoc 0 ⇒ 256) when
+        // Csiz < 257, two bytes (≤ 16384) otherwise.
+        let (cs_max, ce_max) = if planes.len() >= 257 {
+            (16383, 16384)
+        } else {
+            (255, 256)
+        };
+        if e.component_start > cs_max || e.component_end > ce_max {
+            return Err(Error::NotImplemented);
+        }
+    }
+    // §B.12.1.3 / §B.12.1.4: the RPCL and PCRL position orders require
+    // power-of-two XRsiz / YRsiz — as the COD default or inside a POC
+    // volume (the decoder rejects such a stream as malformed, so do
+    // not emit it).
+    let uses_position_pow2_order = matches!(
+        params.progression,
+        ProgressionOrder::Rpcl | ProgressionOrder::Pcrl
+    ) || params.poc.iter().any(|e| {
+        matches!(
+            e.progression,
+            ProgressionOrder::Rpcl | ProgressionOrder::Pcrl
+        )
+    });
+    if uses_position_pow2_order
+        && params
+            .sub_sampling
+            .iter()
+            .any(|&(x, y)| !x.is_power_of_two() || !y.is_power_of_two())
+    {
+        return Err(Error::NotImplemented);
+    }
     if planes.is_empty()
         || width == 0
         || height == 0
@@ -1427,17 +1488,44 @@ fn encode_core(
     }
 
     // -- Tier-2 packet orders (per tile; computed once) -----------------
+    // With a §A.6.6 POC the concatenated §B.12.2 progression-order
+    // volumes drive the whole tile (the same walk the decoder performs
+    // from the parsed marker); the encoder additionally requires the
+    // volumes to cover every packet of the tile exactly once — the
+    // §B.12.2 cursor never repeats a packet, so coverage reduces to a
+    // count check against the full packet population.
+    let poc_volumes: Vec<PocVolume> = params.poc.iter().map(PocVolume::from_poc).collect();
     let mut orders: Vec<Vec<crate::progression::PacketDescriptor>> =
         Vec::with_capacity(num_tiles as usize);
     for (prog_info, position_infos) in &tile_prog {
-        orders.push(match params.progression {
-            ProgressionOrder::Lrcp => lrcp_packet_order(layer_count, prog_info)?,
-            ProgressionOrder::Rlcp => rlcp_packet_order(layer_count, prog_info)?,
-            ProgressionOrder::Rpcl => rpcl_packet_order(layer_count, position_infos)?,
-            ProgressionOrder::Pcrl => pcrl_packet_order(layer_count, position_infos)?,
-            ProgressionOrder::Cprl => cprl_packet_order(layer_count, position_infos)?,
-            ProgressionOrder::Reserved(_) => return Err(Error::NotImplemented),
-        });
+        let order = if poc_volumes.is_empty() {
+            match params.progression {
+                ProgressionOrder::Lrcp => lrcp_packet_order(layer_count, prog_info)?,
+                ProgressionOrder::Rlcp => rlcp_packet_order(layer_count, prog_info)?,
+                ProgressionOrder::Rpcl => rpcl_packet_order(layer_count, position_infos)?,
+                ProgressionOrder::Pcrl => pcrl_packet_order(layer_count, position_infos)?,
+                ProgressionOrder::Cprl => cprl_packet_order(layer_count, position_infos)?,
+                ProgressionOrder::Reserved(_) => return Err(Error::NotImplemented),
+            }
+        } else {
+            let order =
+                poc_volume_packet_order(&poc_volumes, layer_count, prog_info, position_infos)?;
+            let total: u64 = prog_info
+                .iter()
+                .map(|ci| {
+                    ci.precincts_per_resolution
+                        .iter()
+                        .map(|&n| u64::from(n))
+                        .sum::<u64>()
+                })
+                .sum::<u64>()
+                * u64::from(layer_count);
+            if order.len() as u64 != total {
+                return Err(Error::NotImplemented);
+            }
+            order
+        };
+        orders.push(order);
     }
 
     // -- Assembly: layer split + tier-2 emission + markers -------------
@@ -1832,6 +1920,37 @@ fn encode_core(
                 qcc_payload.extend_from_slice(&quant_payload(precision + 1));
                 push_segment(&mut out, crate::MARKER_QCC, &qcc_payload);
             }
+        }
+
+        // POC (§A.6.6, Table A.32): one entry per progression-order
+        // change, after the quantisation markers. CSpoc / CEpoc are one
+        // byte when Csiz < 257, two otherwise; a full-range CEpoc that
+        // does not fit the one-byte form (256) is written as 0 per the
+        // Table A.32 footnote.
+        if !params.poc.is_empty() {
+            let wide = planes.len() >= 257;
+            let mut poc_payload = Vec::with_capacity(params.poc.len() * if wide { 9 } else { 7 });
+            for e in &params.poc {
+                poc_payload.push(e.resolution_start);
+                if wide {
+                    poc_payload.extend_from_slice(&e.component_start.to_be_bytes());
+                } else {
+                    poc_payload.push(e.component_start as u8);
+                }
+                poc_payload.extend_from_slice(&e.layer_end.to_be_bytes());
+                poc_payload.push(e.resolution_end);
+                if wide {
+                    poc_payload.extend_from_slice(&e.component_end.to_be_bytes());
+                } else {
+                    poc_payload.push(if e.component_end == 256 {
+                        0
+                    } else {
+                        e.component_end as u8
+                    });
+                }
+                poc_payload.push(order_byte(e.progression).expect("validated above"));
+            }
+            push_segment(&mut out, MARKER_POC, &poc_payload);
         }
 
         // SOT + SOD per tile-part (§A.4.2): Psot spans SOT → end of the
@@ -3786,6 +3905,174 @@ mod tests {
             ..EncodeParams::default()
         };
         assert!(encode_j2k(&[&p], 64, 64, &params).is_err());
+    }
+
+    // -- §A.6.6 POC emission (progression-order changes) ----------------
+
+    fn poc_entry(
+        rs: u8,
+        re: u8,
+        cs: u16,
+        ce: u16,
+        ly: u16,
+        o: crate::ProgressionOrder,
+    ) -> crate::PocProgression {
+        crate::PocProgression {
+            resolution_start: rs,
+            resolution_end: re,
+            component_start: cs,
+            component_end: ce,
+            layer_end: ly,
+            progression: o,
+        }
+    }
+
+    #[test]
+    fn poc_two_resolution_volumes_round_trip() {
+        // Volume 1: resolutions 0..1 in LRCP; volume 2: 1..3 in CPRL —
+        // together they cover all NL + 1 = 3 resolutions once.
+        use crate::ProgressionOrder::*;
+        let p = noise(48, 40, 0x90C0_0001);
+        let params = EncodeParams {
+            decomposition_levels: 2,
+            code_block_exp: (4, 4),
+            poc: vec![
+                poc_entry(0, 1, 0, 1, 1, Lrcp),
+                poc_entry(1, 3, 0, 1, 1, Cprl),
+            ],
+            ..EncodeParams::default()
+        };
+        let stream = roundtrip_params(&[&p], 48, 40, &params);
+        // Wire shape: a main-header POC with both entries.
+        let cs = crate::parse_codestream(&stream).expect("parse");
+        let poc = crate::collect_main_header_poc(&stream, cs.header.bytes_consumed, 1)
+            .expect("collect poc")
+            .expect("poc present");
+        assert_eq!(poc.progressions.len(), 2);
+        assert_eq!(poc.progressions[0].resolution_end, 1);
+        assert_eq!(poc.progressions[1].progression, Cprl);
+    }
+
+    #[test]
+    fn poc_layer_then_component_volumes_round_trip() {
+        // 3 components, 2 layers: volume 1 emits layer 0 of everything
+        // (LRCP), volume 2 the remaining layer component-by-component
+        // (CPRL). The §B.12.2 layer cursors keep the second volume from
+        // re-emitting layer 0.
+        use crate::ProgressionOrder::*;
+        let r = noise(32, 24, 0x90C0_0002);
+        let g = noise(32, 24, 0x90C0_0003);
+        let b = noise(32, 24, 0x90C0_0004);
+        let params = EncodeParams {
+            decomposition_levels: 1,
+            code_block_exp: (4, 4),
+            layers: 2,
+            poc: vec![
+                poc_entry(0, 2, 0, 3, 1, Lrcp),
+                poc_entry(0, 2, 0, 3, 2, Cprl),
+            ],
+            ..EncodeParams::default()
+        };
+        roundtrip_params(&[&r, &g, &b], 32, 24, &params);
+    }
+
+    #[test]
+    fn poc_with_position_order_and_precincts() {
+        // A POC volume in RPCL over a real precinct partition, plus an
+        // LRCP tail volume — positions must agree with the decoder.
+        use crate::ProgressionOrder::*;
+        let p = noise(56, 40, 0x90C0_0005);
+        let params = EncodeParams {
+            decomposition_levels: 2,
+            code_block_exp: (2, 2),
+            precincts: vec![0x22, 0x33, 0x44],
+            poc: vec![
+                poc_entry(0, 2, 0, 1, 1, Rpcl),
+                poc_entry(2, 3, 0, 1, 1, Lrcp),
+            ],
+            ..EncodeParams::default()
+        };
+        roundtrip_params(&[&p], 56, 40, &params);
+    }
+
+    #[test]
+    fn poc_composes_with_tiles_framing_and_tile_parts() {
+        // POC + multi-tile + SOP/EPH + per-resolution tile-parts.
+        use crate::ProgressionOrder::*;
+        let p = noise(40, 32, 0x90C0_0006);
+        let params = EncodeParams {
+            decomposition_levels: 1,
+            code_block_exp: (3, 3),
+            tile_size: Some((20, 32)),
+            sop: true,
+            eph: true,
+            tile_parts: TilePartSplit::ByResolution,
+            poc: vec![
+                poc_entry(0, 1, 0, 1, 1, Lrcp),
+                poc_entry(1, 2, 0, 1, 1, Rlcp),
+            ],
+            ..EncodeParams::default()
+        };
+        let stream = roundtrip_params(&[&p], 40, 32, &params);
+        let cs = crate::parse_codestream(&stream).expect("parse");
+        assert_eq!(cs.tile_parts.len(), 4, "2 tiles x 2 resolution parts");
+    }
+
+    #[test]
+    fn poc_incomplete_coverage_rejected() {
+        // The single volume stops at resolution 2 of 3 — packets of the
+        // top resolution would never be emitted.
+        use crate::ProgressionOrder::*;
+        let p = noise(32, 32, 0x90C0_0007);
+        let params = EncodeParams {
+            decomposition_levels: 2,
+            code_block_exp: (4, 4),
+            poc: vec![poc_entry(0, 2, 0, 1, 1, Lrcp)],
+            ..EncodeParams::default()
+        };
+        assert!(encode_j2k(&[&p], 32, 32, &params).is_err());
+    }
+
+    #[test]
+    fn poc_invalid_entries_rejected() {
+        use crate::ProgressionOrder::*;
+        let p = noise(16, 16, 0x90C0_0008);
+        let base = EncodeParams {
+            decomposition_levels: 1,
+            code_block_exp: (4, 4),
+            ..EncodeParams::default()
+        };
+        // REpoc <= RSpoc.
+        let bad1 = EncodeParams {
+            poc: vec![poc_entry(1, 1, 0, 1, 1, Lrcp)],
+            ..base.clone()
+        };
+        assert!(encode_j2k(&[&p], 16, 16, &bad1).is_err());
+        // CEpoc <= CSpoc.
+        let bad2 = EncodeParams {
+            poc: vec![poc_entry(0, 2, 1, 1, 1, Lrcp)],
+            ..base.clone()
+        };
+        assert!(encode_j2k(&[&p], 16, 16, &bad2).is_err());
+        // LYEpoc == 0.
+        let bad3 = EncodeParams {
+            poc: vec![poc_entry(0, 2, 0, 1, 0, Lrcp)],
+            ..base.clone()
+        };
+        assert!(encode_j2k(&[&p], 16, 16, &bad3).is_err());
+        // Reserved Ppoc.
+        let bad4 = EncodeParams {
+            poc: vec![poc_entry(
+                0,
+                2,
+                0,
+                1,
+                1,
+                crate::ProgressionOrder::Reserved(9),
+            )],
+            ..base
+        };
+        assert!(encode_j2k(&[&p], 16, 16, &bad4).is_err());
     }
 
     #[test]
