@@ -187,7 +187,8 @@ What is implemented:
 The crate carries a full **encode** path built from the same clean-room
 spec surface, round-trip-validated against this crate's own decoder and
 independently confirmed conformant by an opaque black-box decoder
-(seven configurations reconstruct **bit-identically**):
+(every configuration below reconstructs **byte-identically** through
+it):
 
 - **MQ arithmetic encoder** (Annex C §C.2) — INITENC / ENCODE
   (CODEMPS / CODELPS with the conditional exchange) / RENORME / BYTEOUT
@@ -197,34 +198,76 @@ independently confirmed conformant by an opaque black-box decoder
   significance-propagation, magnitude-refinement, and cleanup passes
   (incl. the Table D.5 run-length mode and the §D.3.2 sign subroutine),
   sharing the decoder's scan order and context formation so the
-  progressive state stays in lock-step by construction.
+  progressive state stays in lock-step by construction. A segmented
+  scheduler terminates codeword segments per Table D.9 / §D.4.2 when a
+  termination style is signalled.
+- **Coding styles on encode** — the §D.6 **selective
+  arithmetic-coding bypass** (Table A.19 bit 0: SP / MR passes from
+  bit-plane 5 write raw bits through a §D.6 stuff-bit writer while
+  cleanups stay MQ) and §D.4.2 **termination on each coding pass**
+  (bit 2), separately or composed, with the §B.10.7.2 multi-segment
+  length sequences written by the generalised tier-2 writer.
 - **Forward DWT** (§F.4) — 1-D + 2-D 5-3 (bit-exact inverse pair) and
-  9-7 (round-off-exact) analysis over the same PSEO extension.
+  9-7 (round-off-exact) analysis over the same PSEO extension, with the
+  lifting parity and Table B.1 band corners anchored at each tile's
+  absolute reference-grid coordinates.
 - **Tier-2 packet-header writer** (§B.10) — bit-stuffing writer,
-  tag-tree encoder, Table B.4 coding-passes codewords, minimal-`Lblock`
-  segment lengths, and the §B.10.8 packet-header composer with
-  §B.10.3 empty packets.
+  tag-tree encoder, Table B.4 coding-passes codewords,
+  minimal-`Lblock` single- and multi-segment length sequences, and the
+  §B.10.8 packet-header composer with §B.10.3 empty packets, driven
+  across quality layers by a persistent per-precinct encoder state.
 - **Codestream assembly** — `SOC` / `SIZ` / `COD` / `QCD` / `QCC` /
-  `SOT` / `SOD` / `EOC` in the §A.3 order; geometry and packet order are
-  derived from the same `geometry` / `progression` code the decoder
-  uses. Single tile, single layer, LRCP, maximum precincts.
+  per-tile `SOT` / `SOD` / `EOC` in the §A.3 order; geometry and packet
+  order are derived from the same `geometry` / `progression` code the
+  decoder uses.
+- **Structured parameters** (`encode::EncodeParams` +
+  `encode::encode_j2k`) — decomposition levels, code-block exponents,
+  kernel, MCT, and:
+  - **All five §B.12.1 progression orders** (LRCP / RLCP / RPCL /
+    PCRL / CPRL), signalled in `SGcod` and emitted by the decoder's own
+    progression drivers.
+  - **User-defined precinct partitions** (§B.6 / Table A.21, `Scod`
+    bit 0) with the §B.7 precinct-capped code-block grid — one packet
+    per precinct, making the position-keyed orders genuinely
+    interleave.
+  - **Quality layers** (Annex J.13.2 guidance): each code-block's
+    passes are distributed over `L` layers by coded depth on a global
+    bit-plane scale and its codeword segment is cut at the Annex J.13.4
+    per-pass truncation rates `R^n` (encoder-state snapshots), so an
+    independent decoder's layer-limited decodes improve monotonically
+    (measured MSE 4373 → 50 → 1.3 → exact on a lossless 4-layer
+    stream) while full decode stays bit-exact.
+  - **PCRD rate control** (Annex J.13.3): per-block monotone-slope
+    truncation sets over `(R^n, D^n)` — distortions from a §E.1.1.2
+    midpoint-reconstruction model weighted by the sub-band
+    synthesis-waveform L2 norm (J.13.4.1, computed by running an
+    impulse through this crate's own synthesis) — with the Equation
+    J-13 threshold λ bisected to the largest stream not exceeding
+    `target_bytes` (observed within ≤ 5 bytes of budget); truncated
+    blocks are re-encoded so the emitted segment is exactly
+    §C.2.9-terminated.
+  - **Multi-tile encode** (§B.3): an `XTsiz × YTsiz` grid, each tile
+    transformed and coded independently into its own tile-part —
+    including odd-anchored tiles (absolute-parity lifting) and tiny
+    tiles whose deeper levels go empty.
 - **Lossless** (`encode_j2k_lossless`) — reversible 5-3, Table A.28
   style 0, `εb = RI + gain` (Table E.1); decodes back **bit-exactly**.
   Optional §G.2 **RCT** (`encode_j2k_lossless_rct`, `SGcod` MCT = 1)
   with the chroma dynamic-range bit signalled via per-component `QCC`.
 - **Lossy** (`encode_j2k_lossy`) — irreversible 9-7 with Annex E
   scalar-expounded quantisation (Table A.28 style 2); a `fine_bits`
-  knob sets the uniform Equation E-3 step `Δb = 2^(−fine_bits)`
-  (`6` ≈ near-lossless ±1, `0` = coarse `Δb = 1`).
+  knob sets the uniform Equation E-3 step `Δb = 2^(−fine_bits)`.
+  Optional §G.3.1 **ICT** (`encode_j2k_lossy_ict`, MCT = 1 with the
+  9-7 kernel per Table A.17).
 - The `oxideav-core` registry installs the **`Encoder` trait** impl
   alongside the decoder (`make_encoder`), and the historical
   `encode_jpeg2000(pixels, w, h)` byte-vector entry point encodes 1-
   (gray) and 3-component (RGB via RCT) interleaved 8-bit input.
 
-Not yet on the encode side: multiple layers / tiles / precincts,
-rate control, progression orders beyond LRCP, the §D.6 bypass /
-§D.4.2 termination styles on encode, ICT, sub-sampling, >8-bit input,
-and HTJ2K encoding.
+Not yet on the encode side: component sub-sampling, >8-bit input,
+SOP / EPH framing, POC emission, multiple tile-parts per tile
+(`TPsot > 0`), PPM / PPT relocation, per-component `COC` / `QCC`
+overrides, ROI, and HTJ2K encoding.
 
 ### Not yet implemented
 
@@ -275,8 +318,12 @@ let container  = oxideav_jpeg2000::jp2::parse_jp2(bytes)?;
 ```
 
 Decoding: `decode_j2k` (planar) / `decode_jpeg2000` (interleaved bytes).
-Encoding: `encode::encode_j2k_lossless` / `encode_j2k_lossless_rct` /
-`encode_j2k_lossy`, or the historical `encode_jpeg2000(pixels, w, h)`.
+Encoding: `encode::encode_j2k` with `encode::EncodeParams` (kernel,
+MCT, progression order, precincts, quality layers, PCRD
+`target_bytes`, tile grid, bypass / termination styles), the
+`encode_j2k_lossless` / `encode_j2k_lossless_rct` / `encode_j2k_lossy`
+/ `encode_j2k_lossy_ict` wrappers, or the historical
+`encode_jpeg2000(pixels, w, h)`.
 
 The crate also registers a software decoder **and encoder** through the
 standard `oxideav-core` registry path.
