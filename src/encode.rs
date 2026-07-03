@@ -708,6 +708,30 @@ pub enum EncodeKernel {
     },
 }
 
+/// How each tile's packet sequence divides into tile-parts (T.800
+/// §A.4.2 `SOT` — `TPsot` / `TNsot`).
+///
+/// A tile-part boundary may fall on any packet boundary (§A.4.2); the
+/// shapes offered here cut wherever the chosen packet-descriptor axis
+/// *changes* along the tile's §B.12 emission order, so the split
+/// composes with any progression order (an axis that cycles — e.g.
+/// resolution under LRCP with several layers — simply opens a new
+/// tile-part per cycle). `TPsot` counts up in codestream order and
+/// `TNsot` (8-bit, so at most 255 tile-parts per tile) is stamped on
+/// every part.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TilePartSplit {
+    /// One tile-part per tile (`TPsot` = 0, `TNsot` = 1). Default.
+    #[default]
+    Single,
+    /// New tile-part when the emitted packet's **resolution** changes.
+    ByResolution,
+    /// New tile-part when the emitted packet's **layer** changes.
+    ByLayer,
+    /// New tile-part when the emitted packet's **component** changes.
+    ByComponent,
+}
+
 /// Structured encoder parameters — the T.800 §A.6.1 COD fields the
 /// encoder honours, with spec-shaped defaults.
 ///
@@ -803,6 +827,10 @@ pub struct EncodeParams {
     /// same factors (§G.2 / §G.3: "the same separation on the
     /// reference grid").
     pub sub_sampling: Vec<(u8, u8)>,
+    /// §A.4.2 tile-part division: how each tile's packet sequence
+    /// splits into `TPsot`-indexed tile-parts. Default
+    /// [`TilePartSplit::Single`].
+    pub tile_parts: TilePartSplit,
 }
 
 impl Default for EncodeParams {
@@ -822,6 +850,7 @@ impl Default for EncodeParams {
             sop: false,
             eph: false,
             sub_sampling: Vec::new(),
+            tile_parts: TilePartSplit::Single,
         }
     }
 }
@@ -1614,14 +1643,28 @@ fn encode_core(
         }
 
         // Tier-2: emit each tile's packets in the §B.12.1 order the COD
-        // signals; every tile gets its own body (own SOT tile-part).
-        let mut tile_bodies: Vec<Vec<u8>> = Vec::with_capacity(orders.len());
+        // signals; each tile's byte stream divides into one or more
+        // tile-part bodies per the §A.4.2 TilePartSplit (a new part
+        // opens whenever the chosen descriptor axis changes).
+        let mut tile_bodies: Vec<Vec<Vec<u8>>> = Vec::with_capacity(orders.len());
         for (t, order) in orders.iter().enumerate() {
-            let mut tile_body: Vec<u8> = Vec::new();
-            // §A.8.1 Nsop: zero-based per coded tile, +1 per packet,
-            // rolling over at 65 536.
+            let mut parts: Vec<Vec<u8>> = vec![Vec::new()];
+            let mut last_axis: Option<u32> = None;
+            // §A.8.1 Nsop: zero-based per coded tile (continuing across
+            // tile-parts), +1 per packet, rolling over at 65 536.
             let mut nsop = 0u16;
             for desc in order {
+                let axis = match params.tile_parts {
+                    TilePartSplit::Single => 0,
+                    TilePartSplit::ByResolution => u32::from(desc.resolution),
+                    TilePartSplit::ByLayer => u32::from(desc.layer),
+                    TilePartSplit::ByComponent => u32::from(desc.component),
+                };
+                if last_axis.is_some_and(|prev| prev != axis) {
+                    parts.push(Vec::new());
+                }
+                last_axis = Some(axis);
+                let tile_body = parts.last_mut().expect("at least one part");
                 let pa = assembled
                     .get_mut(&(t as u32, desc.component, desc.resolution, desc.precinct))
                     .ok_or(Error::InvalidPacketHeader)?;
@@ -1671,7 +1714,11 @@ fn encode_core(
                 }
                 tile_body.extend_from_slice(&body);
             }
-            tile_bodies.push(tile_body);
+            if parts.len() > 255 {
+                // TNsot is an 8-bit field (Table A.6).
+                return Err(Error::NotImplemented);
+            }
+            tile_bodies.push(parts);
         }
 
         // Markers.
@@ -1787,18 +1834,22 @@ fn encode_core(
             }
         }
 
-        // SOT + SOD + tile body per tile (§A.4.2): each tile is one
-        // tile-part, Psot spans SOT → end of its body.
-        for (t, tile_body) in tile_bodies.iter().enumerate() {
-            let psot = 12u32 + 2 + tile_body.len() as u32;
-            let mut sot_payload = Vec::with_capacity(8);
-            sot_payload.extend_from_slice(&(t as u16).to_be_bytes()); // Isot
-            sot_payload.extend_from_slice(&psot.to_be_bytes());
-            sot_payload.push(0); // TPsot
-            sot_payload.push(1); // TNsot
-            push_segment(&mut out, MARKER_SOT, &sot_payload);
-            out.extend_from_slice(&MARKER_SOD.to_be_bytes());
-            out.extend_from_slice(tile_body);
+        // SOT + SOD per tile-part (§A.4.2): Psot spans SOT → end of the
+        // part's body; TPsot counts up in codestream order and every
+        // part carries the tile's final TNsot.
+        for (t, parts) in tile_bodies.iter().enumerate() {
+            let tnsot = parts.len() as u8;
+            for (i, tile_body) in parts.iter().enumerate() {
+                let psot = 12u32 + 2 + tile_body.len() as u32;
+                let mut sot_payload = Vec::with_capacity(8);
+                sot_payload.extend_from_slice(&(t as u16).to_be_bytes()); // Isot
+                sot_payload.extend_from_slice(&psot.to_be_bytes());
+                sot_payload.push(i as u8); // TPsot
+                sot_payload.push(tnsot); // TNsot
+                push_segment(&mut out, MARKER_SOT, &sot_payload);
+                out.extend_from_slice(&MARKER_SOD.to_be_bytes());
+                out.extend_from_slice(tile_body);
+            }
         }
 
         out.extend_from_slice(&MARKER_EOC.to_be_bytes());
@@ -3558,6 +3609,183 @@ mod tests {
             }
         )
         .is_err());
+    }
+
+    // -- §A.4.2 multi-tile-part emission (TPsot > 0) --------------------
+
+    /// Encode with a tile-part split, decode bit-exactly, and return
+    /// the parsed (Isot, TPsot, TNsot) sequence in codestream order.
+    fn roundtrip_tile_parts(
+        planes: &[&[u8]],
+        w: u32,
+        h: u32,
+        params: &EncodeParams,
+    ) -> Vec<(u16, u8, u8)> {
+        let stream = roundtrip_params(planes, w, h, params);
+        let cs = crate::parse_codestream(&stream).expect("parse");
+        cs.tile_parts
+            .iter()
+            .map(|tp| {
+                (
+                    tp.sot.tile_index,
+                    tp.sot.tile_part_index,
+                    tp.sot.num_tile_parts,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tile_parts_by_resolution_shape_and_round_trip() {
+        // NL = 2, single layer, RLCP (resolution-major) → each tile
+        // carries 3 tile-parts, one per resolution.
+        let p = noise(48, 40, 0x7BA7_0001);
+        let sots = roundtrip_tile_parts(
+            &[&p],
+            48,
+            40,
+            &EncodeParams {
+                decomposition_levels: 2,
+                code_block_exp: (4, 4),
+                progression: crate::ProgressionOrder::Rlcp,
+                tile_parts: TilePartSplit::ByResolution,
+                ..EncodeParams::default()
+            },
+        );
+        assert_eq!(sots, vec![(0, 0, 3), (0, 1, 3), (0, 2, 3)]);
+    }
+
+    #[test]
+    fn tile_parts_by_layer_shape_and_round_trip() {
+        // 3 layers, LRCP (layer-major) → 3 tile-parts per tile.
+        let p = noise(48, 40, 0x7BA7_0002);
+        let sots = roundtrip_tile_parts(
+            &[&p],
+            48,
+            40,
+            &EncodeParams {
+                decomposition_levels: 2,
+                code_block_exp: (4, 4),
+                layers: 3,
+                tile_parts: TilePartSplit::ByLayer,
+                ..EncodeParams::default()
+            },
+        );
+        assert_eq!(sots, vec![(0, 0, 3), (0, 1, 3), (0, 2, 3)]);
+    }
+
+    #[test]
+    fn tile_parts_axis_cycles_open_new_parts() {
+        // LRCP with 2 layers splitting by resolution: within each layer
+        // the resolution axis runs 0, 1, 2 — every change opens a part,
+        // so the cycle across layers yields 2 × 3 = 6 tile-parts.
+        let p = noise(32, 32, 0x7BA7_0003);
+        let sots = roundtrip_tile_parts(
+            &[&p],
+            32,
+            32,
+            &EncodeParams {
+                decomposition_levels: 2,
+                code_block_exp: (4, 4),
+                layers: 2,
+                tile_parts: TilePartSplit::ByResolution,
+                ..EncodeParams::default()
+            },
+        );
+        assert_eq!(sots.len(), 6);
+        assert_eq!(sots.first(), Some(&(0, 0, 6)));
+        assert_eq!(sots.last(), Some(&(0, 5, 6)));
+    }
+
+    #[test]
+    fn tile_parts_by_component_cprl() {
+        // CPRL (component-major) over 3 components → 3 parts per tile.
+        let r = noise(24, 24, 0x7BA7_0004);
+        let g = noise(24, 24, 0x7BA7_0005);
+        let b = noise(24, 24, 0x7BA7_0006);
+        let sots = roundtrip_tile_parts(
+            &[&r, &g, &b],
+            24,
+            24,
+            &EncodeParams {
+                decomposition_levels: 1,
+                code_block_exp: (4, 4),
+                progression: crate::ProgressionOrder::Cprl,
+                tile_parts: TilePartSplit::ByComponent,
+                ..EncodeParams::default()
+            },
+        );
+        assert_eq!(
+            sots,
+            vec![(0, 0, 3), (0, 1, 3), (0, 2, 3)],
+            "one part per component"
+        );
+    }
+
+    #[test]
+    fn tile_parts_compose_with_tiles_framing_and_subsampling() {
+        // The full stack: 4 tiles × per-resolution parts, SOP + EPH
+        // (Nsop continues across a tile's parts), 4:2:0 sub-sampling.
+        let w = 40u32;
+        let h = 24u32;
+        let y = noise(w, h, 0x7BA7_0007);
+        let c = noise(20, 12, 0x7BA7_0008);
+        let params = EncodeParams {
+            decomposition_levels: 1,
+            code_block_exp: (3, 3),
+            progression: crate::ProgressionOrder::Rlcp,
+            tile_size: Some((20, 12)),
+            sub_sampling: vec![(1, 1), (2, 2)],
+            sop: true,
+            eph: true,
+            tile_parts: TilePartSplit::ByResolution,
+            ..EncodeParams::default()
+        };
+        let stream = encode_j2k(&[&y, &c], w, h, &params).expect("encode");
+        let img = decode_j2k(&stream).expect("decode own stream");
+        let got0: Vec<u8> = img.components[0].samples.iter().map(|&s| s as u8).collect();
+        let got1: Vec<u8> = img.components[1].samples.iter().map(|&s| s as u8).collect();
+        assert_eq!(got0, y);
+        assert_eq!(got1, c);
+        let cs = crate::parse_codestream(&stream).expect("parse");
+        // 4 tiles × 2 resolutions = 8 tile-parts.
+        assert_eq!(cs.tile_parts.len(), 8);
+        for tp in &cs.tile_parts {
+            assert_eq!(tp.sot.num_tile_parts, 2);
+        }
+    }
+
+    #[test]
+    fn tile_parts_with_rate_control() {
+        // PCRD accounts the extra SOT + SOD framing of every part.
+        let p = noise(64, 64, 0x7BA7_0009);
+        let params = EncodeParams {
+            decomposition_levels: 2,
+            code_block_exp: (4, 4),
+            kernel: EncodeKernel::Lossy9x7 { fine_bits: 6 },
+            progression: crate::ProgressionOrder::Rlcp,
+            target_bytes: Some(1600),
+            tile_parts: TilePartSplit::ByResolution,
+            ..EncodeParams::default()
+        };
+        let stream = encode_j2k(&[&p], 64, 64, &params).expect("encode");
+        assert!(stream.len() <= 1600, "budget binds: {} B", stream.len());
+        decode_j2k(&stream).expect("decode rate-controlled multi-part stream");
+    }
+
+    #[test]
+    fn tile_parts_reject_tnsot_overflow() {
+        // 300 layers split by layer → 300 > 255 tile-parts (Table A.6
+        // TNsot is 8-bit).
+        let p = noise(64, 64, 0x7BA7_000A);
+        let params = EncodeParams {
+            decomposition_levels: 1,
+            code_block_exp: (4, 4),
+            layers: 300,
+            tile_parts: TilePartSplit::ByLayer,
+            ..EncodeParams::default()
+        };
+        assert!(encode_j2k(&[&p], 64, 64, &params).is_err());
     }
 
     #[test]
