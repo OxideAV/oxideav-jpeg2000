@@ -4,6 +4,17 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- Packed packet headers on encode (T.800 §A.7.4 / §A.7.5):
+  `EncodeParams::packed_headers` relocates every §B.10 packet header
+  into per-tile `PPT` marker segments (first tile-part header) or
+  main-header `PPM` marker segments (one `(Nppm, Ippm)` entry per
+  tile-part in codestream order), each segment cut only on a completed
+  packet header; composes with tiles, tile-part splits, SOP/EPH
+  framing, layers and PCRD rate control. Black-box confirmed
+  byte-identical through an opaque decoder.
+
 ## [0.0.15](https://github.com/OxideAV/oxideav-jpeg2000/compare/v0.0.14...v0.0.15) - 2026-07-03
 
 ### Other

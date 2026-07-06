@@ -658,6 +658,53 @@ fn encode_code_block(
 
 /// Append a marker segment: marker code, 16-bit length (payload + 2),
 /// payload.
+/// One atom of a §A.7.4 / §A.7.5 packed-header series: a byte run plus
+/// whether a `PPM` / `PPT` marker segment may **end** right after it.
+/// T.800 §A.7.4 / §A.7.5: "Every marker segment in this series shall
+/// end with a completed packet header" — so a completed packet header
+/// is a legal cut point while an `Nppm` length prefix is not (the
+/// `Ippm` series it announces must follow, though it may straddle into
+/// the next segment).
+struct PackedAtom {
+    bytes: Vec<u8>,
+    boundary: bool,
+}
+
+/// Chunk a packed-header atom series into `Ippm` / `Ippt` marker-segment
+/// payloads of at most `max_payload` bytes each (the byte budget after
+/// `Lppm` / `Lppt` and `Zppm` / `Zppt`), cutting only at atom
+/// boundaries flagged as completed packet headers.
+fn chunk_packed_headers(atoms: &[PackedAtom], max_payload: usize) -> Result<Vec<Vec<u8>>, Error> {
+    // Group atoms into indivisible runs: everything up to and including
+    // the next legal cut point must land in one segment together.
+    let mut groups: Vec<Vec<u8>> = Vec::new();
+    let mut run: Vec<u8> = Vec::new();
+    for atom in atoms {
+        run.extend_from_slice(&atom.bytes);
+        if atom.boundary {
+            groups.push(std::mem::take(&mut run));
+        }
+    }
+    debug_assert!(run.is_empty(), "series must end on a packet boundary");
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    let mut cur: Vec<u8> = Vec::new();
+    for g in groups {
+        if g.len() > max_payload {
+            // A single packet header longer than a whole marker segment
+            // cannot be relocated (Lppm / Lppt are 16-bit).
+            return Err(Error::NotImplemented);
+        }
+        if !cur.is_empty() && cur.len() + g.len() > max_payload {
+            out.push(std::mem::take(&mut cur));
+        }
+        cur.extend_from_slice(&g);
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    Ok(out)
+}
+
 fn push_segment(out: &mut Vec<u8>, marker: u16, payload: &[u8]) {
     out.extend_from_slice(&marker.to_be_bytes());
     out.extend_from_slice(&((payload.len() as u16 + 2).to_be_bytes()));
@@ -731,6 +778,36 @@ pub enum TilePartSplit {
     ByLayer,
     /// New tile-part when the emitted packet's **component** changes.
     ByComponent,
+}
+
+/// Where the emitted codestream carries its §B.10 packet headers
+/// (T.800 §A.7.4 / §A.7.5).
+///
+/// The packet headers live in exactly one of three places: interleaved
+/// with the packet data inside each tile-part body (the §B.10 default),
+/// relocated per tile into `PPT` marker segments (§A.7.5), or relocated
+/// for the whole codestream into main-header `PPM` marker segments
+/// (§A.7.4). With either relocation the tile-part bodies hold only
+/// packet data; a signalled `SOP` still frames each packet's data in
+/// the body while a signalled `EPH` trails each header inside the
+/// relocated payload (§A.8.1 / §A.8.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PackedHeaders {
+    /// §B.10 — headers interleave with packet data in the tile-part
+    /// bodies. Default.
+    #[default]
+    InStream,
+    /// §A.7.5 — every packet header of a tile is relocated into `PPT`
+    /// marker segments carried in the tile's **first** tile-part header
+    /// ("in the same tile-part header or one with a lower `TPsot`
+    /// value"), in increasing `Zppt` order, each segment ending on a
+    /// completed packet header.
+    Ppt,
+    /// §A.7.4 — every packet header of the codestream is relocated into
+    /// main-header `PPM` marker segments: one `(Nppm, Ippm)` entry per
+    /// tile-part in codestream order, concatenated in increasing `Zppm`
+    /// order, each segment ending on a completed packet header.
+    Ppm,
 }
 
 /// One component's §A.6.2 / §A.6.5 override of the tile-wide COD /
@@ -882,6 +959,10 @@ pub struct EncodeParams {
     /// `QCC` where the quantisation table changes) marker segments.
     /// At most one entry per component. Default empty.
     pub component_overrides: Vec<ComponentOverride>,
+    /// §A.7.4 / §A.7.5 packet-header relocation: whether the §B.10
+    /// packet headers stay in-stream (default), move to per-tile `PPT`
+    /// marker segments, or move to main-header `PPM` marker segments.
+    pub packed_headers: PackedHeaders,
 }
 
 impl Default for EncodeParams {
@@ -904,6 +985,7 @@ impl Default for EncodeParams {
             tile_parts: TilePartSplit::Single,
             poc: Vec::new(),
             component_overrides: Vec::new(),
+            packed_headers: PackedHeaders::InStream,
         }
     }
 }
@@ -1889,9 +1971,27 @@ fn encode_core(
         // signals; each tile's byte stream divides into one or more
         // tile-part bodies per the §A.4.2 TilePartSplit (a new part
         // opens whenever the chosen descriptor axis changes).
-        let mut tile_bodies: Vec<Vec<Vec<u8>>> = Vec::with_capacity(orders.len());
+        //
+        // Each part keeps its packet headers separate from its packet
+        // data: the in-stream (§B.10) layout interleaves them back
+        // together below, while the §A.7.4 / §A.7.5 relocations move
+        // the headers into PPM / PPT marker segments and leave only the
+        // data (plus any §A.8.1 in-body SOP) in the tile-part body.
+        struct PartStream {
+            /// One byte run per packet header (with its §A.8.2 EPH when
+            /// signalled), in packet order.
+            headers: Vec<Vec<u8>>,
+            /// Packet data (each packet's §A.8.1 SOP, when signalled,
+            /// precedes its data here).
+            body: Vec<u8>,
+        }
+        let relocate = params.packed_headers != PackedHeaders::InStream;
+        let mut tile_bodies: Vec<Vec<PartStream>> = Vec::with_capacity(orders.len());
         for (t, order) in orders.iter().enumerate() {
-            let mut parts: Vec<Vec<u8>> = vec![Vec::new()];
+            let mut parts: Vec<PartStream> = vec![PartStream {
+                headers: Vec::new(),
+                body: Vec::new(),
+            }];
             let mut last_axis: Option<u32> = None;
             // §A.8.1 Nsop: zero-based per coded tile (continuing across
             // tile-parts), +1 per packet, rolling over at 65 536.
@@ -1904,10 +2004,13 @@ fn encode_core(
                     TilePartSplit::ByComponent => u32::from(desc.component),
                 };
                 if last_axis.is_some_and(|prev| prev != axis) {
-                    parts.push(Vec::new());
+                    parts.push(PartStream {
+                        headers: Vec::new(),
+                        body: Vec::new(),
+                    });
                 }
                 last_axis = Some(axis);
-                let tile_body = parts.last_mut().expect("at least one part");
+                let part = parts.last_mut().expect("at least one part");
                 let pa = assembled
                     .get_mut(&(t as u32, desc.component, desc.resolution, desc.precinct))
                     .ok_or(Error::InvalidPacketHeader)?;
@@ -1942,20 +2045,28 @@ fn encode_core(
                         }
                     }
                 }
-                let header = encode_packet_header(&mut pa.state, desc.layer, &plans);
+                let mut header = encode_packet_header(&mut pa.state, desc.layer, &plans);
                 if params.sop {
-                    // §A.8.1 / Table A.40: SOP, Lsop = 4, Nsop.
-                    tile_body.extend_from_slice(&crate::packet::MARKER_SOP.to_be_bytes());
-                    tile_body.extend_from_slice(&4u16.to_be_bytes());
-                    tile_body.extend_from_slice(&nsop.to_be_bytes());
+                    // §A.8.1 / Table A.40: SOP, Lsop = 4, Nsop. With
+                    // relocated headers the SOP stays in the body,
+                    // immediately before the packet's data (§A.8.1).
+                    part.body
+                        .extend_from_slice(&crate::packet::MARKER_SOP.to_be_bytes());
+                    part.body.extend_from_slice(&4u16.to_be_bytes());
+                    part.body.extend_from_slice(&nsop.to_be_bytes());
                 }
                 nsop = nsop.wrapping_add(1);
-                tile_body.extend_from_slice(&header);
                 if params.eph {
-                    // §A.8.2: EPH immediately after the packet header.
-                    tile_body.extend_from_slice(&crate::packet::MARKER_EPH.to_be_bytes());
+                    // §A.8.2: EPH immediately after the packet header —
+                    // inside the PPM / PPT payload when relocated.
+                    header.extend_from_slice(&crate::packet::MARKER_EPH.to_be_bytes());
                 }
-                tile_body.extend_from_slice(&body);
+                if relocate {
+                    part.headers.push(header);
+                } else {
+                    part.body.extend_from_slice(&header);
+                }
+                part.body.extend_from_slice(&body);
             }
             if parts.len() > 255 {
                 // TNsot is an 8-bit field (Table A.6).
@@ -2150,21 +2261,98 @@ fn encode_core(
             push_segment(&mut out, MARKER_POC, &poc_payload);
         }
 
+        // The largest Ippm / Ippt byte run one marker segment holds:
+        // Lppm / Lppt are 16-bit and cover the 2-byte length plus the
+        // 1-byte Zppm / Zppt index (Tables A.38 / A.39).
+        const MAX_PACKED_PAYLOAD: usize = 65_535 - 3;
+
+        // PPM (§A.7.4, Table A.38): the whole codestream's packet
+        // headers, as one (Nppm, Ippm) entry per tile-part in
+        // codestream order, chunked into marker segments in increasing
+        // Zppm order (each ending on a completed packet header).
+        if params.packed_headers == PackedHeaders::Ppm {
+            let mut atoms: Vec<PackedAtom> = Vec::new();
+            for parts in &tile_bodies {
+                for part in parts {
+                    let nppm: usize = part.headers.iter().map(Vec::len).sum();
+                    let nppm = u32::try_from(nppm).map_err(|_| Error::NotImplemented)?;
+                    // The Nppm prefix may not end a segment; a part with
+                    // no packets contributes a bare (legal) Nppm = 0.
+                    atoms.push(PackedAtom {
+                        bytes: nppm.to_be_bytes().to_vec(),
+                        boundary: part.headers.is_empty(),
+                    });
+                    for h in &part.headers {
+                        atoms.push(PackedAtom {
+                            bytes: h.clone(),
+                            boundary: true,
+                        });
+                    }
+                }
+            }
+            let chunks = chunk_packed_headers(&atoms, MAX_PACKED_PAYLOAD)?;
+            if chunks.len() > 256 {
+                // Zppm is an 8-bit index (Table A.38).
+                return Err(Error::NotImplemented);
+            }
+            for (z, chunk) in chunks.iter().enumerate() {
+                let mut payload = Vec::with_capacity(1 + chunk.len());
+                payload.push(z as u8); // Zppm
+                payload.extend_from_slice(chunk);
+                push_segment(&mut out, crate::MARKER_PPM, &payload);
+            }
+        }
+
         // SOT + SOD per tile-part (§A.4.2): Psot spans SOT → end of the
         // part's body; TPsot counts up in codestream order and every
-        // part carries the tile's final TNsot.
+        // part carries the tile's final TNsot. Under the §A.7.5 PPT
+        // relocation the tile's packet headers ride in PPT marker
+        // segments inside its first tile-part header (before the SOD),
+        // "in the same tile-part header or one with a lower TPsot
+        // value" than any packet data they describe.
         for (t, parts) in tile_bodies.iter().enumerate() {
             let tnsot = parts.len() as u8;
-            for (i, tile_body) in parts.iter().enumerate() {
-                let psot = 12u32 + 2 + tile_body.len() as u32;
+            let mut ppt_chunks: Vec<Vec<u8>> = Vec::new();
+            if params.packed_headers == PackedHeaders::Ppt {
+                let atoms: Vec<PackedAtom> = parts
+                    .iter()
+                    .flat_map(|part| part.headers.iter())
+                    .map(|h| PackedAtom {
+                        bytes: h.clone(),
+                        boundary: true,
+                    })
+                    .collect();
+                ppt_chunks = chunk_packed_headers(&atoms, MAX_PACKED_PAYLOAD)?;
+                if ppt_chunks.len() > 256 {
+                    // Zppt is an 8-bit index (Table A.39).
+                    return Err(Error::NotImplemented);
+                }
+            }
+            for (i, part) in parts.iter().enumerate() {
+                // Marker + Lppt + Zppt + payload, per PPT segment in
+                // this part's header (first part only).
+                let ppt_bytes: usize = if i == 0 {
+                    ppt_chunks.iter().map(|c| 5 + c.len()).sum()
+                } else {
+                    0
+                };
+                let psot = 12u32 + ppt_bytes as u32 + 2 + part.body.len() as u32;
                 let mut sot_payload = Vec::with_capacity(8);
                 sot_payload.extend_from_slice(&(t as u16).to_be_bytes()); // Isot
                 sot_payload.extend_from_slice(&psot.to_be_bytes());
                 sot_payload.push(i as u8); // TPsot
                 sot_payload.push(tnsot); // TNsot
                 push_segment(&mut out, MARKER_SOT, &sot_payload);
+                if i == 0 {
+                    for (z, chunk) in ppt_chunks.iter().enumerate() {
+                        let mut payload = Vec::with_capacity(1 + chunk.len());
+                        payload.push(z as u8); // Zppt
+                        payload.extend_from_slice(chunk);
+                        push_segment(&mut out, crate::MARKER_PPT, &payload);
+                    }
+                }
                 out.extend_from_slice(&MARKER_SOD.to_be_bytes());
-                out.extend_from_slice(tile_body);
+                out.extend_from_slice(&part.body);
             }
         }
 
@@ -4547,5 +4735,181 @@ mod tests {
         let stream = encode_j2k(&[&p], 64, 64, &params).expect("encode");
         assert!(stream.len() <= 1500, "budget binds: {} B", stream.len());
         decode_j2k(&stream).expect("decode rate-controlled framed stream");
+    }
+
+    // -- §A.7.4 / §A.7.5 packed packet headers on encode ----------------
+
+    /// Count the PPM marker segments in the main header and the PPT
+    /// marker segments per tile-part, via the crate's own parser.
+    fn packed_marker_shape(stream: &[u8]) -> (usize, Vec<usize>) {
+        let cs = crate::parse_codestream(stream).expect("parse");
+        // PPM: length-walk the main header for 0xFF60 segments.
+        let mut ppm = 0usize;
+        let mut pos = 2usize;
+        let header_end = cs.header.bytes_consumed;
+        while pos + 4 <= header_end {
+            let marker = u16::from_be_bytes([stream[pos], stream[pos + 1]]);
+            let len = u16::from_be_bytes([stream[pos + 2], stream[pos + 3]]) as usize;
+            if marker == crate::MARKER_PPM {
+                ppm += 1;
+            }
+            pos += 2 + len;
+        }
+        let ppt = cs
+            .tile_parts
+            .iter()
+            .map(|tp| {
+                tp.markers
+                    .iter()
+                    .filter(|m| matches!(m, crate::TilePartMarker::Ppt(_)))
+                    .count()
+            })
+            .collect();
+        (ppm, ppt)
+    }
+
+    /// The three header placements (§B.10 in-stream, §A.7.5 PPT,
+    /// §A.7.4 PPM) reconstruct identically — and the relocated streams
+    /// actually carry the relocation markers.
+    #[test]
+    fn ppt_and_ppm_relocations_round_trip() {
+        let p = noise(64, 48, 0xA7A7_0001);
+        let base = EncodeParams {
+            decomposition_levels: 2,
+            code_block_exp: (3, 3),
+            precincts: vec![0x22, 0x33, 0x33],
+            layers: 3,
+            ..EncodeParams::default()
+        };
+        let in_stream = roundtrip_params(&[&p], 64, 48, &base);
+        for mode in [PackedHeaders::Ppt, PackedHeaders::Ppm] {
+            let params = EncodeParams {
+                packed_headers: mode,
+                ..base.clone()
+            };
+            let stream = roundtrip_params(&[&p], 64, 48, &params);
+            let (ppm, ppt) = packed_marker_shape(&stream);
+            match mode {
+                PackedHeaders::Ppt => {
+                    assert_eq!(ppm, 0);
+                    assert!(ppt.iter().sum::<usize>() >= 1, "PPT emitted");
+                }
+                PackedHeaders::Ppm => {
+                    assert!(ppm >= 1, "PPM emitted");
+                    assert_eq!(ppt.iter().sum::<usize>(), 0);
+                }
+                PackedHeaders::InStream => unreachable!(),
+            }
+            // Relocation moves bytes around but codes the same packets.
+            assert_ne!(stream, in_stream);
+        }
+        let (ppm, ppt) = packed_marker_shape(&in_stream);
+        assert_eq!((ppm, ppt.iter().sum::<usize>()), (0, 0));
+    }
+
+    /// PPT composes with multiple tiles, multiple tile-parts per tile,
+    /// SOP + EPH framing and the RCT: the headers of *all* of a tile's
+    /// parts ride in its first tile-part header.
+    #[test]
+    fn ppt_composes_with_tiles_parts_and_framing() {
+        let r = noise(48, 40, 0xBEEF_0011);
+        let g = noise(48, 40, 0xBEEF_0022);
+        let b = noise(48, 40, 0xBEEF_0033);
+        let params = EncodeParams {
+            decomposition_levels: 2,
+            code_block_exp: (3, 3),
+            mct: true,
+            tile_size: Some((32, 32)),
+            tile_parts: TilePartSplit::ByResolution,
+            sop: true,
+            eph: true,
+            packed_headers: PackedHeaders::Ppt,
+            ..EncodeParams::default()
+        };
+        let stream = roundtrip_params(&[&r, &g, &b], 48, 40, &params);
+        let cs = crate::parse_codestream(&stream).expect("parse");
+        // 2×2 tiles, 3 resolutions → parts split by resolution.
+        assert!(cs.tile_parts.len() > 4, "multiple parts per tile");
+        for tp in &cs.tile_parts {
+            let ppts = tp
+                .markers
+                .iter()
+                .filter(|m| matches!(m, crate::TilePartMarker::Ppt(_)))
+                .count();
+            if tp.sot.tile_part_index == 0 {
+                assert!(ppts >= 1, "tile {}: PPT in first part", tp.sot.tile_index);
+            } else {
+                assert_eq!(ppts, 0, "later parts carry no PPT");
+            }
+        }
+    }
+
+    /// PPM composes with multiple tiles, tile-part splits, framing and
+    /// PCRD rate control (the budget binds on the relocated stream).
+    #[test]
+    fn ppm_composes_with_tiles_parts_framing_and_pcrd() {
+        let p = noise(64, 64, 0xC0DE_5150);
+        let params = EncodeParams {
+            decomposition_levels: 2,
+            code_block_exp: (3, 3),
+            kernel: EncodeKernel::Lossy9x7 { fine_bits: 6 },
+            tile_size: Some((32, 64)),
+            tile_parts: TilePartSplit::ByResolution,
+            sop: true,
+            eph: true,
+            target_bytes: Some(2200),
+            packed_headers: PackedHeaders::Ppm,
+            ..EncodeParams::default()
+        };
+        let stream = encode_j2k(&[&p], 64, 64, &params).expect("encode");
+        assert!(stream.len() <= 2200, "budget binds: {} B", stream.len());
+        let (ppm, _) = packed_marker_shape(&stream);
+        assert!(ppm >= 1);
+        decode_j2k(&stream).expect("decode relocated rate-controlled stream");
+    }
+
+    /// The §A.7.4 chunker cuts only after completed packet headers and
+    /// never exceeds the payload budget.
+    #[test]
+    fn chunk_packed_headers_respects_boundaries() {
+        // Atoms: [4-byte Nppm, no cut] [3-byte header, cut] [2-byte
+        // Nppm, no cut] [5-byte header, cut] [1-byte header, cut].
+        let atoms = vec![
+            PackedAtom {
+                bytes: vec![0; 4],
+                boundary: false,
+            },
+            PackedAtom {
+                bytes: vec![1; 3],
+                boundary: true,
+            },
+            PackedAtom {
+                bytes: vec![2; 2],
+                boundary: false,
+            },
+            PackedAtom {
+                bytes: vec![3; 5],
+                boundary: true,
+            },
+            PackedAtom {
+                bytes: vec![4; 1],
+                boundary: true,
+            },
+        ];
+        // Budget 8: group1 (4+3=7) fits; group2 (2+5=7) opens a new
+        // chunk; group3 (1) still fits chunk 2.
+        let chunks = chunk_packed_headers(&atoms, 8).expect("chunk");
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].len(), 7);
+        assert_eq!(chunks[1].len(), 8);
+        // A budget smaller than an indivisible group is rejected.
+        assert!(matches!(
+            chunk_packed_headers(&atoms, 6),
+            Err(Error::NotImplemented)
+        ));
+        // A huge budget yields one chunk carrying everything.
+        let one = chunk_packed_headers(&atoms, 1 << 16).expect("chunk");
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].len(), 15);
     }
 }

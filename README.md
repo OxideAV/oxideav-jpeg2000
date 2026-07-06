@@ -272,6 +272,17 @@ it):
     Equation B-12 tile-component regions, the §B.12.1.3–.5
     position-order projections, and the RPCL / PCRL power-of-two
     gate; 4:2:0 / 4:2:2 / asymmetric layouts round-trip bit-exactly.
+  - **Packed packet headers** (§A.7.4 / §A.7.5): every §B.10 packet
+    header relocated out of the tile-part bodies into per-tile `PPT`
+    marker segments (carried in the tile's first tile-part header) or
+    whole-codestream main-header `PPM` segments (one `(Nppm, Ippm)`
+    entry per tile-part in codestream order), each marker segment cut
+    only on a completed packet header (multi-segment `Zppm` / `Zppt`
+    runs when the payload outgrows the 16-bit length); a signalled
+    `SOP` stays in the body before each packet's data and a signalled
+    `EPH` trails each relocated header (§A.8.1 / §A.8.2). Composes
+    with tiles, tile-part splits, layers and PCRD (the budget binds on
+    the relocated stream).
   - **Per-component `COC` / `QCC` overrides** (§A.6.2 / §A.6.5):
     per-component `NL` / code-block size / precinct partition /
     wavelet kernel (mixed 5-3 / 9-7 siblings when the MCT is off),
@@ -306,8 +317,8 @@ emission — round-trip-validated against this crate's independently
 written HT decoder up to 64×64 blocks and 28-bit magnitudes.
 Codestream-level HT emission (`CAP` + `SPcod` bit 6) is not wired yet.
 
-Not yet on the encode side: PPM / PPT relocation, ROI, HT SigProp /
-MagRef refinement passes, and HTJ2K codestream assembly.
+Not yet on the encode side: ROI, HT SigProp / MagRef refinement
+passes, and HTJ2K codestream assembly.
 
 ### Not yet implemented
 
