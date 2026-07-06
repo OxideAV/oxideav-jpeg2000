@@ -656,6 +656,37 @@ pub(crate) fn bypass_segment_spans(
     spans
 }
 
+/// T.814 §B.2: whether the HT coding pass with 0-based absolute index
+/// `i` ends a codeword segment — the boundary set is
+/// `T = ⋃ₖ ⌈3k/2⌉ = {0, 2, 3, 5, 6, 8, 9, …}` (`k ≥ 0`), i.e. every
+/// HT cleanup pass is its own segment while a SigProp + MagRef pair
+/// shares one refinement segment (Figure B.1).
+pub(crate) fn ht_pass_ends_segment(i: u32) -> bool {
+    i % 3 != 1
+}
+
+/// Split an HT code-block's `passes` included coding passes (running
+/// from absolute 0-based index `start_pass`) into the T.814 §B.2 /
+/// §B.3 codeword segments: each segment ends at a set-`T` pass or at
+/// the final pass included in the packet (§B.3). Returns the pass
+/// count of each segment in coding order.
+pub(crate) fn ht_segment_spans(start_pass: u32, passes: u32) -> Vec<u32> {
+    let mut spans = Vec::new();
+    if passes == 0 {
+        return spans;
+    }
+    let last = start_pass + passes - 1;
+    let mut span_passes = 0u32;
+    for i in start_pass..=last {
+        span_passes += 1;
+        if ht_pass_ends_segment(i) || i == last {
+            spans.push(span_passes);
+            span_passes = 0;
+        }
+    }
+    spans
+}
+
 // ---------------------------------------------------------------------------
 // Geometry input + per-code-block state — T.800 §B.10.8.
 // ---------------------------------------------------------------------------
@@ -1085,6 +1116,19 @@ fn decode_one_code_block(
             }
             lens
         }
+        SegmentSplit::Ht => {
+            // T.814 §B.2 / §B.3: segments end at the set-T passes (or
+            // the final included pass); one length per segment, widened
+            // by ⌊log2(passes in segment)⌋ (Equation B-19), with the
+            // increase-Lblock prefix signalled once per contribution.
+            let spans = ht_segment_spans(start_pass, passes);
+            read_lblock_increment(lblock, reader)?;
+            let mut lens = Vec::with_capacity(spans.len());
+            for sp in spans {
+                lens.push(read_segment_length_value(lblock.lblock, sp, reader)?);
+            }
+            lens
+        }
     };
 
     Ok(CodeBlockContribution {
@@ -1158,6 +1202,14 @@ pub enum SegmentSplit {
         /// flag is also set (composes with bypass).
         termination_on_each_coding_pass: bool,
     },
+    /// T.814 §B.2 / §B.3 — the tile-component's code-blocks are HT
+    /// code-blocks (SPcod bit 6). A contribution splits at the set-`T`
+    /// boundaries `{0, 2, 3, 5, 6, …}` over the absolute pass indices:
+    /// each HT cleanup pass is one codeword segment and each
+    /// SigProp (+ MagRef) pair is one refinement segment, so the
+    /// number of §B.10.7 lengths follows [`ht_segment_spans`] (each
+    /// widened by `⌊log2(passes in that segment)⌋` per Equation B-19).
+    Ht,
 }
 
 /// Marker code — SOP (Start of packet, T.800 §A.8.1, `0xFF91`).
@@ -1960,6 +2012,39 @@ mod tests {
         assert!(bypass_pass_is_raw(11)); // MR raw
         assert!(!bypass_pass_is_raw(12)); // cleanup — always AC
         assert!(bypass_pass_is_raw(13)); // SP raw
+    }
+
+    // -- T.814 §B.2 HT codeword-segment split ---------------------------
+
+    #[test]
+    fn ht_boundary_set_matches_t814_b2() {
+        // T = ⋃ₖ ⌈3k/2⌉ = {0, 2, 3, 5, 6, 8, 9, 11, 12, …}: every index
+        // except the SigProp passes (i ≡ 1 mod 3).
+        let expect: Vec<u32> = vec![0, 2, 3, 5, 6, 8, 9, 11, 12];
+        let got: Vec<u32> = (0..=12).filter(|&i| ht_pass_ends_segment(i)).collect();
+        assert_eq!(got, expect);
+        // Cross-check against the closed form ⌈3k/2⌉ directly.
+        let closed: Vec<u32> = (0..9u32).map(|k| (3 * k).div_ceil(2)).collect();
+        assert_eq!(got, closed);
+    }
+
+    #[test]
+    fn ht_segment_spans_shapes() {
+        // Z_blk = 1: the cleanup pass alone (§B.3 NOTE 1).
+        assert_eq!(ht_segment_spans(0, 1), vec![1]);
+        // Z_blk = 2: cleanup, then a SigProp-only refinement segment.
+        assert_eq!(ht_segment_spans(0, 2), vec![1, 1]);
+        // Z_blk = 3: cleanup, then SigProp + MagRef in one segment.
+        assert_eq!(ht_segment_spans(0, 3), vec![1, 2]);
+        // Refinement passes arriving in a later packet (layered): the
+        // cursor starts past the cleanup.
+        assert_eq!(ht_segment_spans(1, 2), vec![2]);
+        assert_eq!(ht_segment_spans(2, 1), vec![1]);
+        // A second HT set repeats the pattern (MULTIHT shape).
+        assert_eq!(ht_segment_spans(0, 6), vec![1, 2, 1, 2]);
+        assert_eq!(ht_segment_spans(3, 3), vec![1, 2]);
+        // Empty contribution.
+        assert!(ht_segment_spans(4, 0).is_empty());
     }
 
     #[test]

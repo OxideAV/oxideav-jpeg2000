@@ -721,6 +721,284 @@ fn emit_u_pair(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// §7.1.5 dual — SigProp bit-stream writer (forward, little-endian).
+// ---------------------------------------------------------------------------
+
+/// Writes the SigProp bit-stream: bits pack LSB-first into forward
+/// bytes; the byte following an emitted `0xFF` carries only 7 payload
+/// bits with a zero MSB (the §7.1.5 stuffing bit the reader validates).
+struct SigPropWriter {
+    out: Vec<u8>,
+    tmp: u32,
+    used: u32,
+    cap: u32,
+}
+
+impl SigPropWriter {
+    fn new() -> Self {
+        Self {
+            out: Vec::new(),
+            tmp: 0,
+            used: 0,
+            cap: 8,
+        }
+    }
+
+    fn bit(&mut self, b: u32) {
+        self.tmp |= (b & 1) << self.used;
+        self.used += 1;
+        if self.used == self.cap {
+            self.out.push(self.tmp as u8);
+            self.cap = if self.tmp == 0xFF { 7 } else { 8 };
+            self.tmp = 0;
+            self.used = 0;
+        }
+    }
+
+    /// Pad any partial byte with `0` bits (never read — the §7.4 pass
+    /// consumes exactly the coded bits) and return the stream.
+    fn finish(mut self) -> Vec<u8> {
+        if self.used > 0 {
+            self.out.push(self.tmp as u8);
+        }
+        self.out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §7.1.6 dual — MagRef bit-stream writer (backward byte layout).
+// ---------------------------------------------------------------------------
+
+/// Writes the MagRef bit-stream. The §7.1.6 reader walks the refinement
+/// segment **backward** from its last byte, taking bits LSB-first and
+/// dropping to 7 bits whenever the previously read byte exceeded `0x8F`
+/// and the current byte's low seven bits are all ones (initial state
+/// `0xFF`, so the very first byte read is subject to the rule). This
+/// writer packs the bit sequence into bytes in *reader* order,
+/// mirroring the same state machine; [`Self::finish`] returns the bytes
+/// ready to be appended reversed at the segment tail.
+struct MagRefWriter {
+    /// Bytes in reader order (first-read byte first).
+    out: Vec<u8>,
+    tmp: u32,
+    used: u32,
+    prev: u32,
+}
+
+impl MagRefWriter {
+    fn new() -> Self {
+        Self {
+            out: Vec::new(),
+            tmp: 0,
+            used: 0,
+            prev: 0xFF,
+        }
+    }
+
+    fn commit(&mut self) {
+        self.out.push(self.tmp as u8);
+        self.prev = self.tmp;
+        self.tmp = 0;
+        self.used = 0;
+    }
+
+    fn bit(&mut self, b: u32) {
+        self.tmp |= (b & 1) << self.used;
+        self.used += 1;
+        // §7.1.6: with the previous byte above 0x8F, a byte whose low
+        // seven bits are all ones carries only those 7 bits — close it
+        // as 0x7F (zero MSB) so the reader's 7-bit rule fires exactly
+        // where the writer stopped; otherwise a byte closes at 8 bits.
+        let seven_ones = self.prev > 0x8F && (self.tmp & 0x7F) == 0x7F;
+        if (self.used == 7 && seven_ones) || self.used == 8 {
+            self.commit();
+        }
+    }
+
+    /// Pad any partial byte with `0` bits (a zero-padded byte can never
+    /// re-trigger the low-seven-ones rule retroactively; the pad is
+    /// never read) and return the bytes in reader order.
+    fn finish(mut self) -> Vec<u8> {
+        if self.used > 0 {
+            self.out.push(self.tmp as u8);
+        }
+        self.out
+    }
+}
+
+/// §7.4 / §7.5 forward — build the HT refinement segment (one SigProp
+/// pass plus one MagRef pass) for a code-block whose HT cleanup pass
+/// transported `μ_n = mag_n >> 1` (i.e. the cleanup stopped one
+/// bit-plane above the LSB and the refinement passes carry bit-plane
+/// 0).
+///
+/// * `mag` — full per-sample magnitudes (raster order), whose bit 0 is
+///   what the refinement passes code;
+/// * `sign` — per-sample signs (`true` ≡ negative), emitted by the
+///   §7.4 sign step for samples SigProp makes newly non-zero.
+///
+/// Mirrors the decoder's §7.4 stripe-oriented scan exactly: a sample
+/// that is insignificant after cleanup (`mag >> 1 == 0`) receives a
+/// SigProp bit iff its 8-neighbourhood significance / scan-causal
+/// refinement OR (`mbr`) is non-zero; every cleanup-significant sample
+/// receives a §7.5 MagRef bit. Returns `None` when some sample with
+/// `mag == 1` is *not* reached by SigProp — such a block cannot decode
+/// losslessly from this pass structure, so the caller must keep the
+/// cleanup at bit-plane 0 instead.
+pub fn encode_ht_refinement_segment(
+    mag: &[u32],
+    sign: &[bool],
+    width: usize,
+    height: usize,
+) -> Option<Vec<u8>> {
+    assert!(width >= 1 && height >= 1);
+    assert_eq!(mag.len(), width * height);
+    assert_eq!(sign.len(), width * height);
+    let sigma = |idx: usize| mag[idx] >= 2;
+
+    let mut sp = SigPropWriter::new();
+    let mut mr = MagRefWriter::new();
+    let mut r = vec![0u8; width * height];
+    let mut z = vec![0u8; width * height];
+
+    // §7.4 — stripes of 4 rows; within a stripe, 4-column groups run
+    // all magnitude steps then all sign steps (same order the decoder
+    // consumes them).
+    let mut y0 = 0;
+    while y0 < height {
+        let rows = (height - y0).min(4);
+        let mut x0 = 0;
+        while x0 < width {
+            let cols = (width - x0).min(4);
+            for dx in 0..cols {
+                for dy in 0..rows {
+                    let x = x0 + dx;
+                    let y = y0 + dy;
+                    let idx = x + y * width;
+                    if sigma(idx) {
+                        continue;
+                    }
+                    let mut mbr = 0u8;
+                    for (nx, ny) in crate::ht::neighbours8(x, y, width, height) {
+                        let nidx = nx + ny * width;
+                        mbr |= u8::from(sigma(nidx));
+                        if crate::ht::scan_causal(nx, ny, x, y) {
+                            mbr |= r[nidx];
+                        }
+                    }
+                    if mbr != 0 {
+                        z[idx] = 1;
+                        r[idx] = (mag[idx] & 1) as u8;
+                        sp.bit(mag[idx] & 1);
+                    }
+                }
+            }
+            for dx in 0..cols {
+                for dy in 0..rows {
+                    let x = x0 + dx;
+                    let y = y0 + dy;
+                    let idx = x + y * width;
+                    if r[idx] != 0 {
+                        // §7.4 sign step: 1 ≡ negative.
+                        sp.bit(u32::from(sign[idx]));
+                    }
+                }
+            }
+            x0 += 4;
+        }
+        y0 += 4;
+    }
+
+    // Losslessness gate: every odd magnitude below the cleanup plane
+    // must have been reached.
+    for idx in 0..width * height {
+        if mag[idx] == 1 && z[idx] == 0 {
+            return None;
+        }
+    }
+
+    // §7.5 — MagRef: one bit-plane-0 bit per cleanup-significant
+    // sample, same stripe scan.
+    let mut y0 = 0;
+    while y0 < height {
+        let rows = (height - y0).min(4);
+        let mut x0 = 0;
+        while x0 < width {
+            let cols = (width - x0).min(4);
+            for dx in 0..cols {
+                for dy in 0..rows {
+                    let idx = (x0 + dx) + (y0 + dy) * width;
+                    if sigma(idx) {
+                        mr.bit(mag[idx] & 1);
+                    }
+                }
+            }
+            x0 += 4;
+        }
+        y0 += 4;
+    }
+
+    // §7.1.5 / §7.1.6 — SigProp bytes extend forward from byte 0 of
+    // the refinement segment; MagRef bytes extend backward from its
+    // last byte.
+    let mut seg = sp.finish();
+    let mr_bytes = mr.finish();
+    seg.extend(mr_bytes.iter().rev());
+    Some(seg)
+}
+
+/// One HT code-block encoded for codestream assembly: the §7.3 cleanup
+/// segment, the optional §7.4 + §7.5 refinement segment, and the
+/// number of bit-planes the refinement passes carry below the cleanup
+/// (`0` or `1`).
+#[derive(Debug, Clone)]
+pub struct HtEncodedBlock {
+    /// HT cleanup segment bytes (§7.1.1 layout).
+    pub cleanup: Vec<u8>,
+    /// HT refinement segment bytes (`Some` ⇒ `Z_blk = 3`).
+    pub refinement: Option<Vec<u8>>,
+    /// Bit-planes left to the refinement passes: `0` (cleanup coded
+    /// down to the LSB, `Z_blk = 1`) or `1` (`Z_blk = 3`).
+    pub beta: u32,
+}
+
+/// Encode one HT code-block from full-precision magnitudes + signs.
+///
+/// With `refine` unset (or unusable) the cleanup pass transports the
+/// full magnitudes (`β = 0`, `Z_blk = 1`). With `refine` set the
+/// cleanup stops one bit-plane short (`μ_n = mag >> 1`) and a SigProp +
+/// MagRef refinement segment carries bit-plane 0 (`β = 1`,
+/// `Z_blk = 3`) — falling back to `β = 0` when the block has no
+/// cleanup-significant sample to anchor the SigProp neighbourhood scan
+/// or when some `mag == 1` sample is unreachable (see
+/// [`encode_ht_refinement_segment`]).
+pub fn encode_ht_codeblock(
+    mag: &[u32],
+    sign: &[bool],
+    width: usize,
+    height: usize,
+    refine: bool,
+) -> Result<HtEncodedBlock, Error> {
+    if refine && mag.iter().any(|&m| m >= 2) {
+        if let Some(refinement) = encode_ht_refinement_segment(mag, sign, width, height) {
+            let mu: Vec<u32> = mag.iter().map(|&m| m >> 1).collect();
+            let cleanup = encode_ht_cleanup_segment(&mu, sign, width, height)?;
+            return Ok(HtEncodedBlock {
+                cleanup,
+                refinement: Some(refinement),
+                beta: 1,
+            });
+        }
+    }
+    let cleanup = encode_ht_cleanup_segment(mag, sign, width, height)?;
+    Ok(HtEncodedBlock {
+        cleanup,
+        refinement: None,
+        beta: 0,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -934,5 +1212,151 @@ mod tests {
         let sign = vec![false; 64 * 64];
         let seg = roundtrip(&mu, &sign, 64, 64);
         assert!(seg.len() < 64, "sparse segment blew up: {} B", seg.len());
+    }
+
+    // -- §7.4 / §7.5 forward refinement passes --------------------------
+
+    /// Encode with `refine`, decode through the crate's §7.1–§7.6 HT
+    /// decoder, and assert bit-exact magnitudes + signs. Returns the
+    /// chosen β (1 ⇒ the refinement segment was exercised).
+    fn roundtrip_refined(mag: &[u32], sign: &[bool], w: usize, h: usize) -> u32 {
+        let enc = encode_ht_codeblock(mag, sign, w, h, true).expect("encode");
+        let max_mag = mag.iter().copied().max().unwrap_or(0);
+        let planes = (32 - max_mag.leading_zeros()).max(2);
+        let (z_blk, s_blk, refinement) = match &enc.refinement {
+            // β = 1: cleanup stops at bit-plane 1, S_blk + 2 = Mb.
+            Some(r) => (3u8, planes - 2, r.as_slice()),
+            // β = 0: cleanup reaches bit-plane 0, S_blk + 1 = Mb.
+            None => (1u8, planes - 1, &[][..]),
+        };
+        let (block, _nb) = decode_ht_codeblock(
+            SubBandOrientation::HL,
+            w,
+            h,
+            planes,
+            &enc.cleanup,
+            refinement,
+            z_blk,
+            s_blk,
+        )
+        .expect("decode own segments");
+        for y in 0..h {
+            for x in 0..w {
+                let c = block.coefficient(x, y);
+                let want = mag[x + y * w];
+                assert_eq!(c.magnitude, want, "mag at ({x},{y}) β={}", enc.beta);
+                if want != 0 {
+                    assert_eq!(c.sign, sign[x + y * w], "sign at ({x},{y})");
+                }
+            }
+        }
+        enc.beta
+    }
+
+    /// Dense noise: every mag-1 sample has significant neighbours, so
+    /// the refinement mode holds (β = 1) and SigProp + MagRef carry
+    /// bit-plane 0 losslessly.
+    #[test]
+    fn refinement_round_trips_dense_noise() {
+        for (w, h, seed, bits) in [
+            (4usize, 4usize, 0xAB01u32, 3u32),
+            (8, 8, 0xAB02, 5),
+            (16, 12, 0xAB03, 8),
+            (32, 32, 0xAB04, 12),
+            (64, 64, 0xAB05, 16),
+            (13, 9, 0xAB06, 6),
+        ] {
+            let mag: Vec<u32> = noise_block(w, h, seed, 0, bits)
+                .iter()
+                .map(|&m| m.max(2)) // dense: everything significant
+                .collect();
+            let sign = noise_signs(w * h, seed ^ 0x5555);
+            assert_eq!(roundtrip_refined(&mag, &sign, w, h), 1, "{w}x{h}");
+        }
+    }
+
+    /// Mixed content with zeros and mag-1 samples adjacent to
+    /// significant ones: SigProp must reach them (magnitude *and* sign
+    /// recovered from the §7.4 pass).
+    #[test]
+    fn refinement_round_trips_sigprop_reachable_ones() {
+        let w = 16;
+        let h = 16;
+        let mut mag = vec![0u32; w * h];
+        let mut sign = vec![false; w * h];
+        // A cross of significant samples with mag-1 satellites.
+        for i in 0..w {
+            mag[8 * w + i] = 4 + (i as u32 % 3);
+            sign[8 * w + i] = i % 2 == 0;
+        }
+        for i in 0..w {
+            mag[7 * w + i] = 1; // neighbours of the significant row
+            sign[7 * w + i] = i % 3 == 0;
+            mag[9 * w + i] = 1;
+            sign[9 * w + i] = i % 3 == 1;
+        }
+        assert_eq!(roundtrip_refined(&mag, &sign, w, h), 1);
+    }
+
+    /// An isolated mag-1 sample (no significant neighbour anywhere)
+    /// cannot be reached by SigProp — the encoder falls back to β = 0
+    /// and stays lossless.
+    #[test]
+    fn refinement_falls_back_for_unreachable_one() {
+        let w = 8;
+        let h = 8;
+        let mut mag = vec![0u32; w * h];
+        mag[0] = 5; // significant corner
+        mag[7 * w + 7] = 1; // isolated LSB-only sample far away
+        let sign = vec![false; w * h];
+        assert_eq!(roundtrip_refined(&mag, &sign, w, h), 0);
+        // All-small blocks (nothing significant at β = 1) also fall
+        // back.
+        let ones = vec![1u32; w * h];
+        assert_eq!(roundtrip_refined(&ones, &vec![false; w * h], w, h), 0);
+    }
+
+    /// All-ones bit patterns push the §7.1.5 / §7.1.6 stuffing rules:
+    /// SigProp emits long 1-runs (0xFF then 7-bit bytes) and MagRef
+    /// alternates the >0x8F / low-seven-ones 7-bit closure.
+    #[test]
+    fn refinement_stuffing_rules_round_trip() {
+        let w = 32;
+        let h = 32;
+        // Everything significant with odd magnitudes → MagRef stream of
+        // all 1s.
+        let mag = vec![3u32; w * h];
+        let sign = vec![true; w * h];
+        assert_eq!(roundtrip_refined(&mag, &sign, w, h), 1);
+        // A significant row with odd magnitudes and negative mag-1
+        // satellites → SigProp data + sign bits of 1s.
+        let mut mag2 = vec![0u32; w * h];
+        let mut sign2 = vec![false; w * h];
+        for x in 0..w {
+            for y in (0..h).step_by(3) {
+                mag2[y * w + x] = 5;
+                sign2[y * w + x] = true;
+            }
+            for y in (1..h).step_by(3) {
+                mag2[y * w + x] = 1;
+                sign2[y * w + x] = true;
+            }
+        }
+        assert_eq!(roundtrip_refined(&mag2, &sign2, w, h), 1);
+    }
+
+    /// Randomised sweep across shapes and densities — every block
+    /// round-trips bit-exactly whichever β the encoder picks.
+    #[test]
+    fn refinement_randomised_sweep() {
+        let mut seed = 0xC0FF_EE00u32;
+        for (w, h) in [(4usize, 4usize), (8, 8), (16, 16), (32, 24), (64, 64)] {
+            for zero_every in [0u32, 2, 5] {
+                seed ^= 0x9E37_79B9;
+                let mag = noise_block(w, h, seed, zero_every, 10);
+                let sign = noise_signs(w * h, seed ^ 0xAAAA);
+                roundtrip_refined(&mag, &sign, w, h);
+            }
+        }
     }
 }

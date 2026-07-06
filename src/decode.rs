@@ -491,9 +491,9 @@ struct BlockAccum {
     p: Option<u32>,
     /// One entry per §C.3 codeword segment, in coding-pass order.
     segments: Vec<AccumSegment>,
-    /// Running absolute pass cursor for the §D.6 bypass span split — the
-    /// count of passes accumulated by prior packets. Unused outside
-    /// bypass.
+    /// Running absolute pass cursor for the §D.6 bypass and T.814 HT
+    /// span splits — the count of passes accumulated by prior packets.
+    /// Unused outside those splits.
     bypass_cursor: u32,
 }
 
@@ -1206,7 +1206,12 @@ fn build_tile_packet_plan(
             },
         ));
     }
-    let split = if params.selective_arithmetic_coding_bypass {
+    let split = if params.high_throughput {
+        // T.814 §B.2 / §B.3 — HT code-blocks split at the set-T
+        // boundaries: one codeword segment per HT cleanup pass, one per
+        // SigProp (+ MagRef) refinement pair.
+        SegmentSplit::Ht
+    } else if params.selective_arithmetic_coding_bypass {
         // §D.6 bypass — Table D.9 AC + raw codeword-segment split.
         // Bit-2 ("termination on each coding pass") composes: when also
         // set every pass (including both raw passes) terminates.
@@ -1345,6 +1350,34 @@ fn decode_tile_from_plan(
             //   running absolute pass cursor (which carries across
             //   layers) and record each segment with its raw / AC tag so
             //   the tier-1 driver dispatches to the right reader.
+            if split == SegmentSplit::Ht {
+                // T.814 §B.2 / §B.3: recompute the set-T spans from the
+                // running absolute pass cursor (which carries across
+                // layers) — one accumulated segment per span, so the HT
+                // block decoder sees the cleanup segment and its
+                // following refinement segment as separate entries.
+                let spans =
+                    crate::packet::ht_segment_spans(entry.bypass_cursor, contrib.coding_passes);
+                if spans.len() != contrib.segment_lengths.len() {
+                    return Err(Error::InvalidPacketHeader);
+                }
+                entry.bypass_cursor = entry
+                    .bypass_cursor
+                    .checked_add(contrib.coding_passes)
+                    .ok_or(Error::InvalidPacketHeader)?;
+                for (&len, span_passes) in contrib.segment_lengths.iter().zip(spans) {
+                    let len = len as usize;
+                    let end = seg_pos.checked_add(len).ok_or(Error::PacketHeaderOverrun)?;
+                    let bytes = body.get(seg_pos..end).ok_or(Error::PacketHeaderOverrun)?;
+                    entry.segments.push(AccumSegment {
+                        bytes: bytes.to_vec(),
+                        passes: span_passes,
+                        is_raw: false,
+                    });
+                    seg_pos = end;
+                }
+                continue;
+            }
             if let SegmentSplit::Bypass {
                 termination_on_each_coding_pass,
             } = split

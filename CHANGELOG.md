@@ -6,6 +6,16 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+- HT SigProp / MagRef forward passes (T.814 §7.4 / §7.5):
+  `htenc::encode_ht_refinement_segment` mirrors the decoder's
+  stripe-oriented scans and writes the §7.1.5 forward SigProp and
+  §7.1.6 backward MagRef bit-streams (both stuffing rules), and
+  `htenc::encode_ht_codeblock` pairs a bit-plane-1 cleanup pass with a
+  refinement segment (`Z_blk = 3`), falling back to a full-depth
+  cleanup when a `mag == 1` sample is SigProp-unreachable. The packet
+  reader gains the T.814 §B.2 `SegmentSplit::Ht` set-`T` codeword
+  split (cleanup / SigProp+MagRef segment lengths), wired into the
+  decode driver for HT tile-components.
 - Region of interest on encode (T.800 Annex H, Maxshift):
   `EncodeParams::roi` takes a reference-grid rectangle, derives each
   component's §H.3.1 wavelet-domain mask (5-3 and 9-7 reach), scales

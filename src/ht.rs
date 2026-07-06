@@ -1075,7 +1075,12 @@ fn decode_magref(
 }
 
 /// The 8-connected neighbours of `(x, y)` inside a `w × h` block.
-fn neighbours8(x: usize, y: usize, w: usize, h: usize) -> impl Iterator<Item = (usize, usize)> {
+pub(crate) fn neighbours8(
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+) -> impl Iterator<Item = (usize, usize)> {
     let mut out = Vec::with_capacity(8);
     for dy in -1i32..=1 {
         for dx in -1i32..=1 {
@@ -1095,7 +1100,7 @@ fn neighbours8(x: usize, y: usize, w: usize, h: usize) -> impl Iterator<Item = (
 /// Whether neighbour `(nx, ny)` precedes `(x, y)` in the stripe-oriented
 /// (column-major within a 4-row stripe) scan — the scan-causal subset of
 /// §7.4.
-fn scan_causal(nx: usize, ny: usize, x: usize, y: usize) -> bool {
+pub(crate) fn scan_causal(nx: usize, ny: usize, x: usize, y: usize) -> bool {
     let nstripe = ny / 4;
     let stripe = y / 4;
     if nstripe != stripe {
