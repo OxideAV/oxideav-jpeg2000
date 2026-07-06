@@ -272,6 +272,21 @@ it):
     Equation B-12 tile-component regions, the §B.12.1.3–.5
     position-order projections, and the RPCL / PCRL power-of-two
     gate; 4:2:0 / 4:2:2 / asymmetric layouts round-trip bit-exactly.
+  - **Region of interest** (Annex H, Maxshift): a reference-grid
+    rectangle (`EncodeParams::roi`) is traced backwards through the
+    wavelet cascade into each component's §H.3.1 coefficient mask
+    (5-3 reach `L(n)…L(n+1)` / `H(n−1)…H(n+1)`, 9-7 reach
+    `L(n−1)…L(n+2)` / `H(n−2)…H(n+2)`, per level and axis), the
+    masked quantized coefficients scale up by the §H.2.2 value
+    `s = max(Mb)` (Equation H-6, per component — the RCT chroma bit
+    and the lossy `fine_bits` excess grow it), and one `RGN` marker
+    per component signals `Srgn = 0` / `SPrgn = s`. Full decodes are
+    unchanged (lossless stays bit-exact); under a PCRD budget every
+    ROI bit-plane precedes the background so the region reconstructs
+    first. The coded budget `M'b = 2s` must fit the 30-bit magnitude
+    lane (all 8-bit shapes fit; 9-7 up to `fine_bits = 4`, deeper
+    inputs up to 12-bit) — an overflowing combination is cleanly
+    rejected. Composes with RCT, tiles, sub-sampling and PPM / PPT.
   - **Packed packet headers** (§A.7.4 / §A.7.5): every §B.10 packet
     header relocated out of the tile-part bodies into per-tile `PPT`
     marker segments (carried in the tile's first tile-part header) or
@@ -317,8 +332,8 @@ emission — round-trip-validated against this crate's independently
 written HT decoder up to 64×64 blocks and 28-bit magnitudes.
 Codestream-level HT emission (`CAP` + `SPcod` bit 6) is not wired yet.
 
-Not yet on the encode side: ROI, HT SigProp / MagRef refinement
-passes, and HTJ2K codestream assembly.
+Not yet on the encode side: HT SigProp / MagRef refinement passes and
+HTJ2K codestream assembly.
 
 ### Not yet implemented
 

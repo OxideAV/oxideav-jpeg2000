@@ -367,6 +367,180 @@ fn forward_cascade_9x7(
     ComponentBands { ll, high }
 }
 
+/// One sub-band's boolean ROI-mask plane, with the same Table B.1
+/// corners as the matching [`BandPlane`].
+struct MaskPlane {
+    x0: u32,
+    y0: u32,
+    width: usize,
+    height: usize,
+    data: Vec<bool>,
+}
+
+impl MaskPlane {
+    fn from_corners(c: &SplitCorners, high_x: bool, high_y: bool) -> Self {
+        let (x0, x1) = if high_x {
+            (c.hx0, c.hx1)
+        } else {
+            (c.lx0, c.lx1)
+        };
+        let (y0, y1) = if high_y {
+            (c.hy0, c.hy1)
+        } else {
+            (c.ly0, c.ly1)
+        };
+        let (w, h) = ((x1 - x0) as usize, (y1 - y0) as usize);
+        MaskPlane {
+            x0,
+            y0,
+            width: w,
+            height: h,
+            data: vec![false; w * h],
+        }
+    }
+}
+
+/// The per-band ROI masks of one component — same shape as
+/// [`ComponentBands`].
+struct MaskBands {
+    ll: MaskPlane,
+    high: Vec<[MaskPlane; 3]>,
+}
+
+/// §H.3.1 one-axis mask expansion: for a needed sample at absolute
+/// lattice coordinate `a` (pair index `n = ⌊a/2⌋`), the coefficients
+/// the §F.4 synthesis reads are `L(n)…L(n+1)`, `H(n−1)…H(n+1)` with the
+/// 5-3 kernel (H.3.1.1) and `L(n−1)…L(n+2)`, `H(n−2)…H(n+2)` with the
+/// 9-7 kernel (H.3.1.2). Returns the (low, high) index reach around
+/// `n`, in band-index space.
+fn roi_reach(reversible: bool) -> ((i64, i64), (i64, i64)) {
+    if reversible {
+        ((0, 1), (-1, 1))
+    } else {
+        ((-1, 2), (-2, 2))
+    }
+}
+
+/// Run one 2-D §H.3.1 mask-expansion level over a boolean mask anchored
+/// at absolute `(x0, y0)`, producing the four sub-band masks with the
+/// same Table B.1 corners the transform's `deinterleave_map` yields.
+fn roi_mask_split(
+    mask: &[bool],
+    w: usize,
+    h: usize,
+    x0: u32,
+    y0: u32,
+    reversible: bool,
+) -> (MaskPlane, MaskPlane, MaskPlane, MaskPlane) {
+    let c = split_corners(x0, y0, x0 + w as u32, y0 + h as u32);
+    let ((lo_a, lo_b), (hi_a, hi_b)) = roi_reach(reversible);
+    let (llw, hw) = ((c.lx1 - c.lx0) as usize, (c.hx1 - c.hx0) as usize);
+    // Pass 1 — expand each row along x into low/high column masks.
+    let mut low_x = vec![false; llw * h];
+    let mut high_x = vec![false; hw * h];
+    for v in 0..h {
+        for u in 0..w {
+            if !mask[v * w + u] {
+                continue;
+            }
+            let n = i64::from(x0 + u as u32) >> 1;
+            for i in n + lo_a..=n + lo_b {
+                let idx = i - i64::from(c.lx0);
+                if (0..llw as i64).contains(&idx) {
+                    low_x[v * llw + idx as usize] = true;
+                }
+            }
+            for i in n + hi_a..=n + hi_b {
+                let idx = i - i64::from(c.hx0);
+                if (0..hw as i64).contains(&idx) {
+                    high_x[v * hw + idx as usize] = true;
+                }
+            }
+        }
+    }
+    // Pass 2 — expand each column along y.
+    let mut ll = MaskPlane::from_corners(&c, false, false);
+    let mut hl = MaskPlane::from_corners(&c, true, false);
+    let mut lh = MaskPlane::from_corners(&c, false, true);
+    let mut hh = MaskPlane::from_corners(&c, true, true);
+    let split_y = |cols: &[bool], colw: usize, low: &mut MaskPlane, high: &mut MaskPlane| {
+        for v in 0..h {
+            for u in 0..colw {
+                if !cols[v * colw + u] {
+                    continue;
+                }
+                let n = i64::from(y0 + v as u32) >> 1;
+                for i in n + lo_a..=n + lo_b {
+                    let idx = i - i64::from(c.ly0);
+                    if (0..low.height as i64).contains(&idx) {
+                        low.data[idx as usize * colw + u] = true;
+                    }
+                }
+                for i in n + hi_a..=n + hi_b {
+                    let idx = i - i64::from(c.hy0);
+                    if (0..high.height as i64).contains(&idx) {
+                        high.data[idx as usize * colw + u] = true;
+                    }
+                }
+            }
+        }
+    };
+    split_y(&low_x, llw, &mut ll, &mut lh);
+    split_y(&high_x, hw, &mut hl, &mut hh);
+    (ll, hl, lh, hh)
+}
+
+/// Build the §H.3.1 wavelet-domain ROI masks for one tile-component:
+/// seed the image-domain mask from the reference-grid rectangle mapped
+/// onto the component grid (§B.2 / §H.3.2 — a component sample `(cx,
+/// cy)` is inside when `cx ∈ [⌈rx0/XRsiz⌉, ⌈rx1/XRsiz⌉)` and likewise
+/// vertically), then trace the `NL`-level cascade backwards level by
+/// level, mirroring [`forward_cascade`]'s geometry.
+#[allow(clippy::too_many_arguments)]
+fn roi_mask_cascade(
+    rect: &RoiRegion,
+    tcx0: u32,
+    tcy0: u32,
+    tcx1: u32,
+    tcy1: u32,
+    xr: u32,
+    yr: u32,
+    nl: u8,
+    reversible: bool,
+) -> MaskBands {
+    let (w, h) = ((tcx1 - tcx0) as usize, (tcy1 - tcy0) as usize);
+    let mut data = vec![false; w * h];
+    let (rx0, rx1) = (rect.x0.div_ceil(xr), rect.x1.div_ceil(xr));
+    let (ry0, ry1) = (rect.y0.div_ceil(yr), rect.y1.div_ceil(yr));
+    for v in 0..h {
+        let cy = tcy0 + v as u32;
+        if !(ry0..ry1).contains(&cy) {
+            continue;
+        }
+        for u in 0..w {
+            let cx = tcx0 + u as u32;
+            if (rx0..rx1).contains(&cx) {
+                data[v * w + u] = true;
+            }
+        }
+    }
+    let mut cur = MaskPlane {
+        x0: tcx0,
+        y0: tcy0,
+        width: w,
+        height: h,
+        data,
+    };
+    let mut high = Vec::with_capacity(nl as usize);
+    for _lev in 1..=nl {
+        let (ll, hl, lh, hh) =
+            roi_mask_split(&cur.data, cur.width, cur.height, cur.x0, cur.y0, reversible);
+        high.push([hl, lh, hh]);
+        cur = ll;
+    }
+    MaskBands { ll: cur, high }
+}
+
 /// One tier-1-encoded code-block ready for packet assembly.
 struct EncodedBlock {
     /// §B.10.5 zero-bit-plane count `P = Mb − planes`.
@@ -810,6 +984,32 @@ pub enum PackedHeaders {
     Ppm,
 }
 
+/// A rectangular region of interest on the **reference grid**
+/// (T.800 Annex H, Maxshift method), `[x0, x1) × [y0, y1)`.
+///
+/// The encoder derives each component's wavelet-domain ROI mask from
+/// this rectangle (§H.3.1 — the coefficients the inverse transform
+/// needs to reconstruct the region), scales the masked quantized
+/// coefficients up by `2^s` with the §H.2.2 scaling value
+/// `s = max(Mb)` (Equation H-6, resolved per component), and signals
+/// `s` through one main-header `RGN` marker segment per component
+/// (Table A.25, `Srgn = 0` implicit ROI). A decoder honouring §H.1
+/// then reconstructs the ROI ahead of (and at least as precisely as)
+/// the background at any truncation point; full decodes are unchanged.
+/// Per §H.3.2 the same region applies to every component (mapped onto
+/// each component's sub-sampled grid).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoiRegion {
+    /// Left edge (inclusive) on the reference grid.
+    pub x0: u32,
+    /// Top edge (inclusive) on the reference grid.
+    pub y0: u32,
+    /// Right edge (exclusive) on the reference grid.
+    pub x1: u32,
+    /// Bottom edge (exclusive) on the reference grid.
+    pub y1: u32,
+}
+
 /// One component's §A.6.2 / §A.6.5 override of the tile-wide COD /
 /// QCD coding parameters, signalled through a main-header `COC`
 /// (Table A.23) and — whenever the quantisation table it implies
@@ -963,6 +1163,13 @@ pub struct EncodeParams {
     /// packet headers stay in-stream (default), move to per-tile `PPT`
     /// marker segments, or move to main-header `PPM` marker segments.
     pub packed_headers: PackedHeaders,
+    /// Annex H region of interest (Maxshift): when set, the masked
+    /// coefficients are scaled up by the per-component §H.2.2 value
+    /// `s = max(Mb)` and one `RGN` marker segment per component
+    /// signals it (`Srgn = 0`, `SPrgn = s`). Requires the coded budget
+    /// `M'b = Mb + s` to stay within this implementation's 30-bit
+    /// magnitude lane (8-bit inputs always fit). Default `None`.
+    pub roi: Option<RoiRegion>,
 }
 
 impl Default for EncodeParams {
@@ -986,6 +1193,7 @@ impl Default for EncodeParams {
             poc: Vec::new(),
             component_overrides: Vec::new(),
             packed_headers: PackedHeaders::InStream,
+            roi: None,
         }
     }
 }
@@ -1369,6 +1577,38 @@ fn encode_core(
         }
     }
 
+    // -- Annex H Maxshift ROI: per-component scaling value --------------
+    // §H.2.2 / Equation H-6: `s` must be at least the largest number of
+    // magnitude bit-planes `Mb` of any background coefficient in the
+    // component; the largest `Mb` across the component's sub-bands
+    // (guard bits + the largest εb − 1 — the HH gain of 2, plus the
+    // lossy `fine_bits` excess, plus the §G.2 RCT chroma bit) bounds
+    // that for every code-block. The coded budget `M'b = Mb + s = 2s`
+    // must stay inside this implementation's magnitude lane, and SPrgn
+    // is an 8-bit field (Table A.25).
+    let roi_s: Vec<u32> = (0..planes.len())
+        .map(|ci| {
+            if params.roi.is_none() {
+                return 0;
+            }
+            let cp = &comp_params[ci];
+            let ri = if use_rct && ci > 0 {
+                u32::from(precision) + 1
+            } else {
+                u32::from(precision)
+            };
+            let fine = match cp.kernel {
+                EncodeKernel::Lossless5x3 => 0,
+                EncodeKernel::Lossy9x7 { fine_bits } => u32::from(fine_bits),
+            };
+            let gain = if cp.nl == 0 { 0 } else { 2 };
+            u32::from(GUARD_BITS) + ri + gain + fine - 1
+        })
+        .collect();
+    if params.roi.is_some() && roi_s.iter().any(|&s| 2 * s > 30 || s > 255) {
+        return Err(Error::NotImplemented);
+    }
+
     let separation = |ci: usize| -> (u32, u32) {
         params
             .sub_sampling
@@ -1565,6 +1805,28 @@ fn encode_core(
     for t in 0..num_tiles {
         let tile = derive_tile_geometry(&siz, t)?;
         let bands = transform_tile(&tile)?;
+        // §H.3.1 wavelet-domain ROI masks for this tile's components.
+        let roi_masks: Option<Vec<MaskBands>> = params.roi.as_ref().map(|rect| {
+            tile.components
+                .iter()
+                .enumerate()
+                .map(|(ci, tc)| {
+                    let cp = &comp_params[ci];
+                    let (xr, yr) = separation(ci);
+                    roi_mask_cascade(
+                        rect,
+                        tc.tcx0,
+                        tc.tcy0,
+                        tc.tcx1,
+                        tc.tcy1,
+                        xr,
+                        yr,
+                        cp.nl,
+                        matches!(cp.kernel, EncodeKernel::Lossless5x3),
+                    )
+                })
+                .collect()
+        });
         let levels_per_comp: Vec<_> = tile
             .components
             .iter()
@@ -1633,7 +1895,30 @@ fn encode_core(
                             EncodeKernel::Lossy9x7 { fine_bits } => u32::from(fine_bits),
                         };
                         let eps = ri + u32::from(band_gain(psb.orientation)) + fine;
-                        let mb = u32::from(GUARD_BITS) + eps - 1;
+                        // §H.2.1 step 3: with an ROI the coded budget
+                        // grows to M'b = Mb + s (the RGN de-scaling
+                        // re-anchors it on decode).
+                        let mb = u32::from(GUARD_BITS) + eps - 1 + roi_s[ci];
+                        // The band's §H.3.1 ROI-mask plane, sharing the
+                        // coefficient plane's Table B.1 corners.
+                        let mask_plane: Option<&MaskPlane> = match (&roi_masks, level.r) {
+                            (None, _) => None,
+                            (Some(m), 0) => Some(&m[ci].ll),
+                            (Some(m), r) => {
+                                let lev = (cp.nl - r + 1) as usize;
+                                let oi = match psb.orientation {
+                                    SubBandOrientation::HL => 0,
+                                    SubBandOrientation::LH => 1,
+                                    SubBandOrientation::HH => 2,
+                                    // r > 0 carries no LL band (already
+                                    // rejected on the plane lookup).
+                                    SubBandOrientation::LL => {
+                                        return Err(Error::InvalidPacketHeader)
+                                    }
+                                };
+                                Some(&m[ci].high[lev - 1][oi])
+                            }
+                        };
                         // J.13.4.1 rate-distortion weight of this band.
                         let weight = if rate_control {
                             band_synthesis_weight(
@@ -1659,8 +1944,20 @@ fn encode_core(
                                 for u in cb.x0..cb.x1 {
                                     let s = plane.data[((v - plane.y0) as usize) * plane.width
                                         + (u - plane.x0) as usize];
+                                    let mut magnitude = s.unsigned_abs();
+                                    // §H.2.1: scale the masked (ROI)
+                                    // quantized coefficients up by 2^s so
+                                    // their bits sit above every
+                                    // background bit-plane.
+                                    if let Some(mp) = mask_plane {
+                                        if mp.data[((v - mp.y0) as usize) * mp.width
+                                            + (u - mp.x0) as usize]
+                                        {
+                                            magnitude <<= roi_s[ci];
+                                        }
+                                    }
                                     targets.push(Coefficient {
-                                        magnitude: s.unsigned_abs(),
+                                        magnitude,
                                         sigma: false,
                                         sign: s < 0,
                                         already_refined: false,
@@ -2228,6 +2525,23 @@ fn encode_core(
             }
             qcc_payload.extend_from_slice(&quant_payload(ri, cp.nl, cp.kernel));
             push_segment(&mut out, crate::MARKER_QCC, &qcc_payload);
+        }
+
+        // RGN (§A.6.3, Table A.25): one implicit-ROI (Maxshift) marker
+        // segment per component — Crgn (8- or 16-bit per Csiz),
+        // Srgn = 0 (the only Part-1 style), SPrgn = s.
+        if params.roi.is_some() {
+            for (ci, &s) in roi_s.iter().enumerate() {
+                let mut rgn_payload = Vec::with_capacity(4);
+                if planes.len() >= 257 {
+                    rgn_payload.extend_from_slice(&(ci as u16).to_be_bytes());
+                } else {
+                    rgn_payload.push(ci as u8);
+                }
+                rgn_payload.push(0); // Srgn — implicit ROI (Maxshift)
+                rgn_payload.push(s as u8); // SPrgn
+                push_segment(&mut out, crate::MARKER_RGN, &rgn_payload);
+            }
         }
 
         // POC (§A.6.6, Table A.32): one entry per progression-order
@@ -4866,6 +5180,217 @@ mod tests {
         let (ppm, _) = packed_marker_shape(&stream);
         assert!(ppm >= 1);
         decode_j2k(&stream).expect("decode relocated rate-controlled stream");
+    }
+
+    // -- Annex H Maxshift region of interest on encode -------------------
+
+    /// Parse back the emitted main-header RGN markers.
+    fn rgn_markers(stream: &[u8]) -> Vec<crate::Rgn> {
+        let header = crate::parse_j2k_header(stream).expect("header");
+        crate::collect_main_header_rgn(
+            stream,
+            header.bytes_consumed,
+            header.siz.components.len() as u16,
+        )
+        .expect("RGN parse")
+    }
+
+    /// A lossless ROI stream decodes bit-exactly (the §H.1 de-scaling
+    /// re-anchors ROI and background alike) and carries one Srgn = 0
+    /// RGN per component with the §H.2.2 scaling value.
+    #[test]
+    fn roi_lossless_round_trips_bit_exact() {
+        let p = noise(64, 48, 0x0510_ACE5);
+        let params = EncodeParams {
+            decomposition_levels: 2,
+            code_block_exp: (3, 3),
+            roi: Some(RoiRegion {
+                x0: 16,
+                y0: 12,
+                x1: 40,
+                y1: 30,
+            }),
+            ..EncodeParams::default()
+        };
+        let stream = roundtrip_params(&[&p], 64, 48, &params);
+        let rgn = rgn_markers(&stream);
+        assert_eq!(rgn.len(), 1);
+        assert_eq!(rgn[0].component_index, 0);
+        assert_eq!(rgn[0].srgn, 0);
+        // s = G + (RI + gain_HH) − 1 = 2 + (8 + 2) − 1 = 11 for 8-bit.
+        assert_eq!(rgn[0].sprgn, 11);
+    }
+
+    /// The lossy 9-7 ROI stream keeps a small full-decode error bound
+    /// everywhere (ROI scaling must not disturb full decodes). The
+    /// §H.2.2 `s` grows with `fine_bits`, so the deepest lossy step
+    /// that fits the magnitude lane for 8-bit input is `fine_bits = 4`
+    /// (`s = 15`, `M'b = 30`); a finer step is cleanly rejected.
+    #[test]
+    fn roi_lossy_round_trips_within_bound() {
+        let p = noise(48, 40, 0x0510_BEE5);
+        let roi = RoiRegion {
+            x0: 8,
+            y0: 8,
+            x1: 24,
+            y1: 24,
+        };
+        let params = EncodeParams {
+            decomposition_levels: 2,
+            code_block_exp: (4, 4),
+            kernel: EncodeKernel::Lossy9x7 { fine_bits: 4 },
+            roi: Some(roi),
+            ..EncodeParams::default()
+        };
+        let stream = encode_j2k(&[&p], 48, 40, &params).expect("encode");
+        let img = decode_j2k(&stream).expect("decode");
+        let max_err = img.components[0]
+            .samples
+            .iter()
+            .zip(&p)
+            .map(|(&got, &want)| (got - i32::from(want)).abs())
+            .max()
+            .unwrap();
+        assert!(max_err <= 3, "9-7 fine_bits=4 with ROI: err {max_err}");
+        assert_eq!(rgn_markers(&stream).len(), 1);
+        // fine_bits = 6 would need M'b = 34 — over the magnitude lane.
+        assert!(matches!(
+            encode_j2k(
+                &[&p],
+                48,
+                40,
+                &EncodeParams {
+                    kernel: EncodeKernel::Lossy9x7 { fine_bits: 6 },
+                    roi: Some(roi),
+                    ..EncodeParams::default()
+                },
+            ),
+            Err(Error::NotImplemented)
+        ));
+    }
+
+    /// Under PCRD rate control the Maxshift scaling puts every ROI
+    /// bit-plane above the background, so a tight budget reconstructs
+    /// the region far more faithfully than the rest.
+    #[test]
+    fn roi_prioritises_region_under_rate_control() {
+        let (w, h) = (64u32, 64u32);
+        let p = noise(w, h, 0x0510_C0DE);
+        let roi = RoiRegion {
+            x0: 16,
+            y0: 16,
+            x1: 48,
+            y1: 48,
+        };
+        let base = EncodeParams {
+            decomposition_levels: 2,
+            code_block_exp: (4, 4),
+            ..EncodeParams::default()
+        };
+        let full_len = encode_j2k(&[&p], w, h, &base).unwrap().len();
+        let stream = encode_j2k(
+            &[&p],
+            w,
+            h,
+            &EncodeParams {
+                roi: Some(roi),
+                target_bytes: Some(full_len * 45 / 100),
+                ..base
+            },
+        )
+        .expect("encode");
+        let img = decode_j2k(&stream).expect("decode");
+        let (mut se_roi, mut n_roi, mut se_bg, mut n_bg) = (0f64, 0u32, 0f64, 0u32);
+        for y in 0..h {
+            for x in 0..w {
+                let got = img.components[0].samples[(y * w + x) as usize];
+                let want = i32::from(p[(y * w + x) as usize]);
+                let e = f64::from(got - want);
+                if (roi.x0..roi.x1).contains(&x) && (roi.y0..roi.y1).contains(&y) {
+                    se_roi += e * e;
+                    n_roi += 1;
+                } else {
+                    se_bg += e * e;
+                    n_bg += 1;
+                }
+            }
+        }
+        let mse_roi = se_roi / f64::from(n_roi);
+        let mse_bg = se_bg / f64::from(n_bg);
+        assert!(
+            mse_roi * 8.0 < mse_bg,
+            "ROI must lead: mse_roi {mse_roi:.2} vs mse_bg {mse_bg:.2}"
+        );
+    }
+
+    /// ROI composes with the RCT, tiles and sub-sampling: bit-exact,
+    /// with one RGN per component (the chroma s grows by the §G.2
+    /// dynamic-range bit).
+    #[test]
+    fn roi_composes_with_rct_tiles_and_subsampling() {
+        let r = noise(48, 40, 0x0510_0001);
+        let g = noise(48, 40, 0x0510_0002);
+        let b = noise(48, 40, 0x0510_0003);
+        let params = EncodeParams {
+            decomposition_levels: 2,
+            code_block_exp: (3, 3),
+            mct: true,
+            tile_size: Some((32, 32)),
+            roi: Some(RoiRegion {
+                x0: 10,
+                y0: 6,
+                x1: 30,
+                y1: 26,
+            }),
+            ..EncodeParams::default()
+        };
+        let stream = roundtrip_params(&[&r, &g, &b], 48, 40, &params);
+        let rgn = rgn_markers(&stream);
+        assert_eq!(rgn.len(), 3);
+        assert_eq!(rgn[0].sprgn, 11); // luma: 2 + (8 + 2) − 1
+        assert_eq!(rgn[1].sprgn, 12); // chroma: RCT adds one bit
+        assert_eq!(rgn[2].sprgn, 12);
+
+        // Sub-sampled (no MCT) shape, odd dimensions.
+        let half = noise(24, 20, 0x0510_0004);
+        let full = noise(47, 39, 0x0510_0005);
+        let params = EncodeParams {
+            decomposition_levels: 1,
+            code_block_exp: (3, 3),
+            sub_sampling: vec![(1, 1), (2, 2)],
+            roi: Some(RoiRegion {
+                x0: 5,
+                y0: 5,
+                x1: 20,
+                y1: 20,
+            }),
+            ..EncodeParams::default()
+        };
+        roundtrip_params(&[&full, &half], 47, 39, &params);
+    }
+
+    /// A coded budget `M'b = 2s` that overflows the magnitude lane is
+    /// rejected rather than mis-encoded (deep inputs).
+    #[test]
+    fn roi_rejects_overdeep_budget() {
+        let p = vec![0u16; 16 * 16];
+        let params = EncodeParams {
+            decomposition_levels: 1,
+            roi: Some(RoiRegion {
+                x0: 0,
+                y0: 0,
+                x1: 8,
+                y1: 8,
+            }),
+            ..EncodeParams::default()
+        };
+        // 16-bit: s = 2 + (16 + 2) − 1 = 19, M'b = 38 > 30.
+        assert!(matches!(
+            encode_j2k_u16(&[&p], 16, 16, 16, &params),
+            Err(Error::NotImplemented)
+        ));
+        // 12-bit: s = 15, M'b = 30 — still encodable.
+        assert!(encode_j2k_u16(&[&p], 16, 16, 12, &params).is_ok());
     }
 
     /// The §A.7.4 chunker cuts only after completed packet headers and

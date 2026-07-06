@@ -6,6 +6,15 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+- Region of interest on encode (T.800 Annex H, Maxshift):
+  `EncodeParams::roi` takes a reference-grid rectangle, derives each
+  component's §H.3.1 wavelet-domain mask (5-3 and 9-7 reach), scales
+  the masked quantized coefficients by the §H.2.2 value `s = max(Mb)`
+  and emits one `RGN` marker segment per component (`Srgn = 0`,
+  `SPrgn = s`). Lossless full decodes stay bit-exact, lossy bounds
+  hold, and PCRD budgets reconstruct the region ahead of the
+  background; composes with RCT, tiles, sub-sampling and PPM/PPT.
+  Black-box confirmed byte-identical through an opaque decoder.
 - Packed packet headers on encode (T.800 §A.7.4 / §A.7.5):
   `EncodeParams::packed_headers` relocates every §B.10 packet header
   into per-tile `PPT` marker segments (first tile-part header) or
