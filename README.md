@@ -182,16 +182,16 @@ What is implemented:
   covers the SINGLEHT / HTONLY / single-HT-set case; the MULTIHT
   (multiple HT sets per code-block, bit-plane skipping via zero-length
   HT sets) and placeholder-pass (`P0 > 0`) variants are not yet
-  exercised. One
-  **known limitation** remains: a small HT code-block (≈ ≤ 12 samples
-  per side) carrying *very high energy* coefficients — as arises in the
-  high-pass sub-bands of a **non-power-of-two** image dimension — can
-  over-read the §7.1.2 MagSgn bit-stream and surface
-  `Error::HtCorruptSegment`. Every clause-7 procedure and both CxtVLC
-  tables have been verified faithful to T.814, so the divergence is a
-  not-yet-isolated emergent decode error in that corner; pinning it
-  needs a clean-room per-quad MagSgn/VLC bit-position reference trace
-  (see the docs-gap note below).
+  exercised. The long-standing small-block / high-energy /
+  non-power-of-two decode divergence is **resolved**: differential
+  tracing against this crate's own independently written HT *encoder*
+  isolated it to the §7.3.4 / §7.3.6 first-line-pair interleave — when
+  `s_mel = 0` and `u_q1 > 2`, the second quad's single `u` bit replaces
+  the *prefix step* and therefore precedes the first quad's suffix bits
+  (decidable from the prefix alone per the §7.3.6 NOTE). With the fix a
+  264-stream black-box sweep (odd and even dimensions to 100×80, 1–5
+  decomposition levels, 4×4–64×64 code-blocks, full-range noise)
+  decodes byte-identical.
 
 ## Encoder
 
@@ -394,15 +394,6 @@ These surface a clean `Error::NotImplemented` rather than mis-decoding:
 - HTJ2K MULTIHT codestreams (more than one HT set per code-block) and
   HT code-blocks that begin with placeholder passes (`P0 > 0`); the
   SINGLEHT / single-HT-set HTJ2K path *is* decoded (see above).
-- A small, very-high-energy HT code-block from a **non-power-of-two**
-  sub-band can over-read the §7.1.2 MagSgn stream
-  (`Error::HtCorruptSegment`). Power-of-two block geometries decode
-  bit-exact at any energy. **Docs gap:** isolating this needs a
-  clean-room per-quad MagSgn / VLC bit-position reference trace for a
-  high-energy odd-dimension HT cleanup segment — every clause-7
-  procedure and both Annex C CxtVLC tables have been verified faithful
-  to T.814, so the spec text alone is insufficient to localise the
-  emergent divergence.
 
 ## Public API
 

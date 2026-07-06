@@ -755,23 +755,25 @@ fn decode_u_pair(
             let u2 = 2 + p2 + s2 + 4 * e2;
             return Ok((u1, u2));
         } else {
-            // sym == 0: q1 by Formula (3); q2 depends on u_q1.
+            // sym == 0: q1 by Formula (3); q2 depends on u_q1. The
+            // §7.3.4 prefix-first interleave holds throughout: when
+            // u_q1 > 2 — decidable from the prefix alone, since
+            // u_q1 > 2 ⟺ u_pfx1 > 2 (§7.3.6 NOTE) — q2's *prefix
+            // step* is replaced by a single raw bit, which therefore
+            // precedes q1's suffix / extension bits.
             let p1 = decode_u_prefix(vlc)?;
-            let s1 = decode_u_suffix(vlc, p1)?;
-            let e1 = decode_u_extension(vlc, s1)?;
-            let u1 = p1 + s1 + 4 * e1;
-            if u1 > 2 {
-                // q2 prefix replaced by a single raw bit.
+            if p1 > 2 {
                 let u_bit = vlc.bit()? as u32;
-                let u2 = u_bit + 1;
-                return Ok((u1, u2));
-            } else {
-                let p2 = decode_u_prefix(vlc)?;
-                let s2 = decode_u_suffix(vlc, p2)?;
-                let e2 = decode_u_extension(vlc, s2)?;
-                let u2 = p2 + s2 + 4 * e2;
-                return Ok((u1, u2));
+                let s1 = decode_u_suffix(vlc, p1)?;
+                let e1 = decode_u_extension(vlc, s1)?;
+                return Ok((p1 + s1 + 4 * e1, u_bit + 1));
             }
+            let p2 = decode_u_prefix(vlc)?;
+            let s1 = decode_u_suffix(vlc, p1)?;
+            let s2 = decode_u_suffix(vlc, p2)?;
+            let e1 = decode_u_extension(vlc, s1)?;
+            let e2 = decode_u_extension(vlc, s2)?;
+            return Ok((p1 + s1 + 4 * e1, p2 + s2 + 4 * e2));
         }
     }
 

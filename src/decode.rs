@@ -1543,6 +1543,8 @@ fn decode_tile_from_plan(
             // with P0 = S_skip = 0 for a single-HT-set code-block (the
             // SINGLEHT case this round targets).
             let s_blk = p;
+            #[cfg(test)]
+            let _ = ();
             let (mut block, nb_ht) = crate::ht::decode_ht_codeblock(
                 psb.orientation,
                 placement.width() as usize,

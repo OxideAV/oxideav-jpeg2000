@@ -247,50 +247,52 @@ impl VlcWriter {
     /// placement). Exhausted positions pad with `1` bits.
     fn finish(self) -> (u8, Vec<u8>) {
         let mut it = self.bits.into_iter();
-        let mut next = |exhausted: &mut bool| -> u32 {
+        // `real` counts data bits placed in the current word so a
+        // trailing word holding only pad is dropped — but one whose
+        // data bits happen to be all ones is NOT (that exact confusion
+        // once dropped a final all-ones codeword byte).
+        let mut real_total = 0usize;
+        let total = it.len();
+        let mut next = |real: &mut u32| -> u32 {
             match it.next() {
-                Some(b) => u32::from(b),
-                None => {
-                    *exhausted = true;
-                    1
+                Some(b) => {
+                    *real += 1;
+                    u32::from(b)
                 }
+                None => 1, // pad with 1 bits
             }
         };
-        let mut done_before;
         // Initial word: 3 bits; a 4th only when the low three are not
         // all ones (`initVLC` sets `vlc_bits = 3` when they are — the
         // nibble's top bit is then the stuffing position, left 0).
+        let mut nreal = 0u32;
         let mut nibble: u32 = 0;
-        done_before = false;
         for i in 0..3 {
-            nibble |= next(&mut done_before) << i;
+            nibble |= next(&mut nreal) << i;
         }
         if nibble & 7 < 7 {
-            nibble |= next(&mut done_before) << 3;
+            nibble |= next(&mut nreal) << 3;
         }
+        real_total += nreal as usize;
         // `vlc_last` as the reader sees it: the modDcup view of byte
         // Lcup − 2 (low nibble forced to 1s).
         let mut vlc_last: u32 = (nibble << 4) | 0x0F;
         let mut body: Vec<u8> = Vec::new();
-        while !done_before {
-            let mut exhausted = false;
+        while real_total < total {
+            let mut real = 0u32;
             let mut cur: u32 = 0;
             for i in 0..7 {
-                cur |= next(&mut exhausted) << i;
-            }
-            if exhausted && cur == 0x7F {
-                // Nothing but pad — no byte needed.
-                break;
+                cur |= next(&mut real) << i;
             }
             // Stuffing rule: after a byte > 0x8F, a low-seven-ones byte
             // delivers only 7 bits (bit 7 stays 0). Otherwise bit 7
             // carries the 8th payload bit.
             if !(vlc_last > 0x8F && (cur & 0x7F) == 0x7F) {
-                cur |= next(&mut exhausted) << 7;
+                cur |= next(&mut real) << 7;
             }
             body.push(cur as u8);
             vlc_last = cur;
-            done_before = exhausted;
+            real_total += real as usize;
         }
         (nibble as u8, body)
     }
@@ -681,16 +683,20 @@ fn emit_u_pair(
             mel.sym(0);
             let (pa, sa, ea) = u_parts(u1);
             encode_u_prefix(vlc, pa);
-            encode_u_suffix(vlc, pa, sa);
-            encode_u_extension(vlc, sa, ea);
             if u1 > 2 {
                 // u2 ∈ {1, 2} here (u2 ≥ 3 took the branch above).
+                // §7.3.4 / §7.3.6: the single bit replaces q2's
+                // *prefix step*, so it precedes q1's suffix.
                 debug_assert!((1..=2).contains(&u2));
                 vlc.bit(u2 - 1);
+                encode_u_suffix(vlc, pa, sa);
+                encode_u_extension(vlc, sa, ea);
             } else {
                 let (pb, sb, eb) = u_parts(u2);
                 encode_u_prefix(vlc, pb);
+                encode_u_suffix(vlc, pa, sa);
                 encode_u_suffix(vlc, pb, sb);
+                encode_u_extension(vlc, sa, ea);
                 encode_u_extension(vlc, sb, eb);
             }
         }
@@ -1343,6 +1349,77 @@ mod tests {
             }
         }
         assert_eq!(roundtrip_refined(&mag2, &sign2, w, h), 1);
+    }
+
+    /// A black-box-encoder-produced 3x3 LL cleanup segment whose
+    /// initial quad-pair takes the §7.3.6 first-line-pair
+    /// `s_mel = 0, u_q1 > 2` path with a shared MEL/VLC tail byte —
+    /// the shape that exposed the u2 single-bit interleave position
+    /// (the bit replaces q2's *prefix step*, so it precedes q1's
+    /// suffix). Decodes bit-exactly.
+    #[test]
+    fn first_line_pair_u2_bit_precedes_suffix_black_box_segment() {
+        let seg: Vec<u8> = vec![
+            0x09, 0x00, 0x54, 0x8d, 0xf4, 0x59, 0x17, 0xfc, 0x10, 0xbe, 0x97, 0x00,
+        ];
+        let (block, _nb) =
+            decode_ht_codeblock(SubBandOrientation::LL, 3, 3, 9, &seg, &[], 1, 8).expect("decode");
+        let want: [(u32, bool); 9] = [
+            (5, true),
+            (17, false),
+            (3, true),
+            (1, false),
+            (5, false),
+            (1, true),
+            (15, true),
+            (5, false),
+            (11, false),
+        ];
+        for y in 0..3 {
+            for x in 0..3 {
+                let c = block.coefficient(x, y);
+                let (m, sg) = want[y * 3 + x];
+                assert_eq!((c.magnitude, c.sign), (m, sg), "({x},{y})");
+            }
+        }
+    }
+
+    /// The same 3x3 content through this crate's own encoder — the
+    /// first-line-pair sym=0 interleave and the VLC tail packing must
+    /// agree with the decoder bit-for-bit.
+    #[test]
+    fn first_line_pair_u2_bit_round_trips_own_encoder() {
+        let mu = [5u32, 17, 3, 1, 5, 1, 15, 5, 11];
+        let sign = [true, false, true, false, false, true, true, false, false];
+        roundtrip(&mu, &sign, 3, 3);
+    }
+
+    /// High-magnitude content over small / odd quad grids: the exact
+    /// family that once dropped an all-ones trailing VLC byte and
+    /// misplaced the first-line-pair u2 bit. Sweeps shapes whose last
+    /// quad row / column is truncated.
+    #[test]
+    fn odd_grid_high_energy_round_trips() {
+        for (w, h) in [
+            (3usize, 3usize),
+            (5, 3),
+            (3, 5),
+            (5, 5),
+            (7, 5),
+            (9, 7),
+            (13, 9),
+            (12, 10),
+            (6, 5),
+            (23, 19),
+        ] {
+            for bits in [8u32, 10, 12, 14] {
+                for seed in 0..20u32 {
+                    let mu = noise_block(w, h, 0xDEB0_0000 ^ seed ^ (bits << 8), 0, bits);
+                    let sign = noise_signs(w * h, seed);
+                    roundtrip(&mu, &sign, w, h);
+                }
+            }
+        }
     }
 
     /// Randomised sweep across shapes and densities — every block

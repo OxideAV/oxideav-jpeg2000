@@ -4,6 +4,18 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ## [Unreleased]
 
+### Fixed
+
+- The long-standing HT decode divergence on small / high-energy /
+  non-power-of-two code-blocks: in the T.814 §7.3.6 first-line-pair
+  `s_mel = 0, u_q1 > 2` case, the second quad's single `u` bit
+  replaces the *prefix step* of the §7.3.4 interleave and therefore
+  precedes the first quad's suffix bits. Isolated by differential
+  tracing against this crate's own HT forward coder; a 264-stream
+  black-box sweep now decodes byte-identical. The forward coder's VLC
+  writer also no longer drops a trailing byte whose data bits are all
+  ones (mistaken for padding).
+
 ### Added
 
 - JPH file format (T.814 Annex D): the `'jph '` brand

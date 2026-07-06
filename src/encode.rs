@@ -5756,6 +5756,26 @@ mod tests {
         }
     }
 
+    /// Odd, non-power-of-two dimensions run the HT block coder over
+    /// truncated edge blocks and quad remainders — both Z_blk shapes
+    /// stay bit-exact through the full codestream path.
+    #[test]
+    fn ht_odd_dimensions_round_trip() {
+        for (w, h) in [(47u32, 39u32), (33, 17), (13, 9)] {
+            let p = noise(w, h, 0x4854_0061 ^ w ^ (h << 8));
+            for refine in [false, true] {
+                let params = EncodeParams {
+                    decomposition_levels: 2,
+                    code_block_exp: (4, 4),
+                    high_throughput: true,
+                    ht_refinement: refine,
+                    ..EncodeParams::default()
+                };
+                roundtrip_params(&[&p], w, h, &params);
+            }
+        }
+    }
+
     /// HT composes with component sub-sampling and per-component
     /// COC / QCC overrides (the COC style byte carries bit 6 too).
     #[test]
