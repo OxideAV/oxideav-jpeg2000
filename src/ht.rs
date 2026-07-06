@@ -926,9 +926,15 @@ pub fn decode_ht_codeblock(
     let nb = (s_blk + 1).min(mb);
 
     let mut coefficients = vec![Coefficient::default(); width * height];
+    // Per-coefficient completed-plane counts (§7.6 Nb(u, v) = S_blk +
+    // 1 + z_n, less the P the reassembly bridge adds back): a refined
+    // sample carries one more decoded plane than the cleanup level, so
+    // the §E.1 reconstruction must not midpoint-lift its exact LSB.
+    let mut decoded_bits = vec![0u32; width * height];
     for y in 0..height {
         for x in 0..width {
             let idx = x + y * width;
+            decoded_bits[idx] = if z[idx] != 0 { 2 } else { 1 };
             let mu = grid.mu[idx];
             let sigma = grid.sigma[idx];
             // Assemble the magnitude integer MSB-first. The cleanup pass
@@ -962,7 +968,8 @@ pub fn decode_ht_codeblock(
         }
     }
 
-    let block = CodeBlock::from_coefficients(orientation, width, height, coefficients);
+    let mut block = CodeBlock::from_coefficients(orientation, width, height, coefficients);
+    block.set_decoded_bits_raw(decoded_bits);
     Ok((block, nb))
 }
 

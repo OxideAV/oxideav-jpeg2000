@@ -6,6 +6,20 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+- HTJ2K codestream assembly on encode (T.814 Annex A):
+  `EncodeParams::high_throughput` codes every block with the HT
+  forward coder and emits a conformant HTJ2K codestream — `Rsiz`
+  bit 14, a `CAP` marker (`Pcap15`; HTONLY / SINGLEHT / HOMOGENEOUS
+  `Ccap15` with measured §8.7.3 MAGB bits and the HTIRV flag),
+  SPcod/SPcoc bit 6, and the §B.2 cleanup / refinement codeword-
+  segment lengths per contribution. `EncodeParams::ht_refinement`
+  emits `Z_blk = 3` blocks (cleanup at bit-plane 1 + SigProp/MagRef).
+  Composes with RCT/ICT, both kernels, tiles, precincts, all five
+  progression orders, SOP/EPH and PPM/PPT. Black-box confirmed
+  byte-identical through two independent opaque HTJ2K decoders. The
+  HT block decoder now records per-coefficient `Nb` (refined samples
+  carry one more plane), fixing the §E.1 reconstruction of foreign
+  `Z_blk ≥ 2` streams.
 - HT SigProp / MagRef forward passes (T.814 §7.4 / §7.5):
   `htenc::encode_ht_refinement_segment` mirrors the decoder's
   stripe-oriented scans and writes the §7.1.5 forward SigProp and

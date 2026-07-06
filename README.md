@@ -170,10 +170,16 @@ What is implemented:
   tiling into four 16×16 blocks, and a 128×128 / 4-decomposition image
   whose high-pass bands each carry several 32×32 HT code-blocks). The
   Annex C CxtVLC tables are confirmed byte-identical to the spec listing
-  (a transcription audit diffs all 802 entries). Currently covers the
-  SINGLEHT / HTONLY / single-HT-set case; the MULTIHT (multiple HT sets
-  per code-block, bit-plane skipping via zero-length HT sets) and
-  placeholder-pass (`P0 > 0`) variants are not yet exercised. One
+  (a transcription audit diffs all 802 entries). The §B.2 set-`T`
+  codeword-segment split is honoured on read — a packet whose HT
+  contribution carries a refinement segment (`Z_blk = 3`) slices the
+  cleanup and SigProp + MagRef lengths separately, and the block
+  decoder records per-coefficient `Nb` (a refined sample carries one
+  more decoded plane) so the §E.1 reconstruction is exact. Currently
+  covers the SINGLEHT / HTONLY / single-HT-set case; the MULTIHT
+  (multiple HT sets per code-block, bit-plane skipping via zero-length
+  HT sets) and placeholder-pass (`P0 > 0`) variants are not yet
+  exercised. One
   **known limitation** remains: a small HT code-block (≈ ≤ 12 samples
   per side) carrying *very high energy* coefficients — as arises in the
   high-pass sub-bands of a **non-power-of-two** image dimension — can
@@ -321,19 +327,36 @@ it):
   `encode_jpeg2000(pixels, w, h)` byte-vector entry point encodes 1-
   (gray) and 3-component (RGB via RCT) interleaved 8-bit input.
 
-The **HTJ2K forward block coder** (T.814) has its §7.3 cleanup-pass
-encoder in place (`htenc::encode_ht_cleanup_segment`): the three §7.1
-bit-stream writers (MagSgn / MEL / VLC with their stuffing rules and
-the backward VLC byte layout), the §7.3.3 adaptive MEL run-length
-encoder, Annex C CxtVLC entry selection (the tables form a covering
-code over the sample values' `U_q − 1` bit pattern), §7.3.6 U-VLC
-residuals with the §7.3.4 quad-pair interleave, and §7.3.8 MagSgn
-emission — round-trip-validated against this crate's independently
-written HT decoder up to 64×64 blocks and 28-bit magnitudes.
-Codestream-level HT emission (`CAP` + `SPcod` bit 6) is not wired yet.
-
-Not yet on the encode side: HT SigProp / MagRef refinement passes and
-HTJ2K codestream assembly.
+The crate also **encodes HTJ2K** (T.814): setting
+`EncodeParams::high_throughput` routes every code-block through the
+HT forward block coder and assembles a conformant HTJ2K codestream.
+The forward coder covers the §7.3 cleanup pass
+(`htenc::encode_ht_cleanup_segment` — the three §7.1 bit-stream
+writers with their stuffing rules and the backward VLC byte layout,
+the §7.3.3 adaptive MEL run-length encoder, Annex C CxtVLC entry
+selection, §7.3.6 U-VLC residuals with the §7.3.4 quad-pair
+interleave, and §7.3.8 MagSgn emission) **and** the §7.4 SigProp +
+§7.5 MagRef refinement passes (`htenc::encode_ht_refinement_segment`
+— forward duals of the stripe-oriented scans writing the §7.1.5
+forward and §7.1.6 backward refinement bit-streams, both stuffing
+state machines included). With `EncodeParams::ht_refinement` each
+block's cleanup stops one bit-plane short and a `Z_blk = 3`
+refinement segment carries bit-plane 0 wherever that stays lossless
+(blocks with a SigProp-unreachable `mag = 1` sample fall back to the
+full-depth cleanup). Codestream assembly signals the capability per
+T.814 Annex A: `Rsiz` bit 14, a `CAP` marker segment (`Pcap15`;
+HTONLY / SINGLEHT / RGNFREE / HOMOGENEOUS `Ccap15` with the measured
+§8.7.3 MAGB bits and the §A.3.6 HTIRV flag when a 9-7 kernel is
+involved), `SPcod` / `SPcoc` bit 6, and the T.814 §B.2 / §B.3
+codeword-segment lengths (cleanup, then SigProp + MagRef) in every
+packet header. Composes with RCT / ICT, both kernels, tiles,
+precincts, all five progression orders, SOP / EPH framing and
+PPM / PPT relocation; the Annex-D-only styles, quality layers, PCRD
+and ROI are cleanly rejected in combination. Validated bit-exact
+through this crate's own decoder and **byte-identical through two
+independent opaque HTJ2K decoders** (gray reversible at 0–3
+decomposition levels, the `Z_blk = 3` refinement shape, and the 9-7
+irreversible path).
 
 ### Not yet implemented
 

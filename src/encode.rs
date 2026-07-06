@@ -570,6 +570,10 @@ struct EncodedBlock {
     /// point: `(orientation, width, height, coefficients, mb)`. Only
     /// kept when rate control is active.
     reencode: Option<(SubBandOrientation, usize, usize, Vec<Coefficient>, u32)>,
+    /// `Some(Lcup)` for a T.814 HT code-block: `bytes` holds the HT
+    /// cleanup segment (`Lcup` bytes) followed by the optional
+    /// refinement segment, and `coding_passes` is `Z_blk`.
+    ht_cleanup_len: Option<usize>,
 }
 
 /// Linearised 5-3 synthesis of one interleaved level (T.800 §F.4.4
@@ -827,6 +831,7 @@ fn encode_code_block(
         weight: 1.0,
         ordinal: 0,
         reencode: None,
+        ht_cleanup_len: None,
     }))
 }
 
@@ -1163,6 +1168,25 @@ pub struct EncodeParams {
     /// packet headers stay in-stream (default), move to per-tile `PPT`
     /// marker segments, or move to main-header `PPM` marker segments.
     pub packed_headers: PackedHeaders,
+    /// T.814 HTJ2K block coding (SPcod bit 6): every code-block is
+    /// coded by the §7.3 HT cleanup forward coder (plus, with
+    /// [`EncodeParams::ht_refinement`], the §7.4 / §7.5 refinement
+    /// passes) instead of the Annex D MQ passes, and the codestream
+    /// signals the capability through `Rsiz` bit 14 and a `CAP` marker
+    /// segment (`Pcap15`, HTONLY / SINGLEHT / HOMOGENEOUS `Ccap15`
+    /// with the §8.7.3 MAGB bits and the HTIRV flag when a 9-7 kernel
+    /// is involved). Layers, PCRD rate control, the §D.6 / §D.4.2
+    /// styles and ROI do not apply to HT code-blocks here and are
+    /// rejected in combination. Default `false`.
+    pub high_throughput: bool,
+    /// With [`EncodeParams::high_throughput`]: stop each block's HT
+    /// cleanup pass one bit-plane short and carry bit-plane 0 in a
+    /// §7.4 SigProp + §7.5 MagRef refinement segment (`Z_blk = 3`)
+    /// wherever that stays lossless (see
+    /// [`crate::htenc::encode_ht_codeblock`]); blocks that cannot fall
+    /// back to the full-depth cleanup. Default `false` (cleanup-only,
+    /// `Z_blk = 1`).
+    pub ht_refinement: bool,
     /// Annex H region of interest (Maxshift): when set, the masked
     /// coefficients are scaled up by the per-component §H.2.2 value
     /// `s = max(Mb)` and one `RGN` marker segment per component
@@ -1193,6 +1217,8 @@ impl Default for EncodeParams {
             poc: Vec::new(),
             component_overrides: Vec::new(),
             packed_headers: PackedHeaders::InStream,
+            high_throughput: false,
+            ht_refinement: false,
             roi: None,
         }
     }
@@ -1466,6 +1492,22 @@ fn encode_core(
     if params.layers == 0 {
         return Err(Error::NotImplemented);
     }
+    // T.814 Table A.4 / §8: the §D.6 / §D.4.2 styles do not apply to
+    // HT code-blocks, the layer / PCRD machinery is Annex-D-pass
+    // based, and the Annex H ROI is out of this HT encoder's scope —
+    // reject the combinations rather than mis-encode.
+    if params.high_throughput
+        && (params.bypass
+            || params.terminate_all
+            || params.roi.is_some()
+            || params.layers != 1
+            || params.target_bytes.is_some())
+    {
+        return Err(Error::NotImplemented);
+    }
+    if params.ht_refinement && !params.high_throughput {
+        return Err(Error::NotImplemented);
+    }
     // Table A.21: when user-defined precincts are signalled the COD
     // carries exactly NL + 1 bytes, and a zero PPx / PPy nibble is only
     // permitted at the lowest resolution level (r = 0).
@@ -1634,7 +1676,8 @@ fn encode_core(
         return Err(Error::NotImplemented);
     }
     let siz = Siz {
-        rsiz: 0,
+        // T.814 §A.2: an HTJ2K codestream sets Rsiz bit 14.
+        rsiz: if params.high_throughput { 0x4000 } else { 0 },
         x_size: width,
         y_size: height,
         x_offset: 0,
@@ -1794,6 +1837,9 @@ fn encode_core(
     let want_rates = layer_count > 1 || rate_control || params.bypass || params.terminate_all;
     let mut packets: BTreeMap<(u32, u16, u8, u32), PrecinctRaw> = BTreeMap::new();
     let mut num_blocks = 0usize;
+    // Largest HT cleanup magnitude bit count — drives the §8.7.3 MAGB
+    // bits of Ccap15.
+    let mut ht_max_bits = 0u32;
     // Deepest coded depth across all code-blocks (zero-bit-planes plus
     // coded plane ordinal) — the J.13.2-style layer split aligns layer
     // boundaries on this global bit-plane depth scale.
@@ -1964,20 +2010,68 @@ fn encode_core(
                                     });
                                 }
                             }
-                            let mut enc = encode_code_block(
-                                psb.orientation,
-                                bw,
-                                bh,
-                                &targets,
-                                mb,
-                                PassCapture {
-                                    rates: want_rates,
-                                    dist: rate_control,
-                                    max_passes: None,
-                                    bypass: params.bypass,
-                                    terminate_all: params.terminate_all,
-                                },
-                            )?;
+                            let mut enc = if params.high_throughput {
+                                // T.814 §7.3 (+ §7.4 / §7.5) HT forward
+                                // coding: the cleanup pass transports the
+                                // full magnitudes (or all but bit-plane 0
+                                // under ht_refinement), signalled with
+                                // P = Mb − 1 − β so the §7.6 positioning
+                                // lands the LSB at weight 2^0 (Nb =
+                                // S_blk + 1 + z_n).
+                                let maxmag = targets.iter().map(|c| c.magnitude).max().unwrap_or(0);
+                                if maxmag == 0 {
+                                    None
+                                } else {
+                                    let planes = 32 - maxmag.leading_zeros();
+                                    if planes > mb {
+                                        return Err(Error::NotImplemented);
+                                    }
+                                    let mag: Vec<u32> =
+                                        targets.iter().map(|c| c.magnitude).collect();
+                                    let sgn: Vec<bool> = targets.iter().map(|c| c.sign).collect();
+                                    let hb = crate::htenc::encode_ht_codeblock(
+                                        &mag,
+                                        &sgn,
+                                        bw,
+                                        bh,
+                                        params.ht_refinement,
+                                    )?;
+                                    ht_max_bits = ht_max_bits.max(planes - hb.beta);
+                                    let cleanup_len = hb.cleanup.len();
+                                    let z_blk = if hb.refinement.is_some() { 3 } else { 1 };
+                                    let mut bytes = hb.cleanup;
+                                    if let Some(r) = hb.refinement {
+                                        bytes.extend_from_slice(&r);
+                                    }
+                                    Some(EncodedBlock {
+                                        zero_bit_planes: mb - 1 - hb.beta,
+                                        coding_passes: z_blk,
+                                        bytes,
+                                        pass_rates: Vec::new(),
+                                        pass_dist: Vec::new(),
+                                        d0: 0.0,
+                                        weight: 1.0,
+                                        ordinal: 0,
+                                        reencode: None,
+                                        ht_cleanup_len: Some(cleanup_len),
+                                    })
+                                }
+                            } else {
+                                encode_code_block(
+                                    psb.orientation,
+                                    bw,
+                                    bh,
+                                    &targets,
+                                    mb,
+                                    PassCapture {
+                                        rates: want_rates,
+                                        dist: rate_control,
+                                        max_passes: None,
+                                        bypass: params.bypass,
+                                        terminate_all: params.terminate_all,
+                                    },
+                                )?
+                            };
                             if let Some(enc) = &mut enc {
                                 zbp[bi] = enc.zero_bit_planes;
                                 // Depth of the block's final pass on the
@@ -2223,7 +2317,15 @@ fn encode_core(
                     let (b0, b1) = (cum_r[start as usize], cum_r[cum as usize]);
                     let mut segs: Vec<(u32, u32)> = Vec::new();
                     if p > 0 {
-                        if styled {
+                        if let Some(lcup) = enc.ht_cleanup_len {
+                            // T.814 §B.2 codeword segments: the HT
+                            // cleanup pass alone, then (Z_blk = 3) the
+                            // SigProp + MagRef refinement segment.
+                            segs.push((1, lcup as u32));
+                            if p > 1 {
+                                segs.push((p - 1, (b1 - b0) as u32 - lcup as u32));
+                            }
+                        } else if styled {
                             let spans =
                                 crate::packet::bypass_segment_spans(start, p, params.terminate_all);
                             let mut at = start;
@@ -2399,6 +2501,33 @@ fn encode_core(
         }
         push_segment(&mut out, MARKER_SIZ, &siz_payload);
 
+        // CAP (T.814 §A.3): required for an HTJ2K codestream — Pcap
+        // signals Part 15 (Pcap15, the 15th most-significant bit) and
+        // Ccap15 describes the stream: bits 14-15 = 00 (HTONLY),
+        // bit 13 = 0 (SINGLEHT), bit 12 = 0 (no RGN), bit 11 = 0
+        // (HOMOGENEOUS), bit 5 = HTIRV when any component codes HT
+        // blocks over the irreversible transform (§A.3.6), and bits
+        // 0-4 carry the §8.7.3 / §A.3.7 MAGB parameter P for the
+        // measured cleanup-magnitude bound B.
+        if params.high_throughput {
+            let irrev = comp_params
+                .iter()
+                .any(|cp| matches!(cp.kernel, EncodeKernel::Lossy9x7 { .. }));
+            let b = ht_max_bits.max(8);
+            let p_bits: u32 = if b <= 8 {
+                0
+            } else if b <= 27 {
+                b - 8
+            } else {
+                19 + (b - 27).div_ceil(4)
+            };
+            let ccap15: u16 = (u16::from(irrev) << 5) | (p_bits as u16 & 0x1F);
+            let mut cap_payload = Vec::with_capacity(6);
+            cap_payload.extend_from_slice(&(1u32 << (32 - 15)).to_be_bytes()); // Pcap
+            cap_payload.extend_from_slice(&ccap15.to_be_bytes());
+            push_segment(&mut out, crate::MARKER_CAP, &cap_payload);
+        }
+
         // COD (Tables A.13 – A.21): Scod bit 0 flags user-defined
         // precincts (whose Table A.21 bytes then trail SPcod), bits
         // 1 / 2 the SOP / EPH framing, the signalled progression, the
@@ -2427,7 +2556,10 @@ fn encode_core(
             // SPcod code-block style (Table A.19): bit 0 = §D.6
             // selective AC bypass, bit 2 = §D.4.2 termination on each
             // coding pass.
-            u8::from(params.bypass) | (u8::from(params.terminate_all) << 2),
+            u8::from(params.bypass)
+                | (u8::from(params.terminate_all) << 2)
+                // T.814 §A.4: bit 6 flags HT code-blocks.
+                | (u8::from(params.high_throughput) << 6),
             transform_byte, // SPcod: transform (Table A.20)
         ];
         cod_payload.extend_from_slice(&params.precincts); // Table A.21
@@ -2451,7 +2583,11 @@ fn encode_core(
             coc_payload.push(cp.nl);
             coc_payload.push(cp.xcb - 2);
             coc_payload.push(cp.ycb - 2);
-            coc_payload.push(u8::from(params.bypass) | (u8::from(params.terminate_all) << 2));
+            coc_payload.push(
+                u8::from(params.bypass)
+                    | (u8::from(params.terminate_all) << 2)
+                    | (u8::from(params.high_throughput) << 6),
+            );
             coc_payload.push(match cp.kernel {
                 EncodeKernel::Lossless5x3 => 1u8,
                 EncodeKernel::Lossy9x7 { .. } => 0u8,
@@ -5391,6 +5527,208 @@ mod tests {
         ));
         // 12-bit: s = 15, M'b = 30 — still encodable.
         assert!(encode_j2k_u16(&[&p], 16, 16, 12, &params).is_ok());
+    }
+
+    // -- T.814 HTJ2K codestream assembly on encode -----------------------
+
+    /// Parse back the CAP marker payload (Pcap, Ccap15) from the main
+    /// header.
+    fn cap_marker(stream: &[u8]) -> Option<(u32, u16)> {
+        let header = crate::parse_j2k_header(stream).expect("header");
+        let mut pos = 2usize;
+        while pos + 4 <= header.bytes_consumed {
+            let marker = u16::from_be_bytes([stream[pos], stream[pos + 1]]);
+            let len = u16::from_be_bytes([stream[pos + 2], stream[pos + 3]]) as usize;
+            if marker == crate::MARKER_CAP {
+                let pcap = u32::from_be_bytes([
+                    stream[pos + 4],
+                    stream[pos + 5],
+                    stream[pos + 6],
+                    stream[pos + 7],
+                ]);
+                let ccap15 = u16::from_be_bytes([stream[pos + 8], stream[pos + 9]]);
+                return Some((pcap, ccap15));
+            }
+            pos += 2 + len;
+        }
+        None
+    }
+
+    /// HT lossless encode round-trips bit-exactly and the codestream
+    /// carries the full T.814 Annex A signalling set: Rsiz bit 14, a
+    /// CAP with Pcap15 + HTONLY/SINGLEHT Ccap15, SPcod bit 6.
+    #[test]
+    fn ht_lossless_round_trips_with_signalling() {
+        for (w, h, nl, cb) in [
+            (32u32, 32u32, 0u8, (5u8, 5u8)),
+            (32, 32, 2, (4, 4)),
+            (64, 64, 3, (6, 6)),
+            (64, 48, 2, (4, 4)),
+        ] {
+            let p = noise(w, h, 0x4854_0001 ^ u32::from(nl));
+            let params = EncodeParams {
+                decomposition_levels: nl,
+                code_block_exp: cb,
+                high_throughput: true,
+                ..EncodeParams::default()
+            };
+            let stream = roundtrip_params(&[&p], w, h, &params);
+            let header = crate::parse_j2k_header(&stream).expect("header");
+            assert_eq!(header.siz.rsiz & 0x4000, 0x4000, "Rsiz bit 14");
+            assert!(
+                header.cod.code_block_style_flags().high_throughput(),
+                "SPcod bit 6"
+            );
+            let (pcap, ccap15) = cap_marker(&stream).expect("CAP present");
+            assert_eq!(pcap, 1 << (32 - 15), "only Pcap15");
+            // HTONLY / SINGLEHT / RGNFREE / HOMOGENEOUS / HTREV: all
+            // upper flags clear; only the MAGB bits may be set.
+            assert_eq!(ccap15 & !0x1F, 0, "Ccap15 upper flags: {ccap15:#06x}");
+        }
+    }
+
+    /// The ht_refinement mode (Z_blk = 3 where lossless) still decodes
+    /// bit-exactly and actually engages on dense content.
+    #[test]
+    fn ht_refinement_mode_round_trips() {
+        let p = noise(64, 64, 0x4854_0002);
+        let base = EncodeParams {
+            decomposition_levels: 2,
+            code_block_exp: (4, 4),
+            high_throughput: true,
+            ..EncodeParams::default()
+        };
+        let plain = roundtrip_params(&[&p], 64, 64, &base);
+        let refined = roundtrip_params(
+            &[&p],
+            64,
+            64,
+            &EncodeParams {
+                ht_refinement: true,
+                ..base
+            },
+        );
+        // The pass structure differs, so the streams must too (the
+        // refinement mode re-shapes every dense block into Z_blk = 3).
+        assert_ne!(plain, refined, "refinement mode engaged");
+    }
+
+    /// HT composes with RGB / RCT, the 9-7 kernel (HTIRV flagged),
+    /// precincts, position progression orders, tiles and framing.
+    #[test]
+    fn ht_composes_with_mct_kernels_tiles_and_orders() {
+        let r = noise(48, 40, 0x4854_0011);
+        let g = noise(48, 40, 0x4854_0012);
+        let b = noise(48, 40, 0x4854_0013);
+        // Lossless RCT, RLCP, multi-precinct.
+        let params = EncodeParams {
+            decomposition_levels: 2,
+            code_block_exp: (3, 3),
+            mct: true,
+            progression: ProgressionOrder::Rlcp,
+            precincts: vec![0x22, 0x33, 0x33],
+            high_throughput: true,
+            ht_refinement: true,
+            ..EncodeParams::default()
+        };
+        let stream = roundtrip_params(&[&r, &g, &b], 48, 40, &params);
+        let (_, ccap15) = cap_marker(&stream).expect("CAP");
+        assert_eq!(ccap15 & (1 << 5), 0, "reversible → HTREV");
+
+        // Lossy 9-7 ICT with tiles + SOP/EPH + RPCL: bounded error and
+        // the HTIRV bit set.
+        let params = EncodeParams {
+            decomposition_levels: 2,
+            code_block_exp: (4, 4),
+            kernel: EncodeKernel::Lossy9x7 { fine_bits: 6 },
+            mct: true,
+            tile_size: Some((32, 32)),
+            progression: ProgressionOrder::Rpcl,
+            sop: true,
+            eph: true,
+            high_throughput: true,
+            ..EncodeParams::default()
+        };
+        let stream = encode_j2k(&[&r, &g, &b], 48, 40, &params).expect("encode");
+        let img = decode_j2k(&stream).expect("decode");
+        for (ci, plane) in [&r, &g, &b].iter().enumerate() {
+            let max_err = img.components[ci]
+                .samples
+                .iter()
+                .zip(plane.iter())
+                .map(|(&got, &want)| (got - i32::from(want)).abs())
+                .max()
+                .unwrap();
+            assert!(max_err <= 1, "comp {ci}: 9-7 fine=6 err {max_err}");
+        }
+        let (_, ccap15) = cap_marker(&stream).expect("CAP");
+        assert_eq!(ccap15 & (1 << 5), 1 << 5, "irreversible → HTIRV");
+    }
+
+    /// HT composes with the §A.7.4 / §A.7.5 packed-header relocations.
+    #[test]
+    fn ht_composes_with_packed_headers() {
+        let p = noise(64, 48, 0x4854_0021);
+        for mode in [PackedHeaders::Ppt, PackedHeaders::Ppm] {
+            let params = EncodeParams {
+                decomposition_levels: 2,
+                code_block_exp: (4, 4),
+                high_throughput: true,
+                ht_refinement: true,
+                packed_headers: mode,
+                ..EncodeParams::default()
+            };
+            roundtrip_params(&[&p], 64, 48, &params);
+        }
+    }
+
+    /// The Annex-D-only knobs (styles, layers, PCRD, ROI) are rejected
+    /// in combination with HT rather than mis-encoded.
+    #[test]
+    fn ht_rejects_annex_d_only_combinations() {
+        let p = noise(16, 16, 0x4854_0031);
+        let ht = EncodeParams {
+            high_throughput: true,
+            ..EncodeParams::default()
+        };
+        for params in [
+            EncodeParams {
+                bypass: true,
+                ..ht.clone()
+            },
+            EncodeParams {
+                terminate_all: true,
+                ..ht.clone()
+            },
+            EncodeParams {
+                layers: 2,
+                ..ht.clone()
+            },
+            EncodeParams {
+                target_bytes: Some(500),
+                ..ht.clone()
+            },
+            EncodeParams {
+                roi: Some(RoiRegion {
+                    x0: 0,
+                    y0: 0,
+                    x1: 8,
+                    y1: 8,
+                }),
+                ..ht.clone()
+            },
+            // ht_refinement without high_throughput is meaningless.
+            EncodeParams {
+                high_throughput: false,
+                ht_refinement: true,
+                ..ht.clone()
+            },
+        ] {
+            assert!(matches!(
+                encode_j2k(&[&p], 16, 16, &params),
+                Err(Error::NotImplemented)
+            ));
+        }
     }
 
     /// The §A.7.4 chunker cuts only after completed packet headers and

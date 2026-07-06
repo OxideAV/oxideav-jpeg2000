@@ -706,6 +706,16 @@ impl CodeBlock {
         &self.decoded_bits
     }
 
+    /// Overwrite the per-coefficient completed-plane counts (raster
+    /// order). The T.814 HT block decoder computes these directly from
+    /// its §7.6 output (`Nb(u, v) = S_blk + 1 + z_n`, minus the `P`
+    /// added back by [`Self::effective_nb`]) rather than iterating
+    /// Annex D passes.
+    pub(crate) fn set_decoded_bits_raw(&mut self, bits: Vec<u32>) {
+        assert_eq!(bits.len(), self.width * self.height);
+        self.decoded_bits = bits;
+    }
+
     /// The full per-coefficient §D.2.1 `Nb(u, v)` for reconstruction:
     /// `P + decoded_bits(u, v)` when the §D.3 passes were tracked on
     /// this block, or the supplied `uniform_fallback` when they were
