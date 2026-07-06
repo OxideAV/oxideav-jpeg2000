@@ -1493,13 +1493,14 @@ fn encode_core(
         return Err(Error::NotImplemented);
     }
     // T.814 Table A.4 / §8: the §D.6 / §D.4.2 styles do not apply to
-    // HT code-blocks, the layer / PCRD machinery is Annex-D-pass
-    // based, and the Annex H ROI is out of this HT encoder's scope —
-    // reject the combinations rather than mis-encode.
+    // HT code-blocks, and the layer / PCRD machinery is
+    // Annex-D-pass based — reject the combinations rather than
+    // mis-encode. (The Annex H ROI *does* compose: §A.5 caps SPrgn at
+    // 37, which the magnitude-lane bound below already guarantees, and
+    // Ccap15 bit 12 flags the RGN presence.)
     if params.high_throughput
         && (params.bypass
             || params.terminate_all
-            || params.roi.is_some()
             || params.layers != 1
             || params.target_bytes.is_some())
     {
@@ -2504,11 +2505,13 @@ fn encode_core(
         // CAP (T.814 §A.3): required for an HTJ2K codestream — Pcap
         // signals Part 15 (Pcap15, the 15th most-significant bit) and
         // Ccap15 describes the stream: bits 14-15 = 00 (HTONLY),
-        // bit 13 = 0 (SINGLEHT), bit 12 = 0 (no RGN), bit 11 = 0
-        // (HOMOGENEOUS), bit 5 = HTIRV when any component codes HT
-        // blocks over the irreversible transform (§A.3.6), and bits
-        // 0-4 carry the §8.7.3 / §A.3.7 MAGB parameter P for the
-        // measured cleanup-magnitude bound B.
+        // bit 13 = 0 (SINGLEHT), bit 11 = 0
+        // (HOMOGENEOUS), bit 12 = an RGN marker is present (§A.3.4;
+        // §A.5's SPrgn ≤ 37 holds since the ROI lane bound keeps
+        // s ≤ 15), bit 5 = HTIRV when any component codes HT blocks
+        // over the irreversible transform (§A.3.6), and bits 0-4 carry
+        // the §8.7.3 / §A.3.7 MAGB parameter P for the measured
+        // cleanup-magnitude bound B.
         if params.high_throughput {
             let irrev = comp_params
                 .iter()
@@ -2521,7 +2524,9 @@ fn encode_core(
             } else {
                 19 + (b - 27).div_ceil(4)
             };
-            let ccap15: u16 = (u16::from(irrev) << 5) | (p_bits as u16 & 0x1F);
+            let ccap15: u16 = (u16::from(params.roi.is_some()) << 12)
+                | (u16::from(irrev) << 5)
+                | (p_bits as u16 & 0x1F);
             let mut cap_payload = Vec::with_capacity(6);
             cap_payload.extend_from_slice(&(1u32 << (32 - 15)).to_be_bytes()); // Pcap
             cap_payload.extend_from_slice(&ccap15.to_be_bytes());
@@ -5708,15 +5713,6 @@ mod tests {
                 target_bytes: Some(500),
                 ..ht.clone()
             },
-            EncodeParams {
-                roi: Some(RoiRegion {
-                    x0: 0,
-                    y0: 0,
-                    x1: 8,
-                    y1: 8,
-                }),
-                ..ht.clone()
-            },
             // ht_refinement without high_throughput is meaningless.
             EncodeParams {
                 high_throughput: false,
@@ -5729,6 +5725,59 @@ mod tests {
                 Err(Error::NotImplemented)
             ));
         }
+    }
+
+    /// The Annex H Maxshift ROI composes with HT block coding
+    /// (T.814 §A.5): bit-exact lossless round-trip, RGN markers
+    /// emitted, and Ccap15 bit 12 flags the RGN presence.
+    #[test]
+    fn ht_composes_with_roi() {
+        let p = noise(64, 48, 0x4854_0041);
+        for refine in [false, true] {
+            let params = EncodeParams {
+                decomposition_levels: 2,
+                code_block_exp: (4, 4),
+                high_throughput: true,
+                ht_refinement: refine,
+                roi: Some(RoiRegion {
+                    x0: 16,
+                    y0: 12,
+                    x1: 40,
+                    y1: 30,
+                }),
+                ..EncodeParams::default()
+            };
+            let stream = roundtrip_params(&[&p], 64, 48, &params);
+            let rgn = rgn_markers(&stream);
+            assert_eq!(rgn.len(), 1);
+            assert_eq!(rgn[0].sprgn, 11);
+            let (_, ccap15) = cap_marker(&stream).expect("CAP");
+            assert_eq!(ccap15 & (1 << 12), 1 << 12, "Ccap15 RGN flag");
+        }
+    }
+
+    /// HT composes with component sub-sampling and per-component
+    /// COC / QCC overrides (the COC style byte carries bit 6 too).
+    #[test]
+    fn ht_composes_with_subsampling_and_overrides() {
+        let full = noise(48, 40, 0x4854_0051);
+        let half = noise(24, 20, 0x4854_0052);
+        let params = EncodeParams {
+            decomposition_levels: 2,
+            code_block_exp: (4, 4),
+            sub_sampling: vec![(1, 1), (2, 2)],
+            component_overrides: vec![ComponentOverride {
+                component: 1,
+                decomposition_levels: Some(1),
+                code_block_exp: Some((3, 3)),
+                precincts: Some(vec![]),
+                kernel: None,
+            }],
+            high_throughput: true,
+            ht_refinement: true,
+            ..EncodeParams::default()
+        };
+        roundtrip_params(&[&full, &half], 48, 40, &params);
     }
 
     /// The §A.7.4 chunker cuts only after completed packet headers and

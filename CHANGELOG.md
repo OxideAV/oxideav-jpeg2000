@@ -6,6 +6,14 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+- HT + ROI composition (T.814 §A.5): `EncodeParams::roi` now composes
+  with `high_throughput` — the Maxshift-scaled coefficients ride the
+  HT cleanup (and optional refinement) passes, `Ccap15` bit 12 flags
+  the RGN presence, and the lane bound keeps `SPrgn ≤ 37`. Also
+  covered: HT with component sub-sampling and per-component COC / QCC
+  overrides. (The available opaque HTJ2K decoders decline RGN, so the
+  HT + ROI shape is validated by this crate's own §H.1-honouring
+  decoder.)
 - HTJ2K codestream assembly on encode (T.814 Annex A):
   `EncodeParams::high_throughput` codes every block with the HT
   forward coder and emits a conformant HTJ2K codestream — `Rsiz`

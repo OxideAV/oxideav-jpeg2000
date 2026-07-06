@@ -350,9 +350,13 @@ HTONLY / SINGLEHT / RGNFREE / HOMOGENEOUS `Ccap15` with the measured
 involved), `SPcod` / `SPcoc` bit 6, and the T.814 §B.2 / §B.3
 codeword-segment lengths (cleanup, then SigProp + MagRef) in every
 packet header. Composes with RCT / ICT, both kernels, tiles,
-precincts, all five progression orders, SOP / EPH framing and
-PPM / PPT relocation; the Annex-D-only styles, quality layers, PCRD
-and ROI are cleanly rejected in combination. Validated bit-exact
+precincts, all five progression orders, SOP / EPH framing, PPM / PPT
+relocation, component sub-sampling, per-component COC / QCC overrides
+**and the Annex H Maxshift ROI** (T.814 §A.5 — `Ccap15` bit 12 flags
+the RGN, `SPrgn` stays ≤ 37 by the lane bound; the available opaque
+HTJ2K decoders decline RGN so that shape is validated by this crate's
+own §H.1-honouring decoder); the Annex-D-only styles, quality layers
+and PCRD are cleanly rejected in combination. Validated bit-exact
 through this crate's own decoder and **byte-identical through two
 independent opaque HTJ2K decoders** (gray reversible at 0–3
 decomposition levels, the `Z_blk = 3` refinement shape, and the 9-7
