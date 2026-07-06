@@ -61,6 +61,10 @@ pub const BOX_TYPE_JP2C: u32 = 0x6A70_3263;
 /// (0x6A70_3220). T.800 Annex I §I.5.2 / Table I.3.
 pub const BRAND_JP2: u32 = 0x6A70_3220;
 
+/// Brand value declared by a conforming JPH (HTJ2K) file — `'jph '`
+/// (0x6A70_6820). T.814 Annex D §D.3.
+pub const BRAND_JPH: u32 = 0x6A70_6820;
+
 /// Magic 4-byte contents of the JPEG 2000 Signature box — the
 /// `\x0D\x0A\x87\x0A` byte string defined in T.800 §I.5.1. The whole
 /// box (LBox + TBox + DBox) is therefore the fixed 12-byte literal
@@ -101,6 +105,12 @@ impl Ftyp {
     /// `'jp2 '` brand.
     pub fn is_jp2_compatible(&self) -> bool {
         self.compatibility.contains(&BRAND_JP2)
+    }
+
+    /// `true` iff one of the compatibility entries is the T.814 §D.3
+    /// `'jph '` brand (a JPH / HTJ2K file).
+    pub fn is_jph_compatible(&self) -> bool {
+        self.compatibility.contains(&BRAND_JPH)
     }
 }
 
@@ -179,6 +189,13 @@ pub enum ColrMethod {
     /// `METH = 2` — restricted ICC profile carried in the `PROFILE`
     /// field of the box.
     RestrictedIccProfile,
+    /// `METH = 3` — **any** ICC input profile (T.814 Table D.1 /
+    /// §D.4.2, defined for JPH files; equivalent to the T.801 Any ICC
+    /// method). The `PROFILE` field carries the ISO 15076-1 profile.
+    AnyIcc,
+    /// `METH = 5` — parameterized colourspace per Rec. ITU-T H.273
+    /// (T.814 Table D.1 / §D.4.3, defined for JPH files).
+    Parameterized,
     /// Any other reserved value. Conforming readers ignore the
     /// entire colour-specification box in this case (T.800 §I.5.3.3).
     Reserved(u8),
@@ -189,9 +206,26 @@ impl ColrMethod {
         match b {
             1 => ColrMethod::Enumerated,
             2 => ColrMethod::RestrictedIccProfile,
+            3 => ColrMethod::AnyIcc,
+            5 => ColrMethod::Parameterized,
             other => ColrMethod::Reserved(other),
         }
     }
+}
+
+/// T.814 §D.4.3 parameterized-colourspace payload (`METH = 5`): the
+/// Rec. ITU-T H.273 code points naming the colour interpretation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParameterizedColour {
+    /// `COLPRIMS` — H.273 `ColourPrimaries` value.
+    pub colour_primaries: u16,
+    /// `TRANSFC` — H.273 `TransferCharacteristics` value.
+    pub transfer_characteristics: u16,
+    /// `MATCOEFFS` — H.273 `MatrixCoefficients` value.
+    pub matrix_coefficients: u16,
+    /// `VIDFRNG` — H.273 `VideoFullRangeFlag` (top bit of the final
+    /// byte; the remaining 7 bits are reserved).
+    pub video_full_range: bool,
 }
 
 /// Enumerated-colourspace value carried in an `EnumCS`-valued
@@ -234,10 +268,12 @@ pub struct Colr {
     pub approximation: u8,
     /// `EnumCS` — present iff `method == Enumerated` (Table I.11).
     pub enumerated: Option<EnumCs>,
-    /// `PROFILE` — present iff `method == RestrictedIccProfile`
-    /// (Table I.11). Preserved as raw bytes since this module does
-    /// not parse the ICC.1 profile body.
+    /// `PROFILE` — present iff `method` is `RestrictedIccProfile`
+    /// (Table I.11) or the T.814 §D.4.2 `AnyIcc`. Preserved as raw
+    /// bytes since this module does not parse the ICC profile body.
     pub icc_profile: Option<Vec<u8>>,
+    /// T.814 §D.4.3 payload — present iff `method == Parameterized`.
+    pub parameterized: Option<ParameterizedColour>,
 }
 
 /// Parsed JP2 Header superbox content (T.800 §I.5.3 / Figure I.7).
@@ -500,6 +536,7 @@ fn parse_colr_content(content: &[u8]) -> Result<Colr, Error> {
     let precedence = content[1] as i8;
     let approximation = content[2];
     let method = ColrMethod::from_byte(method_byte);
+    let mut parameterized = None;
     let (enumerated, icc_profile) = match method {
         ColrMethod::Enumerated => {
             if content.len() != 3 + 4 {
@@ -508,16 +545,30 @@ fn parse_colr_content(content: &[u8]) -> Result<Colr, Error> {
             let cs = u32::from_be_bytes([content[3], content[4], content[5], content[6]]);
             (Some(EnumCs::from_u32(cs)), None)
         }
-        ColrMethod::RestrictedIccProfile => {
-            // T.800 §I.5.3.3: PROFILE is the variable-length ICC
-            // profile body, which must be at least the 128-byte ICC
-            // profile header per ISO 15076-1. We only enforce
-            // "non-empty" here — full ICC-profile parsing is out of
-            // scope for the JP2-box-wrapper layer.
+        ColrMethod::RestrictedIccProfile | ColrMethod::AnyIcc => {
+            // T.800 §I.5.3.3 / T.814 §D.4.2: PROFILE is the
+            // variable-length ICC profile body, which must be at least
+            // the 128-byte ICC profile header per ISO 15076-1. We only
+            // enforce "non-empty" here — full ICC-profile parsing is
+            // out of scope for the JP2-box-wrapper layer.
             if content.len() <= 3 {
                 return Err(Error::InvalidMarkerLength);
             }
             (None, Some(content[3..].to_vec()))
+        }
+        ColrMethod::Parameterized => {
+            // T.814 §D.4.3 / Table D.3: three 16-bit H.273 code points
+            // plus the VIDFRNG flag byte (top bit; 7 reserved bits).
+            if content.len() != 3 + 7 {
+                return Err(Error::InvalidMarkerLength);
+            }
+            parameterized = Some(ParameterizedColour {
+                colour_primaries: u16::from_be_bytes([content[3], content[4]]),
+                transfer_characteristics: u16::from_be_bytes([content[5], content[6]]),
+                matrix_coefficients: u16::from_be_bytes([content[7], content[8]]),
+                video_full_range: content[9] & 0x80 != 0,
+            });
+            (None, None)
         }
         ColrMethod::Reserved(_) => {
             // T.800 §I.5.3.3: "If the value of METH is not 1 or 2,
@@ -534,6 +585,7 @@ fn parse_colr_content(content: &[u8]) -> Result<Colr, Error> {
         approximation,
         enumerated,
         icc_profile,
+        parameterized,
     })
 }
 
@@ -542,7 +594,7 @@ fn parse_colr_content(content: &[u8]) -> Result<Colr, Error> {
 /// The first child box must be `ihdr` (T.800 §I.5.3.1 specifies
 /// "this box shall be the first box in the JP2 Header box"). Any
 /// subsequent `bpcc` / `colr` / unknown boxes are walked in order.
-fn parse_jp2h_content(content: &[u8]) -> Result<Jp2Header, Error> {
+fn parse_jp2h_content(content: &[u8], jph: bool) -> Result<Jp2Header, Error> {
     let first = read_box(content, 0)?;
     if first.box_type != BOX_TYPE_IHDR {
         return Err(Error::InvalidMarkerLength);
@@ -580,8 +632,10 @@ fn parse_jp2h_content(content: &[u8]) -> Result<Jp2Header, Error> {
             .ok_or(Error::InvalidMarkerLength)?;
     }
     // T.800 §I.5.3.3: "There shall be at least one Colour
-    // Specification box within the JP2 Header box."
-    if colr.is_empty() {
+    // Specification box within the JP2 Header box." T.814 §D.2 lifts
+    // the requirement for a JPH file whose `UnkC` flag is non-zero
+    // (the colourspace is then simply unspecified).
+    if colr.is_empty() && !(jph && ihdr.colourspace_unknown != 0) {
         return Err(Error::InvalidMarkerLength);
     }
     // T.800 §I.5.3.1: when the `BPC` sentinel is `0xFF` the
@@ -657,7 +711,7 @@ pub fn parse_jp2(bytes: &[u8]) -> Result<Jp2Container, Error> {
                     return Err(Error::InvalidMarkerLength);
                 }
                 let body = &bytes[body_start..body_end];
-                header = Some(parse_jp2h_content(body)?);
+                header = Some(parse_jp2h_content(body, ftyp.is_jph_compatible())?);
             }
             // Per T.800 Table I.2 the Contiguous Codestream box is
             // "Required" but the file may contain additional ones; we
@@ -1098,5 +1152,141 @@ mod tests {
             compatibility: vec![0xDEAD_BEEF],
         };
         assert!(!ftyp2.is_jp2_compatible());
+    }
+
+    // -- T.814 Annex D — JPH (HTJ2K) file format ------------------------
+
+    /// Build a minimal conforming JPH file (T.814 Annex D): the JP2
+    /// box layout with brand `'jph '`, `UnkC = 1` and — per §D.2 —
+    /// no Colour Specification box, wrapping `codestream`.
+    fn synth_minimal_jph(codestream: &[u8], w: u32, h: u32, colr: Option<&[u8]>) -> Vec<u8> {
+        let mut v = Vec::new();
+        emit_box(&mut v, BOX_TYPE_JP2_SIGNATURE, &JP2_SIGNATURE_MAGIC);
+        // ftyp: BR = 'jph ', MinV = 0, CLi = ['jph '] (§D.3).
+        let mut ftyp_body = Vec::new();
+        ftyp_body.extend_from_slice(&BRAND_JPH.to_be_bytes());
+        ftyp_body.extend_from_slice(&0u32.to_be_bytes());
+        ftyp_body.extend_from_slice(&BRAND_JPH.to_be_bytes());
+        emit_box(&mut v, BOX_TYPE_FTYP, &ftyp_body);
+        let mut jp2h_body = Vec::new();
+        let mut ihdr_body = Vec::new();
+        ihdr_body.extend_from_slice(&h.to_be_bytes());
+        ihdr_body.extend_from_slice(&w.to_be_bytes());
+        ihdr_body.extend_from_slice(&1u16.to_be_bytes()); // NC
+        ihdr_body.push(7); // BPC = 8-bit unsigned
+        ihdr_body.push(7); // C = 7
+        ihdr_body.push(u8::from(colr.is_none())); // UnkC
+        ihdr_body.push(0); // IPR
+        emit_box(&mut jp2h_body, BOX_TYPE_IHDR, &ihdr_body);
+        if let Some(c) = colr {
+            emit_box(&mut jp2h_body, BOX_TYPE_COLR, c);
+        }
+        emit_box(&mut v, BOX_TYPE_JP2H, &jp2h_body);
+        emit_box(&mut v, BOX_TYPE_JP2C, codestream);
+        v
+    }
+
+    /// A JPH file wrapping this crate's own HTJ2K codestream parses
+    /// per Annex D (no colr box under `UnkC = 1`) and its embedded
+    /// codestream decodes bit-exactly.
+    #[test]
+    fn jph_file_with_ht_codestream_round_trips() {
+        let (w, h) = (32u32, 24u32);
+        let mut seed = 0x4A50_4801u32;
+        let plane: Vec<u8> = (0..w * h)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (seed >> 24) as u8
+            })
+            .collect();
+        let codestream = crate::encode::encode_j2k(
+            &[&plane],
+            w,
+            h,
+            &crate::encode::EncodeParams {
+                decomposition_levels: 2,
+                code_block_exp: (4, 4),
+                high_throughput: true,
+                ht_refinement: true,
+                ..crate::encode::EncodeParams::default()
+            },
+        )
+        .expect("HT encode");
+        let jph = synth_minimal_jph(&codestream, w, h, None);
+        let c = parse_jp2(&jph).expect("parse JPH");
+        assert_eq!(c.ftyp.brand, BRAND_JPH);
+        assert!(c.ftyp.is_jph_compatible());
+        assert!(!c.ftyp.is_jp2_compatible());
+        assert!(c.header.colr.is_empty());
+        assert_eq!(c.header.ihdr.colourspace_unknown, 1);
+        let embedded = &jph[c.codestream_offset..c.codestream_offset + c.codestream_len];
+        let img = crate::decode::decode_j2k(embedded).expect("decode embedded HTJ2K");
+        let got: Vec<u8> = img.components[0].samples.iter().map(|&s| s as u8).collect();
+        assert_eq!(got, plane);
+    }
+
+    /// §D.2: the colr box is only optional when `UnkC` is non-zero —
+    /// a JPH header with `UnkC = 0` and no colr stays malformed, and a
+    /// plain JP2 never gets the exemption.
+    #[test]
+    fn jph_colr_exemption_requires_unkc() {
+        let cs = b"\xFF\x4F\xFF\xD9";
+        // UnkC = 0 (colr Some → UnkC 0) but then strip the colr box:
+        // build manually with UnkC = 0 and no colr.
+        let mut v = Vec::new();
+        emit_box(&mut v, BOX_TYPE_JP2_SIGNATURE, &JP2_SIGNATURE_MAGIC);
+        let mut ftyp_body = Vec::new();
+        ftyp_body.extend_from_slice(&BRAND_JPH.to_be_bytes());
+        ftyp_body.extend_from_slice(&0u32.to_be_bytes());
+        ftyp_body.extend_from_slice(&BRAND_JPH.to_be_bytes());
+        emit_box(&mut v, BOX_TYPE_FTYP, &ftyp_body);
+        let mut jp2h_body = Vec::new();
+        let mut ihdr_body = Vec::new();
+        ihdr_body.extend_from_slice(&8u32.to_be_bytes());
+        ihdr_body.extend_from_slice(&8u32.to_be_bytes());
+        ihdr_body.extend_from_slice(&1u16.to_be_bytes());
+        ihdr_body.push(7);
+        ihdr_body.push(7);
+        ihdr_body.push(0); // UnkC = 0 — colr stays required
+        ihdr_body.push(0);
+        emit_box(&mut jp2h_body, BOX_TYPE_IHDR, &ihdr_body);
+        emit_box(&mut v, BOX_TYPE_JP2H, &jp2h_body);
+        emit_box(&mut v, BOX_TYPE_JP2C, cs);
+        assert!(parse_jp2(&v).is_err());
+    }
+
+    /// T.814 §D.4.2 / §D.4.3 — the JPH-defined METH values parse: 3
+    /// (any ICC profile) and 5 (H.273 parameterized colourspace).
+    #[test]
+    fn jph_meth_3_and_5_parse() {
+        let cs = b"\xFF\x4F\xFF\xD9";
+        // METH = 3: any ICC.
+        let mut colr3 = vec![3u8, 0, 0];
+        colr3.extend_from_slice(&[0xAA; 16]); // stand-in profile bytes
+        let jph = synth_minimal_jph(cs, 8, 8, Some(&colr3));
+        let c = parse_jp2(&jph).expect("parse METH 3");
+        assert_eq!(c.header.colr[0].method, ColrMethod::AnyIcc);
+        assert_eq!(
+            c.header.colr[0].icc_profile.as_deref(),
+            Some(&[0xAA; 16][..])
+        );
+        // METH = 5: COLPRIMS = 9 (BT.2020), TRANSFC = 16 (PQ),
+        // MATCOEFFS = 9, VIDFRNG = 1.
+        let colr5 = [5u8, 0, 0, 0, 9, 0, 16, 0, 9, 0x80];
+        let jph = synth_minimal_jph(cs, 8, 8, Some(&colr5));
+        let c = parse_jp2(&jph).expect("parse METH 5");
+        assert_eq!(c.header.colr[0].method, ColrMethod::Parameterized);
+        assert_eq!(
+            c.header.colr[0].parameterized,
+            Some(ParameterizedColour {
+                colour_primaries: 9,
+                transfer_characteristics: 16,
+                matrix_coefficients: 9,
+                video_full_range: true,
+            })
+        );
+        // A METH = 5 payload of the wrong size is malformed.
+        let bad = [5u8, 0, 0, 0, 9, 0, 16];
+        assert!(parse_jp2(&synth_minimal_jph(cs, 8, 8, Some(&bad))).is_err());
     }
 }

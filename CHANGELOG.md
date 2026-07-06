@@ -6,6 +6,13 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+- JPH file format (T.814 Annex D): the `'jph '` brand
+  (`jp2::BRAND_JPH`, `Ftyp::is_jph_compatible`), the §D.2 exemption
+  letting a JPH header omit the Colour Specification box when
+  `UnkC ≠ 0`, and the JPH-defined `METH` values — 3 (any ICC input
+  profile) and 5 (H.273 parameterized colourspace,
+  `jp2::ParameterizedColour`). A JPH file wrapping this crate's own
+  HTJ2K codestream parses and decodes bit-exactly.
 - HT + ROI composition (T.814 §A.5): `EncodeParams::roi` now composes
   with `high_throughput` — the Maxshift-scaled coefficients ride the
   HT cleanup (and optional refinement) passes, `Ccap15` bit 12 flags

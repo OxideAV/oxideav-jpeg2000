@@ -21,7 +21,10 @@ What is implemented:
 
 - **Containers** — J2K raw codestream and the JP2 ISO BMFF box wrapper
   (`jP`, `ftyp`, `jp2h` / `ihdr` / `bpcc` / `colr`, `jp2c`), with all
-  three box length encodings.
+  three box length encodings; plus the **JPH** (HTJ2K, T.814 Annex D)
+  profile of the same layout — the `'jph '` brand, the §D.2
+  no-`colr`-under-`UnkC` exemption, and the §D.4 `METH` values 3 (any
+  ICC profile) and 5 (H.273 parameterized colourspace).
 - **Main header** — `SOC`, `SIZ`, `COD`, `QCD`, plus the typed
   tile-part-header markers (`COD`, `COC`, `QCD`, `QCC`, `RGN`, `POC`,
   `PLT`, `PPT`, `COM`); 8- vs 16-bit component-index width is selected
