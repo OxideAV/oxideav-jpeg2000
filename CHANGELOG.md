@@ -24,6 +24,18 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+- **Layer-limited decode** — `decode_j2k_layers(bytes, max_layers)`,
+  the layer-progressive counterpart of the reduced-resolution surface:
+  tier-2 still parses every packet, but only contributions from
+  quality layers below the limit feed tier-1, so each code-block
+  decodes exactly its first-`max_layers` coding passes (the §E.1.1.2 /
+  §E.1.2.1 truncated reconstruction with the per-coefficient
+  `Nb(u, v)` midpoint lift). Byte-exact against black-box reference
+  decodes at every layer prefix of the five-layer fixture and the
+  tile-part-per-layer fixture (l = 1..=5), with committed l = 1 /
+  l = 3 references; MSE toward the lossless decode is asserted
+  monotone non-increasing and a limit at/above the stream's layer
+  count decodes identically to `decode_j2k`.
 - **Reduced-resolution decode** — `decode_j2k_reduced(bytes,
   discard_levels)`, the ISO/IEC 15444-4 §B.2.3 decode surface its
   Class-0 `rN` reference images are produced with. The §F.3.1

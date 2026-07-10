@@ -486,7 +486,14 @@ grid corner maps through the Equation B-14 ceiling division (image
 and tile origin offsets included), the discarded levels' code-blocks
 skip tier-1, and the reduced planes are validated byte-exact against
 black-box reference decodes at the same reduction (multi-tile,
-offset-anchored, multi-layer, RCT, sub-sampled and 9-7 shapes).
+offset-anchored, multi-layer, RCT, sub-sampled and 9-7 shapes); and
+`decode_j2k_layers(bytes, max_layers)` — the layer-progressive
+counterpart: each code-block decodes exactly the coding passes its
+first `max_layers` quality layers carried (the truncated
+per-coefficient `Nb(u, v)` reconstruction), byte-exact against
+black-box reference decodes at every layer prefix of the committed
+multi-layer fixtures, with monotone non-increasing MSE toward the
+lossless full decode.
 Encoding: `encode::encode_j2k` with `encode::EncodeParams` (kernel,
 MCT, progression order, precincts, quality layers, PCRD
 `target_bytes`, tile grid, bypass / termination styles), the

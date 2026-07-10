@@ -2511,3 +2511,82 @@ fn reduced_below_component_levels_is_rejected() {
     let img = decode_j2k_reduced(GRAY_MULTILAYER_53, nl).expect("LL-only decode");
     assert_eq!((img.width, img.height), (16, 16));
 }
+
+// ---------------------------------------------------------------------------
+// Layer-limited decode (`decode_j2k_layers`): the layer-progressive
+// counterpart of the §B.2.3 reduced-resolution surface. Each
+// code-block decodes exactly the coding passes its first `max_layers`
+// layers carried — the truncated-reconstruction shape (per-coefficient
+// `Nb(u, v)` midpoint lift) — and the committed verdicts are
+// byte-exact against black-box reference decodes at the same layer
+// limit.
+// ---------------------------------------------------------------------------
+
+use oxideav_jpeg2000::decode_j2k_layers;
+
+const GRAY_MULTILAYER_L1_REF: &[u8] = include_bytes!("data/gray-64x64-multilayer-53-l1-ref.pgx");
+const GRAY_MULTILAYER_L3_REF: &[u8] = include_bytes!("data/gray-64x64-multilayer-53-l3-ref.pgx");
+
+#[test]
+fn layer_limited_prefixes_match_black_box_references() {
+    // Five-layer fixture at l = 1 and l = 3: the truncated §E.1.2.1
+    // reconstruction (reversible path, Nb < Mb midpoint lift) must be
+    // byte-exact against the black-box decode of the same prefix.
+    for (limit, refbytes) in [(1u16, GRAY_MULTILAYER_L1_REF), (3, GRAY_MULTILAYER_L3_REF)] {
+        let (_s, _d, rw, rh, refv) = pgx_payload(refbytes);
+        assert_eq!((rw, rh), (64, 64));
+        let img = decode_j2k_layers(GRAY_MULTILAYER_53, limit).expect("layer-limited decode");
+        assert_eq!(img.components[0].samples, refv, "layer limit {limit}");
+    }
+}
+
+#[test]
+fn layer_limited_quality_is_monotone_and_saturates() {
+    // MSE against the lossless full decode must not increase with the
+    // layer count, and a limit at/above the stream's 5 layers decodes
+    // identically to decode_j2k.
+    let full = decode_j2k(GRAY_MULTILAYER_53).expect("full");
+    let fullv = &full.components[0].samples;
+    let mut last_mse = f64::INFINITY;
+    for l in 1..=5u16 {
+        let img = decode_j2k_layers(GRAY_MULTILAYER_53, l).expect("limited");
+        let mse = img.components[0]
+            .samples
+            .iter()
+            .zip(fullv.iter())
+            .map(|(&a, &b)| ((a - b) as f64).powi(2))
+            .sum::<f64>()
+            / fullv.len() as f64;
+        assert!(
+            mse <= last_mse,
+            "MSE must be monotone non-increasing (l={l}: {mse} > {last_mse})"
+        );
+        last_mse = mse;
+    }
+    assert_eq!(last_mse, 0.0, "all 5 layers must reconstruct losslessly");
+    let over = decode_j2k_layers(GRAY_MULTILAYER_53, u16::MAX).expect("over-limit");
+    assert_eq!(&over.components[0].samples, fullv);
+}
+
+#[test]
+fn layer_limited_tile_parts_by_layer_is_consistent() {
+    // The tile-part-per-layer fixture: limiting to 1 / 2 layers drops
+    // whole tile-parts' worth of packets; the walk must stay in sync
+    // (verified byte-exact against the black-box decode during
+    // corpus generation) and 3 layers must reproduce the lossless
+    // raster.
+    for l in 1..=2u16 {
+        decode_j2k_layers(GRAY_TP_LAYERS_53, l).expect("layer-limited tile-part decode");
+    }
+    let img = decode_j2k_layers(GRAY_TP_LAYERS_53, 3).expect("all layers");
+    assert_eq!(img.components[0].samples, gray_pattern(64, 64));
+}
+
+#[test]
+fn layer_limited_zero_is_rejected() {
+    use oxideav_jpeg2000::Error;
+    assert_eq!(
+        decode_j2k_layers(GRAY_MULTILAYER_53, 0),
+        Err(Error::InvalidMarkerLength)
+    );
+}

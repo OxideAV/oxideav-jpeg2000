@@ -134,7 +134,8 @@ pub mod registry;
 pub mod t1;
 
 pub use decode::{
-    decode_codestream, decode_j2k, decode_j2k_reduced, DecodedComponent, DecodedImage,
+    decode_codestream, decode_j2k, decode_j2k_layers, decode_j2k_reduced, DecodedComponent,
+    DecodedImage,
 };
 
 #[cfg(feature = "registry")]

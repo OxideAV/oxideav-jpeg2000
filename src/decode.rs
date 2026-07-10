@@ -1054,6 +1054,11 @@ fn decode_tile(
     // tier-2 walk still parses every packet (the byte stream is
     // sequential); only tier-1 + synthesis stop early.
     discard_levels: u8,
+    // Layer-limited decode: only contributions from quality layers
+    // `< max_layers` feed tier-1 (a §B.12.1.1 prefix truncation — each
+    // code-block sees exactly its first-`max_layers` coding passes,
+    // the same shape as a rate-truncated stream). `u16::MAX` = all.
+    max_layers: u16,
 ) -> Result<Vec<Vec<i32>>, Error> {
     // -- §B.6–§B.12 tile packet plan (geometry, enumeration, walk split) --
     let TilePacketPlan {
@@ -1084,6 +1089,7 @@ fn decode_tile(
         &descriptors,
         &headers,
         discard_levels,
+        max_layers,
     )
 }
 
@@ -1336,6 +1342,7 @@ fn decode_tile_from_plan(
     descriptors: &[PacketDescriptor],
     headers: &[(crate::packet::PacketHeader, usize)],
     discard_levels: u8,
+    max_layers: u16,
 ) -> Result<Vec<Vec<i32>>, Error> {
     let num_components = siz.components.len();
     let tile = derive_tile_geometry(siz, tile_index)?;
@@ -1366,6 +1373,17 @@ fn decode_tile_from_plan(
             .split();
         for contrib in &header.contributions {
             if !contrib.included {
+                continue;
+            }
+            // Layer-limited decode: drop the contribution (the header
+            // walk above already consumed its bytes — tier-2 stays in
+            // sync) so each code-block accumulates exactly the passes
+            // its first `max_layers` layers carried. Contributions
+            // arrive in increasing layer order per code-block (the
+            // §B.12.2 per-precinct "next unsent layer" cursor is
+            // monotone), so this is a per-block prefix truncation —
+            // the same decode shape as a rate-truncated stream.
+            if desc.layer >= max_layers {
                 continue;
             }
             let key: BlockKey = (
@@ -2139,13 +2157,36 @@ pub fn decode_j2k(bytes: &[u8]) -> Result<DecodedImage, Error> {
 /// [`Error::InvalidDecompositionLevels`].
 pub fn decode_j2k_reduced(bytes: &[u8], discard_levels: u8) -> Result<DecodedImage, Error> {
     let cs: J2kCodestream = crate::parse_codestream(bytes)?;
-    decode_codestream_impl(bytes, &cs, discard_levels)
+    decode_codestream_impl(bytes, &cs, discard_levels, u16::MAX)
+}
+
+/// Decode a J2K codestream from its first `max_layers` quality layers
+/// only — the layer-progressive counterpart of [`decode_j2k_reduced`]
+/// (ISO/IEC 15444-4's Class-0 procedures likewise permit decoding a
+/// codestream prefix; §B.2.2's relevant-packet rule).
+///
+/// The tier-2 walk still parses every packet header (the byte stream
+/// is sequential), but only contributions from layers `< max_layers`
+/// feed tier-1, so each code-block decodes exactly the coding passes
+/// its first `max_layers` layers carried — the same §E.1.1.2 /
+/// §E.1.2.1 truncated-reconstruction shape as a rate-limited stream
+/// (per-coefficient `Nb(u, v)` midpoint lift included). A
+/// `max_layers` at or above the codestream's layer count decodes
+/// identically to [`decode_j2k`]; `max_layers == 0` is rejected with
+/// [`Error::InvalidMarkerLength`] (an image cannot be reconstructed
+/// from zero layers).
+pub fn decode_j2k_layers(bytes: &[u8], max_layers: u16) -> Result<DecodedImage, Error> {
+    if max_layers == 0 {
+        return Err(Error::InvalidMarkerLength);
+    }
+    let cs: J2kCodestream = crate::parse_codestream(bytes)?;
+    decode_codestream_impl(bytes, &cs, 0, max_layers)
 }
 
 /// [`decode_j2k`] against an already-parsed [`J2kCodestream`] (the
 /// `bytes` must be the same buffer the codestream was parsed from).
 pub fn decode_codestream(bytes: &[u8], cs: &J2kCodestream) -> Result<DecodedImage, Error> {
-    decode_codestream_impl(bytes, cs, 0)
+    decode_codestream_impl(bytes, cs, 0, u16::MAX)
 }
 
 /// Ceiling division of `v` by `2^d` (Equation B-14's reduced-grid
@@ -2163,6 +2204,7 @@ fn decode_codestream_impl(
     bytes: &[u8],
     cs: &J2kCodestream,
     discard_levels: u8,
+    max_layers: u16,
 ) -> Result<DecodedImage, Error> {
     reject_unsupported_main_header_markers(bytes, cs.header.bytes_consumed)?;
 
@@ -2354,6 +2396,7 @@ fn decode_codestream_impl(
             &body,
             relocated.as_deref(),
             discard_levels,
+            max_layers,
         )?;
 
         // Place each tile-component plane into its image-area plane at
