@@ -330,3 +330,31 @@ fn ht_16bit_reversible_matches_ojph() {
     assert_eq!((c.width as usize, c.height as usize), (rw, rh));
     assert_eq!(c.samples, rdata, "16-bit HT reconstruction differs");
 }
+
+#[test]
+fn ht_reduced_resolution_matches_ojph() {
+    // The §B.2.3 reduced-resolution surface through the HT block
+    // decoder: the multi-tile grid at one discarded level and the
+    // offset-anchored grid at two, each byte-exact against the
+    // black-box HT decoder's own reduced reconstruction.
+    for (j2c, ref_pgm, discard, what) in [
+        (
+            &include_bytes!("fixtures/ht_tiles_rev.j2c")[..],
+            &include_bytes!("fixtures/ht_tiles_rev_r1_ref.pgm")[..],
+            1u8,
+            "multi-tile HT r1",
+        ),
+        (
+            &include_bytes!("fixtures/ht_tiles_offsets_rev.j2c")[..],
+            &include_bytes!("fixtures/ht_tiles_offsets_rev_r2_ref.pgm")[..],
+            2,
+            "offset-anchored HT r2",
+        ),
+    ] {
+        let (rw, rh, rdata) = parse_pgm(ref_pgm);
+        let img = oxideav_jpeg2000::decode_j2k_reduced(j2c, discard).expect("reduced HT decode");
+        let c = &img.components[0];
+        assert_eq!((c.width as usize, c.height as usize), (rw, rh), "{what}");
+        assert_eq!(c.samples, rdata, "{what}: reduced reconstruction differs");
+    }
+}

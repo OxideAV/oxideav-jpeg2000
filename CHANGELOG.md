@@ -24,6 +24,10 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+- **Reduced-resolution decode works through the HT lane too** — the
+  multi-tile and offset-anchored HT fixtures decode at one and two
+  discarded levels byte-exact against the black-box HT decoder's own
+  reduced reconstruction (committed references pin both).
 - **Layer-limited decode** — `decode_j2k_layers(bytes, max_layers)`,
   the layer-progressive counterpart of the reduced-resolution surface:
   tier-2 still parses every packet, but only contributions from
