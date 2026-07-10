@@ -1691,3 +1691,182 @@ fn pcrl_non_power_of_two_subsampling_is_rejected() {
         "PCRL requires power-of-two sub-sampling (§B.12.1.4) — non-pow2 must be rejected"
     );
 }
+
+/// Clean-room assembler: splice two single-component single-tile J2K
+/// codestreams with **divergent Table A.19 code-block-style bytes**
+/// (e.g. one T.814 HT stream and one Annex D stream) into a single
+/// two-component codestream — the T.814 §8.2 HTDECLARED shape when the
+/// styles differ on SPcod/SPcoc bit 6.
+///
+/// Same layout as `assemble_mixed_kernel` (CPRL so component 0's
+/// packets precede component 1's; COC + QCC restate component 1 from
+/// the second stream — including its own style byte), plus the T.814
+/// Annex A signalling: `Rsiz` bit 14 and a `CAP` marker whose `Ccap15`
+/// bits 14-15 declare the HTDECLARED set.
+fn assemble_mixed_style(base: &[u8], other: &[u8]) -> Vec<u8> {
+    let siz_off = find_marker(base, 0xFF51);
+    let siz = marker_payload(base, siz_off);
+    let csiz_pos = 2 + 4 * 8; // 38
+    let csiz = u16::from_be_bytes([siz[csiz_pos], siz[csiz_pos + 1]]);
+    assert_eq!(csiz, 1, "assembler expects single-component sources");
+    let comp_desc = &siz[csiz_pos + 2..csiz_pos + 5];
+    let mut new_siz = Vec::new();
+    new_siz.extend_from_slice(&siz[..csiz_pos]);
+    // T.814 §A.2: Rsiz bit 14 flags an HTJ2K codestream.
+    new_siz[0] |= 0x40;
+    new_siz.extend_from_slice(&2u16.to_be_bytes()); // Csiz = 2
+    new_siz.extend_from_slice(comp_desc);
+    new_siz.extend_from_slice(comp_desc);
+
+    // CAP (T.814 §A.3): Pcap15 + Ccap15 bits 15..14 = 10 (HTDECLARED).
+    let mut cap_payload = Vec::new();
+    cap_payload.extend_from_slice(&(1u32 << (32 - 15)).to_be_bytes());
+    cap_payload.extend_from_slice(&0x8000u16.to_be_bytes());
+
+    // COD: the base stream's, rewritten to CPRL.
+    let mut new_cod = marker_payload(base, find_marker(base, 0xFF52)).to_vec();
+    new_cod[1] = 0x04; // SGcod progression = CPRL
+    assert_eq!(new_cod[4], 0x00, "COD MCT must be off");
+
+    // COC for component 1: SPcoc (incl. its style byte) copied from
+    // the other stream's COD.
+    let cod_other = marker_payload(other, find_marker(other, 0xFF52));
+    let mut coc_payload = vec![0x01u8, 0x00]; // Ccoc = 1, Scoc = 0
+    coc_payload.extend_from_slice(&cod_other[5..]);
+
+    // QCD from the base; QCC for component 1 from the other stream.
+    let qcd = marker_payload(base, find_marker(base, 0xFF5C));
+    let qcd_other = marker_payload(other, find_marker(other, 0xFF5C));
+    let mut qcc_payload = vec![0x01u8];
+    qcc_payload.extend_from_slice(qcd_other);
+
+    let mut body = Vec::new();
+    body.extend_from_slice(tile_body(base));
+    body.extend_from_slice(tile_body(other));
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&0xFF4Fu16.to_be_bytes()); // SOC
+    out.extend_from_slice(&wrap_marker(0xFF51, &new_siz));
+    out.extend_from_slice(&wrap_marker(0xFF50, &cap_payload)); // CAP
+    out.extend_from_slice(&wrap_marker(0xFF52, &new_cod));
+    out.extend_from_slice(&wrap_marker(0xFF53, &coc_payload));
+    out.extend_from_slice(&wrap_marker(0xFF5C, qcd));
+    out.extend_from_slice(&wrap_marker(0xFF5D, &qcc_payload));
+    let sot_off = out.len();
+    out.extend_from_slice(&0xFF90u16.to_be_bytes());
+    out.extend_from_slice(&10u16.to_be_bytes()); // Lsot
+    out.extend_from_slice(&0u16.to_be_bytes()); // Isot
+    out.extend_from_slice(&0u32.to_be_bytes()); // Psot (patched)
+    out.push(0); // TPsot
+    out.push(1); // TNsot
+    out.extend_from_slice(&0xFF93u16.to_be_bytes()); // SOD
+    out.extend_from_slice(&body);
+    out.extend_from_slice(&0xFFD9u16.to_be_bytes()); // EOC
+    let psot = (out.len() - 2 - sot_off) as u32;
+    out[sot_off + 6..sot_off + 10].copy_from_slice(&psot.to_be_bytes());
+    out
+}
+
+/// T.814 §8.2 **HTDECLARED**: a tile whose components mix HT and
+/// Annex D block coding at tile-component granularity — the `COC`
+/// carries a Table A.19 style byte whose bit 6 diverges from the
+/// `COD`'s, so each component's §B.10.7 segment split and tier-1
+/// dispatch resolve independently. Both orientations (HT first and
+/// Annex D first) must reconstruct each component identically to its
+/// single-component decode — which is bit-exact to the sources here
+/// (both lossless).
+#[test]
+fn htdeclared_mixed_ht_and_annex_d_components_reconstruct() {
+    use oxideav_jpeg2000::encode::{encode_j2k, EncodeParams};
+    let mut seed = 0x4854_00A1u32;
+    let mut noise = |n: usize| -> Vec<u8> {
+        (0..n)
+            .map(|_| {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                (seed >> 24) as u8
+            })
+            .collect()
+    };
+    let pa = noise(32 * 32);
+    let pb = noise(32 * 32);
+    let base_params = EncodeParams {
+        decomposition_levels: 2,
+        code_block_exp: (4, 4),
+        ..EncodeParams::default()
+    };
+    let plain = encode_j2k(&[&pa], 32, 32, &base_params).expect("plain encode");
+    let ht = encode_j2k(
+        &[&pb],
+        32,
+        32,
+        &EncodeParams {
+            high_throughput: true,
+            ..base_params
+        },
+    )
+    .expect("HT encode");
+
+    let want_a: Vec<i32> = pa.iter().map(|&v| i32::from(v)).collect();
+    let want_b: Vec<i32> = pb.iter().map(|&v| i32::from(v)).collect();
+
+    // Annex D component 0, HT component 1.
+    let mixed = assemble_mixed_style(&plain, &ht);
+    let img = decode_j2k(&mixed).expect("decode HTDECLARED (Annex D + HT)");
+    assert_eq!(img.components.len(), 2);
+    assert_eq!(img.components[0].samples, want_a, "Annex D component");
+    assert_eq!(img.components[1].samples, want_b, "HT component");
+
+    // HT component 0, Annex D component 1.
+    let mixed = assemble_mixed_style(&ht, &plain);
+    let img = decode_j2k(&mixed).expect("decode HTDECLARED (HT + Annex D)");
+    assert_eq!(img.components.len(), 2);
+    assert_eq!(img.components[0].samples, want_b, "HT component");
+    assert_eq!(img.components[1].samples, want_a, "Annex D component");
+}
+
+/// The per-component style split also carries the Annex D sub-styles:
+/// an Annex D component with the §D.6 bypass + §D.4.2 termination
+/// styles coexists with a default-style component in one tile, each
+/// decoding with its own §B.10.7 segment layout.
+#[test]
+fn mixed_annex_d_styles_per_component_reconstruct() {
+    use oxideav_jpeg2000::encode::{encode_j2k, EncodeParams};
+    let mut seed = 0x4854_00B1u32;
+    let mut noise = |n: usize| -> Vec<u8> {
+        (0..n)
+            .map(|_| {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                (seed >> 24) as u8
+            })
+            .collect()
+    };
+    let pa = noise(32 * 32);
+    let pb = noise(32 * 32);
+    let base_params = EncodeParams {
+        decomposition_levels: 2,
+        code_block_exp: (4, 4),
+        ..EncodeParams::default()
+    };
+    let plain = encode_j2k(&[&pa], 32, 32, &base_params).expect("plain encode");
+    let styled = encode_j2k(
+        &[&pb],
+        32,
+        32,
+        &EncodeParams {
+            bypass: true,
+            terminate_all: true,
+            ..base_params
+        },
+    )
+    .expect("styled encode");
+
+    let mixed = assemble_mixed_style(&plain, &styled);
+    let img = decode_j2k(&mixed).expect("decode mixed Annex D styles");
+    let want_a: Vec<i32> = pa.iter().map(|&v| i32::from(v)).collect();
+    let want_b: Vec<i32> = pb.iter().map(|&v| i32::from(v)).collect();
+    assert_eq!(img.components[0].samples, want_a, "default-style component");
+    assert_eq!(
+        img.components[1].samples, want_b,
+        "bypass+termall component"
+    );
+}

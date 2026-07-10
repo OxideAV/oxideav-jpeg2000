@@ -50,12 +50,14 @@
 //!
 //! Streams that need machinery this round does not wire are
 //! **rejected** with [`Error::NotImplemented`] rather than
-//! mis-decoded: a `COC` whose Table A.19 code-block **style** byte
-//! diverges from the `COD` (the style stays global), a non-Maxshift
-//! `RGN` style (`Srgn ≠ 0`), and RPCL / PCRL under non-power-of-two
-//! sub-sampling (§B.12.1.3 / §B.12.1.4 require power-of-two `XRsiz` /
-//! `YRsiz`; CPRL — §B.12.1.5 — carries no such restriction and is
-//! decoded at any factor).
+//! mis-decoded: a non-Maxshift `RGN` style (`Srgn ≠ 0`), and RPCL /
+//! PCRL under non-power-of-two sub-sampling (§B.12.1.3 / §B.12.1.4
+//! require power-of-two `XRsiz` / `YRsiz`; CPRL — §B.12.1.5 — carries
+//! no such restriction and is decoded at any factor). A `COC` whose
+//! Table A.19 code-block **style** byte diverges from the `COD` *is*
+//! honoured — each component's segment split and tier-1 dispatch
+//! resolve independently (the T.814 §8.2 HTDECLARED HT / Annex D mix
+//! included).
 //!
 //! All behaviour is derived from the staged T.800 specification
 //! text. The
@@ -322,11 +324,12 @@ fn resolve_component_roi_shift(
 
 /// The per-component coding-style parameters resolved after the T.800
 /// §A.6.2 `Main COC > Main COD` precedence: decomposition levels, the
-/// code-block size exponents, the user-defined precinct list, and the
-/// wavelet kernel. The code-block **style** bits (Table A.19 — SOP/EPH
-/// framing, segmentation symbol, vertically-causal, context reset,
-/// per-pass termination, bypass) stay global to the code and are
-/// validated to match the main `COD` (see [`resolve_component_coding`]).
+/// code-block size exponents, the user-defined precinct list, the
+/// wavelet kernel, and the Table A.19 code-block **style** bits
+/// (segmentation symbol, vertically-causal, context reset, per-pass
+/// termination, bypass, predictable termination, T.814 HT) — a `COC`
+/// carries its own style byte, so each tile-component's segment split
+/// and tier-1 dispatch resolve independently.
 #[derive(Clone)]
 struct ComponentCoding {
     /// `SPcoc` decomposition levels, `NL`.
@@ -340,6 +343,8 @@ struct ComponentCoding {
     precincts: Vec<u8>,
     /// Wavelet kernel selected for this component (Table A.20).
     transform: WaveletTransform,
+    /// Table A.19 code-block-style flags for this component.
+    style: BlockStyle,
 }
 
 /// Resolve the per-component coding style for every component, applying
@@ -351,12 +356,11 @@ struct ComponentCoding {
 /// malformed.
 ///
 /// A `COC` may change `NL` / code-block size / precincts / kernel
-/// per component, but the Table A.19 code-block **style** byte is held
-/// global to the code: the tier-1 driver and the packet-header
-/// segment-split are derived once from the main `COD`. A `COC` whose
-/// `code_block_style` differs from the main `COD` would require a
-/// per-component packet-segment split that is not wired, so it is
-/// surfaced as [`Error::NotImplemented`] rather than mis-decoded.
+/// **and** the Table A.19 code-block-style byte per component — a
+/// tile-component whose `SPcoc` bit 6 diverges from the `COD` mixes HT
+/// and Annex D block coding at tile-component granularity, the T.814
+/// §8.2 HTDECLARED set. The packet reader's §B.10.7 segment split and
+/// the tier-1 dispatch both key off the resolved per-component style.
 fn resolve_component_coding(
     num_components: usize,
     cod: &crate::Cod,
@@ -376,6 +380,7 @@ fn resolve_component_coding(
         ycb: cod_ycb,
         precincts: cod.precincts.clone(),
         transform: cod.transform,
+        style: BlockStyle::from_style_byte(cod.code_block_style),
     };
     let mut out: Vec<ComponentCoding> = (0..num_components).map(|_| default.clone()).collect();
     let mut seen = vec![false; num_components];
@@ -389,12 +394,6 @@ fn resolve_component_coding(
             return Err(Error::InvalidMarkerLength);
         }
         seen[c] = true;
-        // Table A.19 code-block style is global to the code; a COC that
-        // diverges from the main COD style is not wired (would need a
-        // per-component §B.10.7 segment split).
-        if coc.code_block_style != cod.code_block_style {
-            return Err(Error::NotImplemented);
-        }
         let xcb = coc
             .code_block_width_exp
             .checked_add(2)
@@ -409,6 +408,7 @@ fn resolve_component_coding(
             ycb,
             precincts: coc.precincts.clone(),
             transform: coc.transform,
+            style: BlockStyle::from_style_byte(coc.code_block_style),
         };
     }
     Ok(out)
@@ -576,15 +576,26 @@ fn completed_bitplanes(passes: u32) -> u32 {
 
 /// The COD-level knobs that stay **global** to the whole code
 /// (T.800 §A.6.1). The per-component coding style — `NL`, code-block
-/// size, precincts and the wavelet kernel — is resolved separately
-/// into [`ComponentCoding`] so a §A.6.2 `COC` override can change them
-/// per component.
+/// size, precincts, the wavelet kernel **and** the Table A.19
+/// code-block-style bits — is resolved separately into
+/// [`ComponentCoding`] so a §A.6.2 `COC` override can change them per
+/// component.
 #[derive(Clone)]
 struct CodingParams {
     layers: u16,
     progression: ProgressionOrder,
     mct: u8,
     sop_eph: SopEphMode,
+}
+
+/// The Table A.19 code-block-style flags, resolved **per component**:
+/// a §A.6.2 `COC` carries its own style byte, so a tile-component may
+/// diverge from the `COD` default — including the T.814 §A.4 SPcod /
+/// SPcoc bit 6, whose per-tile-component mixing of HT and Annex D
+/// block coding is exactly the T.814 §8.2 **HTDECLARED** set. Drives
+/// the component's §B.10.7 segment split and its tier-1 dispatch.
+#[derive(Clone, Copy)]
+struct BlockStyle {
     segmentation_symbols: bool,
     vertically_causal: bool,
     reset_context_probabilities: bool,
@@ -612,29 +623,73 @@ struct CodingParams {
     /// error-resilience check. Forced off for HT code-blocks (Table A.13
     /// "does not apply to HT code-blocks").
     predictable_termination: bool,
-    /// T.814 §A.4 SPcod bit 6: the tile-component's code-blocks are
-    /// HTJ2K (ITU-T T.814 | ISO/IEC 15444-15) HT code-blocks, decoded by
-    /// [`crate::ht`] rather than the Annex D MQ tier-1 path. When set,
-    /// the §D.6 / §D.4.2 flags (Table A.19 bits 0/2) do not apply to the
-    /// HT code-blocks (Table A.4) and are forced off so the packet reader
-    /// uses the single-segment layout.
+    /// T.814 §A.4 SPcod / SPcoc bit 6: the tile-component's code-blocks
+    /// are HTJ2K (ITU-T T.814 | ISO/IEC 15444-15) HT code-blocks,
+    /// decoded by [`crate::ht`] rather than the Annex D MQ tier-1 path.
+    /// When set, the §D.6 / §D.4.2 flags (Table A.19 bits 0/2) do not
+    /// apply to the HT code-blocks (Table A.4) and are forced off so
+    /// the packet reader uses the HT set-`T` layout.
     high_throughput: bool,
+}
+
+impl BlockStyle {
+    /// Decode a Table A.19 `SPcod` / `SPcoc` style byte.
+    ///
+    /// T.814 §A.4: when bit 6 is set the code-blocks are HT code-blocks
+    /// and the Table A.4 reading of the byte applies — bits 0/1/2/4/5
+    /// (bypass / context-reset / per-pass-termination / predictable-
+    /// termination / segmentation-symbols) do NOT apply to HT
+    /// code-blocks. Only the vertically-causal bit 3 carries over.
+    /// Force the rest off.
+    fn from_style_byte(byte: u8) -> Self {
+        let style_flags = crate::CodeBlockStyle::from_byte(byte);
+        let ht = style_flags.high_throughput();
+        BlockStyle {
+            segmentation_symbols: !ht && style_flags.segmentation_symbols(),
+            vertically_causal: style_flags.vertically_causal_context(),
+            reset_context_probabilities: !ht && style_flags.reset_context_probabilities(),
+            // §D.4.2 "termination on each coding pass" (Table A.19
+            // bit 2) splits the contribution into one terminated §C.3
+            // codeword segment per coding pass (§B.10.7.2). The §C.3.6
+            // context-reset bit (0x02) does NOT split the stream — it
+            // only re-initialises the Annex D contexts to their Table
+            // D.7 states at each pass boundary — and is threaded into
+            // the `BitPlaneSequencer` rather than the packet reader.
+            termination_on_each_coding_pass: !ht && style_flags.termination_on_each_coding_pass(),
+            selective_arithmetic_coding_bypass: !ht
+                && style_flags.selective_arithmetic_coding_bypass(),
+            predictable_termination: !ht && style_flags.predictable_termination(),
+            high_throughput: ht,
+        }
+    }
+
+    /// The §B.10.7 codeword-segment split these style bits select for
+    /// the component's code-block contributions.
+    fn split(&self) -> SegmentSplit {
+        if self.high_throughput {
+            // T.814 §B.2 / §B.3 — HT code-blocks split at the set-T
+            // boundaries: one codeword segment per HT cleanup pass, one
+            // per SigProp (+ MagRef) refinement pair.
+            SegmentSplit::Ht
+        } else if self.selective_arithmetic_coding_bypass {
+            // §D.6 bypass — Table D.9 AC + raw codeword-segment split.
+            // Bit-2 ("termination on each coding pass") composes: when
+            // also set every pass (including both raw passes)
+            // terminates.
+            SegmentSplit::Bypass {
+                termination_on_each_coding_pass: self.termination_on_each_coding_pass,
+            }
+        } else if self.termination_on_each_coding_pass {
+            SegmentSplit::PerPass
+        } else {
+            SegmentSplit::Single
+        }
+    }
 }
 
 /// Build the global [`CodingParams`] from a resolved [`Cod`] (the
 /// main-header default, or a tile-part `COD` override per §A.6.1).
-///
-/// Surfaces the §D.6 selective-arithmetic-coding-bypass (Table A.19
-/// bit 0) and §D.4.2 per-pass-termination decisions the packet reader
-/// and tier-1 driver need.
 fn coding_params_from_cod(cod: &crate::Cod) -> Result<CodingParams, Error> {
-    let style_flags = cod.code_block_style_flags();
-    // T.814 §A.4: when bit 6 is set the code-blocks are HT code-blocks
-    // and the Table A.4 reading of the SPcod byte applies — bits 0/1/2/4/5
-    // (bypass / context-reset / per-pass-termination / predictable-
-    // termination / segmentation-symbols) do NOT apply to HT code-blocks.
-    // Only the vertically-causal bit 3 carries over. Force the rest off.
-    let ht = style_flags.high_throughput();
     Ok(CodingParams {
         layers: cod.layers,
         progression: cod.progression,
@@ -645,27 +700,6 @@ fn coding_params_from_cod(cod: &crate::Cod) -> Result<CodingParams, Error> {
             (false, true) => SopEphMode::EphOnly,
             (true, true) => SopEphMode::SopAndEph,
         },
-        segmentation_symbols: !ht && style_flags.segmentation_symbols(),
-        vertically_causal: style_flags.vertically_causal_context(),
-        reset_context_probabilities: !ht && style_flags.reset_context_probabilities(),
-        high_throughput: ht,
-        // §D.4.2 "termination on each coding pass" (Table A.19 bit 2)
-        // splits the contribution into one terminated §C.3 codeword
-        // segment per coding pass (§B.10.7.2). The §C.3.6 context-reset
-        // bit (0x02) does NOT split the stream — it only re-initialises
-        // the Annex D contexts to their Table D.7 states at each pass
-        // boundary — and is threaded into the `BitPlaneSequencer` rather
-        // than the packet reader.
-        termination_on_each_coding_pass: !ht && style_flags.termination_on_each_coding_pass(),
-        // §D.6 selective arithmetic-coding bypass (Table A.19 bit 0):
-        // the tier-1 driver dispatches the SP / MR passes from bit-plane
-        // 5 onward to their raw entry points and the packet reader uses
-        // the §B.10.7.2 / Table D.9 `SegmentSplit::Bypass` length layout.
-        selective_arithmetic_coding_bypass: !ht && style_flags.selective_arithmetic_coding_bypass(),
-        // §D.4.2 predictable termination (Table A.19 bit 4): a decode-time
-        // conformance check on each terminated MQ codeword segment. Forced
-        // off for HT code-blocks (Table A.13).
-        predictable_termination: !ht && style_flags.predictable_termination(),
     })
 }
 
@@ -753,7 +787,6 @@ fn gather_ppt_headers(parts: &[&crate::TilePart]) -> Result<Option<Vec<u8>>, Err
 #[allow(clippy::too_many_arguments)]
 fn resolve_tile_coding<'a>(
     num_components: usize,
-    main_cod: &'a crate::Cod,
     main_rgns: &[crate::Rgn],
     main_poc: Option<&crate::Poc>,
     main_params: &CodingParams,
@@ -841,7 +874,7 @@ fn resolve_tile_coding<'a>(
         // Start from the main-header resolution, then let any tile COC
         // override per component (the tile COC outranks the main COC).
         let mut comp_coding = main_coding.to_vec();
-        apply_coc_overrides(&mut comp_coding, main_cod, &tile_cocs)?;
+        apply_coc_overrides(&mut comp_coding, &tile_cocs)?;
         (main_params.clone(), comp_coding)
     };
 
@@ -905,11 +938,10 @@ fn cloned<T: Clone>(refs: &[&T]) -> Vec<T> {
 /// Apply tile-part `COC` overrides on top of an already-resolved
 /// per-component coding vector (the no-tile-COD branch). The tile COC
 /// outranks both the main COC (already folded into `coding`) and the
-/// main COD; its code-block style must still match the main COD's
-/// global style byte (the §B.10.7 segment split is derived once).
+/// main COD — including its Table A.19 code-block-style byte, which
+/// resolves per component.
 fn apply_coc_overrides(
     coding: &mut [ComponentCoding],
-    main_cod: &crate::Cod,
     tile_cocs: &[&crate::Coc],
 ) -> Result<(), Error> {
     let mut seen = vec![false; coding.len()];
@@ -922,9 +954,6 @@ fn apply_coc_overrides(
             return Err(Error::InvalidMarkerLength);
         }
         seen[c] = true;
-        if coc.code_block_style != main_cod.code_block_style {
-            return Err(Error::NotImplemented);
-        }
         let xcb = coc
             .code_block_width_exp
             .checked_add(2)
@@ -939,6 +968,7 @@ fn apply_coc_overrides(
             ycb,
             precincts: coc.precincts.clone(),
             transform: coc.transform,
+            style: BlockStyle::from_style_byte(coc.code_block_style),
         };
     }
     Ok(())
@@ -1026,7 +1056,6 @@ fn decode_tile(
         precinct_geom,
         descriptors,
         packets,
-        split,
     } = build_tile_packet_plan(siz, params, comp_coding, poc_volumes, tile_index)?;
 
     // -- §A.7.4 / §A.7.5: when packet headers are relocated into PPM / PPT
@@ -1035,8 +1064,7 @@ fn decode_tile(
     // path recovers the data start from `pos + header.bytes_consumed`
     // instead. Normalise both into a `(header, data_offset)` list so the
     // segment-slicing replay below is identical for the two framings.
-    let headers =
-        walk_tile_packet_headers(body, &packets, params.sop_eph, split, relocated_headers)?;
+    let headers = walk_tile_packet_headers(body, &packets, params.sop_eph, relocated_headers)?;
 
     decode_tile_from_plan(
         siz,
@@ -1050,7 +1078,6 @@ fn decode_tile(
         &precinct_geom,
         &descriptors,
         &headers,
-        split,
     )
 }
 
@@ -1064,12 +1091,11 @@ struct TilePacketPlan {
     precinct_geom: BTreeMap<(u16, u8, u32), PrecinctCodeBlocks>,
     /// Packet enumeration order (§B.12 / §B.12.2).
     descriptors: Vec<PacketDescriptor>,
-    /// One `(precinct-state-id, geometry)` per packet, in `descriptors`
-    /// order, for the tier-2 header walk.
-    packets: Vec<(usize, PacketGeometry)>,
-    /// The §B.10.7 codeword-segment split selected by the Table A.19
-    /// code-block-style bits.
-    split: SegmentSplit,
+    /// One `(precinct-state-id, geometry, segment-split)` per packet,
+    /// in `descriptors` order, for the tier-2 header walk. The
+    /// §B.10.7 split is per packet because it follows the packet's
+    /// component's resolved Table A.19 style byte (§A.6.2).
+    packets: Vec<(usize, PacketGeometry, SegmentSplit)>,
 }
 
 /// Builds the [`TilePacketPlan`] for one tile: per-component
@@ -1192,7 +1218,8 @@ fn build_tile_packet_plan(
     // Assign one stable precinct-state id per (component, resolution,
     // precinct) triple; build one PacketGeometry per packet.
     let mut state_ids: BTreeMap<(u16, u8, u32), usize> = BTreeMap::new();
-    let mut packets: Vec<(usize, PacketGeometry)> = Vec::with_capacity(descriptors.len());
+    let mut packets: Vec<(usize, PacketGeometry, SegmentSplit)> =
+        Vec::with_capacity(descriptors.len());
     for desc in &descriptors {
         let key = (desc.component, desc.resolution, desc.precinct);
         let next_id = state_ids.len();
@@ -1206,38 +1233,31 @@ fn build_tile_packet_plan(
                 height: sb.grid_high,
             })
             .collect();
+        // The §B.10.7 codeword-segment split is a property of the
+        // packet's **component** (its resolved Table A.19 style byte,
+        // §A.6.2) — packets of different components in one tile may
+        // split differently (e.g. the T.814 HTDECLARED HT / Annex D
+        // mix).
+        let split = comp_coding
+            .get(desc.component as usize)
+            .ok_or(Error::InvalidMarkerLength)?
+            .style
+            .split();
         packets.push((
             id,
             PacketGeometry {
                 sub_bands,
                 layer: desc.layer,
             },
+            split,
         ));
     }
-    let split = if params.high_throughput {
-        // T.814 §B.2 / §B.3 — HT code-blocks split at the set-T
-        // boundaries: one codeword segment per HT cleanup pass, one per
-        // SigProp (+ MagRef) refinement pair.
-        SegmentSplit::Ht
-    } else if params.selective_arithmetic_coding_bypass {
-        // §D.6 bypass — Table D.9 AC + raw codeword-segment split.
-        // Bit-2 ("termination on each coding pass") composes: when also
-        // set every pass (including both raw passes) terminates.
-        SegmentSplit::Bypass {
-            termination_on_each_coding_pass: params.termination_on_each_coding_pass,
-        }
-    } else if params.termination_on_each_coding_pass {
-        SegmentSplit::PerPass
-    } else {
-        SegmentSplit::Single
-    };
 
     Ok(TilePacketPlan {
         levels_per_comp,
         precinct_geom,
         descriptors,
         packets,
-        split,
     })
 }
 
@@ -1252,25 +1272,19 @@ fn build_tile_packet_plan(
 ///   from each header's `bytes_consumed`.
 fn walk_tile_packet_headers(
     body: &[u8],
-    packets: &[(usize, PacketGeometry)],
+    packets: &[(usize, PacketGeometry, SegmentSplit)],
     sop_eph: SopEphMode,
-    split: SegmentSplit,
     relocated_headers: Option<&[u8]>,
 ) -> Result<Vec<(crate::packet::PacketHeader, usize)>, Error> {
     if let Some(header_bytes) = relocated_headers {
-        let walked = crate::packet::walk_packet_headers_separate(
-            header_bytes,
-            body,
-            packets,
-            sop_eph,
-            split,
-        )?;
+        let walked =
+            crate::packet::walk_packet_headers_separate(header_bytes, body, packets, sop_eph)?;
         Ok(walked
             .into_iter()
             .map(|rp| (rp.header, rp.body_offset))
             .collect())
     } else {
-        let walked = crate::packet::walk_packet_headers(body, packets, sop_eph, split)?;
+        let walked = crate::packet::walk_packet_headers(body, packets, sop_eph)?;
         let mut pos = 0usize;
         let mut out = Vec::with_capacity(walked.len());
         for header in walked {
@@ -1305,7 +1319,6 @@ fn decode_tile_from_plan(
     precinct_geom: &BTreeMap<(u16, u8, u32), PrecinctCodeBlocks>,
     descriptors: &[PacketDescriptor],
     headers: &[(crate::packet::PacketHeader, usize)],
-    split: SegmentSplit,
 ) -> Result<Vec<Vec<i32>>, Error> {
     let num_components = siz.components.len();
     let tile = derive_tile_geometry(siz, tile_index)?;
@@ -1314,6 +1327,14 @@ fn decode_tile_from_plan(
     let mut accum: BTreeMap<BlockKey, BlockAccum> = BTreeMap::new();
     for (desc, (header, data_offset)) in descriptors.iter().zip(headers.iter()) {
         let mut seg_pos = *data_offset;
+        // The §B.10.7 codeword-segment split follows this packet's
+        // component's resolved Table A.19 style byte (§A.6.2) — the
+        // same per-packet choice the header walk made.
+        let split = comp_coding
+            .get(desc.component as usize)
+            .ok_or(Error::InvalidMarkerLength)?
+            .style
+            .split();
         for contrib in &header.contributions {
             if !contrib.included {
                 continue;
@@ -1566,10 +1587,16 @@ fn decode_tile_from_plan(
         if p >= mb_coded {
             return Err(Error::InvalidPacketHeader);
         }
+        // The Table A.19 style byte resolved for this block's
+        // component (§A.6.2) — tier-1 dispatch is per component.
+        let style = comp_coding
+            .get(*c as usize)
+            .ok_or(Error::InvalidMarkerLength)?
+            .style;
         // §D.3: at most 3 (M'b − P) − 2 passes fit above bit-plane 0.
         // The HT path has its own §B.3 cap (Z_blk ≤ 3) and a different
         // pass↔bit-plane relationship, so the Annex D cap does not apply.
-        if !params.high_throughput && acc.passes > 3 * (mb_coded - p) - 2 {
+        if !style.high_throughput && acc.passes > 3 * (mb_coded - p) - 2 {
             return Err(Error::InvalidPacketHeader);
         }
         // -- HTJ2K (T.814) HT code-block path --
@@ -1583,7 +1610,7 @@ fn decode_tile_from_plan(
         // its cleanup pass and its HT refinement segment concatenates
         // the codeword segments covering its refinement passes (§B.3 —
         // a layer boundary may cut between SigProp and MagRef).
-        if params.high_throughput {
+        if style.high_throughput {
             // A block whose passes never resolved a first HT cleanup
             // pass carries only placeholder passes — no HT segments,
             // all samples 0 (§7.1.1 with Z_blk = 0, §B.3 NOTE 4).
@@ -1706,12 +1733,12 @@ fn decode_tile_from_plan(
         );
         let mut ctx = reset_contexts();
         let mut seq = BitPlaneSequencer::new(mb_coded - 1 - p)
-            .with_segmentation_symbols(params.segmentation_symbols)
-            .with_vertically_causal_context(params.vertically_causal)
-            .with_reset_context_probabilities(params.reset_context_probabilities)
-            .with_termination_on_each_coding_pass(params.termination_on_each_coding_pass)
-            .with_selective_arithmetic_coding_bypass(params.selective_arithmetic_coding_bypass)
-            .with_predictable_termination(params.predictable_termination);
+            .with_segmentation_symbols(style.segmentation_symbols)
+            .with_vertically_causal_context(style.vertically_causal)
+            .with_reset_context_probabilities(style.reset_context_probabilities)
+            .with_termination_on_each_coding_pass(style.termination_on_each_coding_pass)
+            .with_selective_arithmetic_coding_bypass(style.selective_arithmetic_coding_bypass)
+            .with_predictable_termination(style.predictable_termination);
         // Drive the §D.3 pass schedule across this code-block's §C.3
         // codeword segments. Each AC segment opens a fresh MqDecoder (the
         // MQ engine restarts per §C.3 at every termination boundary —
@@ -1743,7 +1770,7 @@ fn decode_tile_from_plan(
                 // because the segment was truncated — fails the check; the
                 // §B.10.7 length and the codeword segment disagree, which
                 // this error-resilience flag exists to surface.
-                if params.predictable_termination
+                if style.predictable_termination
                     && !decoder.predictable_termination_satisfied(seg.bytes.len())
                 {
                     return Err(Error::InvalidPacketHeader);
@@ -2166,7 +2193,6 @@ pub fn decode_codestream(bytes: &[u8], cs: &J2kCodestream) -> Result<DecodedImag
             parts.first().map(|tp| tp.markers.as_slice()).unwrap_or(&[]);
         let tile_coding = resolve_tile_coding(
             siz.components.len(),
-            cod,
             &main_rgns,
             main_poc.as_ref(),
             &params,
@@ -2306,7 +2332,6 @@ pub(crate) fn relocate_single_tilepart_to_ppt(bytes: &[u8]) -> Result<Vec<u8>, E
 
     let tile_coding = resolve_tile_coding(
         siz.components.len(),
-        cod,
         &main_rgns,
         main_poc.as_ref(),
         &params,
@@ -2334,13 +2359,7 @@ pub(crate) fn relocate_single_tilepart_to_ppt(bytes: &[u8]) -> Result<Vec<u8>, E
         &tile_coding.poc_volumes,
         tp.sot.tile_index as u32,
     )?;
-    let headers = walk_tile_packet_headers(
-        body,
-        &plan.packets,
-        tile_coding.params.sop_eph,
-        plan.split,
-        None,
-    )?;
+    let headers = walk_tile_packet_headers(body, &plan.packets, tile_coding.params.sop_eph, None)?;
 
     let mut header_buf: Vec<u8> = Vec::new();
     let mut data_buf: Vec<u8> = Vec::new();
@@ -2436,7 +2455,6 @@ pub(crate) fn relocate_single_tilepart_to_ppm(bytes: &[u8]) -> Result<Vec<u8>, E
     let params = coding_params_from_cod(cod)?;
     let tile_coding = resolve_tile_coding(
         siz.components.len(),
-        cod,
         &main_rgns,
         main_poc.as_ref(),
         &params,
@@ -2458,13 +2476,7 @@ pub(crate) fn relocate_single_tilepart_to_ppm(bytes: &[u8]) -> Result<Vec<u8>, E
         &tile_coding.poc_volumes,
         tp.sot.tile_index as u32,
     )?;
-    let headers = walk_tile_packet_headers(
-        body,
-        &plan.packets,
-        tile_coding.params.sop_eph,
-        plan.split,
-        None,
-    )?;
+    let headers = walk_tile_packet_headers(body, &plan.packets, tile_coding.params.sop_eph, None)?;
     let mut header_buf: Vec<u8> = Vec::new();
     let mut data_buf: Vec<u8> = Vec::new();
     for (header, data_offset) in &headers {
@@ -2819,22 +2831,12 @@ mod tests {
     }
 
     #[test]
-    fn predictable_termination_bit_is_read_into_coding_params() {
-        // Table A.19 bit 4 (0x10) set in the COD's code-block style byte
-        // surfaces as CodingParams::predictable_termination so the tier-1
-        // driver runs the §D.4.2 conformance check.
-        let with = cod(2, 2, 2, 0x10, WaveletTransform::Reversible5x3, &[]);
-        assert!(
-            coding_params_from_cod(&with)
-                .unwrap()
-                .predictable_termination
-        );
-        let without = cod(2, 2, 2, 0x00, WaveletTransform::Reversible5x3, &[]);
-        assert!(
-            !coding_params_from_cod(&without)
-                .unwrap()
-                .predictable_termination
-        );
+    fn predictable_termination_bit_is_read_into_block_style() {
+        // Table A.19 bit 4 (0x10) set in the style byte surfaces as
+        // BlockStyle::predictable_termination so the tier-1 driver runs
+        // the §D.4.2 conformance check.
+        assert!(BlockStyle::from_style_byte(0x10).predictable_termination);
+        assert!(!BlockStyle::from_style_byte(0x00).predictable_termination);
     }
 
     #[test]
@@ -2842,10 +2844,9 @@ mod tests {
         // T.814 Table A.13: predictable termination "does not apply to HT
         // code-blocks". bit 6 (HT) + bit 4 (predictable termination) →
         // the builder forces predictable termination off.
-        let ht_pterm = cod(2, 2, 2, 0x50, WaveletTransform::Reversible5x3, &[]);
-        let params = coding_params_from_cod(&ht_pterm).unwrap();
-        assert!(params.high_throughput);
-        assert!(!params.predictable_termination);
+        let style = BlockStyle::from_style_byte(0x50);
+        assert!(style.high_throughput);
+        assert!(!style.predictable_termination);
     }
 
     #[test]
@@ -3048,16 +3049,26 @@ mod tests {
     }
 
     #[test]
-    fn resolve_component_coding_rejects_divergent_code_block_style() {
-        // The Table A.19 code-block style is held global; a COC that
-        // changes it relative to the COD is NotImplemented (it would
-        // need a per-component §B.10.7 segment split).
+    fn resolve_component_coding_honours_divergent_code_block_style() {
+        // §A.6.2: a COC carries its own Table A.19 style byte, so the
+        // per-component style (and hence the §B.10.7 segment split and
+        // the tier-1 dispatch) resolves independently — component 1
+        // here turns on the §D.4.2 per-pass termination while
+        // component 0 keeps the COD default.
         let base = cod(3, 2, 2, 0x00, WaveletTransform::Reversible5x3, &[]);
         let diverge = coc(1, 3, 2, 2, 0x04, WaveletTransform::Reversible5x3, &[]);
-        assert!(matches!(
-            resolve_component_coding(2, &base, std::slice::from_ref(&diverge)),
-            Err(Error::NotImplemented)
-        ));
+        let out = resolve_component_coding(2, &base, std::slice::from_ref(&diverge)).unwrap();
+        assert!(!out[0].style.termination_on_each_coding_pass);
+        assert!(out[1].style.termination_on_each_coding_pass);
+        assert!(matches!(out[0].style.split(), SegmentSplit::Single));
+        assert!(matches!(out[1].style.split(), SegmentSplit::PerPass));
+        // And the T.814 HTDECLARED shape: SPcoc bit 6 on one component
+        // only.
+        let ht_coc = coc(1, 3, 2, 2, 0x40, WaveletTransform::Reversible5x3, &[]);
+        let out = resolve_component_coding(2, &base, std::slice::from_ref(&ht_coc)).unwrap();
+        assert!(!out[0].style.high_throughput);
+        assert!(out[1].style.high_throughput);
+        assert!(matches!(out[1].style.split(), SegmentSplit::Ht));
     }
 
     // -- §A.6 tile-part header override precedence --
@@ -3091,7 +3102,7 @@ mod tests {
         let q = qcd(QuantizationStyle::None, 2, &[0x40, 0x41, 0x42]);
         let (params, coding, quant) = main_defaults(2, &c, &q);
         let roi = vec![0u32; 2];
-        let resolved = resolve_tile_coding(2, &c, &[], None, &params, &coding, &quant, &roi, &[])
+        let resolved = resolve_tile_coding(2, &[], None, &params, &coding, &quant, &roi, &[])
             .expect("resolve");
         assert_eq!(resolved.comp_coding[0].n_l, 2);
         assert_eq!(resolved.comp_quant[0].guard_bits, 2);
@@ -3110,18 +3121,8 @@ mod tests {
         // Tile COD: NL = 4, code-block 8×8 (xcb=ycb=1 → +2 = 3).
         let tile_c = cod(4, 1, 1, 0x00, WaveletTransform::Reversible5x3, &[]);
         let markers = vec![crate::TilePartMarker::Cod(tile_c)];
-        let resolved = resolve_tile_coding(
-            2,
-            &main_c,
-            &[],
-            None,
-            &params,
-            &coding,
-            &quant,
-            &roi,
-            &markers,
-        )
-        .expect("resolve");
+        let resolved = resolve_tile_coding(2, &[], None, &params, &coding, &quant, &roi, &markers)
+            .expect("resolve");
         for cc in &resolved.comp_coding {
             assert_eq!(cc.n_l, 4);
             assert_eq!(cc.xcb, 3);
@@ -3142,18 +3143,8 @@ mod tests {
             crate::TilePartMarker::Cod(tile_c),
             crate::TilePartMarker::Coc(tile_coc1),
         ];
-        let resolved = resolve_tile_coding(
-            2,
-            &main_c,
-            &[],
-            None,
-            &params,
-            &coding,
-            &quant,
-            &roi,
-            &markers,
-        )
-        .expect("resolve");
+        let resolved = resolve_tile_coding(2, &[], None, &params, &coding, &quant, &roi, &markers)
+            .expect("resolve");
         // Component 0 follows the tile COD (NL = 4); component 1 the COC.
         assert_eq!(resolved.comp_coding[0].n_l, 4);
         assert_eq!(resolved.comp_coding[1].n_l, 1);
@@ -3170,18 +3161,8 @@ mod tests {
         let roi = vec![0u32; 2];
         let tile_coc0 = coc(0, 1, 1, 1, 0x00, WaveletTransform::Reversible5x3, &[]);
         let markers = vec![crate::TilePartMarker::Coc(tile_coc0)];
-        let resolved = resolve_tile_coding(
-            2,
-            &main_c,
-            &[],
-            None,
-            &params,
-            &coding,
-            &quant,
-            &roi,
-            &markers,
-        )
-        .expect("resolve");
+        let resolved = resolve_tile_coding(2, &[], None, &params, &coding, &quant, &roi, &markers)
+            .expect("resolve");
         assert_eq!(resolved.comp_coding[0].n_l, 1);
         assert_eq!(resolved.comp_coding[0].xcb, 3);
         // Component 1 keeps the main COD.
@@ -3198,18 +3179,8 @@ mod tests {
         let roi = vec![0u32; 2];
         let tile_q = qcd(QuantizationStyle::None, 4, &[0x50, 0x51, 0x52]);
         let markers = vec![crate::TilePartMarker::Qcd(tile_q)];
-        let resolved = resolve_tile_coding(
-            2,
-            &main_c,
-            &[],
-            None,
-            &params,
-            &coding,
-            &quant,
-            &roi,
-            &markers,
-        )
-        .expect("resolve");
+        let resolved = resolve_tile_coding(2, &[], None, &params, &coding, &quant, &roi, &markers)
+            .expect("resolve");
         for cq in &resolved.comp_quant {
             assert_eq!(cq.guard_bits, 4);
             assert_eq!(cq.spqcd, &[0x50, 0x51, 0x52]);
@@ -3229,18 +3200,8 @@ mod tests {
             crate::TilePartMarker::Qcd(tile_q),
             crate::TilePartMarker::Qcc(tile_qcc1),
         ];
-        let resolved = resolve_tile_coding(
-            2,
-            &main_c,
-            &[],
-            None,
-            &params,
-            &coding,
-            &quant,
-            &roi,
-            &markers,
-        )
-        .expect("resolve");
+        let resolved = resolve_tile_coding(2, &[], None, &params, &coding, &quant, &roi, &markers)
+            .expect("resolve");
         // Component 0 follows the tile QCD; component 1 the tile QCC.
         assert_eq!(resolved.comp_quant[0].guard_bits, 4);
         assert_eq!(resolved.comp_quant[1].guard_bits, 5);
@@ -3257,18 +3218,8 @@ mod tests {
         let roi = vec![0u32; 2];
         let tile_qcc0 = qcc(0, QuantizationStyle::None, 6, &[0x70, 0x71, 0x72]);
         let markers = vec![crate::TilePartMarker::Qcc(tile_qcc0)];
-        let resolved = resolve_tile_coding(
-            2,
-            &main_c,
-            &[],
-            None,
-            &params,
-            &coding,
-            &quant,
-            &roi,
-            &markers,
-        )
-        .expect("resolve");
+        let resolved = resolve_tile_coding(2, &[], None, &params, &coding, &quant, &roi, &markers)
+            .expect("resolve");
         assert_eq!(resolved.comp_quant[0].guard_bits, 6);
         assert_eq!(resolved.comp_quant[1].guard_bits, 2);
     }
@@ -3285,7 +3236,7 @@ mod tests {
         let tile_rgn1 = rgn(1, 0, 7); // component 1 gets s = 7 in this tile.
         let markers = vec![crate::TilePartMarker::Rgn(tile_rgn1)];
         let resolved = resolve_tile_coding(
-            2, &main_c, &main_rgns, None, &params, &coding, &quant, &roi, &markers,
+            2, &main_rgns, None, &params, &coding, &quant, &roi, &markers,
         )
         .expect("resolve");
         assert_eq!(resolved.roi_shift, vec![3, 7]);
@@ -3305,17 +3256,7 @@ mod tests {
         let tile_rgn = rgn(1, 1, 7); // Srgn = 1 (Part-2 rectangle ROI).
         let markers = vec![crate::TilePartMarker::Rgn(tile_rgn)];
         assert!(matches!(
-            resolve_tile_coding(
-                2,
-                &main_c,
-                &[],
-                None,
-                &params,
-                &coding,
-                &quant,
-                &roi,
-                &markers
-            ),
+            resolve_tile_coding(2, &[], None, &params, &coding, &quant, &roi, &markers),
             Err(Error::NotImplemented)
         ));
     }
@@ -3329,23 +3270,15 @@ mod tests {
         let main_c = cod(2, 2, 2, 0x00, WaveletTransform::Reversible5x3, &[]);
         let main_q = qcd(QuantizationStyle::None, 2, &[0x40, 0x41, 0x42]);
         let (params, coding, quant) = main_defaults(2, &main_c, &main_q);
-        assert!(!params.selective_arithmetic_coding_bypass);
+        assert!(!coding[0].style.selective_arithmetic_coding_bypass);
         let roi = vec![0u32; 2];
         let tile_c = cod(2, 2, 2, 0x01, WaveletTransform::Reversible5x3, &[]);
         let markers = vec![crate::TilePartMarker::Cod(tile_c)];
-        let resolved = resolve_tile_coding(
-            2,
-            &main_c,
-            &[],
-            None,
-            &params,
-            &coding,
-            &quant,
-            &roi,
-            &markers,
-        )
-        .expect("resolve");
-        assert!(resolved.params.selective_arithmetic_coding_bypass);
+        let resolved = resolve_tile_coding(2, &[], None, &params, &coding, &quant, &roi, &markers)
+            .expect("resolve");
+        for cc in &resolved.comp_coding {
+            assert!(cc.style.selective_arithmetic_coding_bypass);
+        }
     }
 
     #[test]
@@ -3358,18 +3291,9 @@ mod tests {
         let a = cod(2, 2, 2, 0x00, WaveletTransform::Reversible5x3, &[]);
         let b = cod(3, 1, 1, 0x00, WaveletTransform::Reversible5x3, &[]);
         let markers = vec![crate::TilePartMarker::Cod(a), crate::TilePartMarker::Cod(b)];
-        assert!(resolve_tile_coding(
-            2,
-            &main_c,
-            &[],
-            None,
-            &params,
-            &coding,
-            &quant,
-            &roi,
-            &markers
-        )
-        .is_err());
+        assert!(
+            resolve_tile_coding(2, &[], None, &params, &coding, &quant, &roi, &markers).is_err()
+        );
     }
 
     /// A `PocProgression` covering the whole component/resolution/layer
@@ -3396,18 +3320,8 @@ mod tests {
         let markers = vec![crate::TilePartMarker::Poc(crate::Poc {
             progressions: vec![poc_entry(ProgressionOrder::Rlcp)],
         })];
-        let resolved = resolve_tile_coding(
-            2,
-            &main_c,
-            &[],
-            None,
-            &params,
-            &coding,
-            &quant,
-            &roi,
-            &markers,
-        )
-        .expect("tile POC resolves");
+        let resolved = resolve_tile_coding(2, &[], None, &params, &coding, &quant, &roi, &markers)
+            .expect("tile POC resolves");
         assert_eq!(resolved.poc_volumes.len(), 1);
         assert_eq!(resolved.poc_volumes[0].order, ProgressionOrder::Rlcp);
     }
@@ -3428,7 +3342,6 @@ mod tests {
         })];
         let resolved = resolve_tile_coding(
             2,
-            &main_c,
             &[],
             Some(&main_poc),
             &params,
@@ -3454,18 +3367,9 @@ mod tests {
         let main_poc = crate::Poc {
             progressions: vec![poc_entry(ProgressionOrder::Rpcl)],
         };
-        let resolved = resolve_tile_coding(
-            2,
-            &main_c,
-            &[],
-            Some(&main_poc),
-            &params,
-            &coding,
-            &quant,
-            &roi,
-            &[],
-        )
-        .expect("resolve");
+        let resolved =
+            resolve_tile_coding(2, &[], Some(&main_poc), &params, &coding, &quant, &roi, &[])
+                .expect("resolve");
         assert_eq!(resolved.poc_volumes.len(), 1);
         assert_eq!(resolved.poc_volumes[0].order, ProgressionOrder::Rpcl);
     }
@@ -3485,17 +3389,8 @@ mod tests {
                 progressions: vec![poc_entry(ProgressionOrder::Rlcp)],
             }),
         ];
-        assert!(resolve_tile_coding(
-            2,
-            &main_c,
-            &[],
-            None,
-            &params,
-            &coding,
-            &quant,
-            &roi,
-            &markers
-        )
-        .is_err());
+        assert!(
+            resolve_tile_coding(2, &[], None, &params, &coding, &quant, &roi, &markers).is_err()
+        );
     }
 }

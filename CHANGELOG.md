@@ -31,6 +31,19 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+- **Per-component code-block style** (T.800 §A.6.2) — a `COC` whose
+  Table A.19 style byte diverges from the `COD` now decodes: the
+  style flags (segmentation symbols, vertically-causal, context
+  reset, §D.4.2 terminations, §D.6 bypass, T.814 HT) resolve per
+  component along the §A.6 precedence, and both the packet reader's
+  §B.10.7 segment split and the tier-1 dispatch follow the packet's
+  component. This unlocks the T.814 §8.2 **HTDECLARED** set — a tile
+  mixing HT-coded and Annex-D-coded components — validated
+  end-to-end by a clean-room assembler that splices an HT and a
+  plain single-component stream into one two-component codestream
+  (`Rsiz` bit 14 + HTDECLARED `CAP`), in both component orders, plus
+  a bypass+termination / default-style Annex D mix. Previously a
+  divergent style byte surfaced `NotImplemented`.
 - A `decode_j2k` fuzz target driving the **full decode** path
   (packet headers across all progression walks, every codeword-
   segment split incl. the HT set-`T` / placeholder shapes, both

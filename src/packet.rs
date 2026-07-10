@@ -1397,9 +1397,12 @@ fn consume_eph_after(bytes: &[u8], offset: usize) -> Result<usize, Error> {
 // ---------------------------------------------------------------------------
 
 /// Walks a series of packet headers across one tile-part's body
-/// according to a caller-supplied list of [`PacketGeometry`] entries
-/// (one per packet, in codestream order — i.e. the progression order
-/// from T.800 §B.12).
+/// according to a caller-supplied list of `(precinct-state id,
+/// [`PacketGeometry`], [`SegmentSplit`])` entries (one per packet, in
+/// codestream order — i.e. the progression order from T.800 §B.12).
+/// The split is per packet because it follows the packet's
+/// component's resolved Table A.19 style byte (§A.6.2 — components
+/// may diverge, e.g. the T.814 HTDECLARED HT / Annex D mix).
 ///
 /// The walker maintains a `(precinct_index → PrecinctState)` map; each
 /// packet's `precinct_index` selects which precinct's tag-tree state
@@ -1417,9 +1420,8 @@ fn consume_eph_after(bytes: &[u8], offset: usize) -> Result<usize, Error> {
 /// trailing padding the encoder placed).
 pub fn walk_packet_headers(
     body: &[u8],
-    packets: &[(usize, PacketGeometry)],
+    packets: &[(usize, PacketGeometry, SegmentSplit)],
     sop_eph: SopEphMode,
-    split: SegmentSplit,
 ) -> Result<Vec<PacketHeader>, Error> {
     // We don't know up-front how many distinct precinct_index values
     // appear; collect into a sparse map.
@@ -1434,7 +1436,7 @@ pub fn walk_packet_headers(
     // equal this running ordinal — a mismatch flags a desynchronised /
     // lost packet, so it is rejected rather than silently mis-decoded.
     let sop_allowed = matches!(sop_eph, SopEphMode::SopOnly | SopEphMode::SopAndEph);
-    for (packet_ordinal, (precinct_index, geometry)) in packets.iter().enumerate() {
+    for (packet_ordinal, (precinct_index, geometry, split)) in packets.iter().enumerate() {
         if pos > body.len() {
             return Err(Error::PacketHeaderOverrun);
         }
@@ -1448,7 +1450,7 @@ pub fn walk_packet_headers(
             }
         }
         let state = precincts.entry(*precinct_index).or_default();
-        let header = decode_packet_header(&body[pos..], geometry, state, sop_eph, split)?;
+        let header = decode_packet_header(&body[pos..], geometry, state, sop_eph, *split)?;
         pos = pos
             .checked_add(header.bytes_consumed)
             .ok_or(Error::PacketHeaderOverrun)?;
@@ -1507,9 +1509,8 @@ pub struct RelocatedPacket {
 pub fn walk_packet_headers_separate(
     header_bytes: &[u8],
     body: &[u8],
-    packets: &[(usize, PacketGeometry)],
+    packets: &[(usize, PacketGeometry, SegmentSplit)],
     sop_eph: SopEphMode,
-    split: SegmentSplit,
 ) -> Result<Vec<RelocatedPacket>, Error> {
     // §A.8.1 / §A.8.2: when headers are relocated, SOP (if allowed)
     // sits in the body before each packet's data, and EPH (if
@@ -1527,7 +1528,7 @@ pub fn walk_packet_headers_separate(
     let mut out = Vec::with_capacity(packets.len());
     let mut hpos = 0usize;
     let mut bpos = 0usize;
-    for (packet_ordinal, (precinct_index, geometry)) in packets.iter().enumerate() {
+    for (packet_ordinal, (precinct_index, geometry, split)) in packets.iter().enumerate() {
         if hpos > header_bytes.len() || bpos > body.len() {
             return Err(Error::PacketHeaderOverrun);
         }
@@ -1544,7 +1545,7 @@ pub fn walk_packet_headers_separate(
         }
         let state = precincts.entry(*precinct_index).or_default();
         let header =
-            decode_packet_header(&header_bytes[hpos..], geometry, state, header_mode, split)?;
+            decode_packet_header(&header_bytes[hpos..], geometry, state, header_mode, *split)?;
         hpos = hpos
             .checked_add(header.bytes_consumed)
             .ok_or(Error::PacketHeaderOverrun)?;
@@ -2938,9 +2939,11 @@ mod tests {
         };
         let headers = walk_packet_headers(
             &all,
-            &[(0usize, g0.clone()), (0usize, g1.clone())],
+            &[
+                (0usize, g0.clone(), SegmentSplit::Single),
+                (0usize, g1.clone(), SegmentSplit::Single),
+            ],
             SopEphMode::None,
-            SegmentSplit::Single,
         )
         .unwrap();
         assert_eq!(headers.len(), 2);
@@ -2995,18 +2998,15 @@ mod tests {
             }],
             layer,
         };
-        let packets = [(0usize, g(0)), (0usize, g(1))];
+        let packets = [
+            (0usize, g(0), SegmentSplit::Single),
+            (0usize, g(1), SegmentSplit::Single),
+        ];
 
-        let inline_headers =
-            walk_packet_headers(&inline, &packets, SopEphMode::None, SegmentSplit::Single).unwrap();
-        let relocated = walk_packet_headers_separate(
-            &header_buf,
-            &data_buf,
-            &packets,
-            SopEphMode::None,
-            SegmentSplit::Single,
-        )
-        .unwrap();
+        let inline_headers = walk_packet_headers(&inline, &packets, SopEphMode::None).unwrap();
+        let relocated =
+            walk_packet_headers_separate(&header_buf, &data_buf, &packets, SopEphMode::None)
+                .unwrap();
 
         assert_eq!(relocated.len(), inline_headers.len());
         // Body offsets address the two data spans in `data_buf`.
@@ -3049,9 +3049,8 @@ mod tests {
         let relocated = walk_packet_headers_separate(
             &header_buf,
             &data_buf,
-            &[(0usize, geom)],
+            &[(0usize, geom, SegmentSplit::Single)],
             SopEphMode::SopAndEph,
-            SegmentSplit::Single,
         )
         .unwrap();
         assert_eq!(relocated.len(), 1);
@@ -3082,9 +3081,8 @@ mod tests {
         let err = walk_packet_headers_separate(
             &header_buf,
             &data_buf,
-            &[(0usize, geom)],
+            &[(0usize, geom, SegmentSplit::Single)],
             SopEphMode::SopAndEph,
-            SegmentSplit::Single,
         )
         .unwrap_err();
         assert_eq!(err, Error::InvalidPacketHeader);
@@ -3107,9 +3105,8 @@ mod tests {
         };
         let err = walk_packet_headers(
             &all,
-            &[(0usize, geom)],
+            &[(0usize, geom, SegmentSplit::Single)],
             SopEphMode::None,
-            SegmentSplit::Single,
         )
         .unwrap_err();
         assert_eq!(err, Error::PacketHeaderOverrun);
@@ -3211,7 +3208,10 @@ mod tests {
     /// Build the two-packet body of `walk_two_packets_same_precinct_*`
     /// with an SOP marker (carrying `nsop0` / `nsop1`) prefixing each
     /// packet, plus the matching geometry pair.
-    fn two_sop_packets(nsop0: u16, nsop1: u16) -> (Vec<u8>, [(usize, PacketGeometry); 2]) {
+    fn two_sop_packets(
+        nsop0: u16,
+        nsop1: u16,
+    ) -> (Vec<u8>, [(usize, PacketGeometry, SegmentSplit); 2]) {
         let mut all = Vec::new();
         all.extend([0xFFu8, 0x91, 0x00, 0x04]);
         all.extend(nsop0.to_be_bytes());
@@ -3228,16 +3228,20 @@ mod tests {
             }],
             layer,
         };
-        (all, [(0usize, g(0)), (0usize, g(1))])
+        (
+            all,
+            [
+                (0usize, g(0), SegmentSplit::Single),
+                (0usize, g(1), SegmentSplit::Single),
+            ],
+        )
     }
 
     #[test]
     fn walk_validates_sequential_sop_nsop() {
         // §A.8.1: Nsop = 0, 1 for the first two packets of a coded tile.
         let (body, packets) = two_sop_packets(0, 1);
-        let headers =
-            walk_packet_headers(&body, &packets, SopEphMode::SopOnly, SegmentSplit::Single)
-                .unwrap();
+        let headers = walk_packet_headers(&body, &packets, SopEphMode::SopOnly).unwrap();
         assert_eq!(headers.len(), 2);
         assert!(headers[0].non_zero_length);
         assert!(headers[1].non_zero_length);
@@ -3248,10 +3252,7 @@ mod tests {
         // Second packet claims Nsop = 5 where the tile ordinal is 1 — a
         // desynchronised / lost-packet signature, rejected.
         let (body, packets) = two_sop_packets(0, 5);
-        assert!(
-            walk_packet_headers(&body, &packets, SopEphMode::SopOnly, SegmentSplit::Single)
-                .is_err()
-        );
+        assert!(walk_packet_headers(&body, &packets, SopEphMode::SopOnly).is_err());
     }
 
     #[test]
@@ -3276,9 +3277,11 @@ mod tests {
         };
         let headers = walk_packet_headers(
             &all,
-            &[(0usize, g(0)), (0usize, g(1))],
+            &[
+                (0usize, g(0), SegmentSplit::Single),
+                (0usize, g(1), SegmentSplit::Single),
+            ],
             SopEphMode::SopOnly,
-            SegmentSplit::Single,
         )
         .unwrap();
         assert_eq!(headers.len(), 2);

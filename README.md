@@ -117,9 +117,19 @@ What is implemented:
   clean-room assembler that splices a 5-3 and a 9-7 single-component
   stream into one two-component codestream and asserts each component
   reconstructs identically to its standalone decode. A mixed-kernel tile
-  that *also* signals an MCT (`Rmct = 1`) is rejected. The Table A.19
-  code-block **style** byte is held global to the code; a `COC` that
-  diverges from the `COD` style is cleanly rejected.
+  that *also* signals an MCT (`Rmct = 1`) is rejected. **The Table
+  A.19 code-block style byte also resolves per component**: a `COC`
+  whose style diverges from the `COD` gives its component its own
+  §B.10.7 segment split and tier-1 dispatch — an Annex D component
+  with the §D.6 bypass / §D.4.2 termination styles coexists with a
+  default-style sibling, and a component whose `SPcoc` bit 6 signals
+  HT block coding coexists with an Annex D sibling: the T.814 §8.2
+  **HTDECLARED** set. Both mixes are validated end-to-end by a
+  clean-room assembler that splices an HT (or styled) and a plain
+  single-component stream into one two-component codestream (`Rsiz`
+  bit 14 + `CAP` with the HTDECLARED `Ccap15`) and asserts each
+  component reconstructs identically to its standalone decode, in
+  both component orders.
 - **Progression** — all five §B.12.1 orders (LRCP, RLCP, RPCL, PCRL,
   CPRL) and the §A.6.6 **progression order change** (`POC`) wired into
   the decode driver: a main-header or first-tile-part `POC` drives the
@@ -390,14 +400,12 @@ single-layer shapes; the decoders decline multi-layer HT).
 
 These surface a clean `Error::NotImplemented` rather than mis-decoding:
 
-- A `COC` whose Table A.19 code-block **style** byte diverges from the
-  `COD` (the common `COC` override of per-component `NL` / code-block
-  size / precincts / kernel *is* honoured, including **different kernels
-  per component** when the MCT is off), in both the main and tile-part
-  headers (main-header *and* tile-part `COD` / `COC` / `QCD` / `QCC`
-  overrides are otherwise honoured). A mixed-kernel tile that also
-  signals a multiple-component transform (`Rmct = 1`) is rejected — the
-  RCT / ICT requires one kernel across components 0–2.
+- A mixed-kernel tile that also signals a multiple-component transform
+  (`Rmct = 1`) — the RCT / ICT requires one kernel across components
+  0–2. (The `COC` overrides themselves — per-component `NL` /
+  code-block size / precincts / kernel *and* the Table A.19 style
+  byte, including the T.814 HTDECLARED HT / Annex D mix — *are*
+  honoured, in both the main and tile-part headers.)
 - A non-Maxshift `RGN` style. T.800 Table A.25 (Part 1) defines **only**
   `Srgn = 0` (implicit ROI / Maxshift) — all other values are reserved
   in Part 1, and the main-header *and* tile-part Maxshift `RGN` *are*
