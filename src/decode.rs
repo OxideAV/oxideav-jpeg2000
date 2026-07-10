@@ -614,14 +614,14 @@ struct BlockStyle {
     /// pass to its AC or raw entry point.
     selective_arithmetic_coding_bypass: bool,
     /// §D.4.2 "predictable termination" (Table A.19 bit 4): every
-    /// terminated §C.3 codeword segment in the packet body was flushed by
-    /// the §D.4.2 procedure so a conforming decoder's `BP` lands exactly
-    /// at the signalled segment end. When set the tier-1 driver validates
-    /// each terminated MQ segment with
-    /// [`crate::mq::MqDecoder::predictable_termination_satisfied`] and
-    /// rejects a stream whose decoder ran short or long — an
-    /// error-resilience check. Forced off for HT code-blocks (Table A.13
-    /// "does not apply to HT code-blocks").
+    /// terminated §C.3 codeword segment in the packet body was flushed
+    /// by the specific §D.4.2 procedure. The flag constrains the
+    /// *encoder's* flush only — decoding is unchanged (the §D.4.1
+    /// synthesised 0xFF extension applies as usual, and real
+    /// predictable-termination streams routinely finish their final
+    /// renormalisations inside it), so the flag is carried for
+    /// introspection but drives no decode-side branch. Forced off for
+    /// HT code-blocks (Table A.13 "does not apply to HT code-blocks").
     predictable_termination: bool,
     /// T.814 §A.4 SPcod / SPcoc bit 6: the tile-component's code-blocks
     /// are HTJ2K (ITU-T T.814 | ISO/IEC 15444-15) HT code-blocks,
@@ -1761,20 +1761,18 @@ fn decode_tile_from_plan(
             } else {
                 let mut decoder = crate::mq::MqDecoder::new(&seg.bytes);
                 seq.decode_passes(&mut block, &mut decoder, &mut ctx, seg.passes)?;
-                // §D.4.2 predictable termination (Table A.19 bit 4): every
-                // non-raw `AccumSegment` is a terminated §C.3 codeword
-                // segment, so a conforming decoder's `BP` must land exactly
-                // at the signalled segment end (every byte consumed, or
-                // parked on a trailing 0xFF marker prefix). A decoder that
-                // ran short or long — or that fell back to §D.4.1 0xFF fill
-                // because the segment was truncated — fails the check; the
-                // §B.10.7 length and the codeword segment disagree, which
-                // this error-resilience flag exists to surface.
-                if style.predictable_termination
-                    && !decoder.predictable_termination_satisfied(seg.bytes.len())
-                {
-                    return Err(Error::InvalidPacketHeader);
-                }
+                // §D.4.2 predictable termination (Table A.19 bit 4)
+                // constrains the *encoder's* flush procedure only — the
+                // decode path is unchanged and the §D.4.1 synthesised
+                // 0xFF extension still applies ("Often at that point
+                // there are more symbols to be decoded. Therefore, the
+                // decoder shall extend the input bit stream … with 0xFF
+                // bytes"). Real predictable-termination codestreams
+                // routinely finish their final renormalisations inside
+                // that synthesised fill, so no landing-position check can
+                // be made without rejecting conforming streams; §J.7
+                // names the segmentation symbol (§D.5) as the in-stream
+                // error-detection mechanism instead.
             }
         }
         // Record the §B.10.5 zero-MSB count so the reassembly bridge can

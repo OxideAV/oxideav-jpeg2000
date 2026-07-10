@@ -1139,26 +1139,105 @@ fn set_predictable_termination(stream: &[u8]) -> Vec<u8> {
     panic!("no COD in main header");
 }
 
-/// §D.4.2 predictable-termination error resilience: a codestream that
-/// *signals* predictable termination (Table A.19 bit 4) but whose
-/// codeword segments were not flushed by the §D.4.2 procedure must be
-/// rejected — the decoder's `BP` does not land on the §B.10.7 segment
-/// boundary. The committed gray fixture was encoded *without*
-/// predictable termination, so flipping the signalling bit makes the
-/// signalled contract and the actual segment bytes disagree, and the
-/// decode-time check surfaces it instead of returning a corrupt image.
+/// §D.4.2 predictable termination (Table A.19 bit 4) constrains the
+/// *encoder's* flush procedure only — the decode path is identical
+/// either way, and the §D.4.1 synthesised 0xFF extension applies as
+/// usual ("Often at that point there are more symbols to be decoded.
+/// Therefore, the decoder shall extend the input bit stream … with
+/// 0xFF bytes"). Flipping the signalling bit on a stream encoded
+/// without it must therefore leave the decode pixel-exact: there is
+/// no decoder-side landing-position contract to violate (§J.7 names
+/// the §D.5 segmentation symbol as the in-stream error-detection
+/// mechanism, not bit 4). Through round 409 the decoder enforced an
+/// invented exact-landing check here, which mis-rejected real
+/// predictable-termination codestreams (their final renormalisations
+/// routinely read into the synthesised fill).
 #[test]
-fn gray_53_predictable_termination_mismatch_is_rejected() {
+fn gray_53_predictable_termination_bit_does_not_change_decode() {
     // Sanity: the unmodified fixture decodes pixel-exact.
     assert_eq!(
         decode_j2k(GRAY_53).expect("baseline").components[0].samples,
         gray_17x13_pattern()
     );
     let mutated = set_predictable_termination(GRAY_53);
-    assert!(
-        decode_j2k(&mutated).is_err(),
-        "a stream falsely signalling predictable termination must be rejected"
+    let img = decode_j2k(&mutated).expect("decode with bit 4 set");
+    assert_eq!(
+        img.components[0].samples,
+        gray_17x13_pattern(),
+        "Table A.19 bit 4 must not change the decoded samples"
     );
+}
+
+// §D.4.2 predictable-termination fixtures from a real (black-box CLI)
+// encoder: the same 40×40 gray raster, lossless 5-3, NL = 3, 8×8
+// code-blocks, encoded with Table A.19 style combinations that all
+// include bit 4 (0x10, "predictable termination"):
+//
+//   * mode16 — bit 4 alone (single codeword segment per block).
+//   * mode17 — bits 0 + 4 (selective AC bypass, §D.6: the raw MR
+//     segments' padding uses the §D.6 alternating 0/1 sequence).
+//   * mode20 — bits 2 + 4 (termination on each coding pass, §B.10.7.2
+//     per-pass segments, each flushed by the §D.4.2 procedure).
+//   * mode48 — bits 4 + 5 (segmentation symbols, §D.5 — the NOTE's
+//     "with or without the predictable termination" composition).
+//   * mode63 — bits 0–5 all set (bypass + reset + termall + vertically
+//     causal + predictable + segmentation symbols).
+//
+// Decoding a §D.4.2-flushed segment routinely finishes its final
+// renormalisations inside the §D.4.1 synthesised 0xFF fill, so these
+// pin that no landing-position check mis-fires; the reversible path
+// must stay pixel-exact. COM markers scrubbed.
+const GRAY_MODE16_53: &[u8] = include_bytes!("data/gray-40x40-mode16-53.j2k");
+const GRAY_MODE17_53: &[u8] = include_bytes!("data/gray-40x40-mode17-53.j2k");
+const GRAY_MODE20_53: &[u8] = include_bytes!("data/gray-40x40-mode20-53.j2k");
+const GRAY_MODE48_53: &[u8] = include_bytes!("data/gray-40x40-mode48-53.j2k");
+const GRAY_MODE63_53: &[u8] = include_bytes!("data/gray-40x40-mode63-53.j2k");
+
+/// Shared body for the §D.4.2 predictable-termination fixtures:
+/// assert the COD carries the expected Table A.19 style byte, then
+/// assert the reversible 5-3 decode reproduces the source raster.
+fn assert_mode_fixture_pixel_exact(j2k: &[u8], expected_style: u8) {
+    let cs = parse_codestream(j2k).expect("parse");
+    assert_eq!(
+        cs.header.cod.code_block_style, expected_style,
+        "fixture COD code-block style byte"
+    );
+    assert!(
+        cs.header
+            .cod
+            .code_block_style_flags()
+            .predictable_termination(),
+        "fixture must signal predictable termination (bit 4)"
+    );
+    let img = decode_j2k(j2k).expect("decode predictable-termination fixture");
+    assert_eq!((img.width, img.height), (40, 40));
+    assert_eq!(img.components.len(), 1);
+    assert_eq!(img.components[0].samples, gray_40x40_pattern());
+}
+
+#[test]
+fn gray_53_predictable_termination_alone_is_pixel_exact() {
+    assert_mode_fixture_pixel_exact(GRAY_MODE16_53, 0x10);
+}
+
+#[test]
+fn gray_53_predictable_termination_with_bypass_is_pixel_exact() {
+    assert_mode_fixture_pixel_exact(GRAY_MODE17_53, 0x11);
+}
+
+#[test]
+fn gray_53_predictable_termination_with_termall_is_pixel_exact() {
+    assert_mode_fixture_pixel_exact(GRAY_MODE20_53, 0x14);
+}
+
+#[test]
+fn gray_53_predictable_termination_with_segmentation_symbols_is_pixel_exact() {
+    assert_mode_fixture_pixel_exact(GRAY_MODE48_53, 0x30);
+}
+
+#[test]
+fn gray_53_all_six_style_bits_is_pixel_exact() {
+    assert_mode_fixture_pixel_exact(GRAY_MODE63_53, 0x3F);
 }
 
 #[test]

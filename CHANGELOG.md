@@ -6,6 +6,23 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Fixed
 
+- **§D.4.2 predictable termination no longer mis-rejects real
+  codestreams.** The decoder enforced an invented decode-time check —
+  each terminated MQ segment's `BP` had to land exactly on the §B.10.7
+  boundary with no §D.4.1 synthesised-fill use — but the §D.4.2 flush
+  is an *encoder-side* contract and a conforming decoder routinely
+  finishes its final renormalisations inside the synthesised `0xFF`
+  extension ("Often at that point there are more symbols to be
+  decoded", §D.4.1). Every real predictable-termination stream from a
+  black-box CLI encoder was rejected with `InvalidPacketHeader`,
+  surfaced by an ISO/IEC 15444-4-style conformance sweep (§B.2.4
+  metrics over a black-box encode matrix). The check is removed
+  (`MqDecoder::predictable_termination_satisfied` with it; the style
+  bit is still parsed and carried), and five real-encoder fixtures
+  covering Table A.19 styles 0x10 / 0x11 / 0x14 / 0x30 / 0x3F now pin
+  the reversible path pixel-exact — including the full six-bit 0x3F
+  composition (bypass + reset + termall + vertically-causal +
+  predictable + segmentation symbols).
 - Two debug-build shift-overflow panics in the HT block decoder on
   corrupt / non-conformant streams, found by the new `decode_j2k`
   fuzz harness: a §7.3.8 `decodeMagSgnValue` bit count driven past

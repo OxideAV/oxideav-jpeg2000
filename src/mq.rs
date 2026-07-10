@@ -509,9 +509,11 @@ pub struct MqDecoder<'a> {
     ///
     /// Initialised to `false`. Set the first time `bytein` reads past the
     /// end of `data` (either the `B` lookup or the `B1` peek when the
-    /// segment ends mid-0xFF-prefix) and never cleared. The §D.4.2
-    /// predictable-termination check ([`Self::predictable_termination_satisfied`])
-    /// requires this to stay `false` for the segment to be conformant.
+    /// segment ends mid-0xFF-prefix) and never cleared. Purely
+    /// observational: per §D.4.1 the synthesised extension is a normal
+    /// part of decoding a terminated segment ("Often at that point there
+    /// are more symbols to be decoded"), including segments flushed by
+    /// the §D.4.2 predictable-termination procedure.
     synthetic_fill_used: bool,
 }
 
@@ -532,8 +534,8 @@ impl<'a> MqDecoder<'a> {
     pub fn new(data: &'a [u8]) -> Self {
         let first = data.first().copied().unwrap_or(0xFF);
         // INITDEC's first byte read is itself a §C.3.4 BYTEIN — if the
-        // input slice is empty the synthesised 0xFF fill kicks in and the
-        // predictable-termination check must observe it.
+        // input slice is empty the synthesised 0xFF fill kicks in
+        // immediately.
         let synthetic_fill_used = data.is_empty();
         let mut dec = MqDecoder {
             data,
@@ -728,76 +730,14 @@ impl<'a> MqDecoder<'a> {
     /// BYTEIN sets a sticky flag the first time the input slice runs out
     /// (either at the `B` lookup or the `B1` peek that follows a `0xFF`
     /// prefix when the prefix sits at the end of the segment). The flag
-    /// is never cleared; once observed the segment cannot satisfy the
-    /// T.800 §D.4.2 predictable-termination contract because the encoder
-    /// guarantees every bit the decoder asks for is materialised in the
-    /// codestream.
+    /// is never cleared. It is observational only: §D.4.1 makes the
+    /// synthesised extension a routine part of decoding *any* terminated
+    /// codeword segment — including one flushed by the §D.4.2
+    /// predictable-termination procedure, whose guarantee is merely that
+    /// the decoder need not backtrack, not that it never reads into the
+    /// synthesised fill.
     pub fn synthetic_fill_used(&self) -> bool {
         self.synthetic_fill_used
-    }
-
-    /// Whether the decoder's run over a predictably-terminated codeword
-    /// segment of length `segment_len` is conformant with the T.800
-    /// §D.4.2 termination contract.
-    ///
-    /// Returns `true` iff **both** of the following hold:
-    ///
-    /// 1. No synthetic `0xFF`-fill was consumed
-    ///    ([`Self::synthetic_fill_used`] is `false`). The §D.4.2 procedure
-    ///    pushes out `k = (11 − CT) + 1` bits via repeated BYTEOUT calls
-    ///    so the encoder side guarantees every bit the decoder will ever
-    ///    ask for is already present in the codestream — the §C.3.4
-    ///    end-of-stream marker (BYTEIN synthesising `0xFF` past the end
-    ///    of the slice) is mutually exclusive with a predictably
-    ///    terminated segment.
-    /// 2. The byte pointer has advanced to exactly `segment_len`, **or**
-    ///    sits one byte short of it on the `0xFF` prefix of an
-    ///    end-of-stream marker. Either case means the decoder consumed
-    ///    the entire signalled segment without backtracking. The
-    ///    one-short case is the §C.3.4 BYTEIN behaviour described at the
-    ///    top of the module: when `B = 0xFF` and `B1 > 0x8F`, `BP` stays
-    ///    on the `0xFF` prefix (no advance past the marker code), so a
-    ///    properly-terminated segment whose last byte is `0xFF` parks
-    ///    `BP` on `segment_len − 1`.
-    ///
-    /// Predictable termination is signalled via the COD / COC Table A.19
-    /// bit-4 ([`crate::CodeBlockStyle::predictable_termination`]) and is
-    /// independent of the bit-2 termination-on-each-coding-pass flag
-    /// (§D.4.2 says "this can be used with or without the predictable
-    /// termination" via the segmentation-symbol cross-reference; the
-    /// flags compose). The §D.6 selective bypass mode terminates the
-    /// fourth cleanup pass and every raw segment, and the predictable
-    /// flag applies to each terminated segment in isolation — open a
-    /// fresh [`MqDecoder`] per terminated segment and call this method
-    /// against that segment's length.
-    ///
-    /// HTJ2K (Part 15) HT code-blocks explicitly opt out of predictable
-    /// termination (the §A.6.1 Table A.13 Scod-bit-5 description for
-    /// HT code-blocks reads "Predictable termination (does not apply to
-    /// HT code-blocks)") and consumers should not call this method on
-    /// HT code-block segments.
-    ///
-    /// `segment_len` should equal the segment length the §B.10.7
-    /// packet-header walker (or the §D.4.2-aware caller's pre-allocated
-    /// slice length) signalled. A length smaller than the decoder's
-    /// `BP` returns `false` — the decoder ran past the signalled segment
-    /// end, which is itself a §D.4.2 violation.
-    pub fn predictable_termination_satisfied(&self, segment_len: usize) -> bool {
-        if self.synthetic_fill_used {
-            return false;
-        }
-        // Two acceptable terminal positions:
-        //   - BP == segment_len: every byte consumed, no marker tail.
-        //   - BP == segment_len - 1 AND data[BP] == 0xFF: parked on the
-        //     0xFF prefix of an end-of-segment marker (the §C.3.4 BYTEIN
-        //     rule keeps BP on the prefix without advancing past it).
-        if self.bp == segment_len {
-            return true;
-        }
-        if segment_len > 0 && self.bp + 1 == segment_len {
-            return matches!(self.data.get(self.bp), Some(&0xFF));
-        }
-        false
     }
 }
 
@@ -1108,88 +1048,9 @@ mod tests {
     #[test]
     fn synthetic_fill_set_by_empty_input() {
         // §C.3.4: empty data → BYTEIN immediately synthesises the
-        // 0xFF-fill terminal state. The decoder must record this and a
-        // predictable-termination check against any length must fail.
+        // 0xFF-fill terminal state, and the decoder records it.
         let dec = MqDecoder::new(&[]);
         assert!(dec.synthetic_fill_used());
-        assert!(!dec.predictable_termination_satisfied(0));
-        assert!(!dec.predictable_termination_satisfied(8));
-    }
-
-    #[test]
-    fn predictable_termination_holds_when_bp_lands_on_segment_end() {
-        // INITDEC over [0x12, 0x34, 0x56] parks BP at 1 (it consumed
-        // bytes 0 and 1 — see initdec_register_alignment_known_bytes).
-        // A signalled segment_len == 1 covers exactly the consumed
-        // bytes; report conformance.
-        let bytes = [0x12u8, 0x34, 0x56];
-        let dec = MqDecoder::new(&bytes);
-        assert_eq!(dec.byte_pointer(), 1);
-        assert!(!dec.synthetic_fill_used());
-        assert!(dec.predictable_termination_satisfied(1));
-    }
-
-    #[test]
-    fn predictable_termination_fails_when_bp_short_of_segment_end() {
-        // BP == 1 with segment_len == 3 means the decoder stopped two
-        // bytes shy of the signalled segment end — not conformant.
-        let bytes = [0x12u8, 0x34, 0x56];
-        let dec = MqDecoder::new(&bytes);
-        assert_eq!(dec.byte_pointer(), 1);
-        assert!(!dec.predictable_termination_satisfied(3));
-    }
-
-    #[test]
-    fn predictable_termination_fails_when_bp_overruns_segment_len() {
-        // A segment_len strictly less than BP means the decoder ran
-        // past the signalled segment end during decode (§D.4.2 says
-        // "the decoder need not backtrack" — a strict overrun is a
-        // violation).
-        let bytes = [0x12u8, 0x34, 0x56];
-        let dec = MqDecoder::new(&bytes);
-        assert_eq!(dec.byte_pointer(), 1);
-        assert!(!dec.predictable_termination_satisfied(0));
-    }
-
-    #[test]
-    fn predictable_termination_accepts_bp_parked_on_0xff_marker_prefix() {
-        // §C.3.4: when BP sits on a 0xFF byte and the next byte is the
-        // 0xFF marker tail, BYTEIN feeds 1-bits without advancing BP.
-        // A predictably-terminated segment whose final byte is 0xFF
-        // therefore parks BP on segment_len − 1, on the 0xFF prefix.
-        // [data[BP] == 0xFF AND BP + 1 == segment_len] must report
-        // conformance.
-        let bytes = [0x10u8, 0xFFu8, 0xFFu8]; // 0xFF at index 1
-        let mut dec = MqDecoder::new(&bytes);
-        let mut cx = MqContext::default();
-        // Drive enough decisions to push BP onto the 0xFF prefix at
-        // index 1 (where it parks per §C.3.4 marker rule).
-        for _ in 0..64 {
-            dec.decode(&mut cx);
-        }
-        // BP must be parked on the 0xFF prefix (≤ bytes.len() — 1).
-        // Pick a segment_len that matches BP + 1.
-        let bp = dec.byte_pointer();
-        if dec.data.get(bp) == Some(&0xFF) {
-            assert!(dec.predictable_termination_satisfied(bp + 1));
-        }
-    }
-
-    #[test]
-    fn predictable_termination_fails_when_synthetic_fill_used() {
-        // INITDEC over a single byte: byte 0 is read into Chigh, then
-        // BYTEIN runs and reads data[1] which is off the end → fill
-        // synthesised. The flag is sticky and the predictable check
-        // must reject every segment length.
-        let bytes = [0x12u8];
-        let dec = MqDecoder::new(&bytes);
-        assert!(dec.synthetic_fill_used());
-        for seg in 0..=bytes.len() + 4 {
-            assert!(
-                !dec.predictable_termination_satisfied(seg),
-                "predictable check must reject segment_len {seg} when synthetic fill fired"
-            );
-        }
     }
 
     #[test]
@@ -1205,37 +1066,11 @@ mod tests {
             dec.decode(&mut cx);
         }
         assert!(!dec.synthetic_fill_used());
-        // BP parks on or before the 0xFF prefix; the marker-prefix
-        // acceptance rule lets the check accept segment_len = BP + 1.
+        // BP parks on (or before) the 0xFF prefix per the §C.3.4
+        // marker rule — it never advances past the end of the slice.
         let bp = dec.byte_pointer();
         assert!(bp < bytes.len());
         assert_eq!(dec.data[bp], 0xFF);
-        assert!(dec.predictable_termination_satisfied(bp + 1));
-    }
-
-    #[test]
-    fn predictable_termination_segment_len_zero_rejects_non_initial_bp() {
-        // A segment_len of zero with BP > 0 is rejected. Even the
-        // INITDEC-only state (BP == 1 for typical non-FF inputs) sits
-        // past 0, so the check returns false.
-        let bytes = [0x12u8, 0x34];
-        let dec = MqDecoder::new(&bytes);
-        assert_eq!(dec.byte_pointer(), 1);
-        assert!(!dec.predictable_termination_satisfied(0));
-    }
-
-    #[test]
-    fn predictable_termination_zero_byte_segment_initial_state_passes() {
-        // The degenerate case of an empty-data decoder with a
-        // segment_len of zero: synthetic fill fired in INITDEC (data
-        // was empty) so the check must still reject. Validates the
-        // synthetic-fill gate takes priority over the BP-vs-len test.
-        let dec = MqDecoder::new(&[]);
-        assert!(dec.synthetic_fill_used());
-        // BP is 0 and segment_len is 0: the BP equality would alone
-        // accept, but the synthetic-fill gate kicks first.
-        assert_eq!(dec.byte_pointer(), 0);
-        assert!(!dec.predictable_termination_satisfied(0));
     }
 
     #[test]

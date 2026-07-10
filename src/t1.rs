@@ -61,11 +61,11 @@
 //!   step.
 //! * The §D.4.2 **predictable termination** flag (Scod bit-4) **is
 //!   wired** via the
-//!   [`BitPlaneSequencer::with_predictable_termination`] toggle and the
-//!   [`MqDecoder::predictable_termination_satisfied`] decoder-side
-//!   validator that a §D.4.2-aware packet reader calls against each
-//!   terminated segment's length to confirm BP landed on the segment
-//!   end without any synthetic 0xFF fill. The §D.4.2 **per-pass**
+//!   [`BitPlaneSequencer::with_predictable_termination`] toggle. The
+//!   flag constrains the encoder's flush only — decode proceeds
+//!   unchanged and the §D.4.1 synthesised 0xFF extension applies as
+//!   usual, so the sequencer carries the flag purely for
+//!   introspection. The §D.4.2 **per-pass**
 //!   termination flag (Scod bit-2) **is wired** via the
 //!   [`BitPlaneSequencer::with_termination_on_each_coding_pass`]
 //!   builder, the matching accessor, and the
@@ -2177,13 +2177,14 @@ pub enum Pass {
 /// The COD / COC Table A.19 bit-4 flag
 /// ([`crate::CodeBlockStyle::predictable_termination`]) signals that
 /// every terminated codeword segment in the packet body was flushed by
-/// the §D.4.2 procedure (k = (11 − CT) + 1 bits pushed out, terminating
-/// BYTEOUT, no 0xFF tail-byte elision). The sequencer carries the
-/// toggle via [`Self::with_predictable_termination`] /
-/// [`Self::predictable_termination`]; the decoder-side validator is
-/// [`MqDecoder::predictable_termination_satisfied`] which a packet
-/// reader calls on each terminated segment's decoder against the
-/// segment length the §B.10.7 packet header signalled.
+/// the specific §D.4.2 procedure (k = (11 − CT) + 1 bits pushed out,
+/// terminating BYTEOUT, no 0xFF tail-byte elision). The constraint
+/// binds the *encoder*; decoding is unchanged (the §D.4.1 synthesised
+/// 0xFF extension still applies, and real predictable-termination
+/// streams routinely finish their final renormalisations inside it).
+/// The sequencer carries the toggle via
+/// [`Self::with_predictable_termination`] /
+/// [`Self::predictable_termination`] for introspection only.
 ///
 /// ## §D.7 vertically-causal context formation
 ///
@@ -2270,18 +2271,13 @@ pub struct BitPlaneSequencer {
     /// When `true`, every terminated codeword segment in the packet
     /// body has been flushed by the §D.4.2 procedure (k = (11 − CT) + 1
     /// bits pushed out, terminating BYTEOUT, no 0xFF tail-byte
-    /// elision). A §D.4.2-aware packet reader can validate each
-    /// terminated segment via
-    /// [`MqDecoder::predictable_termination_satisfied`] against the
-    /// segment length the §B.10.7 packet header signalled.
-    ///
-    /// The sequencer itself does not perform the check — it is the
-    /// packet-reader-level responsibility, parallel to the
-    /// `termination_on_each_coding_pass` dispatch. The toggle composes
-    /// with the §D.5 segmentation-symbol mode (per the §D.5 NOTE,
-    /// "this can be used with or without the predictable termination").
-    /// HTJ2K (Part 15) HT code-blocks opt out — the flag does not apply
-    /// to HT code-block segments.
+    /// elision). That is an *encoder-side* contract: the decode path is
+    /// identical either way, so the sequencer carries the flag for
+    /// introspection only. The toggle composes with the §D.5
+    /// segmentation-symbol mode (per the §D.5 NOTE, "this can be used
+    /// with or without the predictable termination"). HTJ2K (Part 15)
+    /// HT code-blocks opt out — the flag does not apply to HT
+    /// code-block segments.
     predictable_termination: bool,
     /// Whether the COD / COC Table A.19 `reset of context probabilities
     /// on coding pass boundaries` flag (bit 1 of `Scod`, `0x02`) is set
@@ -2513,13 +2509,9 @@ impl BitPlaneSequencer {
     ///
     /// When enabled, every terminated codeword segment in the packet
     /// body was flushed by the §D.4.2 procedure (k = (11 − CT) + 1 bits
-    /// pushed out, terminating BYTEOUT, no 0xFF tail-byte elision). The
-    /// matching decoder-side validator is
-    /// [`MqDecoder::predictable_termination_satisfied`]: a
-    /// §D.4.2-aware packet reader opens a fresh decoder over each
-    /// terminated segment (the segment lengths come from §B.10.7) and
-    /// asks the decoder whether its terminal state is conformant after
-    /// consuming the segment's symbols.
+    /// pushed out, terminating BYTEOUT, no 0xFF tail-byte elision) —
+    /// an encoder-side contract that leaves the decode path unchanged,
+    /// so the toggle is carried for introspection only.
     ///
     /// The flag is taken from the COD / COC Table A.19
     /// [`crate::CodeBlockStyle::predictable_termination`] bit. The

@@ -87,13 +87,16 @@ What is implemented:
   `0xFF` fill (stuff-bit rule applied) so a truncated or in-progress raw
   pass still decodes. Validated end-to-end on the 5-3 lossless, 9-7
   irreversible, and 2×2-tile bypass paths. The §D.4.2 **predictable
-  termination** style bit (Table A.19 Scod bit 4) is enforced as a
-  decode-time conformance check: each terminated MQ codeword segment's
-  decoder must land exactly on the `§B.10.7` segment boundary, so a
-  stream that signals predictable termination but whose segments were
-  not flushed by the §D.4.2 procedure (or is truncated) is rejected
-  rather than silently mis-decoded. Forced off for HT code-blocks
-  (T.814 Table A.13).
+  termination** style bit (Table A.19 Scod bit 4) is parsed and carried,
+  and — per §D.4.2 — treated as an *encoder-side* flush contract:
+  decoding is unchanged (the §D.4.1 synthesised `0xFF` extension applies
+  as usual; real predictable-termination streams routinely finish their
+  final renormalisations inside it, so no landing-position check can be
+  made without rejecting conforming streams — a mis-rejection this
+  decoder performed through round 409). All six Table A.19 style bits
+  are pinned pixel-exact against real black-box-encoder fixtures,
+  including the 0x11 / 0x14 / 0x30 / 0x3F combinations. Bits 0/1/2/4/5
+  forced off for HT code-blocks (T.814 Table A.13).
 - **Reassembly** — per-coefficient `Nb(u, v)` magnitude-bit tracking for
   rate-truncated streams, dequantisation, the 5-3 and 9-7 inverse DWT,
   and the inverse multi-component transform.
