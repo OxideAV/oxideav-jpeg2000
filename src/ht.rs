@@ -110,10 +110,19 @@ impl<'a> MagSgnReader<'a> {
 
     /// Unpack `m` bits as a little-endian integer (the inner loop of
     /// §7.3.8 `decodeMagSgnValue`).
+    ///
+    /// A conformant stream in this crate's supported precision range
+    /// keeps every magnitude inside the 32-bit lane (`Mb` is bounded
+    /// well below 32 by the Equation E-2 quantisation tables), so a
+    /// bit count that cannot fit is a corrupt / non-conformant stream,
+    /// not a wider integer.
     fn bits(&mut self, m: u32) -> Result<u32, Error> {
+        if m > 32 {
+            return Err(Error::HtCorruptSegment);
+        }
         let mut val = 0u32;
         for i in 0..m {
-            val += (self.bit()? as u32) << i;
+            val |= (self.bit()? as u32) << i;
         }
         Ok(val)
     }
@@ -835,6 +844,13 @@ fn decode_quad_magsgn(grid: &mut HtGrid, magsgn: &mut MagSgnReader, q: usize) ->
         let i_n = (qs.e_1 >> j) & 1; // EMB known-1
                                      // m_n = σ_n · U_q − k_n  (§7.3.8).
         let m_n = u_big.saturating_sub(k_n as u32);
+        // The m_n MagSgn bits plus the known-1 bit at position m_n
+        // must fit the 32-bit magnitude lane; every Mb this crate's
+        // Equation E-2 tables can produce sits far below that, so a
+        // wider exponent is a corrupt / non-conformant stream.
+        if m_n > 31 {
+            return Err(Error::HtCorruptSegment);
+        }
         // decodeMagSgnValue: m_n bits little-endian + (i_n << m_n).
         let mut val = magsgn.bits(m_n)?;
         val += (i_n as u32) << m_n;
@@ -904,6 +920,16 @@ pub fn decode_ht_codeblock(
 
     let mut grid = HtGrid::new(width, height);
     decode_cleanup(&mut grid, cleanup)?;
+
+    // §7.6 conformance: a cleanup magnitude carries at most
+    // `S_blk + 1` bit-planes (`MSB_1 .. MSB_{S_blk+1}`); anything
+    // wider cannot be positioned inside the band's `Mb` planes — and
+    // would overflow the refinement compose below on a corrupt
+    // stream.
+    let mu_bits = (s_blk + 1).min(31);
+    if grid.mu.iter().any(|&mu| mu >> mu_bits != 0) {
+        return Err(Error::HtCorruptSegment);
+    }
 
     // Refinement-indicator z_n / refinement-bit r_n from the SigProp /
     // MagRef passes (§7.4 / §7.5). Default 0. `sp_sign` records the sign

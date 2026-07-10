@@ -6,6 +6,19 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Fixed
 
+- Two debug-build shift-overflow panics in the HT block decoder on
+  corrupt / non-conformant streams, found by the new `decode_j2k`
+  fuzz harness: a §7.3.8 `decodeMagSgnValue` bit count driven past
+  the 32-bit magnitude lane now surfaces `Error::HtCorruptSegment`
+  (both the MagSgn bit unpacking and the EMB known-1 compose are
+  bounded), and the recovered cleanup magnitudes are checked against
+  the §7.6 `S_blk + 1` bit-plane budget before the refinement
+  compose. Both crash inputs are committed as regression fixtures.
+- The T.814 HT set accumulation bounds a block's total coding passes
+  (and placeholder passes) by the band's bit-plane budget before any
+  per-set allocation, closing an attacker-controlled allocation scale
+  (a 65 535-layer stream could previously demand millions of HT-set
+  slots per code-block).
 - The long-standing HT decode divergence on small / high-energy /
   non-power-of-two code-blocks: in the T.814 §7.3.6 first-line-pair
   `s_mel = 0, u_q1 > 2` case, the second quad's single `u` bit
@@ -18,6 +31,11 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+- A `decode_j2k` fuzz target driving the **full decode** path
+  (packet headers across all progression walks, every codeword-
+  segment split incl. the HT set-`T` / placeholder shapes, both
+  tier-1 coders, DWT + component transforms) with header-derived
+  geometry caps so no iteration allocates attacker-scaled buffers.
 - **MULTIHT decode** (T.814 §B.1 / §B.3 / §8.3): HT code-blocks
   carrying more than one HT set now decode — the accumulated codeword
   segments group into per-set cleanup / refinement HT segments

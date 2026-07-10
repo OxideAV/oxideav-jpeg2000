@@ -159,3 +159,18 @@ fn ht_gray64_d3_irreversible_multiblock_matches_ojph() {
         "irreversible multi-code-block HT reconstruction differs"
     );
 }
+
+#[test]
+fn fuzz_regressions_error_cleanly() {
+    // Corrupt HT codestreams found by the decode_j2k fuzz harness. Both
+    // drove the §7.3.8 decodeMagSgnValue width past the 32-bit
+    // magnitude lane (an m_n no conformant stream in this crate's
+    // precision range can signal) and must surface a clean error — the
+    // decoder previously panicked on the left shift.
+    for bytes in [
+        &include_bytes!("fixtures/fuzz_ht_magsgn_width.j2c")[..],
+        &include_bytes!("fixtures/fuzz_ht_emb_shift.j2c")[..],
+    ] {
+        assert!(oxideav_jpeg2000::decode_j2k(bytes).is_err());
+    }
+}

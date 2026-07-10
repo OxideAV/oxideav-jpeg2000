@@ -1596,6 +1596,14 @@ fn decode_tile_from_plan(
             // in-set role: ≡ 0 (mod 3) ends a cleanup segment, else it
             // ends (part of) the refinement segment of the same set.
             let avail = acc.passes - p0;
+            // Every HT set (and every placeholder triple) skips one
+            // more magnitude bit-plane (§B.3), so a conformant block
+            // cannot carry more of either than the band has bit-planes
+            // — and the per-set allocations below must not scale with
+            // an attacker-controlled pass count.
+            if avail > 3 * mb_coded || p0 > 3 * mb_coded {
+                return Err(Error::InvalidPacketHeader);
+            }
             let num_sets = avail.div_ceil(3) as usize;
             let mut cleanup_seg: Vec<Vec<u8>> = vec![Vec::new(); num_sets];
             let mut refine_seg: Vec<Vec<u8>> = vec![Vec::new(); num_sets];

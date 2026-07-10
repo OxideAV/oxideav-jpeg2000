@@ -1,7 +1,7 @@
 name: Fuzz
 
 # Daily fuzz run for the cargo-fuzz harnesses under fuzz/. Splits the
-# 30-minute total budget across the 3 targets (~10 min each). The
+# 30-minute total budget across the targets. The
 # cross-decode harnesses dlopen libopenjp2 at runtime via libloading
 # and shell out to opj_compress / opj_decompress; the CI runner needs
 # `libopenjp2-7-dev` (library + headers) and `libopenjp2-tools` (the
