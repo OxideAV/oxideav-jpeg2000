@@ -20,6 +20,21 @@ const GRAY_97_REF_PGM: &[u8] = include_bytes!("data/gray-32x32-97-ref.pgm");
 const GRAY_97_FULL: &[u8] = include_bytes!("data/gray-32x32-97full.j2k");
 const GRAY_97_FULL_REF_PGM: &[u8] = include_bytes!("data/gray-32x32-97full-ref.pgm");
 
+// Second, independent black-box reference decodes of the same three
+// 9-7 codestreams (a different opaque CLI decoder than the one that
+// produced the `-ref.pgm` files). The two references disagree with
+// *each other* by ±1 at a handful of pixels whose reconstructed
+// continuous value sits within ~0.004 of a half-integer — the
+// inter-decoder rounding latitude ISO/IEC 15444-4 exists to budget
+// (its Table C.1 allows peak errors up to 109 and MSE up to 743 on
+// 9-7 test codestreams; §B.2.4 defines the MSE / peak metrics). This
+// crate's decode is byte-exact against the second reference on all
+// three fixtures (and across a 60-case black-box sweep), so the tests
+// pin exactness against ref2 and the documented ±1 latitude against
+// ref1.
+const GRAY_97_REF2_PGM: &[u8] = include_bytes!("data/gray-32x32-97-ref2.pgm");
+const GRAY_97_FULL_REF2_PGM: &[u8] = include_bytes!("data/gray-32x32-97full-ref2.pgm");
+
 // Position-keyed §B.12.1.3–5 progression-order fixtures: the same
 // 48×32 three-component raster, lossless 5-3, MCT off (each plane
 // independent), 3 resolution levels, one precinct per level — one
@@ -117,6 +132,7 @@ const GRAY_BYPASS_53: &[u8] = include_bytes!("data/gray-40x40-bypass-53.j2k");
 // COM markers scrubbed.
 const GRAY_BYPASS_97: &[u8] = include_bytes!("data/gray-40x40-bypass-97.j2k");
 const GRAY_BYPASS_97_REF_PGM: &[u8] = include_bytes!("data/gray-40x40-bypass-97-ref.pgm");
+const GRAY_BYPASS_97_REF2_PGM: &[u8] = include_bytes!("data/gray-40x40-bypass-97-ref2.pgm");
 
 // §D.6 bypass across a 20×20 tile grid (2×2 = 4 tiles), lossless 5-3,
 // NL = 3, 8×8 code-blocks, bypass style bit set. Each tile's
@@ -732,8 +748,10 @@ fn gray_53_termination_on_each_pass_is_pixel_exact() {
 fn gray_97_selective_arithmetic_coding_bypass_tracks_black_box_reference() {
     // §D.6 bypass through the 9-7 irreversible reconstruction. The raw
     // SP / MR passes feed the scalar-quantised inverse DWT; the decode
-    // must track the committed black-box reference within the Annex F
-    // ±1 floating-point latitude.
+    // must be **byte-exact** against the second independent black-box
+    // reference and within the documented ±1 inter-reference rounding
+    // latitude against the first (the two references themselves differ
+    // by 1 at one half-integer-boundary pixel of this fixture).
     let cs = parse_codestream(GRAY_BYPASS_97).expect("parse");
     assert!(
         cs.header
@@ -746,16 +764,37 @@ fn gray_97_selective_arithmetic_coding_bypass_tracks_black_box_reference() {
     assert_eq!(img.components.len(), 1);
     let c = &img.components[0];
     assert_eq!((c.width, c.height), (40, 40));
+
+    // Reference 2: byte-exact.
+    let (rw2, rh2, payload2) = pgm_payload(GRAY_BYPASS_97_REF2_PGM);
+    assert_eq!((rw2, rh2), (40, 40));
+    let ours: Vec<u8> = c.samples.iter().map(|&s| s as u8).collect();
+    assert_eq!(
+        ours.as_slice(),
+        payload2,
+        "9-7 bypass decode must match the second reference byte-exactly"
+    );
+
+    // Reference 1: the ISO/IEC 15444-4-style peak / MSE verdict
+    // (Equations B-5 / B-4) within the documented latitude.
     let (rw, rh, payload) = pgm_payload(GRAY_BYPASS_97_REF_PGM);
     assert_eq!((rw, rh), (40, 40));
     assert_eq!(payload.len(), c.samples.len());
     let mut max_diff = 0i32;
-    for (&ours, &refv) in c.samples.iter().zip(payload.iter()) {
-        max_diff = max_diff.max((ours - refv as i32).abs());
+    let mut sq = 0u64;
+    for (&o, &refv) in c.samples.iter().zip(payload.iter()) {
+        let d = (o - refv as i32).abs();
+        max_diff = max_diff.max(d);
+        sq += (d as u64) * (d as u64);
     }
+    let mse = sq as f64 / payload.len() as f64;
     assert!(
         max_diff <= 1,
-        "9-7 bypass decode deviates from the reference by {max_diff} (> 1)"
+        "9-7 bypass decode deviates from reference 1 by {max_diff} (> 1)"
+    );
+    assert!(
+        mse <= 0.001,
+        "9-7 bypass decode MSE vs reference 1 is {mse} (> 0.001)"
     );
 }
 
@@ -854,8 +893,9 @@ fn rgb_rct_53_interleaved_wrapper_matches_planes() {
     }
 }
 
-/// Decode a 32×32 9-7 fixture and return `(max, mean)` absolute
-/// deviation from its committed black-box reference decode.
+/// Decode a 32×32 9-7 fixture and return `(peak, mse)` — the ISO/IEC
+/// 15444-4 §B.2.4 comparison metrics (Equations B-5 / B-4) — against a
+/// committed black-box reference decode.
 fn gray_97_deviation(j2k: &[u8], ref_pgm: &[u8]) -> (i32, f64) {
     let img = decode_j2k(j2k).expect("decode");
     assert_eq!(img.components.len(), 1);
@@ -867,50 +907,76 @@ fn gray_97_deviation(j2k: &[u8], ref_pgm: &[u8]) -> (i32, f64) {
     assert_eq!(payload.len(), c.samples.len());
 
     let mut max_diff = 0i32;
-    let mut sum = 0u64;
+    let mut sq = 0u64;
     for (&ours, &refv) in c.samples.iter().zip(payload.iter()) {
         let d = (ours - refv as i32).abs();
         max_diff = max_diff.max(d);
-        sum += d as u64;
+        sq += (d as u64) * (d as u64);
     }
-    (max_diff, sum as f64 / payload.len() as f64)
+    (max_diff, sq as f64 / payload.len() as f64)
 }
 
 #[test]
-fn gray_97_irreversible_full_quality_matches_black_box_reference() {
+fn gray_97_irreversible_full_quality_matches_black_box_references() {
     // 9-7 irreversible, scalar-expounded quantisation, 6 resolution
     // levels, every coding pass present (no rate truncation, so
-    // Nb = Mb for every code-block). Pinned against a committed
-    // black-box decode of the same codestream; ±1 covers the Annex F
-    // floating-point latitude between conforming inverse DWTs.
-    let (max_diff, _) = gray_97_deviation(GRAY_97_FULL, GRAY_97_FULL_REF_PGM);
+    // Nb = Mb for every code-block — no §E.1.1.2 midpoint lift is in
+    // play; the residual is pure inverse-DWT arithmetic).
+    //
+    // Byte-exact against the second independent reference; ±1 (at the
+    // five pixels where the two references themselves disagree —
+    // reconstructed values within 0.004 of a half-integer) against the
+    // first, with the §B.2.4 MSE far inside the Table C.1 class
+    // allowances.
+    let (peak2, mse2) = gray_97_deviation(GRAY_97_FULL, GRAY_97_FULL_REF2_PGM);
+    assert_eq!(
+        (peak2, mse2),
+        (0, 0.0),
+        "full-quality 9-7 decode must match the second reference byte-exactly"
+    );
+    let (peak, mse) = gray_97_deviation(GRAY_97_FULL, GRAY_97_FULL_REF_PGM);
     assert!(
-        max_diff <= 1,
-        "full-quality 9-7 decode deviates from the reference by {max_diff} (> 1)"
+        peak <= 1,
+        "full-quality 9-7 decode deviates from reference 1 by {peak} (> 1)"
+    );
+    assert!(
+        mse <= 0.005,
+        "full-quality 9-7 MSE vs reference 1 is {mse} (> 0.005)"
     );
 }
 
 #[test]
-fn gray_97_irreversible_truncated_tracks_black_box_reference() {
+fn gray_97_irreversible_truncated_matches_black_box_references() {
     // Same source rate-limited 4:1 — coding passes are truncated
     // mid-bit-plane, so per the §E.1.1.2 NOTE Nb(u, v) differs across
     // one code-block: the coefficients the final partial pass reached
     // carry one more decoded magnitude bit than those it did not. The
-    // tier-1 decoder now tracks the §D.2.1 per-coefficient decoded-bit
+    // tier-1 decoder tracks the §D.2.1 per-coefficient decoded-bit
     // count and the §E.1.1.2 reconstruction lifts each coefficient by
-    // its own `r · 2^(Mb − Nb(u, v))` midpoint (round 302). With the
-    // per-coefficient Nb the truncated decode tracks the black-box
-    // reference within the same ±1 floating-point latitude as the
-    // full-quality decode — a step down from the max ≤ 16 / mean ≤ 4
-    // the per-block-Nb approximation pinned through round 295.
-    let (max_diff, mean) = gray_97_deviation(GRAY_97, GRAY_97_REF_PGM);
+    // its own `r · 2^(Mb − Nb(u, v))` midpoint (round 302).
+    //
+    // The rate-truncated path is **byte-exact** against the second
+    // independent reference (round 410; previously "±1 of reference"
+    // was the best statement this suite could make). The residual ±1
+    // against the first reference is the two references' own
+    // disagreement — a single pixel whose reconstructed value lands
+    // ~0.0008 above a half-integer — i.e. the inter-decoder rounding
+    // latitude ISO/IEC 15444-4 budgets (Table C.1), not a defect in
+    // the truncation handling.
+    let (peak2, mse2) = gray_97_deviation(GRAY_97, GRAY_97_REF2_PGM);
+    assert_eq!(
+        (peak2, mse2),
+        (0, 0.0),
+        "truncated 9-7 decode must match the second reference byte-exactly"
+    );
+    let (peak, mse) = gray_97_deviation(GRAY_97, GRAY_97_REF_PGM);
     assert!(
-        max_diff <= 1,
-        "truncated 9-7 decode deviates from the reference by {max_diff} (> 1)"
+        peak <= 1,
+        "truncated 9-7 decode deviates from reference 1 by {peak} (> 1)"
     );
     assert!(
-        mean <= 0.05,
-        "truncated 9-7 decode mean deviation {mean} (> 0.05)"
+        mse <= 0.001,
+        "truncated 9-7 MSE vs reference 1 is {mse} (> 0.001)"
     );
 }
 

@@ -17,6 +17,20 @@ sizes, precinct sizes, and quality layers). Fixtures are encoded and
 COM-scrubbed with an opaque CLI codec used strictly as a black box; no
 external library source is consulted.
 
+On the irreversible 9-7 path — including **rate-truncated** streams
+(the §E.1.1.2 per-coefficient `Nb(u, v)` midpoint reconstruction) —
+the decode is **byte-exact against an independent black-box reference
+decoder** across the committed fixtures and a 60-case ISO/IEC
+15444-4-style sweep (§B.2.4 peak / MSE metrics over an encode matrix
+of sizes, levels, styles, progressions, truncations and ROI). A second
+reference decoder disagrees with the first by ±1 at a handful of
+pixels whose reconstructed continuous value lands within ~0.004 of a
+half-integer; that inter-reference rounding latitude is exactly what
+ISO/IEC 15444-4 budgets (Table C.1 allows peak ≤ 109 / MSE ≤ 743 on
+its 9-7 test codestreams — this decoder measures peak ≤ 1,
+MSE ≤ 0.005 against that reference and 0 against the other), and the
+tests pin both verdicts per fixture.
+
 What is implemented:
 
 - **Containers** — J2K raw codestream and the JP2 ISO BMFF box wrapper

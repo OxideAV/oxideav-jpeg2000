@@ -4,6 +4,24 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ## [Unreleased]
 
+### Changed
+
+- **The 9-7 irreversible path (full-quality, rate-truncated and §D.6
+  bypass) is pinned byte-exact against an independent black-box
+  reference decoder** — closing the long-standing "±1 of reference"
+  statement on rate-truncated streams. Root cause of the residual ±1:
+  the two available independent reference decoders disagree with *each
+  other* at exactly those pixels (reconstructed continuous values
+  within ~0.004 of a half-integer; an f32-lane experiment reproduced
+  none of it, so it is upstream arithmetic-order latitude, not final
+  rounding). That inter-reference latitude is what ISO/IEC 15444-4
+  budgets — Table C.1 allows peak ≤ 109 / MSE ≤ 743 on 9-7 test
+  codestreams, against which this decoder measures peak ≤ 1 /
+  MSE ≤ 0.005 (and 0 / 0 against the second reference, both on the
+  committed fixtures and across a 60-case §B.2.4-metric sweep). Each
+  9-7 e2e test now records both verdicts: byte-exact vs reference 2,
+  peak + MSE bounds vs reference 1.
+
 ### Fixed
 
 - **§D.4.2 predictable termination no longer mis-rejects real
