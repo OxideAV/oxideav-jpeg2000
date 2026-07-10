@@ -1129,6 +1129,16 @@ fn build_tile_packet_plan(
         let mut res_layouts = Vec::with_capacity(levels.len());
         for level in &levels {
             let pp = precinct_exponents_at(&cc.precincts, level.r);
+            // §B.6: "PPx and PPy must be at least 1 for all resolution
+            // levels except r = 0 where they are allowed to be zero"
+            // (Table A.21 mirrors this on the marker payload). A zero
+            // exponent at r > 0 cannot come from a conforming encoder —
+            // decoding on regardless would build a precinct lattice the
+            // encoder cannot have used and desynchronise the packet
+            // walk, so reject the stream instead.
+            if level.r > 0 && (pp.ppx == 0 || pp.ppy == 0) {
+                return Err(Error::InvalidPrecinctSize);
+            }
             let partition = derive_precinct_partition(level, pp);
             let num = partition.num_precincts();
             let num = u32::try_from(num).map_err(|_| Error::InvalidMarkerLength)?;

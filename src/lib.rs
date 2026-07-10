@@ -240,6 +240,14 @@ pub enum Error {
     /// Round-5 packet-header reader hit an invalid bit-sequence or a
     /// geometry mismatch (T.800 §B.10).
     InvalidPacketHeader,
+    /// A `COD` / `COC` user-defined precinct exponent violated the
+    /// T.800 §B.6 / Table A.21 constraint that `PPx` / `PPy` "may only
+    /// equal zero at the resolution level corresponding to the `NLLL`
+    /// band" — i.e. a `PPx = 0` or `PPy = 0` was signalled at `r > 0`.
+    /// No conforming encoder can have produced the stream, so it is
+    /// rejected rather than decoded against a precinct lattice the
+    /// packet sequence cannot match.
+    InvalidPrecinctSize,
     /// Round-5 packet-header walker advanced past the end of the
     /// tile-part body before all geometry-required packets were
     /// decoded.
@@ -301,6 +309,12 @@ impl core::fmt::Display for Error {
             }
             Error::InvalidPacketHeader => {
                 write!(f, "JPEG 2000: malformed packet header (T.800 §B.10)")
+            }
+            Error::InvalidPrecinctSize => {
+                write!(
+                    f,
+                    "JPEG 2000: precinct exponent PPx/PPy = 0 at resolution level r > 0 (T.800 §B.6)"
+                )
             }
             Error::PacketHeaderOverrun => {
                 write!(

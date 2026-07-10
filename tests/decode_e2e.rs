@@ -1246,6 +1246,60 @@ fn truncated_codestream_is_rejected() {
     assert!(decode_j2k(cut).is_err());
 }
 
+/// §B.6 / Table A.21: a user-defined precinct exponent byte "may only
+/// equal zero at the resolution level corresponding to the NLLL band"
+/// (`r = 0`). Rewrite one `r > 0` precinct byte of the multi-precinct
+/// fixture's `COD` to `0x00` and assert the stream is rejected with
+/// `Error::InvalidPrecinctSize` — decoding on would build a precinct
+/// lattice no conforming encoder can have used and desynchronise the
+/// packet walk. (Independent black-box reference decoders likewise
+/// refuse such a stream at the `COD` marker.)
+#[test]
+fn gray_53_zero_precinct_exponent_above_r0_is_rejected() {
+    use oxideav_jpeg2000::{Error, MARKER_COD};
+
+    let cs = parse_codestream(GRAY_MULTIPRECINCT_53).expect("parse");
+    assert!(
+        cs.header.cod.user_defined_precincts,
+        "fixture must carry user-defined precincts"
+    );
+    let nl = cs.header.cod.decomposition_levels as usize;
+    assert_eq!(
+        cs.header.cod.precincts.len(),
+        nl + 1,
+        "Table A.21: NL + 1 precinct bytes"
+    );
+
+    // Locate the COD in the main header; the precinct bytes trail the
+    // fixed SPcod fields (Table A.12: marker(2) Lcod(2) Scod(1)
+    // SGcod(4) SPcod fixed(5), then NL + 1 precinct bytes).
+    let mut out = GRAY_MULTIPRECINCT_53.to_vec();
+    let m = MARKER_COD.to_be_bytes();
+    let cod_at = (2..cs.header.bytes_consumed)
+        .find(|&i| out[i] == m[0] && out[i + 1] == m[1])
+        .expect("COD marker present");
+    let precinct0_at = cod_at + 2 + 2 + 1 + 4 + 5;
+
+    // Sanity: the located bytes match the parsed precinct vector.
+    assert_eq!(
+        &out[precinct0_at..precinct0_at + nl + 1],
+        cs.header.cod.precincts.as_slice()
+    );
+
+    // Zero the r = 1 byte (the first above-NLLL resolution level).
+    out[precinct0_at + 1] = 0x00;
+    assert_eq!(
+        decode_j2k(&out),
+        Err(Error::InvalidPrecinctSize),
+        "PPx = PPy = 0 at r = 1 must be rejected"
+    );
+
+    // The untouched fixture still decodes pixel-exact (guards against
+    // the mutation helper drifting).
+    let img = decode_j2k(GRAY_MULTIPRECINCT_53).expect("baseline decode");
+    assert_eq!(img.components[0].samples, gray_40x40_pattern());
+}
+
 // -------------------------------------------------------------------------
 // §A.6.2 mixed-kernel-per-component (Rmct = 0) assembly + decode.
 // -------------------------------------------------------------------------

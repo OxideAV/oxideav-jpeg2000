@@ -696,9 +696,11 @@ pub fn derive_resolution_levels(tc: TileComponentGeometry, n_l: u8) -> Vec<Resol
 ///
 /// `PPx` / `PPy` may be zero only at the resolution level corresponding
 /// to the `NLLL` band (`r = 0`); at every `r ≥ 1` they are at least 1
-/// (Table A.21). This is an encoder constraint — the partition formula
-/// here does not enforce it (a malformed `PPx = 0` at `r > 0` simply
-/// yields a one-sample-wide precinct grid).
+/// (§B.6 / Table A.21). The partition formula here stays permissive (a
+/// `PPx = 0` at `r > 0` simply yields a one-sample-step precinct grid);
+/// the decode driver rejects such a stream up front with
+/// [`crate::Error::InvalidPrecinctSize`], and the encoder refuses to
+/// emit one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PrecinctExponents {
     /// `PPx` — precinct width exponent (precinct width = `2^PPx`).

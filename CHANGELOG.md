@@ -23,6 +23,15 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
   the reversible path pixel-exact — including the full six-bit 0x3F
   composition (bypass + reset + termall + vertically-causal +
   predictable + segmentation symbols).
+- **`PPx`/`PPy` = 0 above `r = 0` is now rejected** (new
+  `Error::InvalidPrecinctSize`). T.800 §B.6 / Table A.21 permit a zero
+  precinct exponent only at the `NLLL` resolution level; the decoder
+  previously accepted such a stream and built a precinct lattice no
+  conforming encoder can have used (independent black-box reference
+  decoders refuse the same stream at the `COD` marker). Found by the
+  round's conformance sweep when a black-box encoder emitted one for a
+  precinct-smaller-than-code-block request. The encoder side already
+  refused to emit the shape.
 - Two debug-build shift-overflow panics in the HT block decoder on
   corrupt / non-conformant streams, found by the new `decode_j2k`
   fuzz harness: a §7.3.8 `decodeMagSgnValue` bit count driven past
