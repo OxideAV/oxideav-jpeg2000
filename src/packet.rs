@@ -536,6 +536,14 @@ fn read_segment_length_value(
     passes_in_segment: u32,
     reader: &mut PacketBitReader<'_>,
 ) -> Result<u32, Error> {
+    let bits = segment_length_width(lblock, passes_in_segment)?;
+    reader.read_bits(bits)
+}
+
+/// The §B.10.7.1 / Equation B-19 bit width of one codeword-segment
+/// length field: `lblock + floor(log2 passes_in_segment)`, validated
+/// against the bit reader's 32-bit ceiling.
+fn segment_length_width(lblock: u32, passes_in_segment: u32) -> Result<u8, Error> {
     let extra = if passes_in_segment <= 1 {
         0
     } else {
@@ -553,7 +561,7 @@ fn read_segment_length_value(
         // own read_bits ceiling.
         return Err(Error::InvalidPacketHeader);
     }
-    reader.read_bits(bits as u8)
+    Ok(bits as u8)
 }
 
 /// The kind of coding pass at absolute pass index `i` within a
@@ -657,20 +665,24 @@ pub(crate) fn bypass_segment_spans(
 }
 
 /// T.814 §B.2: whether the HT coding pass with 0-based absolute index
-/// `i` ends a codeword segment — the boundary set is
-/// `T = ⋃ₖ ⌈3k/2⌉ = {0, 2, 3, 5, 6, 8, 9, …}` (`k ≥ 0`), i.e. every
-/// HT cleanup pass is its own segment while a SigProp + MagRef pair
-/// shares one refinement segment (Figure B.1).
-pub(crate) fn ht_pass_ends_segment(i: u32) -> bool {
-    i % 3 != 1
+/// `i` ends a codeword segment. `p0_passes` is the number of leading
+/// **placeholder passes** (`3·P0`, §B.1) — the boundary set is
+/// `T = ⋃ₖ (3P0 + ⌈3k/2⌉) = {3P0, 3P0+2, 3P0+3, 3P0+5, 3P0+6, …}`
+/// (`k ≥ 0`), i.e. every HT cleanup pass is its own segment while a
+/// SigProp + MagRef pair shares one refinement segment (Figure B.1).
+/// The placeholder passes carry no boundary of their own — they fold
+/// into the segment ending at the first HT cleanup pass (index `3P0`).
+pub(crate) fn ht_pass_ends_segment(i: u32, p0_passes: u32) -> bool {
+    i >= p0_passes && (i - p0_passes) % 3 != 1
 }
 
 /// Split an HT code-block's `passes` included coding passes (running
 /// from absolute 0-based index `start_pass`) into the T.814 §B.2 /
-/// §B.3 codeword segments: each segment ends at a set-`T` pass or at
-/// the final pass included in the packet (§B.3). Returns the pass
+/// §B.3 codeword segments, given the block's `p0_passes` (= `3·P0`)
+/// leading placeholder passes: each segment ends at a set-`T` pass or
+/// at the final pass included in the packet (§B.3). Returns the pass
 /// count of each segment in coding order.
-pub(crate) fn ht_segment_spans(start_pass: u32, passes: u32) -> Vec<u32> {
+pub(crate) fn ht_segment_spans(start_pass: u32, passes: u32, p0_passes: u32) -> Vec<u32> {
     let mut spans = Vec::new();
     if passes == 0 {
         return spans;
@@ -679,12 +691,30 @@ pub(crate) fn ht_segment_spans(start_pass: u32, passes: u32) -> Vec<u32> {
     let mut span_passes = 0u32;
     for i in start_pass..=last {
         span_passes += 1;
-        if ht_pass_ends_segment(i) || i == last {
+        if ht_pass_ends_segment(i, p0_passes) || i == last {
             spans.push(span_passes);
             span_passes = 0;
         }
     }
     spans
+}
+
+/// The absolute pass index at which an HT code-block's **first HT
+/// cleanup pass** can sit inside a contribution covering passes
+/// `[start_pass, start_pass + passes)`, when every prior pass was a
+/// placeholder pass. T.814 §B.1 places the first cleanup pass at
+/// index `3·P0` and §B.3 allows at most one HT cleanup pass in the
+/// packet that carries it, so the only candidate is the **last**
+/// multiple of 3 below the contribution's end (at most two refinement
+/// passes may follow it). Returns `None` when no multiple of 3 falls
+/// inside the contribution — the contribution can only extend the
+/// placeholder run.
+pub(crate) fn ht_first_cleanup_candidate(start_pass: u32, passes: u32) -> Option<u32> {
+    if passes == 0 {
+        return None;
+    }
+    let cup = ((start_pass + passes - 1) / 3) * 3;
+    (cup >= start_pass).then_some(cup)
 }
 
 // ---------------------------------------------------------------------------
@@ -831,6 +861,13 @@ pub struct SubBandState {
     /// is keyed off the absolute pass index, which carries across
     /// layers), indexed `y * width + x`.
     pub passes_so_far: Vec<u32>,
+    /// T.814 §B.1 placeholder-pass resolution per HT code-block,
+    /// indexed `y * width + x`. `None` while the block's first HT
+    /// cleanup pass has not yet been seen (every pass contributed so
+    /// far was a placeholder pass); `Some(3·P0)` once the first
+    /// cleanup pass fixed the placeholder count. Unused outside
+    /// [`SegmentSplit::Ht`].
+    pub ht_placeholder_passes: Vec<Option<u32>>,
     /// Sub-band grid dimensions.
     pub geometry: SubBandGeometry,
 }
@@ -845,6 +882,7 @@ impl SubBandState {
             already_included: vec![false; n],
             lblock: vec![LblockState::default(); n],
             passes_so_far: vec![0u32; n],
+            ht_placeholder_passes: vec![None; n],
             geometry,
         }
     }
@@ -1121,13 +1159,85 @@ fn decode_one_code_block(
             // the final included pass); one length per segment, widened
             // by ⌊log2(passes in segment)⌋ (Equation B-19), with the
             // increase-Lblock prefix signalled once per contribution.
-            let spans = ht_segment_spans(start_pass, passes);
-            read_lblock_increment(lblock, reader)?;
-            let mut lens = Vec::with_capacity(spans.len());
-            for sp in spans {
-                lens.push(read_segment_length_value(lblock.lblock, sp, reader)?);
+            //
+            // The set T is anchored at the block's 3·P0 placeholder
+            // passes (§B.1). P0 is not signalled anywhere — it is
+            // pinned the moment the first HT cleanup pass appears: the
+            // §B.3 one-cleanup-per-first-packet rule leaves exactly one
+            // candidate index (the last multiple of 3 inside the
+            // contribution), and the first HT cleanup segment's length
+            // is required to exceed 1 (§B.3) while a placeholder pass
+            // carries no bytes at all, so a first length field of 0
+            // *is* a placeholder run and a first length field ≥ 2 *is*
+            // the cleanup segment. The two readings only differ in the
+            // Equation B-19 widening of the first field — the
+            // cleanup-candidate reading is never wider, so the prefix
+            // bits are read at the narrow width and the residual
+            // widening bits (which a placeholder run's zero field pads
+            // with zeros) are consumed after the fact.
+            match sub_band.ht_placeholder_passes[idx] {
+                Some(p0) => {
+                    let spans = ht_segment_spans(start_pass, passes, p0);
+                    read_lblock_increment(lblock, reader)?;
+                    let mut lens = Vec::with_capacity(spans.len());
+                    for sp in spans {
+                        lens.push(read_segment_length_value(lblock.lblock, sp, reader)?);
+                    }
+                    lens
+                }
+                None => {
+                    read_lblock_increment(lblock, reader)?;
+                    match ht_first_cleanup_candidate(start_pass, passes) {
+                        None => {
+                            // No multiple of 3 inside the contribution:
+                            // it can only extend the placeholder run —
+                            // one zero-length segment (§B.1).
+                            let len = read_segment_length_value(lblock.lblock, passes, reader)?;
+                            if len != 0 {
+                                return Err(Error::InvalidPacketHeader);
+                            }
+                            vec![0]
+                        }
+                        Some(cup) => {
+                            // Trial-read the first field at the
+                            // cleanup-candidate width.
+                            let span1 = cup - start_pass + 1;
+                            let narrow = segment_length_width(lblock.lblock, span1)?;
+                            let v = reader.read_bits(narrow)?;
+                            if v >= 2 {
+                                // First HT cleanup segment (covers the
+                                // placeholder run, if any, plus the
+                                // cleanup pass at index `cup` = 3·P0).
+                                sub_band.ht_placeholder_passes[idx] = Some(cup);
+                                let rem = start_pass + passes - 1 - cup;
+                                let mut lens = vec![v];
+                                if rem > 0 {
+                                    lens.push(read_segment_length_value(
+                                        lblock.lblock,
+                                        rem,
+                                        reader,
+                                    )?);
+                                }
+                                lens
+                            } else if v == 0 {
+                                // Placeholder run: the single field was
+                                // written at the span-`passes` width;
+                                // consume the residual low bits (all
+                                // zero for a zero length).
+                                let wide = segment_length_width(lblock.lblock, passes)?;
+                                if wide > narrow && reader.read_bits(wide - narrow)? != 0 {
+                                    return Err(Error::InvalidPacketHeader);
+                                }
+                                vec![0]
+                            } else {
+                                // A first HT cleanup segment of length 1
+                                // violates §B.3 under either reading.
+                                return Err(Error::InvalidPacketHeader);
+                            }
+                        }
+                    }
+                }
             }
-            lens
         }
     };
 
@@ -1204,11 +1314,15 @@ pub enum SegmentSplit {
     },
     /// T.814 §B.2 / §B.3 — the tile-component's code-blocks are HT
     /// code-blocks (SPcod bit 6). A contribution splits at the set-`T`
-    /// boundaries `{0, 2, 3, 5, 6, …}` over the absolute pass indices:
-    /// each HT cleanup pass is one codeword segment and each
-    /// SigProp (+ MagRef) pair is one refinement segment, so the
-    /// number of §B.10.7 lengths follows [`ht_segment_spans`] (each
-    /// widened by `⌊log2(passes in that segment)⌋` per Equation B-19).
+    /// boundaries `{3P0, 3P0+2, 3P0+3, 3P0+5, 3P0+6, …}` over the
+    /// absolute pass indices (anchored at the block's `3·P0` §B.1
+    /// placeholder passes): each HT cleanup pass is one codeword
+    /// segment and each SigProp (+ MagRef) pair is one refinement
+    /// segment, so the number of §B.10.7 lengths follows
+    /// [`ht_segment_spans`] (each widened by
+    /// `⌊log2(passes in that segment)⌋` per Equation B-19). `P0` is
+    /// pinned when the first HT cleanup pass appears (its segment
+    /// length exceeds 1 while a placeholder run's is 0, §B.3).
     Ht,
 }
 
@@ -2021,30 +2135,77 @@ mod tests {
         // T = ⋃ₖ ⌈3k/2⌉ = {0, 2, 3, 5, 6, 8, 9, 11, 12, …}: every index
         // except the SigProp passes (i ≡ 1 mod 3).
         let expect: Vec<u32> = vec![0, 2, 3, 5, 6, 8, 9, 11, 12];
-        let got: Vec<u32> = (0..=12).filter(|&i| ht_pass_ends_segment(i)).collect();
+        let got: Vec<u32> = (0..=12).filter(|&i| ht_pass_ends_segment(i, 0)).collect();
         assert_eq!(got, expect);
         // Cross-check against the closed form ⌈3k/2⌉ directly.
         let closed: Vec<u32> = (0..9u32).map(|k| (3 * k).div_ceil(2)).collect();
         assert_eq!(got, closed);
+        // With 3·P0 placeholder passes the whole set shifts by 3P0 and
+        // no boundary falls inside the placeholder run (§B.2).
+        let shifted: Vec<u32> = (0..=15).filter(|&i| ht_pass_ends_segment(i, 3)).collect();
+        let expect3: Vec<u32> = expect.iter().map(|&i| i + 3).collect();
+        assert_eq!(shifted, expect3);
     }
 
     #[test]
     fn ht_segment_spans_shapes() {
         // Z_blk = 1: the cleanup pass alone (§B.3 NOTE 1).
-        assert_eq!(ht_segment_spans(0, 1), vec![1]);
+        assert_eq!(ht_segment_spans(0, 1, 0), vec![1]);
         // Z_blk = 2: cleanup, then a SigProp-only refinement segment.
-        assert_eq!(ht_segment_spans(0, 2), vec![1, 1]);
+        assert_eq!(ht_segment_spans(0, 2, 0), vec![1, 1]);
         // Z_blk = 3: cleanup, then SigProp + MagRef in one segment.
-        assert_eq!(ht_segment_spans(0, 3), vec![1, 2]);
+        assert_eq!(ht_segment_spans(0, 3, 0), vec![1, 2]);
         // Refinement passes arriving in a later packet (layered): the
         // cursor starts past the cleanup.
-        assert_eq!(ht_segment_spans(1, 2), vec![2]);
-        assert_eq!(ht_segment_spans(2, 1), vec![1]);
+        assert_eq!(ht_segment_spans(1, 2, 0), vec![2]);
+        assert_eq!(ht_segment_spans(2, 1, 0), vec![1]);
         // A second HT set repeats the pattern (MULTIHT shape).
-        assert_eq!(ht_segment_spans(0, 6), vec![1, 2, 1, 2]);
-        assert_eq!(ht_segment_spans(3, 3), vec![1, 2]);
+        assert_eq!(ht_segment_spans(0, 6, 0), vec![1, 2, 1, 2]);
+        assert_eq!(ht_segment_spans(3, 3, 0), vec![1, 2]);
         // Empty contribution.
-        assert!(ht_segment_spans(4, 0).is_empty());
+        assert!(ht_segment_spans(4, 0, 0).is_empty());
+    }
+
+    #[test]
+    fn ht_segment_spans_with_placeholders() {
+        // One placeholder triple (P0 = 1): the first HT cleanup pass
+        // sits at absolute index 3 and the set-T boundaries shift by
+        // 3·P0 (§B.2). A contribution carrying the whole placeholder
+        // run plus the first HT set folds the placeholders into the
+        // cleanup segment (§B.1 — they contribute no bytes).
+        assert_eq!(ht_segment_spans(0, 6, 3), vec![4, 2]);
+        // The placeholder run alone has no set-T boundary — one
+        // segment ending at the last included pass.
+        assert_eq!(ht_segment_spans(0, 3, 3), vec![3]);
+        // The first HT set arriving after the placeholder packet.
+        assert_eq!(ht_segment_spans(3, 3, 3), vec![1, 2]);
+        // A second HT set under P0 = 1 (MULTIHT + placeholders).
+        assert_eq!(ht_segment_spans(6, 3, 3), vec![1, 2]);
+        // Mid-triple placeholder split across packets: the second
+        // chunk continues the run and then carries the cleanup pass.
+        assert_eq!(ht_segment_spans(0, 2, 3), vec![2]);
+        assert_eq!(ht_segment_spans(2, 2, 3), vec![2]);
+    }
+
+    #[test]
+    fn ht_first_cleanup_candidate_pins_p0() {
+        // First contribution shapes: the candidate is the last
+        // multiple of 3 inside the contribution.
+        assert_eq!(ht_first_cleanup_candidate(0, 1), Some(0));
+        assert_eq!(ht_first_cleanup_candidate(0, 2), Some(0));
+        assert_eq!(ht_first_cleanup_candidate(0, 3), Some(0));
+        // A placeholder triple followed by the first HT set.
+        assert_eq!(ht_first_cleanup_candidate(3, 3), Some(3));
+        assert_eq!(ht_first_cleanup_candidate(0, 6), Some(3));
+        // Placeholders + cleanup (+ SigProp) inside one contribution.
+        assert_eq!(ht_first_cleanup_candidate(0, 4), Some(3));
+        assert_eq!(ht_first_cleanup_candidate(0, 5), Some(3));
+        // No multiple of 3 inside the span: placeholder-run extension
+        // only.
+        assert_eq!(ht_first_cleanup_candidate(4, 1), None);
+        assert_eq!(ht_first_cleanup_candidate(4, 2), None);
+        assert_eq!(ht_first_cleanup_candidate(7, 1), None);
+        assert_eq!(ht_first_cleanup_candidate(0, 0), None);
     }
 
     #[test]

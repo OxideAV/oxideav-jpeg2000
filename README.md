@@ -178,11 +178,25 @@ What is implemented:
   contribution carries a refinement segment (`Z_blk = 3`) slices the
   cleanup and SigProp + MagRef lengths separately, and the block
   decoder records per-coefficient `Nb` (a refined sample carries one
-  more decoded plane) so the §E.1 reconstruction is exact. Currently
-  covers the SINGLEHT / HTONLY / single-HT-set case; the MULTIHT
-  (multiple HT sets per code-block, bit-plane skipping via zero-length
-  HT sets) and placeholder-pass (`P0 > 0`) variants are not yet
-  exercised. The long-standing small-block / high-energy /
+  more decoded plane) so the §E.1 reconstruction is exact. Beyond the
+  SINGLEHT / HTONLY case, **MULTIHT** codestreams (§8.3) decode: the
+  accumulated codeword segments group into per-set §B.1 cleanup /
+  refinement HT segments (a refinement segment split across packets is
+  concatenated), each set's `Z_blk` follows §B.3 (a zero-length
+  refinement segment demotes its SigProp / MagRef passes; a zero-length
+  cleanup segment marks a bit-plane-skip set), and the block decodes
+  from the **last** set whose cleanup segment is present — each set
+  re-codes the block one bit-plane finer, `S_blk = P + P0 + S_skip`.
+  **Placeholder passes** (§B.1, `P0 > 0`) are resolved with no side
+  channel: the §B.3 one-cleanup-per-first-packet rule leaves a single
+  candidate index for the first cleanup pass in a contribution, and the
+  required `Lcup > 1` (vs. a placeholder run's mandatory zero length)
+  pins `3·P0` from the first §B.10.7 length field, which then anchors
+  the set-`T` boundaries, the Equation B-19 widths and `S_blk`. (The
+  available opaque HTJ2K decoders are SINGLEHT-only and decline these
+  streams, so the MULTIHT shapes are validated against this crate's own
+  encoder plus spec-level unit tests of the split and the `P0`
+  pinning.) The long-standing small-block / high-energy /
   non-power-of-two decode divergence is **resolved**: differential
   tracing against this crate's own independently written HT *encoder*
   isolated it to the §7.3.4 / §7.3.6 first-line-pair interleave — when
@@ -358,12 +372,19 @@ relocation, component sub-sampling, per-component COC / QCC overrides
 **and the Annex H Maxshift ROI** (T.814 §A.5 — `Ccap15` bit 12 flags
 the RGN, `SPrgn` stays ≤ 37 by the lane bound; the available opaque
 HTJ2K decoders decline RGN so that shape is validated by this crate's
-own §H.1-honouring decoder); the Annex-D-only styles, quality layers
-and PCRD are cleanly rejected in combination. Validated bit-exact
-through this crate's own decoder and **byte-identical through two
-independent opaque HTJ2K decoders** (gray reversible at 0–3
-decomposition levels, the `Z_blk = 3` refinement shape, and the 9-7
-irreversible path).
+own §H.1-honouring decoder); the Annex-D-only styles and PCRD are
+cleanly rejected in combination. **Quality layers compose as
+MULTIHT**: with `layers > 1` each layer carries one §B.1 HT set per
+code-block (each set one magnitude bit-plane finer; sets before the
+last signal their unused refinement passes with a zero-length segment
+per §B.3 NOTE 3), a block too shallow for the early layers emits §B.1
+placeholder triples instead, and `Ccap15` bit 13 signals MULTIHT —
+decoded bit-exactly by this crate's own §B.1 / §B.3 set grouping (the
+opaque HTJ2K decoders are SINGLEHT-only). Validated bit-exact through
+this crate's own decoder and **byte-identical through two independent
+opaque HTJ2K decoders** (gray reversible at 0–3 decomposition levels,
+the `Z_blk = 3` refinement shape, and the 9-7 irreversible path —
+single-layer shapes; the decoders decline multi-layer HT).
 
 ### Not yet implemented
 
@@ -391,9 +412,11 @@ These surface a clean `Error::NotImplemented` rather than mis-decoding:
   for those two orders, so a non-power-of-two factor there is rejected.
   **CPRL** (§B.12.1.5) carries no such restriction and *is* decoded at
   any integer sub-sampling.
-- HTJ2K MULTIHT codestreams (more than one HT set per code-block) and
-  HT code-blocks that begin with placeholder passes (`P0 > 0`); the
-  SINGLEHT / single-HT-set HTJ2K path *is* decoded (see above).
+- HTJ2K MIXED-set codestreams (T.814 §8.2: `SPcod` bits 6 + 7 marking
+  a tile-component whose code-blocks are *individually* either HT or
+  T.800 Annex D blocks, distinguished only by trial decoding). The
+  HTONLY sets — including MULTIHT and placeholder passes — *are*
+  decoded (see above).
 
 ## Public API
 

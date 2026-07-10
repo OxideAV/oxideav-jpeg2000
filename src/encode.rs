@@ -574,6 +574,31 @@ struct EncodedBlock {
     /// cleanup segment (`Lcup` bytes) followed by the optional
     /// refinement segment, and `coding_passes` is `Z_blk`.
     ht_cleanup_len: Option<usize>,
+    /// `Some` for a T.814 **MULTIHT** HT code-block (quality layers):
+    /// `bytes` concatenates one HT cleanup segment per §B.1 HT set and
+    /// each layer carries one set (after the leading placeholder
+    /// layers). Mutually exclusive with `ht_cleanup_len`.
+    ht_multi: Option<HtMultiPlan>,
+}
+
+/// T.814 §B.1 MULTIHT emission plan for one HT code-block.
+///
+/// The block's quality-layer split is structural rather than
+/// rate-driven: layer `placeholder_layers + i` carries HT set `i`,
+/// whose cleanup pass re-codes the block one magnitude bit-plane finer
+/// than set `i − 1` (§B.3 — `S_blk` grows by one per set), and each of
+/// the first `placeholder_layers` layers carries a placeholder triple
+/// (three coding passes, one zero-length codeword segment) so that a
+/// shallow block's first real set still lands on the layer whose
+/// bit-plane depth it codes. Sets before the last signal their unused
+/// SigProp + MagRef passes with a zero-length refinement segment
+/// (§B.3 NOTE 3, `Z_blk = 1`).
+struct HtMultiPlan {
+    /// Leading layers that carry only a §B.1 placeholder triple.
+    placeholder_layers: u32,
+    /// Per-set HT cleanup segment length; `EncodedBlock::bytes`
+    /// concatenates the segments in set order.
+    cleanup_lens: Vec<usize>,
 }
 
 /// Linearised 5-3 synthesis of one interleaved level (T.800 §F.4.4
@@ -832,6 +857,7 @@ fn encode_code_block(
         ordinal: 0,
         reencode: None,
         ht_cleanup_len: None,
+        ht_multi: None,
     }))
 }
 
@@ -1493,16 +1519,19 @@ fn encode_core(
         return Err(Error::NotImplemented);
     }
     // T.814 Table A.4 / §8: the §D.6 / §D.4.2 styles do not apply to
-    // HT code-blocks, and the layer / PCRD machinery is
-    // Annex-D-pass based — reject the combinations rather than
-    // mis-encode. (The Annex H ROI *does* compose: §A.5 caps SPrgn at
-    // 37, which the magnitude-lane bound below already guarantees, and
-    // Ccap15 bit 12 flags the RGN presence.)
+    // HT code-blocks, and the PCRD machinery is Annex-D-pass based —
+    // reject the combinations rather than mis-encode. (The Annex H ROI
+    // *does* compose: §A.5 caps SPrgn at 37, which the magnitude-lane
+    // bound below already guarantees, and Ccap15 bit 12 flags the RGN
+    // presence.) Quality layers *do* compose with HT: each layer
+    // carries one §B.1 HT set per code-block (a MULTIHT codestream,
+    // with §B.1 placeholder passes aligning shallow blocks), built
+    // below — but not together with the ht_refinement segment shape.
     if params.high_throughput
         && (params.bypass
             || params.terminate_all
-            || params.layers != 1
-            || params.target_bytes.is_some())
+            || params.target_bytes.is_some()
+            || (params.layers != 1 && params.ht_refinement))
     {
         return Err(Error::NotImplemented);
     }
@@ -2030,32 +2059,81 @@ fn encode_core(
                                     let mag: Vec<u32> =
                                         targets.iter().map(|c| c.magnitude).collect();
                                     let sgn: Vec<bool> = targets.iter().map(|c| c.sign).collect();
-                                    let hb = crate::htenc::encode_ht_codeblock(
-                                        &mag,
-                                        &sgn,
-                                        bw,
-                                        bh,
-                                        params.ht_refinement,
-                                    )?;
-                                    ht_max_bits = ht_max_bits.max(planes - hb.beta);
-                                    let cleanup_len = hb.cleanup.len();
-                                    let z_blk = if hb.refinement.is_some() { 3 } else { 1 };
-                                    let mut bytes = hb.cleanup;
-                                    if let Some(r) = hb.refinement {
-                                        bytes.extend_from_slice(&r);
+                                    if layer_count > 1 {
+                                        // T.814 MULTIHT: one §B.1 HT set
+                                        // per quality layer, each set one
+                                        // magnitude bit-plane finer (the
+                                        // §B.3 S_blk grows by one per
+                                        // set); P = Mb − J anchors the
+                                        // final set at full precision
+                                        // (S_blk = Mb − 1). A block too
+                                        // shallow for the early layers
+                                        // fills them with placeholder
+                                        // triples instead of sets, and a
+                                        // band too shallow for the layer
+                                        // count simply stops
+                                        // contributing (J < L).
+                                        let j_eff = u32::from(layer_count).min(mb);
+                                        let k = j_eff.saturating_sub(planes);
+                                        let mut bytes = Vec::new();
+                                        let mut lens = Vec::with_capacity((j_eff - k) as usize);
+                                        for l in k..j_eff {
+                                            let shift = j_eff - 1 - l;
+                                            let mag_l: Vec<u32> =
+                                                mag.iter().map(|&m| m >> shift).collect();
+                                            let hb = crate::htenc::encode_ht_codeblock(
+                                                &mag_l, &sgn, bw, bh, false,
+                                            )?;
+                                            debug_assert_eq!(hb.beta, 0);
+                                            lens.push(hb.cleanup.len());
+                                            bytes.extend_from_slice(&hb.cleanup);
+                                        }
+                                        ht_max_bits = ht_max_bits.max(planes);
+                                        Some(EncodedBlock {
+                                            zero_bit_planes: mb - j_eff,
+                                            coding_passes: 3 * (j_eff - 1) + 1,
+                                            bytes,
+                                            pass_rates: Vec::new(),
+                                            pass_dist: Vec::new(),
+                                            d0: 0.0,
+                                            weight: 1.0,
+                                            ordinal: 0,
+                                            reencode: None,
+                                            ht_cleanup_len: None,
+                                            ht_multi: Some(HtMultiPlan {
+                                                placeholder_layers: k,
+                                                cleanup_lens: lens,
+                                            }),
+                                        })
+                                    } else {
+                                        let hb = crate::htenc::encode_ht_codeblock(
+                                            &mag,
+                                            &sgn,
+                                            bw,
+                                            bh,
+                                            params.ht_refinement,
+                                        )?;
+                                        ht_max_bits = ht_max_bits.max(planes - hb.beta);
+                                        let cleanup_len = hb.cleanup.len();
+                                        let z_blk = if hb.refinement.is_some() { 3 } else { 1 };
+                                        let mut bytes = hb.cleanup;
+                                        if let Some(r) = hb.refinement {
+                                            bytes.extend_from_slice(&r);
+                                        }
+                                        Some(EncodedBlock {
+                                            zero_bit_planes: mb - 1 - hb.beta,
+                                            coding_passes: z_blk,
+                                            bytes,
+                                            pass_rates: Vec::new(),
+                                            pass_dist: Vec::new(),
+                                            d0: 0.0,
+                                            weight: 1.0,
+                                            ordinal: 0,
+                                            reencode: None,
+                                            ht_cleanup_len: Some(cleanup_len),
+                                            ht_multi: None,
+                                        })
                                     }
-                                    Some(EncodedBlock {
-                                        zero_bit_planes: mb - 1 - hb.beta,
-                                        coding_passes: z_blk,
-                                        bytes,
-                                        pass_rates: Vec::new(),
-                                        pass_dist: Vec::new(),
-                                        d0: 0.0,
-                                        weight: 1.0,
-                                        ordinal: 0,
-                                        reencode: None,
-                                        ht_cleanup_len: Some(cleanup_len),
-                                    })
                                 }
                             } else {
                                 encode_code_block(
@@ -2251,6 +2329,45 @@ fn encode_core(
                     let cut = (enc.pass_rates[n_eff as usize - 1] as usize).min(enc.bytes.len());
                     enc.bytes[..cut].to_vec()
                 };
+                if let Some(hm) = &enc.ht_multi {
+                    // T.814 MULTIHT layout: layer ↦ HT set (or
+                    // placeholder triple) is fixed by the plan — no
+                    // rate-driven pass split. Placeholder layers signal
+                    // three coding passes with a single zero-length
+                    // codeword segment; each set layer signals its
+                    // cleanup segment (§B.2: one codeword segment for
+                    // the cleanup pass, covering the placeholder run
+                    // for the first set) plus, when the set is not the
+                    // block's last, a zero-length refinement segment
+                    // for its unused SigProp + MagRef passes.
+                    let k = hm.placeholder_layers as usize;
+                    let num_sets = hm.cleanup_lens.len();
+                    let mut per_layer: Vec<LayerShare> = Vec::with_capacity(layer_count as usize);
+                    let mut off = 0usize;
+                    for l in 0..layer_count as usize {
+                        if l < k {
+                            per_layer.push((3, 0..0, vec![(3, 0)]));
+                        } else if l < k + num_sets {
+                            let len = hm.cleanup_lens[l - k];
+                            let range = off..off + len;
+                            off += len;
+                            if l + 1 == k + num_sets {
+                                per_layer.push((1, range, vec![(1, len as u32)]));
+                            } else {
+                                per_layer.push((3, range, vec![(1, len as u32), (2, 0)]));
+                            }
+                        } else {
+                            per_layer.push((0, 0..0, Vec::new()));
+                        }
+                    }
+                    first_layers[sb_idx][bi] = 0;
+                    blocks.push(Some(LayeredBlock {
+                        zero_bit_planes: enc.zero_bit_planes,
+                        per_layer,
+                        bytes: seg,
+                    }));
+                    continue;
+                }
                 let total = seg.len();
                 // Cumulative byte boundary after each pass (index 0 is
                 // the segment start), clamped monotone with the final
@@ -2505,7 +2622,9 @@ fn encode_core(
         // CAP (T.814 §A.3): required for an HTJ2K codestream — Pcap
         // signals Part 15 (Pcap15, the 15th most-significant bit) and
         // Ccap15 describes the stream: bits 14-15 = 00 (HTONLY),
-        // bit 13 = 0 (SINGLEHT), bit 11 = 0
+        // bit 13 = SINGLEHT (0) or MULTIHT (1: with quality layers
+        // each code-block carries one §B.1 HT set per layer, so more
+        // than one HT set can be present, §A.3.3), bit 11 = 0
         // (HOMOGENEOUS), bit 12 = an RGN marker is present (§A.3.4;
         // §A.5's SPrgn ≤ 37 holds since the ROI lane bound keeps
         // s ≤ 15), bit 5 = HTIRV when any component codes HT blocks
@@ -2524,7 +2643,8 @@ fn encode_core(
             } else {
                 19 + (b - 27).div_ceil(4)
             };
-            let ccap15: u16 = (u16::from(params.roi.is_some()) << 12)
+            let ccap15: u16 = (u16::from(params.layers > 1) << 13)
+                | (u16::from(params.roi.is_some()) << 12)
                 | (u16::from(irrev) << 5)
                 | (p_bits as u16 & 0x1F);
             let mut cap_payload = Vec::with_capacity(6);
@@ -5687,8 +5807,9 @@ mod tests {
         }
     }
 
-    /// The Annex-D-only knobs (styles, layers, PCRD, ROI) are rejected
-    /// in combination with HT rather than mis-encoded.
+    /// The Annex-D-only knobs (styles, PCRD) are rejected in
+    /// combination with HT rather than mis-encoded, as is the
+    /// layers + ht_refinement segment-shape combination.
     #[test]
     fn ht_rejects_annex_d_only_combinations() {
         let p = noise(16, 16, 0x4854_0031);
@@ -5707,6 +5828,7 @@ mod tests {
             },
             EncodeParams {
                 layers: 2,
+                ht_refinement: true,
                 ..ht.clone()
             },
             EncodeParams {
@@ -5754,6 +5876,106 @@ mod tests {
             let (_, ccap15) = cap_marker(&stream).expect("CAP");
             assert_eq!(ccap15 & (1 << 12), 1 << 12, "Ccap15 RGN flag");
         }
+    }
+
+    // -- T.814 MULTIHT (quality layers over HT) ---------------------------
+
+    /// Quality layers compose with HT block coding as a T.814 MULTIHT
+    /// codestream: each layer carries one §B.1 HT set per code-block
+    /// (each set re-coding the block one magnitude bit-plane finer,
+    /// §B.3), the full decode stays bit-exact through this crate's own
+    /// §B.1 / §B.3 set grouping, and Ccap15 bit 13 signals MULTIHT.
+    #[test]
+    fn ht_multiht_layers_round_trip_with_signalling() {
+        let p = noise(64, 48, 0x4854_0051);
+        for layers in [2u16, 4, 7] {
+            let params = EncodeParams {
+                decomposition_levels: 2,
+                code_block_exp: (4, 4),
+                layers,
+                high_throughput: true,
+                ..EncodeParams::default()
+            };
+            let stream = roundtrip_params(&[&p], 64, 48, &params);
+            let header = crate::parse_j2k_header(&stream).expect("header");
+            assert_eq!(header.cod.layers, layers);
+            let (_, ccap15) = cap_marker(&stream).expect("CAP");
+            assert_eq!(ccap15 & (1 << 13), 1 << 13, "Ccap15 MULTIHT flag");
+        }
+    }
+
+    /// §B.1 placeholder passes: a block too shallow for the early
+    /// layers fills them with placeholder triples (three coding
+    /// passes, one zero-length codeword segment) so its first HT set
+    /// still lands on the layer whose bit-plane depth it codes. The
+    /// decoder pins `3·P0` from the first cleanup segment's length
+    /// (§B.3) and the round trip stays bit-exact.
+    #[test]
+    fn ht_multiht_placeholder_passes_round_trip() {
+        // Every block shallow: 2-bit magnitudes under 5 layers force a
+        // placeholder run in front of every code-block's first set.
+        let shallow: Vec<u8> = noise(48, 32, 0x4854_0061).iter().map(|&v| v & 3).collect();
+        let params = EncodeParams {
+            decomposition_levels: 1,
+            code_block_exp: (4, 4),
+            layers: 5,
+            high_throughput: true,
+            ..EncodeParams::default()
+        };
+        roundtrip_params(&[&shallow], 48, 32, &params);
+
+        // Mixed depth: a flat-ish half and a full-range half, so
+        // placeholder and non-placeholder blocks coexist in one
+        // precinct and the per-block `P0` state stays independent.
+        let full = noise(64, 32, 0x4854_0062);
+        let mut mixed = full.clone();
+        for y in 0..32usize {
+            for x in 0..32usize {
+                mixed[y * 64 + x] = full[y * 64 + x] & 3;
+            }
+        }
+        let params = EncodeParams {
+            decomposition_levels: 1,
+            code_block_exp: (4, 4),
+            layers: 6,
+            high_throughput: true,
+            ..EncodeParams::default()
+        };
+        roundtrip_params(&[&mixed], 64, 32, &params);
+    }
+
+    /// MULTIHT composes with RCT, precincts, position progression
+    /// orders, tiles and SOP / EPH framing.
+    #[test]
+    fn ht_multiht_composes_with_rct_tiles_and_orders() {
+        let r = noise(48, 40, 0x4854_0071);
+        let g = noise(48, 40, 0x4854_0072);
+        let b = noise(48, 40, 0x4854_0073);
+        let params = EncodeParams {
+            decomposition_levels: 2,
+            code_block_exp: (3, 3),
+            mct: true,
+            layers: 3,
+            progression: ProgressionOrder::Rlcp,
+            precincts: vec![0x22, 0x33, 0x33],
+            high_throughput: true,
+            ..EncodeParams::default()
+        };
+        roundtrip_params(&[&r, &g, &b], 48, 40, &params);
+
+        let params = EncodeParams {
+            decomposition_levels: 1,
+            code_block_exp: (4, 4),
+            mct: true,
+            layers: 4,
+            tile_size: Some((32, 32)),
+            progression: ProgressionOrder::Pcrl,
+            sop: true,
+            eph: true,
+            high_throughput: true,
+            ..EncodeParams::default()
+        };
+        roundtrip_params(&[&r, &g, &b], 48, 40, &params);
     }
 
     /// Odd, non-power-of-two dimensions run the HT block coder over

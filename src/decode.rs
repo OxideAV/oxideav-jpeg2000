@@ -495,6 +495,10 @@ struct BlockAccum {
     /// span splits — the count of passes accumulated by prior packets.
     /// Unused outside those splits.
     bypass_cursor: u32,
+    /// T.814 §B.1 placeholder-pass resolution (HT split only): `None`
+    /// while every accumulated pass is a placeholder pass, `Some(3·P0)`
+    /// once the first HT cleanup pass pinned the placeholder count.
+    ht_p0: Option<u32>,
 }
 
 /// One accumulated §C.3 codeword segment for a code-block.
@@ -508,6 +512,10 @@ struct AccumSegment {
     /// [`crate::t1::RawBitReader`] rather than an
     /// [`crate::mq::MqDecoder`]. Always `false` outside §D.6 bypass.
     is_raw: bool,
+    /// Absolute index of the segment's first coding pass. Only
+    /// meaningful for the T.814 HT split (the §B.3 set grouping keys
+    /// off pass positions); 0 elsewhere.
+    start_pass: u32,
 }
 
 /// Key addressing one code-block inside one tile:
@@ -1354,10 +1362,50 @@ fn decode_tile_from_plan(
                 // T.814 §B.2 / §B.3: recompute the set-T spans from the
                 // running absolute pass cursor (which carries across
                 // layers) — one accumulated segment per span, so the HT
-                // block decoder sees the cleanup segment and its
-                // following refinement segment as separate entries.
-                let spans =
-                    crate::packet::ht_segment_spans(entry.bypass_cursor, contrib.coding_passes);
+                // set grouping below sees each cleanup segment and each
+                // refinement segment as separate entries.
+                //
+                // The placeholder-pass resolution mirrors the packet
+                // reader's: while the first HT cleanup pass has not
+                // been seen, a contribution whose first signalled
+                // length is 0 extends the §B.1 placeholder run (one
+                // zero-length segment), and one whose first length is
+                // ≥ 2 carries the first cleanup pass at the unique
+                // candidate index, pinning `3·P0` (§B.3 — the first HT
+                // cleanup segment's length exceeds 1, a placeholder
+                // run's is 0).
+                let start_pass = entry.bypass_cursor;
+                let spans = match entry.ht_p0 {
+                    Some(p0) => {
+                        crate::packet::ht_segment_spans(start_pass, contrib.coding_passes, p0)
+                    }
+                    None => {
+                        let cup = crate::packet::ht_first_cleanup_candidate(
+                            start_pass,
+                            contrib.coding_passes,
+                        );
+                        let first_len = contrib.segment_lengths.first().copied().unwrap_or(0);
+                        match cup {
+                            Some(cup) if first_len >= 2 => {
+                                entry.ht_p0 = Some(cup);
+                                let rem = start_pass + contrib.coding_passes - 1 - cup;
+                                let mut s = vec![cup - start_pass + 1];
+                                if rem > 0 {
+                                    s.push(rem);
+                                }
+                                s
+                            }
+                            _ => {
+                                // Placeholder-run extension: exactly one
+                                // zero-length segment.
+                                if first_len != 0 {
+                                    return Err(Error::InvalidPacketHeader);
+                                }
+                                vec![contrib.coding_passes]
+                            }
+                        }
+                    }
+                };
                 if spans.len() != contrib.segment_lengths.len() {
                     return Err(Error::InvalidPacketHeader);
                 }
@@ -1365,6 +1413,7 @@ fn decode_tile_from_plan(
                     .bypass_cursor
                     .checked_add(contrib.coding_passes)
                     .ok_or(Error::InvalidPacketHeader)?;
+                let mut span_start = start_pass;
                 for (&len, span_passes) in contrib.segment_lengths.iter().zip(spans) {
                     let len = len as usize;
                     let end = seg_pos.checked_add(len).ok_or(Error::PacketHeaderOverrun)?;
@@ -1373,7 +1422,9 @@ fn decode_tile_from_plan(
                         bytes: bytes.to_vec(),
                         passes: span_passes,
                         is_raw: false,
+                        start_pass: span_start,
                     });
+                    span_start += span_passes;
                     seg_pos = end;
                 }
                 continue;
@@ -1402,6 +1453,7 @@ fn decode_tile_from_plan(
                         bytes: bytes.to_vec(),
                         passes: span_passes,
                         is_raw,
+                        start_pass: 0,
                     });
                     seg_pos = end;
                 }
@@ -1418,6 +1470,7 @@ fn decode_tile_from_plan(
                         bytes: Vec::new(),
                         passes: 0,
                         is_raw: false,
+                        start_pass: 0,
                     });
                 }
                 let seg = &mut entry.segments[0];
@@ -1448,6 +1501,7 @@ fn decode_tile_from_plan(
                         bytes: bytes.to_vec(),
                         passes: seg_passes,
                         is_raw: false,
+                        start_pass: 0,
                     });
                     seg_pos = end;
                 }
@@ -1521,41 +1575,107 @@ fn decode_tile_from_plan(
         // -- HTJ2K (T.814) HT code-block path --
         // When the tile-component signals HT block coding (SPcod bit 6),
         // every code-block is an HT code-block (§A.4 HTONLY/HTDECLARED).
-        // The §B.2 HT segments map onto the accumulated codeword
-        // segments: the first carries the HT cleanup pass; a following
-        // non-empty segment carries the HT refinement passes (SigProp +
-        // optional MagRef). `Z_blk` is the number of coding passes in
-        // the (single) HT set this decode processes, capped at 3.
+        // The accumulated codeword segments group into §B.1 HT sets:
+        // after the 3·P0 placeholder passes, set `j` covers the three
+        // coding passes at absolute indices `3P0+3j .. 3P0+3j+2`
+        // (cleanup, SigProp, MagRef; the last set may be shorter). Each
+        // set's HT cleanup segment is the codeword segment ending at
+        // its cleanup pass and its HT refinement segment concatenates
+        // the codeword segments covering its refinement passes (§B.3 —
+        // a layer boundary may cut between SigProp and MagRef).
         if params.high_throughput {
-            let cleanup = acc
-                .segments
-                .first()
-                .map(|s| s.bytes.as_slice())
-                .unwrap_or(&[]);
-            let refinement = acc
-                .segments
-                .get(1)
-                .map(|s| s.bytes.as_slice())
-                .unwrap_or(&[]);
-            // §B.3: Z_blk is the number of coding passes processed.
-            let z_blk = acc.passes.min(3) as u8;
-            // §B.3 S_blk for the first HT set: S_blk = P + P0 + S_skip,
-            // with P0 = S_skip = 0 for a single-HT-set code-block (the
-            // SINGLEHT case this round targets).
-            let s_blk = p;
-            #[cfg(test)]
-            let _ = ();
+            // A block whose passes never resolved a first HT cleanup
+            // pass carries only placeholder passes — no HT segments,
+            // all samples 0 (§7.1.1 with Z_blk = 0, §B.3 NOTE 4).
+            let Some(p0) = acc.ht_p0 else {
+                continue;
+            };
+            // Group the codeword segments into per-set cleanup /
+            // refinement HT segments. `p0` is a multiple of 3 by
+            // construction, so `last − p0` keys the set index and the
+            // in-set role: ≡ 0 (mod 3) ends a cleanup segment, else it
+            // ends (part of) the refinement segment of the same set.
+            let avail = acc.passes - p0;
+            let num_sets = avail.div_ceil(3) as usize;
+            let mut cleanup_seg: Vec<Vec<u8>> = vec![Vec::new(); num_sets];
+            let mut refine_seg: Vec<Vec<u8>> = vec![Vec::new(); num_sets];
+            for seg in &acc.segments {
+                if seg.passes == 0 {
+                    continue;
+                }
+                let seg_last = seg.start_pass + seg.passes - 1;
+                if seg_last < p0 {
+                    // Pure placeholder run — carries no bytes.
+                    if !seg.bytes.is_empty() {
+                        return Err(Error::InvalidPacketHeader);
+                    }
+                    continue;
+                }
+                let rel = seg_last - p0;
+                let set = (rel / 3) as usize;
+                if rel % 3 == 0 {
+                    cleanup_seg[set].extend_from_slice(&seg.bytes);
+                } else {
+                    refine_seg[set].extend_from_slice(&seg.bytes);
+                }
+            }
+            // §B.3 validity: the first HT cleanup segment must be
+            // longer than 1 byte; a later one is 0 (a bit-plane-skip
+            // set) or longer than 1; a refinement segment may only be
+            // non-empty when its set's cleanup segment is.
+            let mut chosen: Option<usize> = None;
+            for j in 0..num_sets {
+                let cl = cleanup_seg[j].len();
+                if cl == 1 || (j == 0 && cl == 0) {
+                    return Err(Error::InvalidPacketHeader);
+                }
+                if cl == 0 && !refine_seg[j].is_empty() {
+                    return Err(Error::InvalidPacketHeader);
+                }
+                if cl > 0 {
+                    chosen = Some(j);
+                }
+            }
+            // Every HT set re-codes the block one magnitude bit-plane
+            // finer than its predecessor (S_blk grows by one per §B.3),
+            // so the maximal-fidelity choice — and the one a
+            // single-set stream reduces to — is the last set whose
+            // cleanup segment is present.
+            let Some(j) = chosen else {
+                continue;
+            };
+            let passes_in_set = (avail - 3 * j as u32).min(3);
+            // §B.3: Z_blk = 1 when the cleanup segment is the only
+            // non-empty segment of the set (SigProp / MagRef passes
+            // tied to a zero-length refinement segment are not
+            // processed), the pass count of the set otherwise.
+            let z_blk = if refine_seg[j].is_empty() {
+                1
+            } else {
+                passes_in_set as u8
+            };
+            // §B.3: S_blk = P + P0 + S_skip.
+            let s_blk = p + p0 / 3 + j as u32;
+            if s_blk >= mb_coded {
+                // More skipped bit-planes than the sub-band has
+                // (Equation E-2) — the §7.6 output would not fit Mb.
+                return Err(Error::InvalidPacketHeader);
+            }
             let (mut block, nb_ht) = crate::ht::decode_ht_codeblock(
                 psb.orientation,
                 placement.width() as usize,
                 placement.height() as usize,
                 mb_coded,
-                cleanup,
-                refinement,
+                &cleanup_seg[j],
+                &refine_seg[j],
                 z_blk,
                 s_blk,
             )?;
-            block.set_zero_bit_planes(p);
+            // §7.6 Nb(u, v) = S_blk + 1 + z_n: the HT block decoder
+            // stores the per-sample `1 + z_n` part, the recorded base
+            // supplies the S_blk (the §B.10.5 P plus the placeholder /
+            // set-skip planes).
+            block.set_zero_bit_planes(s_blk);
             // §H.1 Maxshift de-scaling (no-op when s == 0).
             block.apply_roi_maxshift(mb, s);
             decoded.push(DecodedBlock {

@@ -18,6 +18,34 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+- **MULTIHT decode** (T.814 §B.1 / §B.3 / §8.3): HT code-blocks
+  carrying more than one HT set now decode — the accumulated codeword
+  segments group into per-set cleanup / refinement HT segments
+  (concatenating a refinement segment split across packets), each
+  set's `Z_blk` follows the §B.3 definition (a zero-length refinement
+  segment demotes its SigProp / MagRef passes, a zero-length cleanup
+  segment marks a bit-plane-skip set), and the decoder processes the
+  **last** set whose cleanup segment is present with
+  `S_blk = P + P0 + S_skip`.
+- **Placeholder passes** (T.814 §B.1, `P0 > 0`): the packet reader
+  and the decode driver resolve the `3·P0` leading placeholder passes
+  without any side channel — the §B.3 one-cleanup-per-first-packet
+  rule leaves exactly one candidate index for the first HT cleanup
+  pass inside a contribution, and its required `Lcup > 1` (against a
+  placeholder run's mandatory zero length) pins `P0` from the first
+  length field. Set-`T` codeword-segment boundaries, the §B.10.7.2
+  length widths and `S_blk` all honour the placeholder offset.
+- **MULTIHT encode**: `EncodeParams::layers > 1` now composes with
+  `high_throughput` — each quality layer carries one HT set per
+  code-block (each set re-coding the block one magnitude bit-plane
+  finer, sets before the last signalling their unused refinement
+  passes with a zero-length segment per §B.3 NOTE 3), blocks too
+  shallow for the early layers emit placeholder triples, and `Ccap15`
+  bit 13 signals MULTIHT. Full decodes stay bit-exact through this
+  crate's decoder. The available opaque HTJ2K decoders decline
+  multi-layer HT codestreams outright (SINGLEHT-only), so the MULTIHT
+  shape is validated by this crate's own §B.1 / §B.3 set grouping
+  plus spec-level unit tests of the segment split and `P0` pinning.
 - JPH file format (T.814 Annex D): the `'jph '` brand
   (`jp2::BRAND_JPH`, `Ftyp::is_jph_compatible`), the §D.2 exemption
   letting a JPH header omit the Colour Specification box when
