@@ -2208,6 +2208,159 @@ mod tests {
         assert_eq!(ht_first_cleanup_candidate(0, 0), None);
     }
 
+    /// MULTIHT + placeholder packet headers round-trip through the
+    /// writer / reader pair: the reader pins `3·P0` from the first
+    /// non-zero length field (§B.3) and re-derives the same set-`T`
+    /// spans — including the trial read whose first field is narrower
+    /// than a placeholder run's (Equation B-19).
+    #[test]
+    fn packet_header_ht_placeholders_and_sets_round_trip() {
+        let geom = SubBandGeometry {
+            width: 2,
+            height: 1,
+        };
+        // Block 0 spends layer 0 on a placeholder triple (P0 = 1);
+        // block 1 starts its first HT set immediately. Both then carry
+        // one HT set per layer (zero-length refinement on non-final
+        // sets, §B.3 NOTE 3).
+        type Shape = (u32, Vec<(u32, u32)>);
+        let shapes: [[Shape; 2]; 3] = [
+            [(3, vec![(3, 0)]), (3, vec![(1, 7), (2, 0)])],
+            [(3, vec![(1, 5), (2, 0)]), (3, vec![(1, 9), (2, 4)])],
+            [(1, vec![(1, 11)]), (1, vec![(1, 6)])],
+        ];
+        let zbp = vec![1u32, 0];
+        let mut enc = PrecinctEncoderState::new(&[(geom, vec![0u32, 0], zbp.clone())]);
+        let headers: Vec<Vec<u8>> = shapes
+            .iter()
+            .enumerate()
+            .map(|(l, row)| {
+                let plans: Vec<CodeBlockPlan> = row
+                    .iter()
+                    .zip(zbp.iter())
+                    .map(|((passes, segs), &p)| CodeBlockPlan {
+                        included: true,
+                        zero_bit_planes: p,
+                        coding_passes: *passes,
+                        segments: segs.clone(),
+                    })
+                    .collect();
+                encode_packet_header(&mut enc, l as u16, &plans)
+            })
+            .collect();
+
+        let mut dec = PrecinctState::new();
+        for (l, hb) in headers.iter().enumerate() {
+            let geometry = PacketGeometry {
+                sub_bands: vec![geom],
+                layer: l as u16,
+            };
+            let hdr =
+                decode_packet_header(hb, &geometry, &mut dec, SopEphMode::None, SegmentSplit::Ht)
+                    .unwrap();
+            for (b, c) in hdr.contributions.iter().enumerate() {
+                assert!(c.included, "layer {l} block {b}");
+                assert_eq!(c.coding_passes, shapes[l][b].0, "layer {l} block {b}");
+                let want: Vec<u32> = shapes[l][b].1.iter().map(|s| s.1).collect();
+                assert_eq!(c.segment_lengths, want, "layer {l} block {b}");
+            }
+        }
+        // The placeholder count resolved where the first cleanup
+        // segment appeared: pass 3 for block 0, pass 0 for block 1.
+        assert_eq!(
+            dec.sub_bands[0].ht_placeholder_passes,
+            vec![Some(3), Some(0)]
+        );
+    }
+
+    /// A bit-plane-skip HT set (§B.3 NOTE 2: zero-length cleanup +
+    /// refinement segments) and a refinement segment split across
+    /// packets (§B.3: SigProp and MagRef may land in different layers)
+    /// both round-trip.
+    #[test]
+    fn packet_header_ht_skip_set_and_split_refinement_round_trip() {
+        let geom = SubBandGeometry {
+            width: 1,
+            height: 1,
+        };
+        // L0: set-0 cleanup; L1: set-0 SigProp alone; L2: set-0 MagRef
+        // alone; L3: a whole skip set (three passes, both segments
+        // zero-length); L4: set-2 cleanup.
+        type Shape = (u32, Vec<(u32, u32)>);
+        let shapes: [Shape; 5] = [
+            (1, vec![(1, 8)]),
+            (1, vec![(1, 3)]),
+            (1, vec![(1, 2)]),
+            (3, vec![(1, 0), (2, 0)]),
+            (1, vec![(1, 13)]),
+        ];
+        let mut enc = PrecinctEncoderState::new(&[(geom, vec![0u32], vec![4u32])]);
+        let headers: Vec<Vec<u8>> = shapes
+            .iter()
+            .enumerate()
+            .map(|(l, (passes, segs))| {
+                encode_packet_header(
+                    &mut enc,
+                    l as u16,
+                    &[CodeBlockPlan {
+                        included: true,
+                        zero_bit_planes: 4,
+                        coding_passes: *passes,
+                        segments: segs.clone(),
+                    }],
+                )
+            })
+            .collect();
+        let mut dec = PrecinctState::new();
+        for (l, hb) in headers.iter().enumerate() {
+            let geometry = PacketGeometry {
+                sub_bands: vec![geom],
+                layer: l as u16,
+            };
+            let hdr =
+                decode_packet_header(hb, &geometry, &mut dec, SopEphMode::None, SegmentSplit::Ht)
+                    .unwrap();
+            let c = &hdr.contributions[0];
+            assert_eq!(c.coding_passes, shapes[l].0, "layer {l}");
+            let want: Vec<u32> = shapes[l].1.iter().map(|s| s.1).collect();
+            assert_eq!(c.segment_lengths, want, "layer {l}");
+        }
+    }
+
+    /// A placeholder run whose first length field is non-zero is not a
+    /// legal reading under either §B.3 interpretation (a first HT
+    /// cleanup segment of length 1 is barred, and a placeholder run
+    /// carries no bytes) — the reader rejects rather than desyncs.
+    #[test]
+    fn packet_header_ht_length_one_first_segment_rejected() {
+        let geom = SubBandGeometry {
+            width: 1,
+            height: 1,
+        };
+        // Write a contribution shaped like a first HT set whose
+        // cleanup length is 1.
+        let mut enc = PrecinctEncoderState::new(&[(geom, vec![0u32], vec![0u32])]);
+        let hb = encode_packet_header(
+            &mut enc,
+            0,
+            &[CodeBlockPlan {
+                included: true,
+                zero_bit_planes: 0,
+                coding_passes: 3,
+                segments: vec![(1, 1), (2, 0)],
+            }],
+        );
+        let geometry = PacketGeometry {
+            sub_bands: vec![geom],
+            layer: 0,
+        };
+        let mut dec = PrecinctState::new();
+        assert!(
+            decode_packet_header(&hb, &geometry, &mut dec, SopEphMode::None, SegmentSplit::Ht,)
+                .is_err()
+        );
+    }
+
     #[test]
     fn bypass_segment_spans_default_schedule() {
         // 14 passes from a fresh code-block: the AC region (10 passes,

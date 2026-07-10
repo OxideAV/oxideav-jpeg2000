@@ -5944,6 +5944,102 @@ mod tests {
         roundtrip_params(&[&mixed], 64, 32, &params);
     }
 
+    /// A hand-assembled MULTIHT codestream with a **bit-plane-skip HT
+    /// set** (§B.3 NOTE 2) decodes from the last non-empty set: 8×8
+    /// gray, NL = 0, three layers carrying set 0 (two planes coarse),
+    /// a skip set (all zero-length segments), and set 2 (full
+    /// precision) — with set 0's unused refinement passes riding the
+    /// skip-set contribution. The decoder must pick set 2 with
+    /// `S_blk = P + S_skip = P + 2` and reconstruct bit-exactly.
+    #[test]
+    fn ht_multiht_skip_set_decodes_last_set() {
+        use crate::packet::{
+            encode_packet_header, CodeBlockPlan, PrecinctEncoderState, SubBandGeometry,
+        };
+        let pixels = noise(8, 8, 0x4854_0081);
+        // NL = 0: the single LL band holds the DC-shifted pixels
+        // (T.800 §G.1.2), reversible, unquantized. Mb = G + ε − 1 =
+        // 2 + 8 − 1 = 9; the final set at S_blk = Mb − 1 = 8 needs
+        // P = Mb − 3 = 6 under S_skip = 2.
+        let mb = 9u32;
+        let p_signalled = mb - 3;
+        let mag: Vec<u32> = pixels
+            .iter()
+            .map(|&v| (i32::from(v) - 128).unsigned_abs())
+            .collect();
+        let sgn: Vec<bool> = pixels.iter().map(|&v| i32::from(v) < 128).collect();
+        let coarse: Vec<u32> = mag.iter().map(|&m| m >> 2).collect();
+        let set0 = crate::htenc::encode_ht_codeblock(&coarse, &sgn, 8, 8, false).unwrap();
+        let set2 = crate::htenc::encode_ht_codeblock(&mag, &sgn, 8, 8, false).unwrap();
+
+        // Three LRCP packets over the one-block precinct.
+        let geom = SubBandGeometry {
+            width: 1,
+            height: 1,
+        };
+        let mut st = PrecinctEncoderState::new(&[(geom, vec![0u32], vec![p_signalled])]);
+        let plan = |passes: u32, segments: Vec<(u32, u32)>| CodeBlockPlan {
+            included: true,
+            zero_bit_planes: p_signalled,
+            coding_passes: passes,
+            segments,
+        };
+        // L0: set-0 cleanup. L1: set 0's unused SigProp + MagRef
+        // (zero-length refinement) then the whole skip set. L2: set-2
+        // cleanup.
+        type LayerShape<'a> = (u32, Vec<(u32, u32)>, &'a [u8]);
+        let shapes: [LayerShape<'_>; 3] = [
+            (1, vec![(1, set0.cleanup.len() as u32)], &set0.cleanup),
+            (5, vec![(2, 0), (1, 0), (2, 0)], &[]),
+            (1, vec![(1, set2.cleanup.len() as u32)], &set2.cleanup),
+        ];
+        let mut body = Vec::new();
+        for (l, (passes, segs, data)) in shapes.iter().enumerate() {
+            body.extend_from_slice(&encode_packet_header(
+                &mut st,
+                l as u16,
+                &[plan(*passes, segs.clone())],
+            ));
+            body.extend_from_slice(data);
+        }
+
+        // Main header (T.800 Annex A / T.814 Annex A).
+        let mut out = Vec::new();
+        out.extend_from_slice(&crate::MARKER_SOC.to_be_bytes());
+        let mut siz = Vec::new();
+        siz.extend_from_slice(&0x4000u16.to_be_bytes()); // Rsiz bit 14
+        for v in [8u32, 8, 0, 0, 8, 8, 0, 0] {
+            siz.extend_from_slice(&v.to_be_bytes());
+        }
+        siz.extend_from_slice(&1u16.to_be_bytes()); // Csiz
+        siz.extend_from_slice(&[7, 1, 1]); // Ssiz (8-bit), XRsiz, YRsiz
+        push_segment(&mut out, MARKER_SIZ, &siz);
+        let mut cap = Vec::new();
+        cap.extend_from_slice(&(1u32 << (32 - 15)).to_be_bytes());
+        cap.extend_from_slice(&(1u16 << 13).to_be_bytes()); // MULTIHT
+        push_segment(&mut out, crate::MARKER_CAP, &cap);
+        // COD: LRCP, 3 layers, no MCT; NL = 0, 8×8 blocks, style
+        // bit 6 (HT), 5-3 kernel.
+        push_segment(&mut out, MARKER_COD, &[0, 0, 0, 3, 0, 0, 1, 1, 0x40, 1]);
+        // QCD: no quantization (Table A.28 style 0), 2 guard bits,
+        // ε = 8 for the lone LL band.
+        push_segment(&mut out, MARKER_QCD, &[0x40, 8 << 3]);
+        // One tile-part.
+        let psot = 12 + 2 + body.len() as u32;
+        let mut sot = Vec::new();
+        sot.extend_from_slice(&0u16.to_be_bytes()); // Isot
+        sot.extend_from_slice(&psot.to_be_bytes());
+        sot.extend_from_slice(&[0, 1]); // TPsot, TNsot
+        push_segment(&mut out, crate::MARKER_SOT, &sot);
+        out.extend_from_slice(&crate::MARKER_SOD.to_be_bytes());
+        out.extend_from_slice(&body);
+        out.extend_from_slice(&crate::MARKER_EOC.to_be_bytes());
+
+        let img = decode_j2k(&out).expect("MULTIHT skip-set decode");
+        let want: Vec<i32> = pixels.iter().map(|&v| i32::from(v)).collect();
+        assert_eq!(img.components[0].samples, want, "last set is bit-exact");
+    }
+
     /// MULTIHT composes with RCT, precincts, position progression
     /// orders, tiles and SOP / EPH framing.
     #[test]

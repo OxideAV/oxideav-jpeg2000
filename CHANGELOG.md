@@ -45,7 +45,12 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
   crate's decoder. The available opaque HTJ2K decoders decline
   multi-layer HT codestreams outright (SINGLEHT-only), so the MULTIHT
   shape is validated by this crate's own §B.1 / §B.3 set grouping
-  plus spec-level unit tests of the segment split and `P0` pinning.
+  plus spec-level unit tests of the segment split and `P0` pinning,
+  packet-header writer / reader round-trips of the placeholder,
+  skip-set and split-refinement shapes, and a hand-assembled
+  three-layer codestream whose middle HT set is a §B.3 NOTE 2
+  bit-plane skip (the decoder picks the last non-empty set,
+  bit-exactly).
 - JPH file format (T.814 Annex D): the `'jph '` brand
   (`jp2::BRAND_JPH`, `Ftyp::is_jph_compatible`), the §D.2 exemption
   letting a JPH header omit the Colour Specification box when
