@@ -24,6 +24,21 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+- **ISO/IEC 15444-4-style conformance corpus across the C.1 ATS axes.**
+  Twelve new real-encoder fixtures pin previously-untested decode
+  surfaces: non-zero SIZ image offsets on the 5-3 *and* 9-7 paths plus
+  a combined image-offset + tile-offset 32×24-tile grid (Equations
+  B-1/B-7 reference-grid anchoring), tile-parts split on the layer
+  axis, PLT and TLM pointer markers, MCT-off RGB, signed 8-bit and
+  12-bit and unsigned 16-bit components, all-component XRsiz = 2
+  sub-sampling (pinned byte-exact against §B.2.6 PGX reference
+  decodes with a PGX parser in the harness), and a black-box-encoded
+  JP2 container. A 44-case sweep over the same encoder additionally
+  covers guard-bit extremes, PSNR-driven layers, derived tile-part
+  divisions and 4-bit depth: every reversible case decodes
+  pixel-exact and every 9-7 case sits at peak ≤ 1 vs the reference
+  (16-bit 9-7: the two independent references disagree by up to ±3
+  with each other; this decoder stays within ±1 of the closer one).
 - **Whole-codestream HTJ2K depth on real HT codestreams.** A 46-case
   black-box sweep (both kernels; LRCP/RLCP/RPCL/PCRL/CPRL; precinct and
   code-block shapes; multi-tile grids with ragged edges; non-zero SIZ

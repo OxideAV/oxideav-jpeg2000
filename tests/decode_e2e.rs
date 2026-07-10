@@ -2069,3 +2069,314 @@ fn mixed_annex_d_styles_per_component_reconstruct() {
         "bypass+termall component"
     );
 }
+
+// ---------------------------------------------------------------------------
+// ISO/IEC 15444-4-style conformance-corpus depth (round 410): fixtures
+// from a real black-box encoder covering C.1 ATS axes the committed
+// corpus did not yet pin — non-zero SIZ image/tile offsets, tile-parts
+// split by layer, PLT / TLM pointer markers, MCT-off RGB, signed and
+// deep bit depths, reference-grid component sub-sampling, and the JP2
+// container. Lossless fixtures assert pixel-exactness against the
+// regenerated source raster; the 9-7 offset fixture asserts
+// byte-exactness against a committed reference decode (two independent
+// black-box decoders agree byte-for-byte on it). COM markers scrubbed.
+// ---------------------------------------------------------------------------
+
+const GRAY_OFF31_53: &[u8] = include_bytes!("data/gray-33x29-off31-53.j2k");
+const GRAY_OFF31_97: &[u8] = include_bytes!("data/gray-33x29-off31-97.j2k");
+const GRAY_OFF31_97_REF_PGX: &[u8] = include_bytes!("data/gray-33x29-off31-97-ref.pgx");
+const GRAY_OFFTILED_53: &[u8] = include_bytes!("data/gray-96x80-offtiled-53.j2k");
+const GRAY_TP_LAYERS_53: &[u8] = include_bytes!("data/gray-64x64-tp-layers-53.j2k");
+const GRAY_PLT_53: &[u8] = include_bytes!("data/gray-64x64-plt-53.j2k");
+const GRAY_TLM_53: &[u8] = include_bytes!("data/gray-96x80-tlm-53.j2k");
+const RGB_MCT0_53: &[u8] = include_bytes!("data/rgb-48x32-mct0-53.j2k");
+const GRAY_S8_53: &[u8] = include_bytes!("data/gray-32x32-s8-53.j2k");
+const GRAY_S12_53: &[u8] = include_bytes!("data/gray-32x32-s12-53.j2k");
+const GRAY_U16_53: &[u8] = include_bytes!("data/gray-32x32-u16-53.j2k");
+const RGB_SUB21_53: &[u8] = include_bytes!("data/rgb-95x48-sub21-53.j2k");
+const RGB_SUB21_REF0_PGX: &[u8] = include_bytes!("data/rgb-95x48-sub21-53-ref0.pgx");
+const RGB_SUB21_REF1_PGX: &[u8] = include_bytes!("data/rgb-95x48-sub21-53-ref1.pgx");
+const RGB_SUB21_REF2_PGX: &[u8] = include_bytes!("data/rgb-95x48-sub21-53-ref2.pgx");
+const RGB_JP2: &[u8] = include_bytes!("data/rgb-48x32.jp2");
+
+/// The deterministic gray gradient the offset / pointer-marker / PLT /
+/// TLM fixtures were encoded from, at an arbitrary size.
+fn gray_pattern(w: i32, h: i32) -> Vec<i32> {
+    let mut out = Vec::with_capacity((w * h) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            out.push((x * 7 + y * 13 + (x * y) % 31) % 256);
+        }
+    }
+    out
+}
+
+/// Minimal ISO/IEC 15444-4 §B.2.6 PGX reference-image parser (the
+/// conformance suite's reference format): `PG ML [+|-]depth w h\n`
+/// header, big-endian samples, 1 byte per sample up to depth 8, 2
+/// bytes up to 16, sign-extended two's complement when signed.
+fn pgx_payload(bytes: &[u8]) -> (bool, u32, usize, usize, Vec<i32>) {
+    let nl = bytes
+        .iter()
+        .position(|&b| b == b'\n')
+        .expect("PGX header newline");
+    let header = std::str::from_utf8(&bytes[..nl]).expect("PGX header utf8");
+    let mut toks = header.split_whitespace();
+    assert_eq!(toks.next(), Some("PG"));
+    assert_eq!(toks.next(), Some("ML"));
+    // The sign may be fused with the depth ("+8") or separate ("+ 8").
+    let t = toks.next().expect("depth token");
+    let (signed, depth): (bool, u32) = if t == "+" || t == "-" {
+        (
+            t == "-",
+            toks.next().expect("depth").parse().expect("depth"),
+        )
+    } else {
+        let signed = t.starts_with('-');
+        (
+            signed,
+            t.trim_start_matches(['+', '-']).parse().expect("depth"),
+        )
+    };
+    let w: usize = toks.next().expect("width").parse().expect("width");
+    let h: usize = toks.next().expect("height").parse().expect("height");
+    let raw = &bytes[nl + 1..];
+    let mut vals = Vec::with_capacity(w * h);
+    if depth <= 8 {
+        for &b in &raw[..w * h] {
+            vals.push(if signed {
+                i32::from(b as i8)
+            } else {
+                i32::from(b)
+            });
+        }
+    } else {
+        for p in raw[..2 * w * h].chunks_exact(2) {
+            let u = u16::from_be_bytes([p[0], p[1]]);
+            vals.push(if signed {
+                i32::from(u as i16)
+            } else {
+                i32::from(u)
+            });
+        }
+    }
+    (signed, depth, w, h, vals)
+}
+
+/// §B.2 non-zero image origin: `XOsiz = 3`, `YOsiz = 1` on a 33×29
+/// gray raster (lossless 5-3, NL = 2). Equations B-1/B-12 anchor every
+/// tile-component region (and the DWT parity) at the offset origin, so
+/// pixel-exactness pins the whole reference-grid anchoring chain.
+#[test]
+fn gray_53_image_offset_is_pixel_exact() {
+    let cs = parse_codestream(GRAY_OFF31_53).expect("parse");
+    assert_eq!((cs.header.siz.x_offset, cs.header.siz.y_offset), (3, 1));
+    let img = decode_j2k(GRAY_OFF31_53).expect("decode offset stream");
+    assert_eq!((img.width, img.height), (33, 29));
+    assert_eq!(img.components[0].samples, gray_pattern(33, 29));
+}
+
+/// The same offset geometry through the 9-7 irreversible path, pinned
+/// byte-exact against a committed §B.2.6 PGX reference decode (both
+/// independent black-box decoders reconstruct this stream
+/// identically).
+#[test]
+fn gray_97_image_offset_matches_black_box_reference() {
+    let (signed, depth, rw, rh, refv) = pgx_payload(GRAY_OFF31_97_REF_PGX);
+    assert!(!signed);
+    assert_eq!(depth, 8);
+    assert_eq!((rw, rh), (33, 29));
+    let img = decode_j2k(GRAY_OFF31_97).expect("decode 9-7 offset stream");
+    assert_eq!(img.components[0].samples, refv);
+}
+
+/// Image origin offset (5, 5) *and* tile origin offset (2, 3) with a
+/// 32×24 tile grid over 96×80: the §B.3 / Equation B-7 tile partition
+/// anchors at `XTOsiz`, the first tile row/column is cropped by the
+/// image origin, and every tile decodes on its absolute-parity grid.
+#[test]
+fn gray_53_image_and_tile_offsets_with_tiles_is_pixel_exact() {
+    let cs = parse_codestream(GRAY_OFFTILED_53).expect("parse");
+    assert_eq!((cs.header.siz.x_offset, cs.header.siz.y_offset), (5, 5));
+    assert_eq!(
+        (cs.header.siz.tile_x_offset, cs.header.siz.tile_y_offset),
+        (2, 3)
+    );
+    assert!(cs.tile_parts.len() > 1, "expected a multi-tile grid");
+    let img = decode_j2k(GRAY_OFFTILED_53).expect("decode offset+tiled stream");
+    assert_eq!((img.width, img.height), (96, 80));
+    assert_eq!(img.components[0].samples, gray_pattern(96, 80));
+}
+
+/// §A.4.2 tile-parts split on the *layer* axis (`TPsot` 0, 1, 2 for
+/// one tile): three quality layers, each layer's packets in their own
+/// tile-part. The SOT walk must chain the parts in `TPsot` order and
+/// the final (lossless) layer must land pixel-exact.
+#[test]
+fn gray_53_tile_parts_by_layer_is_pixel_exact() {
+    let cs = parse_codestream(GRAY_TP_LAYERS_53).expect("parse");
+    assert!(cs.header.cod.layers >= 3, "fixture must carry 3 layers");
+    assert!(
+        cs.tile_parts.iter().any(|tp| tp.sot.tile_part_index > 0),
+        "fixture must carry TPsot > 0 tile-parts"
+    );
+    let img = decode_j2k(GRAY_TP_LAYERS_53).expect("decode layer-split tile-parts");
+    assert_eq!(img.components[0].samples, gray_pattern(64, 64));
+}
+
+/// §A.7.3 PLT (packet-length, tile-part header) pointer marker: the
+/// tile-part header carries packet lengths the decoder does not need
+/// but must parse-and-carry without desynchronising the header walk.
+#[test]
+fn gray_53_plt_pointer_marker_is_pixel_exact() {
+    let cs = parse_codestream(GRAY_PLT_53).expect("parse");
+    assert!(
+        cs.tile_parts.iter().any(|tp| tp
+            .markers
+            .iter()
+            .any(|m| matches!(m, oxideav_jpeg2000::TilePartMarker::Plt(_)))),
+        "fixture must carry a PLT marker"
+    );
+    let img = decode_j2k(GRAY_PLT_53).expect("decode PLT stream");
+    assert_eq!(img.components[0].samples, gray_pattern(64, 64));
+}
+
+/// §A.7.1 TLM (tile-part length, main header) pointer marker over a
+/// 48×40 tile grid: the main header announces every tile-part length
+/// up front; the sequential SOT walk must agree with it.
+#[test]
+fn gray_53_tlm_pointer_marker_with_tiles_is_pixel_exact() {
+    let img = decode_j2k(GRAY_TLM_53).expect("decode TLM stream");
+    assert_eq!((img.width, img.height), (96, 80));
+    assert_eq!(img.components[0].samples, gray_pattern(96, 80));
+}
+
+/// Three-component RGB with the MCT explicitly OFF (`SGcod` MCT = 0):
+/// each plane codes independently through the reversible path — no
+/// §G.2 RCT on decode.
+#[test]
+fn rgb_53_mct_off_is_pixel_exact() {
+    let cs = parse_codestream(RGB_MCT0_53).expect("parse");
+    assert_eq!(cs.header.cod.multi_component_transform, 0);
+    let img = decode_j2k(RGB_MCT0_53).expect("decode MCT-off RGB");
+    assert_eq!(img.components.len(), 3);
+    let want: [Vec<i32>; 3] = {
+        let (w, h) = (48i32, 32i32);
+        let mut r = Vec::new();
+        let mut g = Vec::new();
+        let mut b = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                r.push((x * 5 + y * 11) % 256);
+                g.push((x * 9 + y * 3) % 256);
+                b.push((x * 2 + y * 7) % 256);
+            }
+        }
+        [r, g, b]
+    };
+    for (c, exp) in img.components.iter().zip(want.iter()) {
+        assert_eq!(&c.samples, exp);
+    }
+}
+
+/// Signed 8-bit samples (SIZ `Ssiz` sign bit set): no DC level shift
+/// on decode (§G.1.2 applies only to unsigned components), two's
+/// complement range −128..=127 reproduced exactly.
+#[test]
+fn gray_53_signed_8bit_is_pixel_exact() {
+    let cs = parse_codestream(GRAY_S8_53).expect("parse");
+    assert!(cs.header.siz.components[0].is_signed);
+    let img = decode_j2k(GRAY_S8_53).expect("decode signed 8-bit");
+    let c = &img.components[0];
+    assert!(c.is_signed);
+    assert_eq!(c.precision_bits, 8);
+    let want: Vec<i32> = gray_pattern(32, 32).iter().map(|&v| v - 128).collect();
+    assert_eq!(c.samples, want);
+}
+
+/// Signed 12-bit samples: the deep signed lane (range −2048..=2047)
+/// through the reversible path.
+#[test]
+fn gray_53_signed_12bit_is_pixel_exact() {
+    let img = decode_j2k(GRAY_S12_53).expect("decode signed 12-bit");
+    let c = &img.components[0];
+    assert!(c.is_signed);
+    assert_eq!(c.precision_bits, 12);
+    let (w, h) = (32i32, 32i32);
+    let mut want = Vec::new();
+    for y in 0..h {
+        for x in 0..w {
+            want.push((x * 31 + y * 17 + (x * y) % 211) % 4096 - 2048);
+        }
+    }
+    assert_eq!(c.samples, want);
+}
+
+/// Unsigned 16-bit samples through the reversible path (full-depth
+/// magnitude lane + 16-bit output surface).
+#[test]
+fn gray_53_unsigned_16bit_is_pixel_exact() {
+    let img = decode_j2k(GRAY_U16_53).expect("decode 16-bit");
+    let c = &img.components[0];
+    assert!(!c.is_signed);
+    assert_eq!(c.precision_bits, 16);
+    let (w, h) = (32i32, 32i32);
+    let mut want = Vec::new();
+    for y in 0..h {
+        for x in 0..w {
+            want.push((x * 997 + y * 271 + (x * y) % 4099) % 65536);
+        }
+    }
+    assert_eq!(c.samples, want);
+}
+
+/// §B.2 reference-grid component sub-sampling on every component
+/// (`XRsiz = 2`, `YRsiz = 1`, Xsiz = 95): each 48×48 plane decodes on
+/// its own component grid (`ceil(95 / 2) = 48` columns), pinned
+/// byte-exact against committed §B.2.6 PGX reference decodes.
+#[test]
+fn rgb_53_all_component_subsampling_matches_black_box_reference() {
+    let cs = parse_codestream(RGB_SUB21_53).expect("parse");
+    for comp in &cs.header.siz.components {
+        assert_eq!((comp.h_separation, comp.v_separation), (2, 1));
+    }
+    let img = decode_j2k(RGB_SUB21_53).expect("decode sub-sampled RGB");
+    assert_eq!(img.components.len(), 3);
+    for (c, refbytes) in
+        img.components
+            .iter()
+            .zip([RGB_SUB21_REF0_PGX, RGB_SUB21_REF1_PGX, RGB_SUB21_REF2_PGX])
+    {
+        let (_signed, _depth, rw, rh, refv) = pgx_payload(refbytes);
+        assert_eq!((c.width as usize, c.height as usize), (rw, rh));
+        assert_eq!((rw, rh), (48, 48));
+        assert_eq!(c.samples, refv);
+    }
+}
+
+/// JP2 container from a real black-box encoder: locate the `jp2c`
+/// codestream through `jp2::parse_jp2` and decode it pixel-exact.
+#[test]
+fn jp2_container_rgb_is_pixel_exact() {
+    let container = oxideav_jpeg2000::jp2::parse_jp2(RGB_JP2).expect("parse jp2");
+    let cs = &RGB_JP2
+        [container.codestream_offset..container.codestream_offset + container.codestream_len];
+    let img = decode_j2k(cs).expect("decode jp2 codestream");
+    assert_eq!(img.components.len(), 3);
+    assert_eq!((img.width, img.height), (48, 32));
+    // Same planes as the raw-codestream MCT-default fixture family.
+    let (w, h) = (48i32, 32i32);
+    for (ci, c) in img.components.iter().enumerate() {
+        let mut want = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                want.push(match ci {
+                    0 => (x * 5 + y * 11) % 256,
+                    1 => (x * 9 + y * 3) % 256,
+                    _ => (x * 2 + y * 7) % 256,
+                });
+            }
+        }
+        assert_eq!(&c.samples, &want, "jp2 component {ci}");
+    }
+}

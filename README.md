@@ -31,6 +31,19 @@ its 9-7 test codestreams — this decoder measures peak ≤ 1,
 MSE ≤ 0.005 against that reference and 0 against the other), and the
 tests pin both verdicts per fixture.
 
+The committed conformance corpus follows the ISO/IEC 15444-4 C.1
+abstract-test-suite axes with real black-box-encoder fixtures:
+non-zero **image and tile origin offsets** (XOsiz/YOsiz + XTOsiz/YTOsiz
+reference-grid anchoring, 5-3 and 9-7), **tile-parts split by layer**
+(TPsot > 0 chains), **PLT** and **TLM** pointer markers, **MCT-off**
+RGB, **signed 8- and 12-bit** and **unsigned 16-bit** depths,
+all-component **reference-grid sub-sampling** (XRsiz = 2 planes pinned
+against §B.2.6 PGX reference decodes), the **JP2 container** from a
+real encoder, and all six Table A.19 code-block style combinations —
+alongside the progression-order, precinct, quality-layer, bypass /
+termination, ROI, POC, PPM / PPT and HT fixtures listed throughout
+this README.
+
 What is implemented:
 
 - **Containers** — J2K raw codestream and the JP2 ISO BMFF box wrapper
