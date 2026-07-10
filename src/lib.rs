@@ -133,7 +133,9 @@ pub mod reassemble;
 pub mod registry;
 pub mod t1;
 
-pub use decode::{decode_codestream, decode_j2k, DecodedComponent, DecodedImage};
+pub use decode::{
+    decode_codestream, decode_j2k, decode_j2k_reduced, DecodedComponent, DecodedImage,
+};
 
 #[cfg(feature = "registry")]
 pub use registry::{make_decoder, Jpeg2000Decoder};

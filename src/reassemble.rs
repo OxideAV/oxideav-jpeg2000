@@ -599,14 +599,15 @@ pub fn idwt_5x3<'a, S: BlockSource<'a>>(
     let mut carry_ll = arrays0.ll;
     let mut carry_dims = arrays0.ll_dims;
 
-    // Step 2 — NL == 0: the NLLL band IS the tile-component (§F.3.1
+    // Step 2 — a single level: the NLLL band IS the output (§F.3.1
     // "the sub-band a0LL is the output array I(x, y)" when no
-    // decomposition was applied).
-    let n_l = level0.n_l;
-    if n_l == 0 {
+    // decomposition was applied — and likewise when the caller
+    // truncated the level slice down to the LL for a
+    // maximally-reduced-resolution decode).
+    if levels.len() == 1 {
         // Wrap LL into an Interleaved2D of the same extent. The
-        // interleave is trivially the same array — at NL = 0 every
-        // sample is an LL coefficient.
+        // interleave is trivially the same array — every sample of a
+        // lone LL level is an LL coefficient.
         return Ok(Interleaved2D {
             data: carry_ll,
             width: carry_dims.0,
@@ -614,15 +615,19 @@ pub fn idwt_5x3<'a, S: BlockSource<'a>>(
         });
     }
 
-    // Step 3 — cascade k = 1..=NL.
+    // Step 3 — cascade k = 1..levels.len().
     //
     // §F.3.1 produces (lev - 1) LL from lev LL/HL/LH/HH. In our
     // (r-keyed) representation, "lev LL" is the LL of the previous
     // iteration (`carry_ll`) and "lev HL/LH/HH" are the high-pass
     // bands of `levels[k]`. The output is the LL of resolution
     // level k — its origin on the tile-component domain is
-    // `(levels[k].trx0, levels[k].try0)`.
-    for k in 1..=(n_l as usize) {
+    // `(levels[k].trx0, levels[k].try0)`. A full slice carries
+    // `NL + 1` levels so the cascade runs `k = 1..=NL`; a slice the
+    // caller truncated to `keep + 1` levels stops the synthesis at
+    // resolution level `keep`, yielding that level's reconstruction
+    // (the ISO/IEC 15444-4 §B.2.3 reduced-resolution decode surface).
+    for k in 1..levels.len() {
         let level_k = &levels[k];
         let arrays_k = reassemble_resolution_5x3(level_k, source, &mb_per_level[k], r)?;
         let i0 = level_k.trx0 as i32;
@@ -674,8 +679,7 @@ pub fn idwt_9x7<'a, S: BlockSource<'a>>(
     let mut carry_ll = arrays0.ll;
     let mut carry_dims = arrays0.ll_dims;
 
-    let n_l = level0.n_l;
-    if n_l == 0 {
+    if levels.len() == 1 {
         return Ok(Interleaved2D {
             data: carry_ll,
             width: carry_dims.0,
@@ -683,7 +687,7 @@ pub fn idwt_9x7<'a, S: BlockSource<'a>>(
         });
     }
 
-    for k in 1..=(n_l as usize) {
+    for k in 1..levels.len() {
         let level_k = &levels[k];
         let arrays_k = reassemble_resolution_9x7(level_k, source, &quant_per_level[k], r)?;
         let i0 = level_k.trx0 as i32;

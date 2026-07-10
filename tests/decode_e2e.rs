@@ -2380,3 +2380,134 @@ fn jp2_container_rgb_is_pixel_exact() {
         assert_eq!(&c.samples, &want, "jp2 component {ci}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// ISO/IEC 15444-4 §B.2.3 reduced-resolution decode (`decode_j2k_reduced`):
+// the conformance suite's Class-0 reference images are produced by
+// discarding N inverse wavelet transforms (the `rN` suffix in its
+// reference-file names). Every reversible case below is byte-exact
+// against a committed black-box reference decode at the same
+// reduction; the 9-7 case carries the usual ±1 half-integer
+// inter-decoder latitude.
+// ---------------------------------------------------------------------------
+
+use oxideav_jpeg2000::decode_j2k_reduced;
+
+const GRAY_MULTILAYER_R1_REF: &[u8] = include_bytes!("data/gray-64x64-multilayer-53-r1-ref.pgx");
+const GRAY_OFFTILED_R2_REF: &[u8] = include_bytes!("data/gray-96x80-offtiled-53-r2-ref.pgx");
+const GRAY_OFF31_R1_REF: &[u8] = include_bytes!("data/gray-33x29-off31-53-r1-ref.pgx");
+const GRAY_97_FULL_R1_REF: &[u8] = include_bytes!("data/gray-32x32-97full-r1-ref.pgx");
+const RGB_RCT_R1_REF0: &[u8] = include_bytes!("data/rgb-16x16-rct-53-r1-ref0.pgx");
+const RGB_RCT_R1_REF1: &[u8] = include_bytes!("data/rgb-16x16-rct-53-r1-ref1.pgx");
+const RGB_RCT_R1_REF2: &[u8] = include_bytes!("data/rgb-16x16-rct-53-r1-ref2.pgx");
+
+/// Shared body: decode at `discard` levels and compare one gray
+/// component byte-exactly against a §B.2.6 PGX reference decode.
+fn assert_reduced_matches_pgx(j2k: &[u8], discard: u8, ref_pgx: &[u8], what: &str) {
+    let (_signed, _depth, rw, rh, refv) = pgx_payload(ref_pgx);
+    let img = decode_j2k_reduced(j2k, discard).expect("reduced decode");
+    assert_eq!(img.components.len(), 1);
+    let c = &img.components[0];
+    assert_eq!(
+        (c.width as usize, c.height as usize),
+        (rw, rh),
+        "{what}: reduced dims"
+    );
+    assert_eq!(c.samples, refv, "{what}: reduced samples");
+}
+
+#[test]
+fn reduced_zero_discard_equals_full_decode() {
+    let full = decode_j2k(GRAY_MULTILAYER_53).expect("full");
+    let red = decode_j2k_reduced(GRAY_MULTILAYER_53, 0).expect("r0");
+    assert_eq!(full.components[0].samples, red.components[0].samples);
+    assert_eq!((full.width, full.height), (red.width, red.height));
+}
+
+#[test]
+fn reduced_multilayer_r1_matches_black_box_reference() {
+    // 64×64, NL = 2, five quality layers → 32×32 at r1. The tier-2
+    // walk still parses every layer's packets for the discarded level.
+    assert_reduced_matches_pgx(
+        GRAY_MULTILAYER_53,
+        1,
+        GRAY_MULTILAYER_R1_REF,
+        "multilayer r1",
+    );
+}
+
+#[test]
+fn reduced_offsets_and_tiles_r2_matches_black_box_reference() {
+    // Image origin (5, 5), tile origin (2, 3), 32×24 tiles → at r2
+    // every tile-component corner maps through the Equation B-14
+    // ceiling division and the reduced planes must tile the reduced
+    // image area gap-free.
+    assert_reduced_matches_pgx(GRAY_OFFTILED_53, 2, GRAY_OFFTILED_R2_REF, "offset+tiled r2");
+}
+
+#[test]
+fn reduced_image_offset_r1_matches_black_box_reference() {
+    // XOsiz = 3 / YOsiz = 1 on 33×29: the reduced grid is
+    // ceil(36/2) − ceil(3/2) = 16 wide by ceil(30/2) − ceil(1/2) = 14
+    // high — the offset ceiling-division path.
+    let (_s, _d, rw, rh, _v) = pgx_payload(GRAY_OFF31_R1_REF);
+    assert_eq!((rw, rh), (16, 14));
+    assert_reduced_matches_pgx(GRAY_OFF31_53, 1, GRAY_OFF31_R1_REF, "offset r1");
+}
+
+#[test]
+fn reduced_rct_r1_matches_black_box_reference() {
+    // The §G.2.2 inverse RCT runs on the reduced planes (all three
+    // components share the reduced grid).
+    let img = decode_j2k_reduced(RGB_RCT_53, 1).expect("reduced RCT decode");
+    assert_eq!(img.components.len(), 3);
+    for (c, refbytes) in
+        img.components
+            .iter()
+            .zip([RGB_RCT_R1_REF0, RGB_RCT_R1_REF1, RGB_RCT_R1_REF2])
+    {
+        let (_s, _d, rw, rh, refv) = pgx_payload(refbytes);
+        assert_eq!((c.width as usize, c.height as usize), (rw, rh));
+        assert_eq!((rw, rh), (8, 8));
+        assert_eq!(c.samples, refv);
+    }
+}
+
+#[test]
+fn reduced_97_r1_tracks_black_box_reference() {
+    // 9-7 at r1: the truncated synthesis feeds the same f32
+    // integerisation, so the ±1 half-integer inter-decoder latitude
+    // applies exactly as at full resolution (ISO/IEC 15444-4
+    // Table C.1 budgets far more).
+    let (_s, _d, rw, rh, refv) = pgx_payload(GRAY_97_FULL_R1_REF);
+    let img = decode_j2k_reduced(GRAY_97_FULL, 1).expect("reduced 9-7 decode");
+    let c = &img.components[0];
+    assert_eq!((c.width as usize, c.height as usize), (rw, rh));
+    let mut peak = 0i32;
+    let mut sq = 0u64;
+    for (&o, &r) in c.samples.iter().zip(refv.iter()) {
+        let d = (o - r).abs();
+        peak = peak.max(d);
+        sq += (d as u64) * (d as u64);
+    }
+    assert!(peak <= 1, "reduced 9-7 peak {peak} (> 1)");
+    let mse = sq as f64 / refv.len() as f64;
+    assert!(mse <= 0.01, "reduced 9-7 MSE {mse} (> 0.01)");
+}
+
+#[test]
+fn reduced_below_component_levels_is_rejected() {
+    use oxideav_jpeg2000::Error;
+    // The multilayer fixture carries NL = 2 — discarding 3 levels is
+    // unrepresentable and must surface InvalidDecompositionLevels
+    // rather than clamp silently.
+    let cs = parse_codestream(GRAY_MULTILAYER_53).expect("parse");
+    let nl = cs.header.cod.decomposition_levels;
+    assert_eq!(
+        decode_j2k_reduced(GRAY_MULTILAYER_53, nl + 1),
+        Err(Error::InvalidDecompositionLevels)
+    );
+    // Discarding exactly NL levels (down to the NLLL band) is valid.
+    let img = decode_j2k_reduced(GRAY_MULTILAYER_53, nl).expect("LL-only decode");
+    assert_eq!((img.width, img.height), (16, 16));
+}

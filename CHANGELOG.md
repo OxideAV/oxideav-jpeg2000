@@ -24,6 +24,21 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+- **Reduced-resolution decode** — `decode_j2k_reduced(bytes,
+  discard_levels)`, the ISO/IEC 15444-4 §B.2.3 decode surface its
+  Class-0 `rN` reference images are produced with. The §F.3.1
+  synthesis cascade stops `discard_levels` short (the IDWT drivers now
+  cascade over the level slice they are given), the discarded levels'
+  code-blocks skip tier-1 entirely (tier-2 still parses every packet),
+  and the output grids / tile placement / image dims all map through
+  the Equation B-14 ceiling division — including non-zero image and
+  tile origin offsets. Validated byte-exact against black-box
+  reference decodes at the same reduction across multi-tile,
+  offset-anchored, multi-layer, RCT, RPCL, multi-precinct and
+  sub-sampled fixtures (12-case sweep); the 9-7 reduced case carries
+  the same ±1 half-integer latitude as full resolution. A reduction
+  below a component's (per-`COC`) decomposition count surfaces
+  `Error::InvalidDecompositionLevels`.
 - **ISO/IEC 15444-4-style conformance corpus across the C.1 ATS axes.**
   Twelve new real-encoder fixtures pin previously-untested decode
   surfaces: non-zero SIZ image offsets on the 5-3 *and* 9-7 paths plus

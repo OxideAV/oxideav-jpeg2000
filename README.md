@@ -478,7 +478,15 @@ let container  = oxideav_jpeg2000::jp2::parse_jp2(bytes)?;
 # Ok::<(), oxideav_jpeg2000::Error>(())
 ```
 
-Decoding: `decode_j2k` (planar) / `decode_jpeg2000` (interleaved bytes).
+Decoding: `decode_j2k` (planar) / `decode_jpeg2000` (interleaved
+bytes) / `decode_j2k_reduced(bytes, discard_levels)` — the ISO/IEC
+15444-4 §B.2.3 **reduced-resolution decode** (the `rN` reference-image
+surface): the §F.3.1 synthesis stops `discard_levels` short, every
+grid corner maps through the Equation B-14 ceiling division (image
+and tile origin offsets included), the discarded levels' code-blocks
+skip tier-1, and the reduced planes are validated byte-exact against
+black-box reference decodes at the same reduction (multi-tile,
+offset-anchored, multi-layer, RCT, sub-sampled and 9-7 shapes).
 Encoding: `encode::encode_j2k` with `encode::EncodeParams` (kernel,
 MCT, progression order, precincts, quality layers, PCRD
 `target_bytes`, tile grid, bypass / termination styles), the

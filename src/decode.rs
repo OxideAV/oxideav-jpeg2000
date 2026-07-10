@@ -1049,6 +1049,11 @@ fn decode_tile(
     // only the packet data; when `None` the headers are interleaved
     // in `body` as in §B.10.
     relocated_headers: Option<&[u8]>,
+    // ISO/IEC 15444-4 §B.2.3 reduced-resolution decode: the number of
+    // highest resolution levels to discard. 0 = full resolution. The
+    // tier-2 walk still parses every packet (the byte stream is
+    // sequential); only tier-1 + synthesis stop early.
+    discard_levels: u8,
 ) -> Result<Vec<Vec<i32>>, Error> {
     // -- §B.6–§B.12 tile packet plan (geometry, enumeration, walk split) --
     let TilePacketPlan {
@@ -1078,6 +1083,7 @@ fn decode_tile(
         &precinct_geom,
         &descriptors,
         &headers,
+        discard_levels,
     )
 }
 
@@ -1329,9 +1335,22 @@ fn decode_tile_from_plan(
     precinct_geom: &BTreeMap<(u16, u8, u32), PrecinctCodeBlocks>,
     descriptors: &[PacketDescriptor],
     headers: &[(crate::packet::PacketHeader, usize)],
+    discard_levels: u8,
 ) -> Result<Vec<Vec<i32>>, Error> {
     let num_components = siz.components.len();
     let tile = derive_tile_geometry(siz, tile_index)?;
+
+    // §B.2.3 reduced-resolution decode: every component must carry at
+    // least `discard_levels` decompositions (a per-component `COC` may
+    // lower `NL`; a component that cannot shed that many levels makes
+    // the requested reduction unrepresentable).
+    if discard_levels > 0 {
+        for cc in comp_coding {
+            if discard_levels > cc.n_l {
+                return Err(Error::InvalidDecompositionLevels);
+            }
+        }
+    }
 
     // -- Replay body offsets; accumulate per-code-block segments --
     let mut accum: BTreeMap<BlockKey, BlockAccum> = BTreeMap::new();
@@ -1565,6 +1584,19 @@ fn decode_tile_from_plan(
     for ((c, r, k, sb, cbx, cby), acc) in accum.iter() {
         if acc.passes == 0 {
             continue;
+        }
+        // Reduced-resolution decode: blocks above the kept resolution
+        // level contribute nothing to the truncated synthesis — skip
+        // their (already length-accounted) tier-1 work entirely.
+        {
+            let keep = comp_coding
+                .get(*c as usize)
+                .ok_or(Error::InvalidMarkerLength)?
+                .n_l
+                - discard_levels;
+            if *r > keep {
+                continue;
+            }
         }
         let geom = precinct_geom
             .get(&(*c, *r, *k))
@@ -1826,8 +1858,20 @@ fn decode_tile_from_plan(
     let mut comp_lane: Vec<(WaveletTransform, usize)> = Vec::with_capacity(levels_per_comp.len());
     for (c, levels) in levels_per_comp.iter().enumerate() {
         let cc = comp_coding.get(c).ok_or(Error::InvalidMarkerLength)?;
+        // Reduced-resolution decode: truncate the synthesis cascade to
+        // the kept levels — the output is the resolution-level-`keep`
+        // reconstruction (§F.3.1 stopped early; ISO/IEC 15444-4
+        // §B.2.3). At `discard_levels == 0` this is the full slice and
+        // the level-`NL` (tile-component) extent.
+        let keep = (cc.n_l - discard_levels) as usize;
+        let levels = &levels[..=keep];
+        let out_level = &levels[keep];
         let tc = &tile.components[c];
-        let (tw, th) = (tc.width() as usize, tc.height() as usize);
+        let (tw, th) = if discard_levels == 0 {
+            (tc.width() as usize, tc.height() as usize)
+        } else {
+            (out_level.width() as usize, out_level.height() as usize)
+        };
         if tw == 0 || th == 0 {
             match cc.transform {
                 WaveletTransform::Reversible5x3 => {
@@ -1904,6 +1948,7 @@ fn decode_tile_from_plan(
                 }
                 let mb_per_level: Vec<Vec<u32>> = quant_per_comp[c]
                     .iter()
+                    .take(levels.len())
                     .map(|bands| bands.iter().map(|b| b.mb).collect())
                     .collect();
                 let grid = idwt_5x3(levels, &source, &mb_per_level, 0.5)?;
@@ -1921,6 +1966,7 @@ fn decode_tile_from_plan(
                 }
                 let quant_per_level: Vec<Vec<SubBandQuantization>> = quant_per_comp[c]
                     .iter()
+                    .take(levels.len())
                     .map(|bands| bands.iter().map(|b| b.quant).collect())
                     .collect();
                 let grid = idwt_9x7(levels, &source, &quant_per_level, 0.5)?;
@@ -2072,9 +2118,52 @@ pub fn decode_j2k(bytes: &[u8]) -> Result<DecodedImage, Error> {
     decode_codestream(bytes, &cs)
 }
 
+/// Decode a J2K codestream at **reduced resolution**, discarding the
+/// `discard_levels` highest resolution levels of every tile-component
+/// (the ISO/IEC 15444-4 §B.2.3 "reduced resolution" decode surface —
+/// its Class-0 reference images are decoded exactly this way, and the
+/// suffix `rN` on a 15444-4 reference file is this parameter).
+///
+/// The §F.3.1 synthesis cascade stops `discard_levels` short, so the
+/// output component grids are the resolution-level
+/// `NL − discard_levels` extents — each dimension is
+/// `ceil(full / 2^discard_levels)` on the reference grid (Equation
+/// B-14), including the image / tile origin offsets, which scale by
+/// the same ceiling division. Tier-2 still parses every packet (the
+/// byte stream is sequential); the discarded levels' code-blocks skip
+/// tier-1 entirely.
+///
+/// `discard_levels == 0` is exactly [`decode_j2k`]. A component whose
+/// (per-`COC`) decomposition count is smaller than `discard_levels`
+/// makes the reduction unrepresentable and surfaces
+/// [`Error::InvalidDecompositionLevels`].
+pub fn decode_j2k_reduced(bytes: &[u8], discard_levels: u8) -> Result<DecodedImage, Error> {
+    let cs: J2kCodestream = crate::parse_codestream(bytes)?;
+    decode_codestream_impl(bytes, &cs, discard_levels)
+}
+
 /// [`decode_j2k`] against an already-parsed [`J2kCodestream`] (the
 /// `bytes` must be the same buffer the codestream was parsed from).
 pub fn decode_codestream(bytes: &[u8], cs: &J2kCodestream) -> Result<DecodedImage, Error> {
+    decode_codestream_impl(bytes, cs, 0)
+}
+
+/// Ceiling division of `v` by `2^d` (Equation B-14's reduced-grid
+/// mapping; `d` is bounded by the Table A.15 `NL ≤ 32` range).
+#[inline]
+fn ceil_shift(v: u32, d: u8) -> u32 {
+    if d == 0 {
+        return v;
+    }
+    let step = 1u64 << d;
+    ((v as u64 + step - 1) >> d) as u32
+}
+
+fn decode_codestream_impl(
+    bytes: &[u8],
+    cs: &J2kCodestream,
+    discard_levels: u8,
+) -> Result<DecodedImage, Error> {
     reject_unsupported_main_header_markers(bytes, cs.header.bytes_consumed)?;
 
     let siz = &cs.header.siz;
@@ -2142,12 +2231,17 @@ pub fn decode_codestream(bytes: &[u8], cs: &J2kCodestream) -> Result<DecodedImag
 
     let mut components: Vec<DecodedComponent> = Vec::with_capacity(siz.components.len());
     for (sc, area) in siz.components.iter().zip(areas.iter()) {
-        let len = (area.width() as usize)
-            .checked_mul(area.height() as usize)
+        // Reduced-resolution output grid: Equation B-14's ceiling
+        // division maps the component's image-area corners onto the
+        // kept resolution level (identity at discard_levels == 0).
+        let rw = ceil_shift(area.x1, discard_levels) - ceil_shift(area.x0, discard_levels);
+        let rh = ceil_shift(area.y1, discard_levels) - ceil_shift(area.y0, discard_levels);
+        let len = (rw as usize)
+            .checked_mul(rh as usize)
             .ok_or(Error::InvalidMarkerLength)?;
         components.push(DecodedComponent {
-            width: area.width(),
-            height: area.height(),
+            width: rw,
+            height: rh,
             precision_bits: sc.precision_bits,
             is_signed: sc.is_signed,
             h_separation: sc.h_separation,
@@ -2259,6 +2353,7 @@ pub fn decode_codestream(bytes: &[u8], cs: &J2kCodestream) -> Result<DecodedImag
             tile_index as u32,
             &body,
             relocated.as_deref(),
+            discard_levels,
         )?;
 
         // Place each tile-component plane into its image-area plane at
@@ -2266,7 +2361,20 @@ pub fn decode_codestream(bytes: &[u8], cs: &J2kCodestream) -> Result<DecodedImag
         let tile = derive_tile_geometry(siz, tile_index as u32)?;
         for (c, plane) in tile_planes.iter().enumerate() {
             let tc = &tile.components[c];
-            let (tw, th) = (tc.width() as usize, tc.height() as usize);
+            // Reduced tile-component region: the same Equation B-14
+            // ceiling division that shaped the output grids (identity
+            // at discard_levels == 0). Adjacent tiles stay adjacent
+            // under ceil-division, so the reduced planes tile the
+            // reduced image area gap-free.
+            let (rx0, ry0) = (
+                ceil_shift(tc.tcx0, discard_levels),
+                ceil_shift(tc.tcy0, discard_levels),
+            );
+            let (rx1, ry1) = (
+                ceil_shift(tc.tcx1, discard_levels),
+                ceil_shift(tc.tcy1, discard_levels),
+            );
+            let (tw, th) = ((rx1 - rx0) as usize, (ry1 - ry0) as usize);
             if tw == 0 || th == 0 {
                 continue;
             }
@@ -2275,13 +2383,11 @@ pub fn decode_codestream(bytes: &[u8], cs: &J2kCodestream) -> Result<DecodedImag
             }
             let comp = &mut components[c];
             let area = &areas[c];
-            let dx = tc
-                .tcx0
-                .checked_sub(area.x0)
+            let dx = rx0
+                .checked_sub(ceil_shift(area.x0, discard_levels))
                 .ok_or(Error::InvalidMarkerLength)? as usize;
-            let dy = tc
-                .tcy0
-                .checked_sub(area.y0)
+            let dy = ry0
+                .checked_sub(ceil_shift(area.y0, discard_levels))
                 .ok_or(Error::InvalidMarkerLength)? as usize;
             let cw = comp.width as usize;
             if dx + tw > cw || dy + th > comp.height as usize {
@@ -2296,8 +2402,10 @@ pub fn decode_codestream(bytes: &[u8], cs: &J2kCodestream) -> Result<DecodedImag
     }
 
     Ok(DecodedImage {
-        width: siz.x_size.saturating_sub(siz.x_offset),
-        height: siz.y_size.saturating_sub(siz.y_offset),
+        width: ceil_shift(siz.x_size, discard_levels)
+            .saturating_sub(ceil_shift(siz.x_offset, discard_levels)),
+        height: ceil_shift(siz.y_size, discard_levels)
+            .saturating_sub(ceil_shift(siz.y_offset, discard_levels)),
         components,
     })
 }
