@@ -198,7 +198,20 @@ What is implemented:
   RGB (RCT), reversible 5-3 and irreversible 9-7, 1-4 decomposition
   levels, and **multiple HT code-blocks per sub-band** (a 32×32 band
   tiling into four 16×16 blocks, and a 128×128 / 4-decomposition image
-  whose high-pass bands each carry several 32×32 HT code-blocks). The
+  whose high-pass bands each carry several 32×32 HT code-blocks).
+  Beyond the block decoder, **whole-codestream HT depth** is pinned
+  against real black-box HT codestreams: a 46-case sweep across both
+  kernels, all five §B.12.1 progression orders, precinct / code-block
+  shapes, multi-tile grids (including ragged edges), **non-zero SIZ
+  image and tile offsets** (XOsiz / YOsiz + XTOsiz / YTOsiz
+  reference-grid anchoring), **tile-part divisions** on the resolution
+  and component axes (TPsot > 0 chains), main-header **TLM** pointer
+  markers, and 12- / 16-bit depths decodes **byte-identical** on every
+  reversible case (the irreversible cases sit within the ±1
+  half-integer inter-decoder rounding latitude ISO/IEC 15444-4
+  budgets); committed fixtures pin the multi-tile, offset-anchored,
+  tile-part R / RC, TLM, PCRL-RGB, irreversible-tiled and 16-bit
+  shapes bit-exact in CI. The
   Annex C CxtVLC tables are confirmed byte-identical to the spec listing
   (a transcription audit diffs all 802 entries). The §B.2 set-`T`
   codeword-segment split is honoured on read — a packet whose HT

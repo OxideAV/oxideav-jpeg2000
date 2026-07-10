@@ -22,6 +22,21 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
   9-7 e2e test now records both verdicts: byte-exact vs reference 2,
   peak + MSE bounds vs reference 1.
 
+### Added
+
+- **Whole-codestream HTJ2K depth on real HT codestreams.** A 46-case
+  black-box sweep (both kernels; LRCP/RLCP/RPCL/PCRL/CPRL; precinct and
+  code-block shapes; multi-tile grids with ragged edges; non-zero SIZ
+  image + tile offsets; tile-part divisions on the resolution and
+  component axes; TLM pointer markers; 12- and 16-bit depths; raw and
+  JPH-extension outputs) decodes byte-identical to the black-box
+  reference on every reversible case — the irreversible cases differ
+  only at ±1 half-integer-boundary pixels (the inter-decoder rounding
+  latitude ISO/IEC 15444-4 budgets). Eight new committed fixtures pin
+  the multi-tile, offset-anchored (first fixtures with non-zero
+  XOsiz/YOsiz + XTOsiz/YTOsiz), tile-part R and RC, TLM, PCRL-RGB,
+  irreversible-tiled and 16-bit whole-codestream shapes bit-exact.
+
 ### Fixed
 
 - **§D.4.2 predictable termination no longer mis-rejects real

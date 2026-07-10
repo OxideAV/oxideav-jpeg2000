@@ -1212,10 +1212,19 @@ pub fn reconstruct_tile_components_9x7(
 ///
 /// `f32::round_ties_even` is the IEEE-754 default rounding mode and
 /// matches the "no required precision" language of the §G.3.2 closing
-/// paragraph: the rounding direction is a decoder choice, and
-/// ties-to-even is the only choice that is statistically unbiased on
-/// arbitrary fractional inputs. The saturation keeps the cast
-/// well-defined when an ICT-amplified sample wanders outside the
+/// paragraph: the rounding direction is a decoder choice. Exact ties
+/// are not hypothetical — an irreversible stream with zero
+/// decomposition levels and a power-of-two `Δb` reconstructs *every*
+/// sample at its §E.1.1.2 quantisation-bin midpoint `(|qb| + r)·Δb`,
+/// i.e. exactly on `X.5` — and the independent black-box reference
+/// decoders split on the convention: two of three realise IEEE
+/// ties-to-even on the signed pre-DC-shift sample (byte-exact against
+/// this implementation on that shape), the third rounds ties away
+/// from zero (a ±1, peak-1 disagreement at every midpoint sample —
+/// well inside the ISO/IEC 15444-4 Table C.1 allowances, which is the
+/// latitude that standard exists to budget). Ties-to-even follows the
+/// majority convention and the IEEE default. The saturation keeps the
+/// cast well-defined when an ICT-amplified sample wanders outside the
 /// `i32` range on a pathological input — the subsequent §G.1.2 NOTE
 /// clamp pulls it back to the descriptor range anyway.
 ///
