@@ -252,7 +252,11 @@ What is implemented:
   half-integer inter-decoder rounding latitude ISO/IEC 15444-4
   budgets); committed fixtures pin the multi-tile, offset-anchored,
   tile-part R / RC, TLM, PCRL-RGB, irreversible-tiled and 16-bit
-  shapes bit-exact in CI. The
+  shapes bit-exact in CI, plus the round-416
+  **precinct-unaligned-tile** shapes (15×13 tiles, custom precincts,
+  image-origin offsets — an 80-case HT sweep across all five orders,
+  byte-exact, with reduced-resolution decodes matching black-box
+  r1 / r2 references on 240 cases across both block-coding lanes). The
   Annex C CxtVLC tables are confirmed byte-identical to the spec listing
   (a transcription audit diffs all 802 entries). The §B.2 set-`T`
   codeword-segment split is honoured on read — a packet whose HT
