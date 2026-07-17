@@ -35,7 +35,10 @@ The committed conformance corpus follows the ISO/IEC 15444-4 C.1
 abstract-test-suite axes with real black-box-encoder fixtures:
 non-zero **image and tile origin offsets** (XOsiz/YOsiz + XTOsiz/YTOsiz
 reference-grid anchoring, 5-3 and 9-7), **tile-parts split by layer**
-(TPsot > 0 chains), **PLT** and **TLM** pointer markers, **MCT-off**
+(TPsot > 0 chains), **tile-parts interleaved across tiles** (the
+§A.4.2 round-robin layout, with the TPsot ordering / TNsot count
+rules enforced against lost or mis-assembled chains), **PLT** and
+**TLM** pointer markers, **MCT-off**
 RGB, **signed 8- and 12-bit** and **unsigned 16-bit** depths,
 all-component **reference-grid sub-sampling** (XRsiz = 2 planes pinned
 against §B.2.6 PGX reference decodes), the **JP2 container** from a

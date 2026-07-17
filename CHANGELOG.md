@@ -6,6 +6,16 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+- **§A.4.2 tile-part interleaving decoded and enforced** — tile-parts of
+  different tiles may interleave in the codestream; a committed 2×2-tile,
+  three-tile-parts-per-tile fixture transcoded into round-robin order
+  (t0p0, t1p0, t2p0, t3p0, t0p1, …) decodes bit-exact. The ordering rules
+  themselves are now enforced instead of silently re-sorted: within a
+  tile the codestream-order TPsot values must be exactly 0, 1, 2, …
+  (an out-of-order, duplicated or gapped index is rejected with
+  `Error::InvalidTilePartIndex`), and a non-zero TNsot must state the
+  tile's true tile-part count (Table A.6).
+
 - **JP2 Header box surface completed (T.800 Annex I)** — the `pclr` Palette
   box (§I.5.3.4, any 1–38-bit signed/unsigned column layout, non-multiple-
   of-8 padded storage), the `cmap` Component Mapping box (§I.5.3.5, direct

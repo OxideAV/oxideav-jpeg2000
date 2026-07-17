@@ -2292,17 +2292,39 @@ fn decode_codestream_impl(
         });
     }
 
-    // -- Group tile-parts by tile, ordered by TPsot --
+    // -- Group tile-parts by tile --
+    //
+    // §A.4.2: "The tile-parts of a given tile shall appear in order
+    // (see TPsot) in the codestream. However, tile-parts from other
+    // tiles may be interleaved in the codestream." Grouping by tile
+    // while preserving codestream order therefore reassembles each
+    // tile's ascending-TPsot chain whatever the interleaving; the
+    // ordering rule itself is enforced below.
     let mut parts_by_tile: BTreeMap<u16, Vec<&crate::TilePart>> = BTreeMap::new();
     for tp in &cs.tile_parts {
         parts_by_tile.entry(tp.sot.tile_index).or_default().push(tp);
     }
 
-    for (tile_index, mut parts) in parts_by_tile {
+    for (tile_index, parts) in parts_by_tile {
         if (tile_index as u64) >= num_tiles {
             return Err(Error::InvalidTilePartIndex);
         }
-        parts.sort_by_key(|tp| tp.sot.tile_part_index);
+        // §A.4.2 / Table A.5: TPsot "denotes the order from 0" and the
+        // tile's tile-parts shall appear in the codestream in that
+        // order — so in codestream order the tile's TPsot values must
+        // be exactly 0, 1, 2, … A gap, duplicate or out-of-order index
+        // means a tile-part was lost or the stream was mis-assembled;
+        // sorting and decoding anyway would silently mis-place packets,
+        // so the fault is rejected. Table A.6: a non-zero TNsot must
+        // state the tile's true tile-part count.
+        for (i, tp) in parts.iter().enumerate() {
+            if usize::from(tp.sot.tile_part_index) != i {
+                return Err(Error::InvalidTilePartIndex);
+            }
+            if tp.sot.num_tile_parts != 0 && usize::from(tp.sot.num_tile_parts) != parts.len() {
+                return Err(Error::InvalidTilePartIndex);
+            }
+        }
 
         // §A.6.1 / §A.6.2 / §A.6.4 / §A.6.5: COD / COC / QCD / QCC / RGN
         // overrides may appear only in the first tile-part (TPsot = 0).

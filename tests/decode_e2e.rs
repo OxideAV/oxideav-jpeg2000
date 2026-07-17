@@ -2457,6 +2457,107 @@ fn jp2_cdef_channel_order_matches_reference() {
     assert_eq!(raw.components[2].samples, img.components[0].samples);
 }
 
+// §A.4.2 tile-part interleaving: a 64×48 gray lossless 5-3 raster on a
+// 2×2 grid of 32×24 tiles, three tile-parts per tile (split on the
+// resolution axis, TNsot = 3), transcoded so the twelve tile-parts are
+// **interleaved across tiles** — t0p0, t1p0, t2p0, t3p0, t0p1, … —
+// instead of the encoder's contiguous per-tile chains. §A.4.2 allows
+// exactly this ("tile-parts from other tiles may be interleaved in the
+// codestream") as long as each tile's own TPsot sequence stays in
+// order. The black-box reference decoder reconstructs the identical
+// raster from both orderings (verified during corpus generation); the
+// source raster is the arithmetic pattern regenerated below. COM
+// markers scrubbed.
+const GRAY_TP_INTERLEAVED_53: &[u8] = include_bytes!("data/gray-64x48-tp-interleaved-53.j2k");
+
+/// §A.4.2: tile-parts interleaved across tiles must decode bit-exact —
+/// grouping by tile has to reassemble each tile's ascending-TPsot
+/// chain from the round-robin codestream layout.
+#[test]
+fn tile_parts_interleaved_across_tiles_decode() {
+    // Prove the fixture really interleaves: the tile indices must not
+    // be grouped contiguously.
+    let cs = parse_codestream(GRAY_TP_INTERLEAVED_53).expect("parse");
+    let order: Vec<(u16, u8)> = cs
+        .tile_parts
+        .iter()
+        .map(|tp| (tp.sot.tile_index, tp.sot.tile_part_index))
+        .collect();
+    assert_eq!(order.len(), 12, "4 tiles x 3 tile-parts");
+    assert_eq!(order[0], (0, 0));
+    assert_eq!(order[1], (1, 0), "second tile-part belongs to tile 1");
+    assert_eq!(order[4], (0, 1), "tile 0 resumes after the round-robin");
+    for tp in &cs.tile_parts {
+        assert_eq!(tp.sot.num_tile_parts, 3, "TNsot = 3 in every header");
+    }
+
+    let img = decode_j2k(GRAY_TP_INTERLEAVED_53).expect("decode interleaved tile-parts");
+    assert_eq!((img.width, img.height), (64, 48));
+    let c = &img.components[0];
+    for y in 0..48i32 {
+        for x in 0..64i32 {
+            assert_eq!(
+                c.samples[(y * 64 + x) as usize],
+                (x * 7 + y * 13) % 256,
+                "pixel ({x}, {y})"
+            );
+        }
+    }
+}
+
+/// Reassemble the fixture's codestream with the tile-part spans in a
+/// caller-chosen order (the main header and `EOC` are preserved).
+fn reorder_tile_parts(bytes: &[u8], order: &[usize]) -> Vec<u8> {
+    let cs = parse_codestream(bytes).expect("parse for reorder");
+    let first_sot = cs.tile_parts[0].sot_offset;
+    let mut out = bytes[..first_sot].to_vec();
+    for &i in order {
+        let tp = &cs.tile_parts[i];
+        out.extend_from_slice(&bytes[tp.sot_offset..tp.body_offset + tp.body_len]);
+    }
+    out.extend_from_slice(&[0xFF, 0xD9]); // EOC
+    out
+}
+
+/// §A.4.2 / Table A.5 / Table A.6 ordering faults are rejected rather
+/// than silently re-sorted: an out-of-order TPsot within a tile, a
+/// duplicated TPsot, and a TNsot that misstates the tile's tile-part
+/// count all name a lost or mis-assembled tile-part chain.
+#[test]
+fn tile_part_order_faults_are_rejected() {
+    use oxideav_jpeg2000::Error;
+    let cs = parse_codestream(GRAY_TP_INTERLEAVED_53).expect("parse");
+    // Codestream layout is t0p0 t1p0 t2p0 t3p0 t0p1 t1p1 … (see the
+    // interleaving test). The identity order must keep decoding.
+    let identity: Vec<usize> = (0..cs.tile_parts.len()).collect();
+    let same = reorder_tile_parts(GRAY_TP_INTERLEAVED_53, &identity);
+    assert_eq!(
+        decode_j2k(&same)
+            .expect("identity reorder decodes")
+            .components[0]
+            .samples,
+        decode_j2k(GRAY_TP_INTERLEAVED_53).expect("base").components[0].samples
+    );
+    // Swap tile 0's TPsot = 1 (index 4) and TPsot = 2 (index 8):
+    // tile 0's chain reads 0, 2, 1 — out of order per §A.4.2.
+    let mut order = identity.clone();
+    order.swap(4, 8);
+    let swapped = reorder_tile_parts(GRAY_TP_INTERLEAVED_53, &order);
+    assert_eq!(decode_j2k(&swapped), Err(Error::InvalidTilePartIndex));
+    // Duplicate TPsot: overwrite tile 0 part 2's TPsot byte (at
+    // SOT + 10) with 1.
+    let tp = &cs.tile_parts[8];
+    assert_eq!((tp.sot.tile_index, tp.sot.tile_part_index), (0, 2));
+    let mut dup = GRAY_TP_INTERLEAVED_53.to_vec();
+    dup[tp.sot_offset + 10] = 1;
+    assert_eq!(decode_j2k(&dup), Err(Error::InvalidTilePartIndex));
+    // TNsot misstatement: claim tile 0 has 2 tile-parts (byte at
+    // SOT + 11) while three are present.
+    let mut wrong = GRAY_TP_INTERLEAVED_53.to_vec();
+    wrong[cs.tile_parts[0].sot_offset + 11] = 2;
+    assert_eq!(decode_j2k(&wrong), Err(Error::InvalidTilePartIndex));
+}
+
 // ---------------------------------------------------------------------------
 // ISO/IEC 15444-4 §B.2.3 reduced-resolution decode (`decode_j2k_reduced`):
 // the conformance suite's Class-0 reference images are produced by
