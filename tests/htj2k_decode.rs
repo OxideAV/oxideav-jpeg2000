@@ -358,3 +358,55 @@ fn ht_reduced_resolution_matches_ojph() {
         assert_eq!(c.samples, rdata, "{what}: reduced reconstruction differs");
     }
 }
+
+/// Round-416 precinct-unaligned-tile shapes through the **HT lane**:
+/// 45×39 gray, 15×13 tiles (tile 1's full-resolution edge lands one
+/// sample below a precinct-cell boundary), custom 16×16 / 8×8
+/// precincts, an XOsiz / YOsiz = 7 / 3 image-origin offset, PCRL, 16×16
+/// HT code-blocks, reversible 5-3 — part of an 80-case black-box HT
+/// sweep (all five orders × tiling × precincts × offsets, gray and
+/// RGB/RCT) that decodes byte-exact against the sources after the
+/// §B.6 / §B.12.1.3–5 unaligned-tile fixes. COM markers scrubbed.
+#[test]
+fn ht_unaligned_tiles_precincts_offset_pcrl_rev() {
+    let bytes = include_bytes!("fixtures/ht_t15_prec_off_pcrl_rev.j2c");
+    let img = oxideav_jpeg2000::decode_j2k(bytes).expect("decode HT unaligned tiles");
+    let c = &img.components[0];
+    assert_eq!((c.width, c.height), (45, 39));
+    for y in 0..39i32 {
+        for x in 0..45i32 {
+            assert_eq!(
+                c.samples[(y * 45 + x) as usize],
+                (x * 7 + y * 13) % 256,
+                "pixel ({x}, {y})"
+            );
+        }
+    }
+}
+
+/// The RGB / RCT sibling: 45×39 three-component, 15×13 tiles, custom
+/// precincts, CPRL, reversible — the component-major order across an
+/// unaligned multi-tile grid in the HT lane.
+#[test]
+fn ht_rgb_unaligned_tiles_precincts_cprl_rev() {
+    let bytes = include_bytes!("fixtures/ht_rgb_t15_prec_cprl_rev.j2c");
+    let img = oxideav_jpeg2000::decode_j2k(bytes).expect("decode HT RGB unaligned tiles");
+    assert_eq!(img.components.len(), 3);
+    for (ci, c) in img.components.iter().enumerate() {
+        assert_eq!((c.width, c.height), (45, 39));
+        for y in 0..39i32 {
+            for x in 0..45i32 {
+                let want = match ci {
+                    0 => (x * 5 + y * 11) % 256,
+                    1 => (x * 9 + y * 3) % 256,
+                    _ => (x * 2 + y * 7) % 256,
+                };
+                assert_eq!(
+                    c.samples[(y * 45 + x) as usize],
+                    want,
+                    "comp {ci} pixel ({x}, {y})"
+                );
+            }
+        }
+    }
+}

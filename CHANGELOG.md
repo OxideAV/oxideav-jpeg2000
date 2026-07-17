@@ -31,6 +31,14 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+- **HT-lane coverage of the precinct-unaligned shapes** — an 80-case
+  black-box HTJ2K sweep (all five progression orders × 15×13 tiles ×
+  custom precincts × image-origin offsets, gray and RGB/RCT reversible)
+  decodes byte-exact, and `decode_j2k_reduced` matches black-box
+  reduced-resolution decodes at r1 / r2 on 240 cases across both the
+  Annex D and HT lanes of the new geometry. Two committed HT fixtures pin
+  the unaligned-tile + precinct + offset PCRL and RGB CPRL shapes.
+
 - **Mixed HT / Annex D block-coding lanes at tile granularity** — a
   multi-tile codestream whose main header signals one lane while selected
   tiles restate the other through their first-tile-part `COD` override
