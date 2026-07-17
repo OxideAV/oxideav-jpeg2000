@@ -4,6 +4,49 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ## [Unreleased]
 
+## [0.0.16](https://github.com/OxideAV/oxideav-jpeg2000/compare/v0.0.15...v0.0.16) - 2026-07-17
+
+### Other
+
+- fuzz the end-to-end JP2 file decode — new decode_jp2 target covering the Annex I box surface, palette application and cdef reorder
+- exploit TLM / PLT pointer markers — T.800 A.7.1/A.7.3 lengths cross-validated against the walked tile-parts and packets; corrupted pointers rejected
+- record the HT unaligned-tile sweep + reduced-resolution pinning
+- HT-lane sweep of the precinct-unaligned shapes — 80 whole-codestream cases byte-exact, reduced-resolution r1/r2 pinned on 240 cases across both lanes
+- fix two precinct-unaligned-tile decode bugs found by a 400-case black-box sweep — position-order partial-first-precinct keys on the tile edge (B.12.1.3-5), precinct anchor projects the B.6 resolution-level cell
+- mixed HT / Annex D lanes at tile granularity — T.814 8.2 HTDECLARED across a multi-tile grid via first-tile-part COD overrides, bit-exact both orientations
+- T.800 A.4.2 tile-part interleaving — round-robin cross-tile orderings decode bit-exact; TPsot order / TNsot count faults rejected
+- complete the T.800 Annex I jp2h box surface — pclr / cmap / cdef / res parse, decode_jp2 applies palette expansion + channel ordering byte-exact vs black-box reference decodes
+- Mark internal codec plumbing #[doc(hidden)]
+- pin reduced-resolution decode through the HT lane — multi-tile r1 and offset-anchored r2 byte-exact vs the black-box HT decoder
+- layer-limited decode — decode_j2k_layers(bytes, max_layers), byte-exact at every layer prefix
+- ISO/IEC 15444-4 §B.2.3 reduced-resolution decode — decode_j2k_reduced(bytes, discard_levels)
+- ISO/IEC 15444-4-style conformance corpus — SIZ offsets, layer tile-parts, PLT/TLM, MCT-off, signed/deep depths, sub-sampling, JP2
+- whole-codestream HTJ2K depth — multi-tile, SIZ offsets, tile-part R/RC chains, TLM, PCRL, 16-bit pinned bit-exact on real HT codestreams
+- pin the 9-7 path byte-exact against a second independent reference — the ±1 was inter-reference rounding latitude
+- reject PPx/PPy = 0 above r = 0 (T.800 §B.6 / Table A.21) — new Error::InvalidPrecinctSize
+- §D.4.2 predictable termination is an encoder-side flush contract — drop the invented decode-time landing check
+- per-component Table A.19 code-block style — T.814 HTDECLARED HT/Annex-D component mix decodes
+- decode_j2k fuzz harness + two HT MagSgn shift-overflow fixes + MULTIHT allocation bound
+- MULTIHT edge-shape coverage — placeholder/skip-set/split-refinement header round-trips + hand-assembled skip-set codestream
+- T.814 MULTIHT + placeholder-pass HT decode (§B.1/§B.3) + MULTIHT encode via quality layers
+- fix T.814 §7.3.4/§7.3.6 first-line-pair u2-bit interleave — resolves the known HT decode divergence
+- T.814 Annex D JPH file format (brand, colr exemption, METH 3/5)
+- HT + Annex H ROI composition (T.814 §A.5) + sub-sampling/COC coverage
+- T.814 HTJ2K codestream assembly on encode (CAP + SPcod bit 6)
+- T.814 §7.4/§7.5 HT refinement forward passes + §B.2 segment split
+- Annex H Maxshift region of interest on encode (RGN)
+- §A.7.4 / §A.7.5 packed packet headers on encode (PPM / PPT)
+- add CI / crates.io / docs.rs / MIT-license badges
+- README — round-388 encoder surface (sub-sampling, deep input, framing, POC, tile-parts, COC/QCC, HT cleanup encoder)
+- HTJ2K forward block coder — T.814 §7.3 cleanup-pass encoder
+- §A.6.2 / §A.6.5 per-component COC / QCC overrides on encode
+- §A.6.6 POC emission (progression-order changes on encode)
+- §A.4.2 multi-tile-part emission (TPsot > 0)
+- drop stray debug fixture committed by mistake
+- §B.2 component sub-sampling on encode (SIZ XRsiz / YRsiz)
+- >8-bit input on encode (encode_j2k_u16, 1..=16-bit Ssiz)
+- §A.8.1 SOP / §A.8.2 EPH packet framing on encode
+
 ### Fixed
 
 - **Two decode bugs specific to precinct-unaligned tile edges**, found by
