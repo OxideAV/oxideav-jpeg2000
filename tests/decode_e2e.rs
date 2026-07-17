@@ -2023,6 +2023,137 @@ fn htdeclared_mixed_ht_and_annex_d_components_reconstruct() {
     assert_eq!(img.components[1].samples, want_a, "Annex D component");
 }
 
+/// Clean-room tile-lane assembler: from two encodes of the same
+/// 2×2-tile image with identical geometry / quantisation — one all
+/// Annex D, one all HT — build a single codestream whose tiles mix
+/// the two block-coding lanes at **tile** granularity: the T.814 §8.2
+/// HTDECLARED set in its §8.5 HETEROGENEOUS shape, where the lane
+/// switch rides the §A.6.1 first-tile-part `COD` override rather than
+/// a per-component `COC`.
+///
+/// `main` supplies the main header (its SIZ gains the T.814 §A.2
+/// `Rsiz` bit 14 and a §A.3 `CAP` segment taken from
+/// `cap_payload_src`; `Ccap15` bit 15 is set to declare HTDECLARED).
+/// Every tile listed in `override_tiles` is taken from `other`
+/// instead, with `other`'s main-header `COD` payload restated as a
+/// tile-part `COD` in its `TPsot = 0` header (Psot re-patched), so
+/// that tile's style byte — including SPcod bit 6 — diverges from the
+/// main header's.
+fn assemble_mixed_tile_lanes(
+    main: &[u8],
+    other: &[u8],
+    cap_payload_src: &[u8],
+    override_tiles: &[u16],
+) -> Vec<u8> {
+    let cs_main = parse_codestream(main).expect("parse main lane");
+    let cs_other = parse_codestream(other).expect("parse other lane");
+    assert_eq!(cs_main.tile_parts.len(), cs_other.tile_parts.len());
+
+    // Main header: SOC + SIZ (Rsiz |= bit 14) + CAP + the rest.
+    let mut out = Vec::new();
+    out.extend_from_slice(&0xFF4Fu16.to_be_bytes());
+    let siz_off = find_marker(main, 0xFF51);
+    let mut siz = marker_payload(main, siz_off).to_vec();
+    siz[0] |= 0x40; // Rsiz bit 14: HTJ2K codestream (T.814 §A.2)
+    out.extend_from_slice(&wrap_marker(0xFF51, &siz));
+    // CAP: reuse the HT lane's payload, with Ccap15 bit 15 set —
+    // HTDECLARED (T.814 §A.3 / §8.2).
+    let cap_off = find_marker(cap_payload_src, 0xFF50);
+    let mut cap = marker_payload(cap_payload_src, cap_off).to_vec();
+    cap[4] |= 0x80;
+    out.extend_from_slice(&wrap_marker(0xFF50, &cap));
+    // The rest of the main header, minus SIZ and any CAP already
+    // there (walk marker by marker).
+    let mut pos = siz_off + 4 + siz.len();
+    let first_sot = cs_main.tile_parts[0].sot_offset;
+    while pos < first_sot {
+        let marker = u16::from_be_bytes([main[pos], main[pos + 1]]);
+        let len = u16::from_be_bytes([main[pos + 2], main[pos + 3]]) as usize;
+        if marker != 0xFF50 {
+            out.extend_from_slice(&main[pos..pos + 2 + len]);
+        }
+        pos += 2 + len;
+    }
+    // The `other` lane's main COD payload becomes the override tiles'
+    // tile-part COD.
+    let cod_other = marker_payload(other, find_marker(other, 0xFF52)).to_vec();
+    // Tile-parts, in codestream order.
+    for (i, tp) in cs_main.tile_parts.iter().enumerate() {
+        if override_tiles.contains(&tp.sot.tile_index) {
+            let tp_o = &cs_other.tile_parts[i];
+            assert_eq!(tp_o.sot.tile_index, tp.sot.tile_index);
+            assert_eq!(tp_o.sot.tile_part_index, 0, "one tile-part per tile");
+            let start = out.len();
+            // SOT segment (12 bytes), then the inserted COD, then the
+            // rest of the tile-part header + body.
+            out.extend_from_slice(&other[tp_o.sot_offset..tp_o.sot_offset + 12]);
+            out.extend_from_slice(&wrap_marker(0xFF52, &cod_other));
+            out.extend_from_slice(&other[tp_o.sot_offset + 12..tp_o.body_offset + tp_o.body_len]);
+            let psot = (out.len() - start) as u32;
+            out[start + 6..start + 10].copy_from_slice(&psot.to_be_bytes());
+        } else {
+            out.extend_from_slice(&main[tp.sot_offset..tp.body_offset + tp.body_len]);
+        }
+    }
+    out.extend_from_slice(&0xFFD9u16.to_be_bytes());
+    out
+}
+
+/// T.814 §8.2 HTDECLARED at **tile** granularity across a multi-tile
+/// grid (the §8.5 HETEROGENEOUS shape): tiles 0 and 3 decode with one
+/// block-coding lane, tiles 1 and 2 with the other, the switch riding
+/// each override tile's first-tile-part `COD`. Both orientations
+/// (HT-main with Annex D override tiles, and Annex-D-main with HT
+/// override tiles) must reconstruct the source raster bit-exactly —
+/// both lanes are lossless here. Both assembled orientations were
+/// additionally verified byte-identical to the source through an
+/// independent black-box decoder during development (a second,
+/// HT-only opaque decoder declines tile-part `COD` segments
+/// altogether, so it cannot arbitrate this shape).
+#[test]
+fn htdeclared_mixed_lanes_across_tiles_reconstruct() {
+    use oxideav_jpeg2000::encode::{encode_j2k, EncodeParams};
+    let (w, h) = (64u32, 64u32);
+    let mut seed = 0x7411_C0DEu32;
+    let src: Vec<u8> = (0..w * h)
+        .map(|_| {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 24) as u8
+        })
+        .collect();
+    let base = EncodeParams {
+        decomposition_levels: 2,
+        code_block_exp: (4, 4),
+        tile_size: Some((32, 32)),
+        ..EncodeParams::default()
+    };
+    let plain = encode_j2k(&[&src], w, h, &base).expect("Annex D encode");
+    let ht = encode_j2k(
+        &[&src],
+        w,
+        h,
+        &EncodeParams {
+            high_throughput: true,
+            ..base
+        },
+    )
+    .expect("HT encode");
+    let want: Vec<i32> = src.iter().map(|&v| i32::from(v)).collect();
+
+    // HT main header; tiles 1 and 2 carry Annex D tile-part CODs.
+    let mixed = assemble_mixed_tile_lanes(&ht, &plain, &ht, &[1, 2]);
+    let cs = parse_codestream(&mixed).expect("parse mixed lanes");
+    assert_eq!(cs.tile_parts.len(), 4);
+    let img = decode_j2k(&mixed).expect("decode HT-main mixed-lane grid");
+    assert_eq!(img.components[0].samples, want, "HT-main mixed lanes");
+
+    // Annex D main header (gains Rsiz bit 14 + CAP); tiles 1 and 2
+    // carry HT tile-part CODs.
+    let mixed = assemble_mixed_tile_lanes(&plain, &ht, &ht, &[1, 2]);
+    let img = decode_j2k(&mixed).expect("decode AnnexD-main mixed-lane grid");
+    assert_eq!(img.components[0].samples, want, "Annex-D-main mixed lanes");
+}
+
 /// The per-component style split also carries the Annex D sub-styles:
 /// an Annex D component with the §D.6 bypass + §D.4.2 termination
 /// styles coexists with a default-style component in one tile, each

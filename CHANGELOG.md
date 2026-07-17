@@ -6,6 +6,14 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+- **Mixed HT / Annex D block-coding lanes at tile granularity** — a
+  multi-tile codestream whose main header signals one lane while selected
+  tiles restate the other through their first-tile-part `COD` override
+  (T.814 §8.2 HTDECLARED in its §8.5 HETEROGENEOUS shape) decodes
+  bit-exact in both orientations (HT-main / Annex-D-main), validated by a
+  clean-room tile-lane assembler over this crate's own encoder and
+  byte-identical through an independent black-box decoder.
+
 - **§A.4.2 tile-part interleaving decoded and enforced** — tile-parts of
   different tiles may interleave in the codestream; a committed 2×2-tile,
   three-tile-parts-per-tile fixture transcoded into round-robin order

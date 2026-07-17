@@ -176,7 +176,12 @@ What is implemented:
   single-component stream into one two-component codestream (`Rsiz`
   bit 14 + `CAP` with the HTDECLARED `Ccap15`) and asserts each
   component reconstructs identically to its standalone decode, in
-  both component orders.
+  both component orders. The lanes also mix at **tile** granularity
+  (the §8.5 HETEROGENEOUS shape): a multi-tile grid whose main
+  header signals one lane while selected tiles restate the other
+  through their first-tile-part `COD` override decodes bit-exact in
+  both orientations, byte-identical through an independent black-box
+  decoder.
 - **Progression** — all five §B.12.1 orders (LRCP, RLCP, RPCL, PCRL,
   CPRL) and the §A.6.6 **progression order change** (`POC`) wired into
   the decode driver: a main-header or first-tile-part `POC` drives the
