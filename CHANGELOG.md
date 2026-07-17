@@ -4,6 +4,31 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- **JP2 Header box surface completed (T.800 Annex I)** — the `pclr` Palette
+  box (§I.5.3.4, any 1–38-bit signed/unsigned column layout, non-multiple-
+  of-8 padded storage), the `cmap` Component Mapping box (§I.5.3.5, direct
+  and palette mappings), the `cdef` Channel Definition box (§I.5.3.6,
+  colour / opacity / premultiplied-opacity types, colour associations, the
+  duplicate-(Typ, Asoc) rule), and the `res ` Resolution superbox
+  (§I.5.3.7, `resc` / `resd` with the Equation I-4 / I-5 points-per-metre
+  values) now parse into typed `Jp2Header` fields, with the §I.5.3.4
+  pclr ⟺ cmap pairing and cross-box index-range rules enforced.
+- **`jp2::decode_jp2`** — end-to-end JP2 / JPH *file* decode: parses the
+  box structure, decodes the `jp2c` codestream and applies the Annex I
+  channel semantics — palette expansion through `pclr` / `cmap` (index
+  clamped to the palette range, generated channels take the column depth /
+  signedness) and `cdef` presentation ordering (colour channels first in
+  colour order, auxiliary channels after). Both are validated byte-exact
+  against black-box reference decodes of committed palettized and
+  BGR-plus-`cdef` fixtures.
+- **JP2 sniffing in the historical entry points** — `decode_jpeg2000` and
+  the registry decoder now detect the 12-byte JP2 Signature box
+  (`looks_like_jp2`) and route whole JP2 / JPH files through
+  `jp2::decode_jp2`, so palettized files come out expanded instead of as a
+  bare index plane.
+
 ### Changed
 
 - **Internal codec plumbing is now `#[doc(hidden)]`** — the tier-1 / tier-2,

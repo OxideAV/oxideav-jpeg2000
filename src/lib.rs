@@ -1937,16 +1937,36 @@ fn scan_until_sot_or_eoc(bytes: &[u8], start: usize) -> Result<usize, Error> {
 // Decoder / encoder entry points.
 // ---------------------------------------------------------------------------
 
-/// Decode a JPEG 2000 codestream (J2K) into interleaved raw 8-bit
-/// component samples (row-major, `Csiz` components per pixel).
+/// `true` iff `bytes` starts with the fixed 12-byte JP2 Signature
+/// box (T.800 §I.5.1) — i.e. the input is a JP2 / JPH **file**, not a
+/// bare Annex A codestream.
+pub fn looks_like_jp2(bytes: &[u8]) -> bool {
+    bytes.len() >= 12
+        && bytes[0..4] == [0x00, 0x00, 0x00, 0x0C]
+        && bytes[4..8] == jp2::BOX_TYPE_JP2_SIGNATURE.to_be_bytes()
+        && bytes[8..12] == jp2::JP2_SIGNATURE_MAGIC
+}
+
+/// Decode a JPEG 2000 codestream (J2K) **or JP2 / JPH file** into
+/// interleaved raw 8-bit channel samples (row-major, one entry per
+/// channel per pixel).
 ///
 /// Convenience wrapper around [`decode_j2k`] preserving the
-/// historical byte-vector signature. Requires every component to be
-/// 8-bit-or-less unsigned at `1:1` sub-sampling (so all planes share
-/// one geometry); other layouts return [`Error::NotImplemented`] —
-/// use [`decode_j2k`] to access the per-component planes directly.
+/// historical byte-vector signature. An input beginning with the
+/// 12-byte JP2 Signature box (T.800 §I.5.1) routes through
+/// [`jp2::decode_jp2`], so the Annex I channel semantics — Palette /
+/// Component Mapping expansion (§I.5.3.4 / §I.5.3.5) and Channel
+/// Definition ordering (§I.5.3.6) — apply. Requires every resulting
+/// channel to be 8-bit-or-less unsigned at `1:1` sub-sampling (so
+/// all planes share one geometry); other layouts return
+/// [`Error::NotImplemented`] — use [`decode_j2k`] /
+/// [`jp2::decode_jp2`] to access the per-component planes directly.
 pub fn decode_jpeg2000(bytes: &[u8]) -> Result<Vec<u8>, Error> {
-    let image = decode_j2k(bytes)?;
+    let image = if looks_like_jp2(bytes) {
+        jp2::decode_jp2(bytes)?
+    } else {
+        decode_j2k(bytes)?
+    };
     let ncomp = image.components.len();
     let first = image.components.first().ok_or(Error::NotImplemented)?;
     let (w, h) = (first.width, first.height);

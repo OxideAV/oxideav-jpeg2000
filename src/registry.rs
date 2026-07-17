@@ -149,7 +149,14 @@ impl Decoder for Jpeg2000Decoder {
                 Err(CoreError::NeedMore)
             };
         };
-        let image = decode_j2k(&pkt.data)?;
+        // A packet may carry either a bare Annex A codestream or a
+        // whole JP2 / JPH file — the latter routes through the Annex I
+        // channel semantics (palette expansion, channel ordering).
+        let image = if crate::looks_like_jp2(&pkt.data) {
+            crate::jp2::decode_jp2(&pkt.data)?
+        } else {
+            decode_j2k(&pkt.data)?
+        };
         let (frame, w, h, format) = image_to_frame(&image, pkt.pts)?;
         self.params.width = Some(w);
         self.params.height = Some(h);

@@ -51,7 +51,21 @@ What is implemented:
   three box length encodings; plus the **JPH** (HTJ2K, T.814 Annex D)
   profile of the same layout — the `'jph '` brand, the §D.2
   no-`colr`-under-`UnkC` exemption, and the §D.4 `METH` values 3 (any
-  ICC profile) and 5 (H.273 parameterized colourspace).
+  ICC profile) and 5 (H.273 parameterized colourspace). The full
+  Annex I `jp2h` box surface parses: the **`pclr` Palette** box
+  (§I.5.3.4 — any 1–38-bit signed / unsigned column layout, padded
+  non-multiple-of-8 storage), the **`cmap` Component Mapping** box
+  (§I.5.3.5, direct + palette mappings, with the pclr ⟺ cmap pairing
+  and index-range rules enforced), the **`cdef` Channel Definition**
+  box (§I.5.3.6 — colour / opacity / premultiplied types, colour
+  associations, the duplicate-(Typ, Asoc) rule), and the **`res `
+  Resolution** superbox (§I.5.3.7, `resc` / `resd` grid resolutions).
+  `jp2::decode_jp2` decodes a JP2 / JPH **file** end-to-end and
+  applies the channel semantics — palette expansion and `cdef`
+  colour-ordering — **byte-exact against black-box reference decodes**
+  of committed palettized and BGR + `cdef` fixtures; the historical
+  `decode_jpeg2000` entry point and the registry decoder sniff the
+  12-byte JP2 signature and route files through the same path.
 - **Main header** — `SOC`, `SIZ`, `COD`, `QCD`, plus the typed
   tile-part-header markers (`COD`, `COC`, `QCD`, `QCC`, `RGN`, `POC`,
   `PLT`, `PPT`, `COM`); 8- vs 16-bit component-index width is selected
@@ -475,6 +489,7 @@ These surface a clean `Error::NotImplemented` rather than mis-decoding:
 let codestream = oxideav_jpeg2000::parse_codestream(bytes)?;
 let header     = oxideav_jpeg2000::parse_j2k_header(bytes)?;
 let container  = oxideav_jpeg2000::jp2::parse_jp2(bytes)?;
+let image      = oxideav_jpeg2000::jp2::decode_jp2(bytes)?; // file → channels
 # Ok::<(), oxideav_jpeg2000::Error>(())
 ```
 

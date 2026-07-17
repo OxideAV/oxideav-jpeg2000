@@ -2381,6 +2381,82 @@ fn jp2_container_rgb_is_pixel_exact() {
     }
 }
 
+// Palettized JP2 (T.800 §I.5.3.4 / §I.5.3.5): a 32×24 single-component
+// index plane (values 0..=15, black-box lossless 5-3 encode, COM
+// markers scrubbed) wrapped with a 16-entry three-column 8-bit `pclr`
+// and a `cmap` applying columns 0/1/2 of component 0 as channels
+// R/G/B. The committed reference is an opaque black-box JP2 reader's
+// decode of the same file (comment-scrubbed P6 PPM) — that reader
+// expands the palette exactly as §I.5.3.5 requires, so `decode_jp2`
+// must match it byte-for-byte.
+const PAL_JP2: &[u8] = include_bytes!("data/pal-32x24.jp2");
+const PAL_JP2_REF_PPM: &[u8] = include_bytes!("data/pal-32x24-ref.ppm");
+
+// Channel-Definition JP2 (T.800 §I.5.3.6): a 16×16 three-component
+// codestream whose planes are stored in B, G, R order, wrapped with a
+// `cdef` associating channel 0 with colour 3 (blue), channel 1 with
+// colour 2 (green) and channel 2 with colour 1 (red). The reference
+// black-box JP2 reader reorders the decoded channels into colour
+// order (R, G, B), matching the `decode_jp2` presentation rule.
+const BGR_CDEF_JP2: &[u8] = include_bytes!("data/bgr-cdef-16x16.jp2");
+const BGR_CDEF_JP2_REF_PPM: &[u8] = include_bytes!("data/bgr-cdef-16x16-ref.ppm");
+
+/// Palettized JP2 end-to-end: `decode_jp2` expands the single index
+/// component through the `pclr` / `cmap` boxes into three 8-bit
+/// channels, byte-exact against the black-box reference decode.
+#[test]
+fn jp2_palette_expansion_matches_reference() {
+    let container = oxideav_jpeg2000::jp2::parse_jp2(PAL_JP2).expect("parse palettized jp2");
+    let header = &container.header;
+    let pclr = header.pclr.as_ref().expect("pclr parsed");
+    assert_eq!(pclr.columns.len(), 3);
+    assert_eq!(pclr.entries(), 16);
+    assert_eq!(header.cmap.as_ref().map(Vec::len), Some(3));
+
+    let img = oxideav_jpeg2000::jp2::decode_jp2(PAL_JP2).expect("decode palettized jp2");
+    assert_eq!(img.components.len(), 3, "palette generates 3 channels");
+    let (w, h, rgb) = ppm_payload(PAL_JP2_REF_PPM);
+    assert_eq!((w, h), (32, 24));
+    for (ci, c) in img.components.iter().enumerate() {
+        assert_eq!((c.width as usize, c.height as usize), (w, h));
+        assert_eq!(c.precision_bits, 8);
+        assert!(!c.is_signed);
+        let want: Vec<i32> = rgb[ci..].iter().step_by(3).map(|&v| i32::from(v)).collect();
+        assert_eq!(c.samples, want, "palette channel {ci}");
+    }
+    // The interleaved entry point sniffs the JP2 signature and must
+    // reproduce the reference PPM payload directly.
+    let interleaved = oxideav_jpeg2000::decode_jpeg2000(PAL_JP2).expect("interleaved");
+    assert_eq!(interleaved.as_slice(), &rgb[..w * h * 3]);
+}
+
+/// Channel-Definition JP2 end-to-end: `decode_jp2` reorders the
+/// stored B, G, R planes into colour order per the `cdef` box,
+/// byte-exact against the black-box reference decode.
+#[test]
+fn jp2_cdef_channel_order_matches_reference() {
+    let container = oxideav_jpeg2000::jp2::parse_jp2(BGR_CDEF_JP2).expect("parse cdef jp2");
+    let defs = container.header.cdef.as_ref().expect("cdef parsed");
+    assert_eq!(defs.len(), 3);
+    assert_eq!(defs[0].association, 3);
+
+    let img = oxideav_jpeg2000::jp2::decode_jp2(BGR_CDEF_JP2).expect("decode cdef jp2");
+    let (w, h, rgb) = ppm_payload(BGR_CDEF_JP2_REF_PPM);
+    assert_eq!((w, h), (16, 16));
+    assert_eq!(img.components.len(), 3);
+    for (ci, c) in img.components.iter().enumerate() {
+        let want: Vec<i32> = rgb[ci..].iter().step_by(3).map(|&v| i32::from(v)).collect();
+        assert_eq!(c.samples, want, "cdef-ordered channel {ci}");
+    }
+    // Raw codestream decode (no box layer) still yields the stored
+    // B, G, R order — the reorder is purely the §I.5.3.6 box's doing.
+    let cs = &BGR_CDEF_JP2
+        [container.codestream_offset..container.codestream_offset + container.codestream_len];
+    let raw = decode_j2k(cs).expect("decode raw codestream");
+    assert_eq!(raw.components[0].samples, img.components[2].samples);
+    assert_eq!(raw.components[2].samples, img.components[0].samples);
+}
+
 // ---------------------------------------------------------------------------
 // ISO/IEC 15444-4 §B.2.3 reduced-resolution decode (`decode_j2k_reduced`):
 // the conformance suite's Class-0 reference images are produced by
