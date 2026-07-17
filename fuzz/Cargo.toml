@@ -77,3 +77,10 @@ path = "fuzz_targets/decode_j2k.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "decode_jp2"
+path = "fuzz_targets/decode_jp2.rs"
+test = false
+doc = false
+bench = false

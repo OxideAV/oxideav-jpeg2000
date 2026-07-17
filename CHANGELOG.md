@@ -31,6 +31,12 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+- **`decode_jp2` fuzz target** — the daily fuzz workflow now exercises the
+  end-to-end JP2 file decode (Annex I box walk including the new
+  `pclr` / `cmap` / `cdef` / `res ` parsers, codestream decode, palette
+  application and `cdef` reorder) with the same geometry caps as the
+  `decode_j2k` harness plus a palette-channel cap.
+
 - **TLM / PLT pointer-marker exploitation (T.800 §A.7.1 / §A.7.3)** — the
   decoder now cross-validates the pointer markers instead of skipping
   them: a main-header `TLM` list must name every tile-part's tile index
