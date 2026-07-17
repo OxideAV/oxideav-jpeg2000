@@ -2372,9 +2372,65 @@ fn gray_53_plt_pointer_marker_is_pixel_exact() {
     assert_eq!(img.components[0].samples, gray_pattern(64, 64));
 }
 
+/// §A.7.1 / §A.7.3 pointer-marker **exploitation** (round 416): the
+/// decoder cross-validates every `TLM` tile-part length against the
+/// walked chain and every `PLT` packet length against the walked
+/// packets. A corrupted pointer must be rejected, not ignored.
+#[test]
+fn corrupted_tlm_and_plt_pointers_are_rejected() {
+    use oxideav_jpeg2000::Error;
+    // TLM: flip the low byte of the last Ptlm entry in the main
+    // header's TLM segment. The announced length then disagrees with
+    // the actual tile-part span.
+    let mut bad = GRAY_TLM_53.to_vec();
+    let tlm_off = bad
+        .windows(2)
+        .position(|w| w == [0xFF, 0x55])
+        .expect("fixture carries a TLM");
+    let ltlm = u16::from_be_bytes([bad[tlm_off + 2], bad[tlm_off + 3]]) as usize;
+    let seg_end = tlm_off + 2 + ltlm;
+    bad[seg_end - 1] ^= 0x01;
+    assert_eq!(decode_j2k(&bad), Err(Error::TlmMismatch));
+    // A TLM entry count that misses tile-parts is likewise rejected:
+    // shrink the segment by one 16-bit Ptlm entry (opaque-encoder
+    // layout: ST = 0 / SP = 0 or larger — rather than model the exact
+    // Stlm, drop the whole final entry by rewriting Ltlm and splicing
+    // the bytes out; the resulting list is shorter than the chain).
+    let stlm = GRAY_TLM_53[tlm_off + 5];
+    let entry = match ((stlm >> 4) & 3, (stlm >> 6) & 1) {
+        (0, 0) => 2usize,
+        (1, 0) => 3,
+        (2, 0) => 4,
+        (0, 1) => 4,
+        (1, 1) => 5,
+        _ => 6,
+    };
+    let mut short = GRAY_TLM_53.to_vec();
+    short.splice(seg_end - entry..seg_end, std::iter::empty());
+    let new_len = (ltlm - entry) as u16;
+    short[tlm_off + 2..tlm_off + 4].copy_from_slice(&new_len.to_be_bytes());
+    assert_eq!(decode_j2k(&short), Err(Error::TlmMismatch));
+
+    // PLT: flip the last Iplt byte (a terminal VLQ byte, bit 7 = 0) of
+    // the tile-part's PLT segment — the announced packet length then
+    // disagrees with the walked packet span.
+    let mut bad = GRAY_PLT_53.to_vec();
+    let plt_off = bad
+        .windows(2)
+        .position(|w| w == [0xFF, 0x58])
+        .expect("fixture carries a PLT");
+    let lplt = u16::from_be_bytes([bad[plt_off + 2], bad[plt_off + 3]]) as usize;
+    let seg_end = plt_off + 2 + lplt;
+    assert_eq!(bad[seg_end - 1] & 0x80, 0, "last Iplt byte terminates");
+    bad[seg_end - 1] ^= 0x01;
+    assert_eq!(decode_j2k(&bad), Err(Error::PltMismatch));
+}
+
 /// §A.7.1 TLM (tile-part length, main header) pointer marker over a
 /// 48×40 tile grid: the main header announces every tile-part length
-/// up front; the sequential SOT walk must agree with it.
+/// up front; the sequential SOT walk must agree with it (and is now
+/// actively cross-validated — see
+/// [`corrupted_tlm_and_plt_pointers_are_rejected`]).
 #[test]
 fn gray_53_tlm_pointer_marker_with_tiles_is_pixel_exact() {
     let img = decode_j2k(GRAY_TLM_53).expect("decode TLM stream");

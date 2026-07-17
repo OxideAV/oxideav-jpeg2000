@@ -31,6 +31,20 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+- **TLM / PLT pointer-marker exploitation (T.800 §A.7.1 / §A.7.3)** — the
+  decoder now cross-validates the pointer markers instead of skipping
+  them: a main-header `TLM` list must name every tile-part's tile index
+  and its exact `SOT`-to-body-end length (all `Stlm` ST / SP sizings,
+  `Ztlm` concatenation, the ST = 0 one-part-per-tile layout), and a
+  tile-part's `PLT` list must match its walked packets one-for-one (the
+  §A.7.3 header-inclusive spans in-stream, data-only spans under
+  PPM / PPT relocation, `Zplt` concatenation, completed-`Iplt` rule). A
+  corrupted, shortened or re-ordered pointer surfaces the new
+  `Error::TlmMismatch` / `Error::PltMismatch` instead of being ignored —
+  validated against a 32-case black-box matrix (`PLT` × `SOP` / `EPH` ×
+  tile-part splits × `TLM` × layers, all decoding bit-exact with
+  validation active) and corrupted-pointer rejection tests.
+
 - **HT-lane coverage of the precinct-unaligned shapes** — an 80-case
   black-box HTJ2K sweep (all five progression orders × 15×13 tiles ×
   custom precincts × image-origin offsets, gray and RGB/RCT reversible)

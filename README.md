@@ -38,7 +38,9 @@ reference-grid anchoring, 5-3 and 9-7), **tile-parts split by layer**
 (TPsot > 0 chains), **tile-parts interleaved across tiles** (the
 §A.4.2 round-robin layout, with the TPsot ordering / TNsot count
 rules enforced against lost or mis-assembled chains), **PLT** and
-**TLM** pointer markers, **MCT-off**
+**TLM** pointer markers (both actively **cross-validated** against the
+walked packets / tile-parts — a corrupted pointer is rejected, not
+skipped), **MCT-off**
 RGB, **signed 8- and 12-bit** and **unsigned 16-bit** depths,
 all-component **reference-grid sub-sampling** (XRsiz = 2 planes pinned
 against §B.2.6 PGX reference decodes), the **JP2 container** from a

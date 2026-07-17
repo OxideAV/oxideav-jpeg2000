@@ -1059,6 +1059,13 @@ fn decode_tile(
     // code-block sees exactly its first-`max_layers` coding passes,
     // the same shape as a rate-truncated stream). `u16::MAX` = all.
     max_layers: u16,
+    // §A.7.3 `PLT` packet-length lists for this tile, one entry per
+    // tile-part in TPsot order: `(body_len, lengths)` where `lengths`
+    // is `Some` iff the tile-part's header carried at least one `PLT`
+    // (its `Iplt` values concatenated in increasing `Zplt` order).
+    // When present, the walked packets are cross-validated against
+    // the listed lengths — see `validate_plt_lengths`.
+    plt: Option<&[TilePartPlt]>,
 ) -> Result<Vec<Vec<i32>>, Error> {
     // -- §B.6–§B.12 tile packet plan (geometry, enumeration, walk split) --
     let TilePacketPlan {
@@ -1075,6 +1082,10 @@ fn decode_tile(
     // instead. Normalise both into a `(header, data_offset)` list so the
     // segment-slicing replay below is identical for the two framings.
     let headers = walk_tile_packet_headers(body, &packets, params.sop_eph, relocated_headers)?;
+
+    if let Some(plt) = plt {
+        validate_plt_lengths(plt, &headers, relocated_headers.is_some())?;
+    }
 
     decode_tile_from_plan(
         siz,
@@ -1283,6 +1294,93 @@ fn build_tile_packet_plan(
         descriptors,
         packets,
     })
+}
+
+/// One tile-part's §A.7.3 `PLT` context for [`validate_plt_lengths`]:
+/// `(body_len, lengths)`, where `lengths` is `Some` iff the tile-part's
+/// header carried at least one `PLT` segment (its `Iplt` values
+/// concatenated in increasing `Zplt` order).
+type TilePartPlt = (usize, Option<Vec<u64>>);
+
+/// Cross-validates a tile's §A.7.3 `PLT` packet-length lists against
+/// the walked packets.
+///
+/// `plt` carries one `(body_len, lengths)` entry per tile-part in
+/// TPsot order; `lengths` is `Some` for tile-parts whose header
+/// carried at least one `PLT` segment. A tile-part's list must
+/// describe **every** packet whose bytes start inside that tile-part
+/// ("a list of packet lengths in the tile-part"), in order, and each
+/// `Iplt` must equal the packet's actual byte span:
+///
+/// * in-stream headers — the whole packet, `SOP` / header / `EPH` /
+///   code-block data ("if packet headers are stored with the packet,
+///   this length includes the packet header");
+/// * relocated `PPM` / `PPT` headers — the in-body bytes only ("this
+///   length does not include the packet header lengths"): any `SOP`
+///   plus the code-block data.
+///
+/// A count or length mismatch means a packet was lost, resized or
+/// reordered relative to the pointer marker — the stream is rejected
+/// rather than decoded against a chain the encoder did not write.
+/// Tile-parts without a `PLT` are unconstrained (the marker is
+/// optional per tile-part).
+fn validate_plt_lengths(
+    plt: &[TilePartPlt],
+    headers: &[(crate::packet::PacketHeader, usize)],
+    relocated: bool,
+) -> Result<(), Error> {
+    // Reconstruct each packet's [start, end) span inside the
+    // concatenated tile body. For the in-stream framing the header
+    // starts the packet (data_offset - bytes_consumed); for the
+    // relocated framing the packet's in-body bytes start at the SOP
+    // (which `walk_packet_headers_separate` consumed just before
+    // `data_offset`) — successive spans abut, so each packet runs to
+    // the next packet's start (the last to the body end).
+    let mut spans: Vec<(usize, usize)> = Vec::with_capacity(headers.len());
+    for (i, (header, data_offset)) in headers.iter().enumerate() {
+        let end = data_offset
+            .checked_add(
+                usize::try_from(header.total_body_bytes()).map_err(|_| Error::PsotOverflow)?,
+            )
+            .ok_or(Error::PsotOverflow)?;
+        let start = if relocated {
+            if i == 0 {
+                0
+            } else {
+                spans[i - 1].1
+            }
+        } else {
+            data_offset
+                .checked_sub(header.bytes_consumed)
+                .ok_or(Error::PacketHeaderOverrun)?
+        };
+        spans.push((start, end));
+    }
+    // Walk the tile-parts, attributing packets by their start offset.
+    let mut next_packet = 0usize;
+    let mut tp_start = 0usize;
+    for (tp_body_len, lengths) in plt {
+        let tp_end = tp_start
+            .checked_add(*tp_body_len)
+            .ok_or(Error::PsotOverflow)?;
+        let first = next_packet;
+        while next_packet < spans.len() && spans[next_packet].0 < tp_end {
+            next_packet += 1;
+        }
+        if let Some(lengths) = lengths {
+            let got = &spans[first..next_packet];
+            if got.len() != lengths.len() {
+                return Err(Error::PltMismatch);
+            }
+            for ((start, end), &listed) in got.iter().zip(lengths.iter()) {
+                if (end - start) as u64 != listed {
+                    return Err(Error::PltMismatch);
+                }
+            }
+        }
+        tp_start = tp_end;
+    }
+    Ok(())
 }
 
 /// Walks one tile's packet headers, normalising the two framings into a
@@ -2244,6 +2342,45 @@ fn decode_codestream_impl(
     // per-tile-part relocated buffers are mapped onto the tile-parts by
     // their codestream ordinal below.
     let main_ppm = crate::collect_main_header_ppm(bytes, cs.header.bytes_consumed)?;
+
+    // §A.7.1: a main-header `TLM` describes *every* tile-part — its
+    // tile index and its `SOT`-to-body-end length ("the same as the
+    // value in the corresponding Psot"). When present, cross-validate
+    // the whole list against the walked tile-part chain: a mismatch
+    // means a tile-part was lost, reordered, resized or corrupted
+    // (exactly what the pointer marker exists to detect), so the
+    // stream is rejected rather than decoded against a chain the
+    // encoder did not write.
+    if let Some(tlm) = crate::collect_main_header_tlm(bytes, cs.header.bytes_consumed)? {
+        if tlm.len() != cs.tile_parts.len() {
+            return Err(Error::TlmMismatch);
+        }
+        for (j, (entry, tp)) in tlm.iter().zip(cs.tile_parts.iter()).enumerate() {
+            match entry.tile {
+                Some(t) => {
+                    if t != tp.sot.tile_index {
+                        return Err(Error::TlmMismatch);
+                    }
+                }
+                // Table A.34 ST = 0: "only one tile-part per tile and
+                // the tiles are in index order without omission or
+                // repetition" — the tile index is implied by position.
+                None => {
+                    if tp.sot.tile_part_index != 0 || usize::from(tp.sot.tile_index) != j {
+                        return Err(Error::TlmMismatch);
+                    }
+                }
+            }
+            let span = tp
+                .body_offset
+                .checked_add(tp.body_len)
+                .and_then(|end| end.checked_sub(tp.sot_offset))
+                .ok_or(Error::PsotOverflow)?;
+            if u64::from(entry.length) != span as u64 {
+                return Err(Error::TlmMismatch);
+            }
+        }
+    }
     if main_ppm.is_some() {
         for tp in &cs.tile_parts {
             if tp
@@ -2409,6 +2546,39 @@ fn decode_codestream_impl(
             gather_ppt_headers(&parts)?
         };
 
+        // §A.7.3: gather each tile-part's `PLT` packet-length lists
+        // (concatenated in increasing `Zplt` order — a duplicated index
+        // makes the concatenation ambiguous and is rejected). Only
+        // tile-parts that carry a `PLT` are constrained.
+        let mut any_plt = false;
+        let mut plt_plan: Vec<TilePartPlt> = Vec::with_capacity(parts.len());
+        for tp in &parts {
+            let mut segs: Vec<&crate::Plt> = tp
+                .markers
+                .iter()
+                .filter_map(|m| match m {
+                    crate::TilePartMarker::Plt(p) => Some(p),
+                    _ => None,
+                })
+                .collect();
+            if segs.is_empty() {
+                plt_plan.push((tp.body_len, None));
+                continue;
+            }
+            any_plt = true;
+            segs.sort_by_key(|p| p.z_index);
+            for w in segs.windows(2) {
+                if w[0].z_index == w[1].z_index {
+                    return Err(Error::PltMismatch);
+                }
+            }
+            let lengths: Vec<u64> = segs
+                .iter()
+                .flat_map(|p| p.packet_lengths.iter().map(|&l| u64::from(l)))
+                .collect();
+            plt_plan.push((tp.body_len, Some(lengths)));
+        }
+
         let tile_planes = decode_tile(
             siz,
             &tile_coding.params,
@@ -2421,6 +2591,7 @@ fn decode_codestream_impl(
             relocated.as_deref(),
             discard_levels,
             max_layers,
+            any_plt.then_some(plt_plan.as_slice()),
         )?;
 
         // Place each tile-component plane into its image-area plane at

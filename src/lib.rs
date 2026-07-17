@@ -217,6 +217,9 @@ pub const MARKER_PPT: u16 = 0xFF61;
 /// `PPM` — Packed packet headers, main header (T.800 Table A.38).
 #[doc(hidden)]
 pub const MARKER_PPM: u16 = 0xFF60;
+/// `TLM` — Tile-part lengths, main header (T.800 Table A.33).
+#[doc(hidden)]
+pub const MARKER_TLM: u16 = 0xFF55;
 /// `CAP` — Extended capabilities (T.800 Table A.11bis).
 #[doc(hidden)]
 pub const MARKER_CAP: u16 = 0xFF50;
@@ -303,6 +306,20 @@ pub enum Error {
     /// (binary `1010`). Indicates that bit errors corrupted this
     /// bit-plane's compressed image data.
     SegmentationSymbolMismatch,
+    /// A main-header `TLM` marker segment (T.800 §A.7.1) disagrees
+    /// with the actual tile-part chain: entry count != tile-part
+    /// count, a `Ttlm` tile index != the corresponding `Isot`, a
+    /// `Ptlm` length != the tile-part's real `SOT`-to-body-end span
+    /// (== `Psot`), an `ST = 0` layout without one-tile-part-per-tile
+    /// in index order, or duplicate / malformed `Ztlm` sequencing.
+    /// Signals a lost, reordered or corrupted tile-part.
+    TlmMismatch,
+    /// A tile-part's `PLT` packet-length list (T.800 §A.7.3) disagrees
+    /// with the actual packets: entry count != the number of packets
+    /// starting in that tile-part, an `Iplt` != the packet's real byte
+    /// span, an incomplete trailing `Iplt`, or duplicate `Zplt`
+    /// sequencing. Signals a lost, resized or reordered packet.
+    PltMismatch,
     /// An HTJ2K (ITU-T T.814 | ISO/IEC 15444-15) HT segment did not
     /// conform to the §7.1 bit-stream-recovery constraints — e.g. a
     /// stuffing bit was non-zero, a state machine ran past its bound,
@@ -371,6 +388,14 @@ impl core::fmt::Display for Error {
             Error::SegmentationSymbolMismatch => write!(
                 f,
                 "JPEG 2000: §D.5 segmentation symbol decoded != 0xA (bit-plane corruption)"
+            ),
+            Error::TlmMismatch => write!(
+                f,
+                "oxideav-jpeg2000: TLM tile-part lengths disagree with the actual tile-part chain (T.800 A.7.1)"
+            ),
+            Error::PltMismatch => write!(
+                f,
+                "oxideav-jpeg2000: PLT packet lengths disagree with the actual packets (T.800 A.7.3)"
             ),
             Error::HtCorruptSegment => write!(
                 f,
@@ -1731,6 +1756,116 @@ pub(crate) fn collect_main_header_ppm(
         }
         out.push(concat[i..end].to_vec());
         i = end;
+    }
+    Ok(Some(out))
+}
+
+/// One tile-part entry of the concatenated main-header `TLM` list
+/// (T.800 §A.7.1): the `Ttlm` tile index (`None` when `ST = 0` — the
+/// "one tile-part per tile, tiles in index order" layout) and the
+/// `Ptlm` length in bytes from the tile-part's `SOT` marker to the end
+/// of its bit-stream data (== `Psot`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TlmEntry {
+    pub tile: Option<u16>,
+    pub length: u32,
+}
+
+/// Gathers the main-header `TLM` marker segments (T.800 §A.7.1) into
+/// the concatenated tile-part list, or `None` when no `TLM` is
+/// present.
+///
+/// Segments concatenate in increasing `Ztlm` order (a duplicate
+/// `Ztlm` is rejected — two segments cannot share a position in the
+/// concatenation). Each segment carries its own `Stlm` sizing: `ST`
+/// selects a 0- / 8- / 16-bit `Ttlm` and `SP` a 16- / 32-bit `Ptlm`
+/// (Tables A.33 / A.34); the reserved `Stlm` bits and an `ST = 3`
+/// are rejected, as is a payload that is not a whole number of
+/// entries.
+pub(crate) fn collect_main_header_tlm(
+    bytes: &[u8],
+    header_end: usize,
+) -> Result<Option<Vec<TlmEntry>>, Error> {
+    // Collect (Ztlm, entries) per segment across the main header.
+    let mut segs: Vec<(u8, Vec<TlmEntry>)> = Vec::new();
+    let mut pos = 2usize; // skip SOC (no length field)
+    while pos + 4 <= header_end {
+        let marker = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]);
+        let len = u16::from_be_bytes([bytes[pos + 2], bytes[pos + 3]]) as usize;
+        if len < 2 {
+            return Err(Error::InvalidMarkerLength);
+        }
+        if marker == MARKER_TLM {
+            // Ltlm >= 4: 2 (length) + 1 (Ztlm) + 1 (Stlm).
+            if len < 4 {
+                return Err(Error::InvalidMarkerLength);
+            }
+            let seg_start = pos + 4;
+            let payload_end = pos + 2 + len;
+            if payload_end > header_end {
+                return Err(Error::InvalidMarkerLength);
+            }
+            let z = bytes[seg_start];
+            let stlm = bytes[seg_start + 1];
+            // Table A.34: bit 6 is SP (Ptlm 16- vs 32-bit) and bits
+            // 5..4 are ST (Ttlm 0- / 8- / 16-bit); ST = 3, bit 7 and
+            // the low nibble are "reserved" and rejected.
+            let st = (stlm >> 4) & 0x3;
+            let sp = (stlm >> 6) & 0x1;
+            if st == 3 || (stlm & 0x8F) != 0 {
+                return Err(Error::InvalidMarkerLength);
+            }
+            let t_size = match st {
+                0 => 0usize,
+                1 => 1,
+                _ => 2,
+            };
+            let p_size = if sp == 0 { 2usize } else { 4 };
+            let body = &bytes[seg_start + 2..payload_end];
+            let entry_size = t_size + p_size;
+            if body.len() % entry_size != 0 {
+                return Err(Error::InvalidMarkerLength);
+            }
+            let mut entries = Vec::with_capacity(body.len() / entry_size);
+            let mut i = 0usize;
+            while i < body.len() {
+                let tile = match t_size {
+                    0 => None,
+                    1 => Some(u16::from(body[i])),
+                    _ => Some(u16::from_be_bytes([body[i], body[i + 1]])),
+                };
+                i += t_size;
+                let length = if p_size == 2 {
+                    u32::from(u16::from_be_bytes([body[i], body[i + 1]]))
+                } else {
+                    u32::from_be_bytes([body[i], body[i + 1], body[i + 2], body[i + 3]])
+                };
+                i += p_size;
+                // Table A.33: Ptlm >= 14 (a tile-part is at least
+                // SOT (12) + SOD (2)).
+                if length < 14 {
+                    return Err(Error::TlmMismatch);
+                }
+                entries.push(TlmEntry { tile, length });
+            }
+            segs.push((z, entries));
+        }
+        pos += 2 + len;
+    }
+    if segs.is_empty() {
+        return Ok(None);
+    }
+    // §A.7.1: concatenate in increasing Ztlm order; a duplicated index
+    // would make the concatenation ambiguous.
+    segs.sort_by_key(|(z, _)| *z);
+    for w in segs.windows(2) {
+        if w[0].0 == w[1].0 {
+            return Err(Error::TlmMismatch);
+        }
+    }
+    let mut out = Vec::new();
+    for (_, mut e) in segs {
+        out.append(&mut e);
     }
     Ok(Some(out))
 }
