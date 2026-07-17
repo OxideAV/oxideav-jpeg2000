@@ -6,6 +6,14 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Changed
 
+- **Internal codec plumbing is now `#[doc(hidden)]`** — the tier-1 / tier-2,
+  MQ, IDWT, MCT, geometry and HTJ2K modules (and the `MARKER_*` marker-code
+  constants) remain `pub` for tests/fuzz but are marked `#[doc(hidden)]`, so
+  cargo-semver-checks no longer tracks them as stable public API. The stable
+  surface is unchanged: the `decode_j2k*` / `decode_codestream` entry points,
+  `DecodedImage` / `DecodedComponent`, the JP2 and encoder APIs, the registry
+  `make_decoder` / `register`, and the `Error` / codestream header types.
+
 - **The 9-7 irreversible path (full-quality, rate-truncated and §D.6
   bypass) is pinned byte-exact against an independent black-box
   reference decoder** — closing the long-standing "±1 of reference"

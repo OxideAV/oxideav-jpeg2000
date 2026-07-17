@@ -115,22 +115,46 @@
 #![warn(missing_debug_implementations)]
 
 pub mod decode;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod dequant;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod dwt;
 pub mod encode;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod geometry;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod ht;
 pub(crate) mod ht_tables;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod htenc;
 pub mod jp2;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod mct;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod mq;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod mqenc;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod packet;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod progression;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod reassemble;
 #[cfg(feature = "registry")]
 pub mod registry;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod t1;
 
 pub use decode::{
@@ -147,41 +171,60 @@ use oxideav_core::RuntimeContext;
 // ---------------------------------------------------------------------------
 // Marker codes (T.800 §A.4 / §A.5 / §A.6 — Tables A.4, A.7, A.8, A.9, A.12,
 // A.22, A.27, A.31).
+//
+// internal — exposed for tests/fuzz; not part of the stable API
 // ---------------------------------------------------------------------------
 
 /// `SOC` — Start of codestream (T.800 Table A.4).
+#[doc(hidden)]
 pub const MARKER_SOC: u16 = 0xFF4F;
 /// `SOT` — Start of tile-part (T.800 Table A.5).
+#[doc(hidden)]
 pub const MARKER_SOT: u16 = 0xFF90;
 /// `SOD` — Start of data (T.800 Table A.7).
+#[doc(hidden)]
 pub const MARKER_SOD: u16 = 0xFF93;
 /// `EOC` — End of codestream (T.800 Table A.8).
+#[doc(hidden)]
 pub const MARKER_EOC: u16 = 0xFFD9;
 /// `SIZ` — Image and tile size (T.800 Table A.9).
+#[doc(hidden)]
 pub const MARKER_SIZ: u16 = 0xFF51;
 /// `COD` — Coding style default (T.800 Table A.12).
+#[doc(hidden)]
 pub const MARKER_COD: u16 = 0xFF52;
 /// `COC` — Coding style component (T.800 Table A.22).
+#[doc(hidden)]
 pub const MARKER_COC: u16 = 0xFF53;
 /// `QCD` — Quantization default (T.800 Table A.27).
+#[doc(hidden)]
 pub const MARKER_QCD: u16 = 0xFF5C;
 /// `QCC` — Quantization component (T.800 Table A.31).
+#[doc(hidden)]
 pub const MARKER_QCC: u16 = 0xFF5D;
 /// `RGN` — Region of interest (T.800 Table A.24).
+#[doc(hidden)]
 pub const MARKER_RGN: u16 = 0xFF5E;
 /// `POC` — Progression order change (T.800 Table A.32).
+#[doc(hidden)]
 pub const MARKER_POC: u16 = 0xFF5F;
 /// `PLT` — Packet length, tile-part header (T.800 Table A.37).
+#[doc(hidden)]
 pub const MARKER_PLT: u16 = 0xFF58;
 /// `PPT` — Packed packet headers, tile-part header (T.800 Table A.39).
+#[doc(hidden)]
 pub const MARKER_PPT: u16 = 0xFF61;
 /// `PPM` — Packed packet headers, main header (T.800 Table A.38).
+#[doc(hidden)]
 pub const MARKER_PPM: u16 = 0xFF60;
 /// `CAP` — Extended capabilities (T.800 Table A.11bis).
+#[doc(hidden)]
 pub const MARKER_CAP: u16 = 0xFF50;
 /// `PRF` — Profile (T.800 Table A.11quater).
+#[doc(hidden)]
 pub const MARKER_PRF: u16 = 0xFF56;
 /// `COM` — Comment (T.800 §A.9.2). Skipped by the round-1 header parser.
+#[doc(hidden)]
 pub const MARKER_COM: u16 = 0xFF64;
 
 // ---------------------------------------------------------------------------
