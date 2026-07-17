@@ -2588,6 +2588,105 @@ fn jp2_cdef_channel_order_matches_reference() {
     assert_eq!(raw.components[2].samples, img.components[0].samples);
 }
 
+// Precinct-unaligned-tile regression fixtures (round 416). A 320-case
+// black-box 5-3 lossless sweep (2 rasters × 5 progression orders ×
+// {untiled, 17×15 tiles} × {default, 8×8 code-blocks} × {default,
+// 16×16 precincts} × {1, 3 layers} × {no offset, XOsiz/YOsiz = 3/5})
+// plus an 80-case 15×13-tile round (both kernels, 8×8 / 16×16
+// precincts, 4×4 code-blocks) exposed two decode bugs this crate had
+// through round 415, both specific to tiles whose reference-grid edges
+// are not precinct-aligned:
+//
+// * The §B.12.1.3–5 position-keyed orders keyed a **partial first
+//   precinct** on `trx0 · 2^(NL − r) · XRsiz` — but the spec's `for x`
+//   loop fires its OR-clause at exactly `x = tx0`, the same value for
+//   every (component, resolution), so the per-component ceiling
+//   rounding mis-ordered the packet walk (all five orders, and every
+//   order under an image-origin offset).
+// * The §B.6 precinct partition anchor was re-derived from each
+//   sub-band's own lo edge; when the level edge sits just below a cell
+//   boundary (e.g. trx0 = 15, PPx = 4: level cell 0, band edge 8 in
+//   band cell 1) the first precinct silently claimed the next cell's
+//   code-blocks (every progression order, tiles + custom precincts).
+//
+// After the fix the full sweep decodes 5-3 byte-exact against the
+// sources and 9-7 byte-exact against at least one of two independent
+// reference decoders on every case. These three committed fixtures pin
+// the sweep's hardest shapes (COM markers scrubbed):
+//
+// * 33×29 gray, XOsiz/YOsiz = 3/5, 17×15 tiles, 16×16 precincts, 8×8
+//   code-blocks, PCRL, 3 layers.
+// * 48×40 RGB (MCT on), 17×15 tiles, CPRL — the multi-tile CPRL shape.
+// * 45×39 gray, 15×13 tiles (trx0 = 15 hits the anchor-rounding cell
+//   edge), 16×16 precincts, 4×4 code-blocks, RPCL.
+const GRAY_TP17_PREC16_PCRL_53: &[u8] =
+    include_bytes!("data/gray-33x29-off35-t17-prec16-pcrl-l3-53.j2k");
+const RGB_T17_CPRL_53: &[u8] = include_bytes!("data/rgb-48x40-t17-cprl-53.j2k");
+const GRAY_T15_PREC16_RPCL_53: &[u8] = include_bytes!("data/gray-45x39-t15-prec16-rpcl-53.j2k");
+
+/// Precinct-unaligned tiles + offsets + position order + layers: the
+/// round-416 sweep's hardest gray shape decodes bit-exact.
+#[test]
+fn unaligned_tiles_precincts_pcrl_offsets_layers_decode() {
+    let img = decode_j2k(GRAY_TP17_PREC16_PCRL_53).expect("decode PCRL unaligned tiles");
+    assert_eq!((img.width, img.height), (33, 29));
+    let c = &img.components[0];
+    for y in 0..29i32 {
+        for x in 0..33i32 {
+            assert_eq!(
+                c.samples[(y * 33 + x) as usize],
+                (x * 7 + y * 13) % 256,
+                "pixel ({x}, {y})"
+            );
+        }
+    }
+}
+
+/// Multi-tile CPRL (the §B.12.1.5 component-major order across a tile
+/// grid) decodes bit-exact.
+#[test]
+fn multi_tile_cprl_decodes() {
+    let img = decode_j2k(RGB_T17_CPRL_53).expect("decode multi-tile CPRL");
+    assert_eq!((img.width, img.height), (48, 40));
+    assert_eq!(img.components.len(), 3);
+    for (ci, c) in img.components.iter().enumerate() {
+        for y in 0..40i32 {
+            for x in 0..48i32 {
+                let want = match ci {
+                    0 => (x * 5 + y * 11) % 256,
+                    1 => (x * 9 + y * 3) % 256,
+                    _ => (x * 2 + y * 7) % 256,
+                };
+                assert_eq!(
+                    c.samples[(y * 48 + x) as usize],
+                    want,
+                    "comp {ci} pixel ({x}, {y})"
+                );
+            }
+        }
+    }
+}
+
+/// The §B.6 anchor-projection cell-edge case: 15×13 tiles put tile 1's
+/// full-resolution left edge at trx0 = 15 with 16×16 precincts, where
+/// the sub-band's ceiling-divided edge rounds into the next partition
+/// cell. Decodes bit-exact after the anchor fix.
+#[test]
+fn precinct_anchor_cell_edge_tiles_decode() {
+    let img = decode_j2k(GRAY_T15_PREC16_RPCL_53).expect("decode 15x13-tile RPCL");
+    assert_eq!((img.width, img.height), (45, 39));
+    let c = &img.components[0];
+    for y in 0..39i32 {
+        for x in 0..45i32 {
+            assert_eq!(
+                c.samples[(y * 45 + x) as usize],
+                (x * 7 + y * 13) % 256,
+                "pixel ({x}, {y})"
+            );
+        }
+    }
+}
+
 // §A.4.2 tile-part interleaving: a 64×48 gray lossless 5-3 raster on a
 // 2×2 grid of 32×24 tiles, three tile-parts per tile (split on the
 // resolution axis, TNsot = 3), transcoded so the twelve tile-parts are

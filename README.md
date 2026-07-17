@@ -191,7 +191,13 @@ What is implemented:
   `Tile-part POC > Main POC > Tile-part COD > Main COD`. Plus
   **multi-layer** / **multi-precinct** reassembly. The position-keyed
   orders project each precinct to its reference-grid corner for any
-  integer `XRsiz` / `YRsiz`; the power-of-two requirement is enforced
+  integer `XRsiz` / `YRsiz` — a **partial first precinct** (a tile or
+  image-origin edge off the precinct lattice) keys on the tile edge
+  `tx0` / `ty0` itself, exactly where the §B.12.1.3–5 OR-clause fires
+  (a 400-case black-box sweep across all five orders × tiling ×
+  precinct / code-block shapes × layers × offsets × both kernels
+  decodes 5-3 byte-exact and 9-7 within the pinned reference
+  latitude); the power-of-two requirement is enforced
   only for RPCL (§B.12.1.3) and PCRL (§B.12.1.4), while **CPRL**
   (§B.12.1.5) decodes at **non-power-of-two sub-sampling** too.
 - **Region of interest** — main-header `RGN` implicit-ROI (Maxshift)

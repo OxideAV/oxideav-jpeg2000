@@ -1180,6 +1180,8 @@ fn build_tile_packet_plan(
         });
         position_infos.push(ComponentPositionInfo {
             num_decomposition_levels: cc.n_l,
+            tile_tx0: tile.tx0,
+            tile_ty0: tile.ty0,
             xrsiz: siz.components[c].h_separation,
             yrsiz: siz.components[c].v_separation,
             resolutions: res_layouts,

@@ -2178,6 +2178,8 @@ fn encode_core(
             let (xr, yr) = separation(ci);
             position_infos.push(ComponentPositionInfo {
                 num_decomposition_levels: cp.nl,
+                tile_tx0: tile.tx0,
+                tile_ty0: tile.ty0,
                 xrsiz: xr as u8,
                 yrsiz: yr as u8,
                 resolutions: res_layouts,

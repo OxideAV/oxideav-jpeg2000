@@ -485,30 +485,50 @@ impl ResolutionPrecinctLayout {
         self.num_wide as u64 * self.num_high as u64
     }
 
-    /// Reference-grid x-coordinate of the left edge of precinct column
-    /// `px` (`0..num_wide`) at this resolution level, given the
-    /// component's `NL_i` and sub-sampling `XRsiz(i)`.
+    /// Reference-grid x-coordinate at which the §B.12.1.3–5 `for x`
+    /// loop first fires for precinct column `px` (`0..num_wide`) at
+    /// this resolution level — i.e. the precinct column's ordering key
+    /// on the x-axis — given the component's `NL_i`, its sub-sampling
+    /// `XRsiz(i)`, and the tile's reference-grid left edge `tx0`
+    /// (Equation B-7).
     ///
-    /// Per §B.6 / Equation B-20: the precinct cell's reduced-resolution
-    /// left edge is `max((anchor_x + px) · 2^PPx, trx0)`; multiplying by
-    /// `XRsiz(i) · 2^(NL_i − r)` projects it to the reference grid. The
-    /// result is the value the §B.12.1.3 `for x` loop reaches when the
-    /// divisibility condition first fires for this precinct column —
-    /// i.e. the precinct column's ordering key on the x-axis.
-    fn ref_grid_x(&self, r: u8, n_l: u8, xrsiz: u8, px: u32) -> u64 {
+    /// The loop's inclusion condition is a disjunction:
+    ///
+    /// * `x` divisible by `XRsiz(i) · 2^(PPx + NL_i − r)` — an aligned
+    ///   precinct boundary. Column `px`'s boundary is the partition
+    ///   cell corner `(anchor_x + px) · 2^PPx` on the reduced domain,
+    ///   projected to the reference grid by `XRsiz(i) · 2^(NL_i − r)`.
+    /// * `(x = tx0) AND (trx0 · 2^(NL_i − r)` not divisible by
+    ///   `2^(PPx + NL_i − r))` — a **partial first precinct** (the
+    ///   resolution's left edge `trx0` falls inside a partition cell,
+    ///   §B.6), which fires at the tile's left edge itself. The key is
+    ///   then exactly `tx0` — shared by every (component, resolution)
+    ///   whose first column is partial, so their relative order falls
+    ///   to the surrounding loop nesting rather than to any
+    ///   per-component rounding of `trx0`.
+    fn ref_grid_x(&self, r: u8, n_l: u8, xrsiz: u8, px: u32, tile_tx0: u32) -> u64 {
+        if px == 0 && self.trx0 % (1u32 << self.ppx) != 0 {
+            // Partial first precinct: fires at x = tx0 (the trx0
+            // divisibility test above is equivalent to the spec's
+            // `trx0 · 2^(NL − r)` form with both sides divided by
+            // `2^(NL − r)`).
+            return tile_tx0 as u64;
+        }
         let cell_left = ((self.anchor_x as u64) + (px as u64)) << (self.ppx as u64);
-        let clipped = cell_left.max(self.trx0 as u64);
         let scale = (xrsiz as u64) << ((n_l.saturating_sub(r)) as u64);
-        clipped.saturating_mul(scale)
+        cell_left.saturating_mul(scale)
     }
 
-    /// Reference-grid y-coordinate of the top edge of precinct row `py`
-    /// (`0..num_high`). The y-axis analogue of [`Self::ref_grid_x`].
-    fn ref_grid_y(&self, r: u8, n_l: u8, yrsiz: u8, py: u32) -> u64 {
+    /// Reference-grid y-coordinate at which the `for y` loop first
+    /// fires for precinct row `py` (`0..num_high`). The y-axis
+    /// analogue of [`Self::ref_grid_x`].
+    fn ref_grid_y(&self, r: u8, n_l: u8, yrsiz: u8, py: u32, tile_ty0: u32) -> u64 {
+        if py == 0 && self.try0 % (1u32 << self.ppy) != 0 {
+            return tile_ty0 as u64;
+        }
         let cell_top = ((self.anchor_y as u64) + (py as u64)) << (self.ppy as u64);
-        let clipped = cell_top.max(self.try0 as u64);
         let scale = (yrsiz as u64) << ((n_l.saturating_sub(r)) as u64);
-        clipped.saturating_mul(scale)
+        cell_top.saturating_mul(scale)
     }
 }
 
@@ -526,6 +546,15 @@ pub struct ComponentPositionInfo {
     /// `NL_i` — number of wavelet decomposition levels for this component
     /// (`COD` / `COC`). Resolution levels run `r = 0..=NL_i`.
     pub num_decomposition_levels: u8,
+    /// `tx0` — the tile's reference-grid left edge (Equation B-7). The
+    /// §B.12.1.3–5 position loops start at `x = tx0`, and a partial
+    /// first precinct column (whose `trx0` is not on a precinct
+    /// boundary) fires exactly there, whatever the component's
+    /// sub-sampling or decomposition depth.
+    pub tile_tx0: u32,
+    /// `ty0` — the tile's reference-grid top edge (Equation B-8); the
+    /// y-axis analogue of [`Self::tile_tx0`].
+    pub tile_ty0: u32,
     /// `XRsiz(i)` — horizontal sub-sampling factor (T.800 Table A.9,
     /// `1..=255`).
     pub xrsiz: u8,
@@ -622,9 +651,9 @@ fn ordered_precinct_visits(
                 continue;
             }
             for py in 0..layout.num_high {
-                let ref_y = layout.ref_grid_y(r, n_l, ci.yrsiz, py);
+                let ref_y = layout.ref_grid_y(r, n_l, ci.yrsiz, py, ci.tile_ty0);
                 for px in 0..layout.num_wide {
-                    let ref_x = layout.ref_grid_x(r, n_l, ci.xrsiz, px);
+                    let ref_x = layout.ref_grid_x(r, n_l, ci.xrsiz, px, ci.tile_tx0);
                     let k = py * layout.num_wide + px;
                     visits.push(PrecinctVisit {
                         ref_y,
@@ -2010,6 +2039,8 @@ mod tests {
     fn one_res_component(wide: u32, high: u32) -> ComponentPositionInfo {
         ComponentPositionInfo {
             num_decomposition_levels: 0,
+            tile_tx0: 0,
+            tile_ty0: 0,
             xrsiz: 1,
             yrsiz: 1,
             resolutions: vec![layout(wide, high, 4, 4)],
@@ -2078,6 +2109,8 @@ mod tests {
     fn rpcl_resolution_length_mismatch_rejected() {
         let comps = vec![ComponentPositionInfo {
             num_decomposition_levels: 2, // expects 3 resolutions
+            tile_tx0: 0,
+            tile_ty0: 0,
             xrsiz: 1,
             yrsiz: 1,
             resolutions: vec![layout(1, 1, 4, 4), layout(1, 1, 4, 4)],
@@ -2093,6 +2126,8 @@ mod tests {
     fn rpcl_zero_subsampling_rejected() {
         let comps = vec![ComponentPositionInfo {
             num_decomposition_levels: 0,
+            tile_tx0: 0,
+            tile_ty0: 0,
             xrsiz: 0, // illegal
             yrsiz: 1,
             resolutions: vec![layout(1, 1, 4, 4)],
@@ -2109,6 +2144,8 @@ mod tests {
     fn rpcl_resolution_outermost() {
         let comps = vec![ComponentPositionInfo {
             num_decomposition_levels: 1,
+            tile_tx0: 0,
+            tile_ty0: 0,
             xrsiz: 1,
             yrsiz: 1,
             resolutions: vec![
@@ -2147,6 +2184,8 @@ mod tests {
             // Component 0: cells of width 2^4 = 16 → corners at x = 0, 16.
             ComponentPositionInfo {
                 num_decomposition_levels: 0,
+                tile_tx0: 0,
+                tile_ty0: 0,
                 xrsiz: 1,
                 yrsiz: 1,
                 resolutions: vec![layout(2, 1, 4, 4)],
@@ -2154,6 +2193,8 @@ mod tests {
             // Component 1: cells of width 2^3 = 8 → corners at x = 0, 8.
             ComponentPositionInfo {
                 num_decomposition_levels: 0,
+                tile_tx0: 0,
+                tile_ty0: 0,
                 xrsiz: 1,
                 yrsiz: 1,
                 resolutions: vec![layout(2, 1, 3, 3)],
@@ -2188,6 +2229,8 @@ mod tests {
     fn pcrl_position_outermost_resolution_inner() {
         let comps = vec![ComponentPositionInfo {
             num_decomposition_levels: 1,
+            tile_tx0: 0,
+            tile_ty0: 0,
             xrsiz: 1,
             yrsiz: 1,
             resolutions: vec![
@@ -2215,6 +2258,8 @@ mod tests {
         ));
         let bad_len = vec![ComponentPositionInfo {
             num_decomposition_levels: 1,
+            tile_tx0: 0,
+            tile_ty0: 0,
             xrsiz: 1,
             yrsiz: 1,
             resolutions: vec![layout(1, 1, 4, 4)],
@@ -2257,6 +2302,8 @@ mod tests {
     fn cprl_position_then_resolution_within_component() {
         let comps = vec![ComponentPositionInfo {
             num_decomposition_levels: 1,
+            tile_tx0: 0,
+            tile_ty0: 0,
             xrsiz: 1,
             yrsiz: 1,
             resolutions: vec![layout(1, 1, 4, 4), layout(2, 1, 4, 4)],
@@ -2283,12 +2330,16 @@ mod tests {
         let comps = vec![
             ComponentPositionInfo {
                 num_decomposition_levels: 1,
+                tile_tx0: 0,
+                tile_ty0: 0,
                 xrsiz: 1,
                 yrsiz: 1,
                 resolutions: vec![layout(1, 1, 4, 4), layout(2, 2, 4, 4)],
             },
             ComponentPositionInfo {
                 num_decomposition_levels: 0,
+                tile_tx0: 0,
+                tile_ty0: 0,
                 xrsiz: 2,
                 yrsiz: 2,
                 resolutions: vec![layout(2, 1, 3, 3)],
@@ -2316,12 +2367,16 @@ mod tests {
         let comps = vec![
             ComponentPositionInfo {
                 num_decomposition_levels: 1,
+                tile_tx0: 0,
+                tile_ty0: 0,
                 xrsiz: 1,
                 yrsiz: 1,
                 resolutions: vec![layout(1, 1, 4, 4), layout(2, 1, 4, 4)],
             },
             ComponentPositionInfo {
                 num_decomposition_levels: 1,
+                tile_tx0: 0,
+                tile_ty0: 0,
                 xrsiz: 1,
                 yrsiz: 1,
                 resolutions: vec![layout(1, 1, 4, 4), layout(2, 1, 4, 4)],
@@ -2355,6 +2410,8 @@ mod tests {
     fn rpcl_clipped_origin_preserves_order() {
         let comps = vec![ComponentPositionInfo {
             num_decomposition_levels: 0,
+            tile_tx0: 0,
+            tile_ty0: 0,
             xrsiz: 1,
             yrsiz: 1,
             resolutions: vec![ResolutionPrecinctLayout {
@@ -2379,6 +2436,8 @@ mod tests {
     fn position_empty_resolution_contributes_nothing() {
         let comps = vec![ComponentPositionInfo {
             num_decomposition_levels: 1,
+            tile_tx0: 0,
+            tile_ty0: 0,
             xrsiz: 1,
             yrsiz: 1,
             resolutions: vec![
@@ -2401,12 +2460,16 @@ mod tests {
         let comps = vec![
             ComponentPositionInfo {
                 num_decomposition_levels: 0,
+                tile_tx0: 0,
+                tile_ty0: 0,
                 xrsiz: 1,
                 yrsiz: 1,
                 resolutions: vec![layout(1, 2, 4, 4)], // rows at ref-y 0, 16
             },
             ComponentPositionInfo {
                 num_decomposition_levels: 0,
+                tile_tx0: 0,
+                tile_ty0: 0,
                 xrsiz: 1,
                 yrsiz: 2, // rows at ref-y 0, 32 (scaled by YRsiz=2)
                 resolutions: vec![layout(1, 2, 4, 4)],
@@ -2443,6 +2506,8 @@ mod tests {
     fn pcomp(nl: u8, wide: u32, high: u32) -> ComponentPositionInfo {
         ComponentPositionInfo {
             num_decomposition_levels: nl,
+            tile_tx0: 0,
+            tile_ty0: 0,
             xrsiz: 1,
             yrsiz: 1,
             resolutions: (0..=nl).map(|_| layout(wide, high, 4, 4)).collect(),

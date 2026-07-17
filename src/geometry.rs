@@ -1023,18 +1023,26 @@ pub struct PrecinctCodeBlocks {
 ///
 /// The geometry per T.800 §B.6 / §B.7 / §B.12 (Equation B-20):
 ///
-/// * The precinct partition is anchored at `(0, 0)` (§B.6). On the
-///   sub-band domain its step is `2^pcb_exp` where `pcb_exp` is the
-///   **projected** precinct exponent — `PP` at `r = 0` (the `LL` band
-///   coincides with the resolution-level domain) and `PP - 1` at
-///   `r ≥ 1` (the high-pass sub-bands sit one wavelet level finer than
-///   the resolution level, so the precinct footprint halves). This is
-///   the `2^(PP + NL - r)` reference-grid step of Equation B-20 divided
-///   by the sub-band's `2^(NL - r + 1)` reference-grid scale.
+/// * The precinct partition is anchored at `(0, 0)` (§B.6) **on the
+///   resolution-level domain**: cell `c` covers level samples
+///   `[c · 2^PP, (c + 1) · 2^PP)`, and the level's own extent starts
+///   inside cell `anchor = floor(trx0 / 2^PP)`. On the sub-band domain
+///   the same cell `c` covers `[c · 2^pcb_exp, (c + 1) · 2^pcb_exp)`,
+///   where `pcb_exp` is the **projected** precinct exponent — `PP` at
+///   `r = 0` (the `LL` band coincides with the resolution-level
+///   domain) and `PP - 1` at `r ≥ 1` (the high-pass sub-bands sit one
+///   wavelet level finer, and the §B.5 `2u + xob` interleave maps the
+///   level cell `[c · 2^PP, …)` exactly onto the band cell
+///   `[c · 2^(PP-1), …)`). The caller passes that resolution-level
+///   `anchor` in — deriving it from the band's own `tb_lo` would
+///   disagree with §B.6 whenever the level edge sits close enough to a
+///   cell boundary that the band's ceiling-divided edge rounds into
+///   the next cell (e.g. `trx0 = 15`, `PP = 4`: level anchor cell 0,
+///   but `tbx0 = 8` sits in band cell 1), silently re-assigning the
+///   first precinct's code-blocks.
 /// * Precinct cell `p` (`0..grid_precincts`) covers sub-band samples
-///   `[(anchor + p) · 2^pcb_exp, (anchor + p + 1) · 2^pcb_exp)` where
-///   `anchor = floor(tb_lo / 2^pcb_exp)`, then clipped to
-///   `[tb_lo, tb_hi)`.
+///   `[(anchor + p) · 2^pcb_exp, (anchor + p + 1) · 2^pcb_exp)`,
+///   clipped to `[tb_lo, tb_hi)`.
 /// * The code-block partition is anchored at `(0, 0)` with step
 ///   `2^cb_exp` (§B.7). The code-blocks intersecting the precinct cell
 ///   run `floor(cell_lo / 2^cb_exp) ..= ceil(cell_hi / 2^cb_exp) - 1`,
@@ -1045,14 +1053,15 @@ fn enumerate_axis(
     pcb_exp: u8,
     cb_exp: u8,
     precinct: u32,
+    anchor: u32,
 ) -> (u32, Vec<(u32, u32)>) {
     // Empty sub-band on this axis → no precinct cells, no code-blocks.
     if tb_hi <= tb_lo {
         return (0, Vec::new());
     }
 
-    // Precinct cell extent on the sub-band domain, anchored at (0, 0).
-    let anchor = floor_div_pow2(tb_lo, pcb_exp);
+    // Precinct cell extent on the sub-band domain — the §B.6
+    // resolution-level partition cell `anchor + precinct`, projected.
     let pstart = pow2_mul(anchor + precinct, pcb_exp);
     let pend = pow2_mul(anchor + precinct + 1, pcb_exp);
     // Clip the precinct cell to the sub-band bounds.
@@ -1134,6 +1143,13 @@ pub fn derive_precinct_code_blocks(
     let px = precinct_index % partition.num_wide;
     let py = precinct_index / partition.num_wide;
 
+    // §B.6: the partition is anchored at (0, 0) on the resolution-level
+    // domain — the level's extent starts inside cell floor(tr0 / 2^PP).
+    // Precinct (px, py) is partition cell (anchor + px, anchor + py) on
+    // *every* domain it projects to (see `enumerate_axis`).
+    let anchor_x = floor_div_pow2(level.trx0, pp.ppx);
+    let anchor_y = floor_div_pow2(level.try0, pp.ppy);
+
     // Projected precinct exponents on the sub-band domain: PP at r = 0
     // (LL coincides with the resolution-level domain), PP - 1 at r ≥ 1
     // (high-pass sub-bands sit one wavelet level finer). See Eq B-20.
@@ -1160,8 +1176,10 @@ pub fn derive_precinct_code_blocks(
 
     let mut sub_bands = Vec::with_capacity(level.sub_bands.len());
     for band in &level.sub_bands {
-        let (grid_wide, cells_x) = enumerate_axis(band.tbx0, band.tbx1, pcbx, cbx_eff, px);
-        let (grid_high, cells_y) = enumerate_axis(band.tby0, band.tby1, pcby, cby_eff, py);
+        let (grid_wide, cells_x) =
+            enumerate_axis(band.tbx0, band.tbx1, pcbx, cbx_eff, px, anchor_x);
+        let (grid_high, cells_y) =
+            enumerate_axis(band.tby0, band.tby1, pcby, cby_eff, py, anchor_y);
 
         // If either axis is empty the precinct holds no code-blocks from
         // this sub-band (an empty precinct, §B.6) — emit a 0×0 grid.

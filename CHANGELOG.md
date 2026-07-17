@@ -4,6 +4,31 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Two decode bugs specific to precinct-unaligned tile edges**, found by
+  a 400-case black-box conformance sweep (5 progression orders × tiling ×
+  code-block / precinct shapes × layers × image-origin offsets × both
+  kernels, 5-3 verified byte-exact against the sources and 9-7 against
+  two independent reference decoders):
+  - the §B.12.1.3–5 position-keyed orders (RPCL / PCRL / CPRL) keyed a
+    partial first precinct on the per-component rounding of
+    `trx0 · 2^(NL − r) · XRsiz`, but the spec's position loop fires its
+    OR-clause at exactly the tile edge `tx0` / `ty0` — the same value
+    for every (component, resolution) — so streams with unaligned tiles
+    or image-origin offsets mis-ordered the packet walk;
+  - the §B.6 precinct partition anchor was re-derived from each
+    sub-band's own lo edge instead of projecting the resolution-level
+    partition cell, so a level edge just below a cell boundary
+    (e.g. `trx0 = 15` with 16-wide precincts) shifted the first
+    precinct's code-blocks into the neighbouring cell for **every**
+    progression order.
+
+  Both fixes also apply to the encoder's emission order (it shares the
+  progression drivers); its unaligned-tile RPCL / PCRL / CPRL output now
+  decodes byte-identical through an independent black-box decoder. Three
+  committed fixtures pin the sweep's hardest shapes.
+
 ### Added
 
 - **Mixed HT / Annex D block-coding lanes at tile granularity** — a
