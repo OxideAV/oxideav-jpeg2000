@@ -559,6 +559,10 @@ struct BlockAccum {
     /// while every accumulated pass is a placeholder pass, `Some(3·P0)`
     /// once the first HT cleanup pass pinned the placeholder count.
     ht_p0: Option<u32>,
+    /// T.814 §A.4 MIXED lane resolution recorded by the packet reader
+    /// (`Some` iff the block sits in a MIXED tile-component; the last
+    /// contribution's verdict — the resolution is monotone).
+    mixed: Option<crate::packet::MixedBlockType>,
 }
 
 /// One accumulated §C.3 codeword segment for a code-block.
@@ -690,6 +694,15 @@ struct BlockStyle {
     /// apply to the HT code-blocks (Table A.4) and are forced off so
     /// the packet reader uses the HT set-`T` layout.
     high_throughput: bool,
+    /// T.814 §A.4 — the tile-component is a **MIXED** set (`SPcod` /
+    /// `SPcoc` bits 6 and 7 both set under a CAP whose `Ccap15`
+    /// permits MIXED): each code-block is individually HT or T.800.
+    /// The packet reader resolves the lanes per
+    /// [`crate::packet::MixedBlockType`]; tier-1 arbitrates the
+    /// unresolved blocks by trial decoding (the §A.4 NOTE). The Table
+    /// A.4 style bits 1 / 3 / 4 / 5 apply to the T.800-lane blocks
+    /// (bit 3 to both lanes); bits 0 / 2 are barred.
+    mixed: bool,
 }
 
 impl BlockStyle {
@@ -752,14 +765,25 @@ impl BlockStyle {
             // §A.4 prose bars the Annex D code-blocks from using
             // either, which is exactly what keeps the T.800 half of
             // the packet-header parse at one length field per
-            // contribution.
+            // contribution (the derived `K(T.800) = 1`).
             if style_flags.selective_arithmetic_coding_bypass()
                 || style_flags.termination_on_each_coding_pass()
             {
                 return Err(Error::NotImplemented);
             }
-            // The per-code-block MIXED decode is not wired yet.
-            return Err(Error::NotImplemented);
+            // Table A.4: bits 1 / 4 / 5 apply to the T.800-lane
+            // code-blocks ("does not apply to HT code-blocks"); bit 3
+            // applies to both lanes.
+            return Ok(BlockStyle {
+                segmentation_symbols: style_flags.segmentation_symbols(),
+                vertically_causal: style_flags.vertically_causal_context(),
+                reset_context_probabilities: style_flags.reset_context_probabilities(),
+                termination_on_each_coding_pass: false,
+                selective_arithmetic_coding_bypass: false,
+                predictable_termination: style_flags.predictable_termination(),
+                high_throughput: false,
+                mixed: true,
+            });
         }
         Ok(BlockStyle {
             segmentation_symbols: !ht && style_flags.segmentation_symbols(),
@@ -777,13 +801,18 @@ impl BlockStyle {
                 && style_flags.selective_arithmetic_coding_bypass(),
             predictable_termination: !ht && style_flags.predictable_termination(),
             high_throughput: ht,
+            mixed: false,
         })
     }
 
     /// The §B.10.7 codeword-segment split these style bits select for
     /// the component's code-block contributions.
     fn split(&self) -> SegmentSplit {
-        if self.high_throughput {
+        if self.mixed {
+            // T.814 §A.4 — per-code-block lane resolution in the
+            // packet reader (K(T.800) = 1 vs the §B.2 set-T split).
+            SegmentSplit::Mixed
+        } else if self.high_throughput {
             // T.814 §B.2 / §B.3 — HT code-blocks split at the set-T
             // boundaries: one codeword segment per HT cleanup pass, one
             // per SigProp (+ MagRef) refinement pair.
@@ -1201,27 +1230,75 @@ fn decode_tile(
     // path recovers the data start from `pos + header.bytes_consumed`
     // instead. Normalise both into a `(header, data_offset)` list so the
     // segment-slicing replay below is identical for the two framings.
-    let headers = walk_tile_packet_headers(body, &packets, params.sop_eph, relocated_headers)?;
-
-    if let Some(plt) = plt {
-        validate_plt_lengths(plt, &headers, relocated_headers.is_some())?;
+    //
+    // T.814 §A.4 MIXED tile-components make the walk a *search*: the
+    // number of length fields per contribution is not determinable
+    // from the packet header alone wherever a code-block's new passes
+    // straddle a §B.2 set-`T` boundary, so the reader logs each such
+    // hypothesis (HT first) and a failure anywhere downstream —
+    // tier-2 desync, body overrun, §A.8.1 Nsop mismatch, pointer-
+    // marker mismatch, or a tier-1 decode of a pinned lane — advances
+    // the log depth-first and re-walks. The first assignment that
+    // survives the whole tile is accepted (the §A.4 NOTE's trial-
+    // decoding posture); the attempt budget bounds hostile inputs.
+    let has_mixed = packets
+        .iter()
+        .any(|(_, _, split)| *split == SegmentSplit::Mixed);
+    let decode_with = |headers: &[(crate::packet::PacketHeader, usize)]| {
+        if let Some(plt) = plt {
+            validate_plt_lengths(plt, headers, relocated_headers.is_some())?;
+        }
+        decode_tile_from_plan(
+            siz,
+            params,
+            comp_coding,
+            comp_quant,
+            roi_shift,
+            tile_index,
+            body,
+            &levels_per_comp,
+            &precinct_geom,
+            &descriptors,
+            headers,
+            discard_levels,
+            max_layers,
+        )
+    };
+    if !has_mixed {
+        let headers = walk_tile_packet_headers(body, &packets, params.sop_eph, relocated_headers)?;
+        return decode_with(&headers);
     }
-
-    decode_tile_from_plan(
-        siz,
-        params,
-        comp_coding,
-        comp_quant,
-        roi_shift,
-        tile_index,
-        body,
-        &levels_per_comp,
-        &precinct_geom,
-        &descriptors,
-        &headers,
-        discard_levels,
-        max_layers,
-    )
+    /// Depth-first attempt budget for the MIXED hypothesis search. A
+    /// conformant stream resolves almost every contribution without a
+    /// choice (§2 of the staged derivation: the hypotheses agree on
+    /// every one-field layout), so real streams stay far below this;
+    /// the cap keeps a hostile stream from driving an exponential
+    /// walk.
+    const MIXED_MAX_ATTEMPTS: u32 = 4096;
+    let mut choices = crate::packet::MixedChoices::new();
+    let mut attempts = 0u32;
+    loop {
+        attempts += 1;
+        if attempts > MIXED_MAX_ATTEMPTS {
+            return Err(Error::InvalidPacketHeader);
+        }
+        let result = walk_tile_packet_headers_with_choices(
+            body,
+            &packets,
+            params.sop_eph,
+            relocated_headers,
+            &mut choices,
+        )
+        .and_then(|headers| decode_with(&headers));
+        match result {
+            Ok(planes) => return Ok(planes),
+            Err(e) => {
+                if !choices.advance() {
+                    return Err(e);
+                }
+            }
+        }
+    }
 }
 
 /// The geometry + enumeration artefacts a tile's tier-2 walk and tier-1
@@ -1518,15 +1595,40 @@ fn walk_tile_packet_headers(
     sop_eph: SopEphMode,
     relocated_headers: Option<&[u8]>,
 ) -> Result<Vec<(crate::packet::PacketHeader, usize)>, Error> {
+    walk_tile_packet_headers_with_choices(
+        body,
+        packets,
+        sop_eph,
+        relocated_headers,
+        &mut crate::packet::MixedChoices::new(),
+    )
+}
+
+/// [`walk_tile_packet_headers`] with an explicit
+/// [`crate::packet::MixedChoices`] log for T.814 §A.4 MIXED packets
+/// (never consulted outside them).
+fn walk_tile_packet_headers_with_choices(
+    body: &[u8],
+    packets: &[(usize, crate::packet::PacketGeometry, SegmentSplit)],
+    sop_eph: crate::packet::SopEphMode,
+    relocated_headers: Option<&[u8]>,
+    choices: &mut crate::packet::MixedChoices,
+) -> Result<Vec<(crate::packet::PacketHeader, usize)>, Error> {
     if let Some(header_bytes) = relocated_headers {
-        let walked =
-            crate::packet::walk_packet_headers_separate(header_bytes, body, packets, sop_eph)?;
+        let walked = crate::packet::walk_packet_headers_separate_with_choices(
+            header_bytes,
+            body,
+            packets,
+            sop_eph,
+            choices,
+        )?;
         Ok(walked
             .into_iter()
             .map(|rp| (rp.header, rp.body_offset))
             .collect())
     } else {
-        let walked = crate::packet::walk_packet_headers(body, packets, sop_eph)?;
+        let walked =
+            crate::packet::walk_packet_headers_with_choices(body, packets, sop_eph, choices)?;
         let mut pos = 0usize;
         let mut out = Vec::with_capacity(walked.len());
         for header in walked {
@@ -1542,6 +1644,140 @@ fn walk_tile_packet_headers(
         }
         Ok(out)
     }
+}
+
+/// Tier-1 for one **HT** code-block's accumulated segments — the
+/// T.814 §B.1 / §B.3 HT-set grouping, validity checks, `Z_blk` /
+/// `S_blk` derivation and the clause-7 block decode, shared by the
+/// HTONLY / HTDECLARED path and the §A.4 MIXED trial dispatch.
+///
+/// The accumulated codeword segments group into §B.1 HT sets: after
+/// the 3·P0 placeholder passes, set `j` covers the three coding
+/// passes at absolute indices `3P0+3j .. 3P0+3j+2` (cleanup, SigProp,
+/// MagRef; the last set may be shorter). Each set's HT cleanup
+/// segment is the codeword segment ending at its cleanup pass and its
+/// HT refinement segment concatenates the codeword segments covering
+/// its refinement passes (§B.3 — a layer boundary may cut between
+/// SigProp and MagRef).
+///
+/// Returns `Ok(None)` for a block that decodes to nothing (only
+/// placeholder passes, or every set's cleanup segment absent), and
+/// the decoded block with its per-block `Nb` fallback otherwise. The
+/// caller applies the §H.1 de-scaling.
+#[allow(clippy::too_many_arguments)]
+fn ht_tier1_block(
+    acc: &BlockAccum,
+    p: u32,
+    mb: u32,
+    mb_coded: u32,
+    s: u32,
+    orientation: SubBandOrientation,
+    width: usize,
+    height: usize,
+) -> Result<Option<(CodeBlock, u32)>, Error> {
+    // A block whose passes never resolved a first HT cleanup
+    // pass carries only placeholder passes — no HT segments,
+    // all samples 0 (§7.1.1 with Z_blk = 0, §B.3 NOTE 4).
+    let Some(p0) = acc.ht_p0 else {
+        return Ok(None);
+    };
+    // Group the codeword segments into per-set cleanup /
+    // refinement HT segments. `p0` is a multiple of 3 by
+    // construction, so `last − p0` keys the set index and the
+    // in-set role: ≡ 0 (mod 3) ends a cleanup segment, else it
+    // ends (part of) the refinement segment of the same set.
+    let avail = acc.passes - p0;
+    // Every HT set (and every placeholder triple) skips one
+    // more magnitude bit-plane (§B.3), so a conformant block
+    // cannot carry more of either than the band has bit-planes
+    // — and the per-set allocations below must not scale with
+    // an attacker-controlled pass count.
+    if avail > 3 * mb_coded || p0 > 3 * mb_coded {
+        return Err(Error::InvalidPacketHeader);
+    }
+    let num_sets = avail.div_ceil(3) as usize;
+    let mut cleanup_seg: Vec<Vec<u8>> = vec![Vec::new(); num_sets];
+    let mut refine_seg: Vec<Vec<u8>> = vec![Vec::new(); num_sets];
+    for seg in &acc.segments {
+        if seg.passes == 0 {
+            continue;
+        }
+        let seg_last = seg.start_pass + seg.passes - 1;
+        if seg_last < p0 {
+            // Pure placeholder run — carries no bytes.
+            if !seg.bytes.is_empty() {
+                return Err(Error::InvalidPacketHeader);
+            }
+            continue;
+        }
+        let rel = seg_last - p0;
+        let set = (rel / 3) as usize;
+        if rel % 3 == 0 {
+            cleanup_seg[set].extend_from_slice(&seg.bytes);
+        } else {
+            refine_seg[set].extend_from_slice(&seg.bytes);
+        }
+    }
+    // §B.3 validity: the first HT cleanup segment must be
+    // longer than 1 byte; a later one is 0 (a bit-plane-skip
+    // set) or longer than 1; a refinement segment may only be
+    // non-empty when its set's cleanup segment is.
+    let mut chosen: Option<usize> = None;
+    for j in 0..num_sets {
+        let cl = cleanup_seg[j].len();
+        if cl == 1 || (j == 0 && cl == 0) {
+            return Err(Error::InvalidPacketHeader);
+        }
+        if cl == 0 && !refine_seg[j].is_empty() {
+            return Err(Error::InvalidPacketHeader);
+        }
+        if cl > 0 {
+            chosen = Some(j);
+        }
+    }
+    // Every HT set re-codes the block one magnitude bit-plane
+    // finer than its predecessor (S_blk grows by one per §B.3),
+    // so the maximal-fidelity choice — and the one a
+    // single-set stream reduces to — is the last set whose
+    // cleanup segment is present.
+    let Some(j) = chosen else {
+        return Ok(None);
+    };
+    let passes_in_set = (avail - 3 * j as u32).min(3);
+    // §B.3: Z_blk = 1 when the cleanup segment is the only
+    // non-empty segment of the set (SigProp / MagRef passes
+    // tied to a zero-length refinement segment are not
+    // processed), the pass count of the set otherwise.
+    let z_blk = if refine_seg[j].is_empty() {
+        1
+    } else {
+        passes_in_set as u8
+    };
+    // §B.3: S_blk = P + P0 + S_skip.
+    let s_blk = p + p0 / 3 + j as u32;
+    if s_blk >= mb_coded {
+        // More skipped bit-planes than the sub-band has
+        // (Equation E-2) — the §7.6 output would not fit Mb.
+        return Err(Error::InvalidPacketHeader);
+    }
+    let (mut block, nb_ht) = crate::ht::decode_ht_codeblock(
+        orientation,
+        width,
+        height,
+        mb_coded,
+        &cleanup_seg[j],
+        &refine_seg[j],
+        z_blk,
+        s_blk,
+    )?;
+    // §7.6 Nb(u, v) = S_blk + 1 + z_n: the HT block decoder
+    // stores the per-sample `1 + z_n` part, the recorded base
+    // supplies the S_blk (the §B.10.5 P plus the placeholder /
+    // set-skip planes).
+    block.set_zero_bit_planes(s_blk);
+    // §H.1 Maxshift de-scaling (no-op when s == 0).
+    block.apply_roi_maxshift(mb, s);
+    Ok(Some((block, nb_ht)))
 }
 
 /// Tier-1 / reassembly half of [`decode_tile`], operating on the
@@ -1646,6 +1882,40 @@ fn decode_tile_from_plan(
             //   running absolute pass cursor (which carries across
             //   layers) and record each segment with its raw / AC tag so
             //   the tier-1 driver dispatches to the right reader.
+            if split == SegmentSplit::Mixed {
+                // T.814 §A.4 MIXED tile-component: the packet reader
+                // recorded, per contribution, the span partition it
+                // read (the §B.2 HT spans, or the single K = 1 span),
+                // the block's lane verdict and its §B.1 placeholder
+                // shadow — replay them verbatim so the tier-1 trial
+                // dispatch sees exactly the tier-2 layout.
+                let info = contrib.mixed.as_ref().ok_or(Error::InvalidPacketHeader)?;
+                if info.spans.len() != contrib.segment_lengths.len() {
+                    return Err(Error::InvalidPacketHeader);
+                }
+                let start_pass = entry.bypass_cursor;
+                entry.bypass_cursor = entry
+                    .bypass_cursor
+                    .checked_add(contrib.coding_passes)
+                    .ok_or(Error::InvalidPacketHeader)?;
+                entry.ht_p0 = info.ht_p0;
+                entry.mixed = Some(info.resolved);
+                let mut span_start = start_pass;
+                for (&len, &span_passes) in contrib.segment_lengths.iter().zip(info.spans.iter()) {
+                    let len = len as usize;
+                    let end = seg_pos.checked_add(len).ok_or(Error::PacketHeaderOverrun)?;
+                    let bytes = body.get(seg_pos..end).ok_or(Error::PacketHeaderOverrun)?;
+                    entry.segments.push(AccumSegment {
+                        bytes: bytes.to_vec(),
+                        passes: span_passes,
+                        is_raw: false,
+                        start_pass: span_start,
+                    });
+                    span_start += span_passes;
+                    seg_pos = end;
+                }
+                continue;
+            }
             if split == SegmentSplit::Ht {
                 // T.814 §B.2 / §B.3: recompute the set-T spans from the
                 // running absolute pass cursor (which carries across
@@ -1875,137 +2145,104 @@ fn decode_tile_from_plan(
             .style;
         // §D.3: at most 3 (M'b − P) − 2 passes fit above bit-plane 0.
         // The HT path has its own §B.3 cap (Z_blk ≤ 3) and a different
-        // pass↔bit-plane relationship, so the Annex D cap does not apply.
-        if !style.high_throughput && acc.passes > 3 * (mb_coded - p) - 2 {
+        // pass↔bit-plane relationship, so the Annex D cap does not
+        // apply; a MIXED block's lane is not known yet, so its cap is
+        // applied on the Annex D side of the dispatch below.
+        if !style.high_throughput && !style.mixed && acc.passes > 3 * (mb_coded - p) - 2 {
             return Err(Error::InvalidPacketHeader);
         }
         // -- HTJ2K (T.814) HT code-block path --
-        // When the tile-component signals HT block coding (SPcod bit 6),
-        // every code-block is an HT code-block (§A.4 HTONLY/HTDECLARED).
-        // The accumulated codeword segments group into §B.1 HT sets:
-        // after the 3·P0 placeholder passes, set `j` covers the three
-        // coding passes at absolute indices `3P0+3j .. 3P0+3j+2`
-        // (cleanup, SigProp, MagRef; the last set may be shorter). Each
-        // set's HT cleanup segment is the codeword segment ending at
-        // its cleanup pass and its HT refinement segment concatenates
-        // the codeword segments covering its refinement passes (§B.3 —
-        // a layer boundary may cut between SigProp and MagRef).
-        if style.high_throughput {
-            // A block whose passes never resolved a first HT cleanup
-            // pass carries only placeholder passes — no HT segments,
-            // all samples 0 (§7.1.1 with Z_blk = 0, §B.3 NOTE 4).
-            let Some(p0) = acc.ht_p0 else {
-                continue;
-            };
-            // Group the codeword segments into per-set cleanup /
-            // refinement HT segments. `p0` is a multiple of 3 by
-            // construction, so `last − p0` keys the set index and the
-            // in-set role: ≡ 0 (mod 3) ends a cleanup segment, else it
-            // ends (part of) the refinement segment of the same set.
-            let avail = acc.passes - p0;
-            // Every HT set (and every placeholder triple) skips one
-            // more magnitude bit-plane (§B.3), so a conformant block
-            // cannot carry more of either than the band has bit-planes
-            // — and the per-set allocations below must not scale with
-            // an attacker-controlled pass count.
-            if avail > 3 * mb_coded || p0 > 3 * mb_coded {
-                return Err(Error::InvalidPacketHeader);
-            }
-            let num_sets = avail.div_ceil(3) as usize;
-            let mut cleanup_seg: Vec<Vec<u8>> = vec![Vec::new(); num_sets];
-            let mut refine_seg: Vec<Vec<u8>> = vec![Vec::new(); num_sets];
-            for seg in &acc.segments {
-                if seg.passes == 0 {
-                    continue;
-                }
-                let seg_last = seg.start_pass + seg.passes - 1;
-                if seg_last < p0 {
-                    // Pure placeholder run — carries no bytes.
-                    if !seg.bytes.is_empty() {
-                        return Err(Error::InvalidPacketHeader);
-                    }
-                    continue;
-                }
-                let rel = seg_last - p0;
-                let set = (rel / 3) as usize;
-                if rel % 3 == 0 {
-                    cleanup_seg[set].extend_from_slice(&seg.bytes);
-                } else {
-                    refine_seg[set].extend_from_slice(&seg.bytes);
-                }
-            }
-            // §B.3 validity: the first HT cleanup segment must be
-            // longer than 1 byte; a later one is 0 (a bit-plane-skip
-            // set) or longer than 1; a refinement segment may only be
-            // non-empty when its set's cleanup segment is.
-            let mut chosen: Option<usize> = None;
-            for j in 0..num_sets {
-                let cl = cleanup_seg[j].len();
-                if cl == 1 || (j == 0 && cl == 0) {
-                    return Err(Error::InvalidPacketHeader);
-                }
-                if cl == 0 && !refine_seg[j].is_empty() {
-                    return Err(Error::InvalidPacketHeader);
-                }
-                if cl > 0 {
-                    chosen = Some(j);
-                }
-            }
-            // Every HT set re-codes the block one magnitude bit-plane
-            // finer than its predecessor (S_blk grows by one per §B.3),
-            // so the maximal-fidelity choice — and the one a
-            // single-set stream reduces to — is the last set whose
-            // cleanup segment is present.
-            let Some(j) = chosen else {
-                continue;
-            };
-            let passes_in_set = (avail - 3 * j as u32).min(3);
-            // §B.3: Z_blk = 1 when the cleanup segment is the only
-            // non-empty segment of the set (SigProp / MagRef passes
-            // tied to a zero-length refinement segment are not
-            // processed), the pass count of the set otherwise.
-            let z_blk = if refine_seg[j].is_empty() {
-                1
-            } else {
-                passes_in_set as u8
-            };
-            // §B.3: S_blk = P + P0 + S_skip.
-            let s_blk = p + p0 / 3 + j as u32;
-            if s_blk >= mb_coded {
-                // More skipped bit-planes than the sub-band has
-                // (Equation E-2) — the §7.6 output would not fit Mb.
-                return Err(Error::InvalidPacketHeader);
-            }
-            let (mut block, nb_ht) = crate::ht::decode_ht_codeblock(
+        // When the tile-component signals HT block coding (SPcod
+        // bit 6, or an HTONLY CAP), every code-block is an HT
+        // code-block (§A.4 HTONLY / HTDECLARED) and an HT tier-1
+        // failure is a stream error. In a §A.4 MIXED tile-component
+        // the lane resolves per block: a tier-2-pinned HT block still
+        // fails hard (driving the caller's depth-first re-walk), a
+        // pinned T.800 block skips straight to Annex D, and an
+        // unresolved block is arbitrated exactly as the §A.4 NOTE
+        // prescribes — "processing the code-block assuming it
+        // conforms to Annex B; failure of such processing indicates
+        // that the code-block might conform to" T.800 — with the
+        // Annex D lane as the fallback.
+        let mixed_ty = style
+            .mixed
+            .then(|| acc.mixed.unwrap_or(crate::packet::MixedBlockType::Unknown));
+        let try_ht = style.high_throughput
+            || matches!(
+                mixed_ty,
+                Some(crate::packet::MixedBlockType::Ht | crate::packet::MixedBlockType::Unknown)
+            );
+        let mut ht_failed = false;
+        if try_ht {
+            match ht_tier1_block(
+                acc,
+                p,
+                mb,
+                mb_coded,
+                s,
                 psb.orientation,
                 placement.width() as usize,
                 placement.height() as usize,
-                mb_coded,
-                &cleanup_seg[j],
-                &refine_seg[j],
-                z_blk,
-                s_blk,
-            )?;
-            // §7.6 Nb(u, v) = S_blk + 1 + z_n: the HT block decoder
-            // stores the per-sample `1 + z_n` part, the recorded base
-            // supplies the S_blk (the §B.10.5 P plus the placeholder /
-            // set-skip planes).
-            block.set_zero_bit_planes(s_blk);
-            // §H.1 Maxshift de-scaling (no-op when s == 0).
-            block.apply_roi_maxshift(mb, s);
-            decoded.push(DecodedBlock {
-                component: *c,
-                r: *r,
-                precinct: *k,
-                sub_band: *sb,
-                cbx: *cbx,
-                cby: *cby,
-                nb: nb_ht,
-                block,
-            });
-            continue;
+            ) {
+                Ok(Some((block, nb_ht))) => {
+                    decoded.push(DecodedBlock {
+                        component: *c,
+                        r: *r,
+                        precinct: *k,
+                        sub_band: *sb,
+                        cbx: *cbx,
+                        cby: *cby,
+                        nb: nb_ht,
+                        block,
+                    });
+                    continue;
+                }
+                Ok(None) => {
+                    // Nothing decodable under the HT reading (only
+                    // placeholder passes / absent cleanup segments).
+                    // For a genuine HT block that is a valid
+                    // all-zero outcome; for an unresolved MIXED
+                    // block the T.800 reading of the same record is
+                    // a zero-byte contribution decoding to the same
+                    // all-zero block — skip either way.
+                    continue;
+                }
+                Err(e) => {
+                    if !matches!(mixed_ty, Some(crate::packet::MixedBlockType::Unknown)) {
+                        return Err(e);
+                    }
+                    // §A.4 NOTE: HT processing failed — the block
+                    // might conform to T.800. Fall through.
+                    ht_failed = true;
+                }
+            }
         }
-
+        let _ = ht_failed;
+        // -- T.800 Annex D path --
+        // For a MIXED block the Annex D reading treats every
+        // accumulated contribution as one continuous §C.3 codeword
+        // segment (the §A.4-derived K(T.800) = 1 — no bypass, no
+        // per-pass termination), so the per-span records concatenate;
+        // and the §D.3 pass cap deferred above applies now.
+        let mixed_concat: Vec<AccumSegment>;
+        let segments: &[AccumSegment] = if mixed_ty.is_some() {
+            if acc.passes > 3 * (mb_coded - p) - 2 {
+                return Err(Error::InvalidPacketHeader);
+            }
+            let mut bytes = Vec::new();
+            for seg in &acc.segments {
+                bytes.extend_from_slice(&seg.bytes);
+            }
+            mixed_concat = vec![AccumSegment {
+                bytes,
+                passes: acc.passes,
+                is_raw: false,
+                start_pass: 0,
+            }];
+            &mixed_concat
+        } else {
+            &acc.segments
+        };
         let mut block = CodeBlock::new(
             psb.orientation,
             placement.width() as usize,
@@ -2029,7 +2266,7 @@ fn decode_tile_from_plan(
         // carrying every pass; the §D.4.2 per-pass case is one iteration
         // per terminated pass; the §D.6 bypass case alternates AC and
         // raw spans (each raw span opens a fresh RawBitReader instead).
-        for seg in &acc.segments {
+        for seg in segments {
             if seg.passes == 0 {
                 continue;
             }

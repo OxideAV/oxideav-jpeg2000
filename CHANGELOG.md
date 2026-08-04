@@ -6,6 +6,39 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+- **HTJ2K MIXED-set decode (T.814 §8.2 / §A.4)** — a tile-component
+  whose style byte carries bits 6 + 7 under a MIXED-permitting
+  `Ccap15` now decodes: each code-block is *individually* an HT or a
+  T.800 code-block with no per-block signalling, so the packet reader
+  runs both tier-2 hypotheses — the derived `K(T.800) = 1` (§A.4 bars
+  bypass and per-pass termination, leaving Table D.8's "termination
+  only on last pass") against the T.814 §B.2 set-`T` partition —
+  parsing the one-field layouts that read identical bits without
+  deciding, pinning the T.800 lane where the §A.4 constraints
+  (`Lblock > 3`, clear first length bit) or §B.3 (first cleanup
+  segment longer than 1) refute HT on the shared bytes, and consulting
+  a depth-first HT-first hypothesis log where a contribution genuinely
+  straddles a set-`T` boundary. A failure anywhere downstream (tier-2
+  desync, body overrun, `Nsop` mismatch, pointer-marker mismatch, a
+  pinned lane failing tier-1) advances the log and re-walks the tile;
+  blocks still unresolved at tier-1 are arbitrated exactly as the
+  §A.4 NOTE prescribes — trial-decoded as Annex B HT with the Annex D
+  path as fallback. The three `hm` MIXED codestreams of the ISO/IEC
+  15444-4 Ed. 4 electronic insert — the only MIXED streams in that
+  corpus — decode end-to-end **on the first assignment** (0 / 7 / 24
+  divergent choices per tile, no backtracking), and are committed as
+  fixtures with the corpus notice: the two `p0_06` transcodes
+  reconstruct their losslessly carried components **byte-identically
+  across the two independent encodings** (the corpus ships no direct
+  reference for the `hm` streams and every available opaque decoder
+  declines them), component 3 lands at the ≈40 dB the bundle's own
+  statistics record, and layer-progressive / reduced-resolution
+  decodes compose (monotone MSE over every layer prefix; placeholder
+  passes preserve the transcoded layer boundaries per §B.1 NOTE).
+  The encoder-side packet writer learned the matching §A.4 headroom
+  (`CodeBlockPlan::mixed_ht`) so an emitted HT block's first non-zero
+  length field carries `Lblock > 3` with a clear top bit.
+
 - **T.814 §A.3.2 stream-level HT signalling** — the `CAP` marker's
   `Ccap15` bits 15-14 now classify the codestream (HTONLY / HTDECLARED /
   MIXED-permitted) and gate how the `SPcod` / `SPcoc` bits 6-7 read:
