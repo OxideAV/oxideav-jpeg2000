@@ -228,3 +228,67 @@ fn mixed_reduced_resolution_decodes() {
         (129, 33)
     );
 }
+
+/// The MIXED codestream decodes through the JP2 container route and
+/// the historical byte-vector entry point too: `jp2::decode_jp2` on a
+/// minimal JP2 wrapping of the 4-bit signed conformance stream
+/// reconstructs the same samples as the raw-codestream decode, and
+/// the registry-facing `decode_jpeg2000` sniffs both framings.
+#[test]
+fn mixed_decodes_through_jp2_container() {
+    let codestream = read_fixture("ds0_hm_15_b8");
+    let raw = oxideav_jpeg2000::decode_j2k(&codestream).unwrap();
+
+    // Minimal Annex I file: signature, ftyp (brand 'jp2 '), jp2h with
+    // ihdr (256×256 × 1 component, 4-bit signed → BPC = 0x83) and a
+    // greyscale colr, then the jp2c codestream box.
+    let mut file = Vec::new();
+    file.extend_from_slice(&12u32.to_be_bytes());
+    file.extend_from_slice(b"jP  ");
+    file.extend_from_slice(&[0x0D, 0x0A, 0x87, 0x0A]);
+    file.extend_from_slice(&20u32.to_be_bytes());
+    file.extend_from_slice(b"ftypjp2 ");
+    file.extend_from_slice(&0u32.to_be_bytes());
+    file.extend_from_slice(b"jp2 ");
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&22u32.to_be_bytes());
+    ihdr.extend_from_slice(b"ihdr");
+    ihdr.extend_from_slice(&256u32.to_be_bytes()); // HEIGHT
+    ihdr.extend_from_slice(&256u32.to_be_bytes()); // WIDTH
+    ihdr.extend_from_slice(&1u16.to_be_bytes()); // NC
+    ihdr.push(0x83); // BPC: 4-bit signed
+    ihdr.extend_from_slice(&[7, 0, 0]); // C = jpeg2000, UnkC = 0, IPR = 0
+    let mut colr = Vec::new();
+    colr.extend_from_slice(&15u32.to_be_bytes());
+    colr.extend_from_slice(b"colr");
+    colr.extend_from_slice(&[1, 0, 0]); // METH = 1 (enumerated)
+    colr.extend_from_slice(&17u32.to_be_bytes()); // greyscale
+    file.extend_from_slice(&((8 + ihdr.len() + colr.len()) as u32).to_be_bytes());
+    file.extend_from_slice(b"jp2h");
+    file.extend_from_slice(&ihdr);
+    file.extend_from_slice(&colr);
+    file.extend_from_slice(&((8 + codestream.len()) as u32).to_be_bytes());
+    file.extend_from_slice(b"jp2c");
+    file.extend_from_slice(&codestream);
+
+    let boxed = oxideav_jpeg2000::jp2::decode_jp2(&file).expect("JP2-wrapped MIXED decode");
+    assert_eq!(boxed.components.len(), 1);
+    assert_eq!(
+        boxed.components[0].samples, raw.components[0].samples,
+        "container route must match the raw-codestream decode"
+    );
+
+    // The historical interleaved-bytes entry point sniffs both
+    // framings and routes through the same decode — and per its
+    // documented contract rejects this stream's **signed** channel
+    // cleanly (callers use `decode_j2k` / `decode_jp2` for the
+    // planar surface) rather than mis-converting it.
+    assert!(matches!(
+        oxideav_jpeg2000::decode_jpeg2000(&file),
+        Err(oxideav_jpeg2000::Error::NotImplemented)
+    ));
+    assert!(matches!(
+        oxideav_jpeg2000::decode_jpeg2000(&codestream),
+        Err(oxideav_jpeg2000::Error::NotImplemented)
+    ));
+}
