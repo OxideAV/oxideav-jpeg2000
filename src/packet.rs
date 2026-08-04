@@ -75,7 +75,7 @@ use crate::Error;
 /// (§B.10.1 final paragraph) and shall not be `0xFF`. The reader
 /// surfaces [`PacketBitReader::align_to_byte`] for callers that want
 /// to skip those padding bits explicitly between packets.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PacketBitReader<'a> {
     bytes: &'a [u8],
     /// Byte index of the next byte to consume (or, if `bits_left > 0`,
@@ -718,6 +718,383 @@ pub(crate) fn ht_first_cleanup_candidate(start_pass: u32, passes: u32) -> Option
 }
 
 // ---------------------------------------------------------------------------
+// T.814 §A.4 MIXED tile-components — per-code-block lane resolution.
+// ---------------------------------------------------------------------------
+
+/// The per-code-block lane of a T.814 §A.4 **MIXED** tile-component
+/// (`SPcod` / `SPcoc` bits 6 and 7 both set under a CAP whose `Ccap15`
+/// permits the MIXED set): each code-block is *individually* either an
+/// HT code-block (T.814 Annex B) or a T.800 code-block, and nothing in
+/// the codestream states which — the §A.4 NOTE's own answer is trial
+/// decoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MixedBlockType {
+    /// Both hypotheses are still viable. Every contribution parsed so
+    /// far was byte-identical under both readings; tier-1 arbitrates
+    /// (HT trial decode first, per the §A.4 NOTE).
+    #[default]
+    Unknown,
+    /// Pinned to the HT lane — a tier-2 divergence was resolved in
+    /// favour of the T.814 §B.2 / §B.3 segment layout.
+    Ht,
+    /// Pinned to the T.800 lane — either the HT hypothesis was refuted
+    /// (a §A.4 / §B.3 constraint failed on the shared bytes) or a
+    /// tier-2 divergence was resolved toward the single-length layout.
+    T800,
+}
+
+/// How the packet reader resolved one MIXED contribution — recorded on
+/// the [`CodeBlockContribution`] so the accumulation / tier-1 side can
+/// replay the exact same segment partition without re-deriving the
+/// hypothesis logic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MixedContribution {
+    /// Coding passes covered by each signalled length, in order (the
+    /// §B.2 span partition under the HT hypothesis; the single
+    /// whole-contribution span under T.800 / agreed layouts).
+    pub spans: Vec<u32>,
+    /// The block's lane after this contribution.
+    pub resolved: MixedBlockType,
+    /// The block's §B.1 placeholder-pass resolution after this
+    /// contribution (the HT-hypothesis shadow while the lane is
+    /// [`MixedBlockType::Unknown`]).
+    pub ht_p0: Option<u32>,
+}
+
+/// Depth-first hypothesis log for the genuinely ambiguous MIXED
+/// contributions (T.814 §A.4 — the printed constraints "do not fully
+/// disambiguate", and the standard supplies no normative tier-2
+/// procedure; a conforming parser must hypothesise and verify).
+///
+/// Each entry is one divergent contribution's choice, `true` = HT.
+/// A walk consumes the preset prefix and extends it with the HT-first
+/// default; on failure the caller calls [`MixedChoices::advance`] to
+/// step depth-first to the next untried assignment and re-walks.
+#[derive(Debug, Clone, Default)]
+pub struct MixedChoices {
+    assignments: Vec<bool>,
+    cursor: usize,
+}
+
+impl MixedChoices {
+    /// Fresh, empty choice log (every divergence takes the HT-first
+    /// default).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The next divergent contribution's hypothesis: replays the
+    /// preset prefix, extending it with `true` (HT) beyond.
+    fn next_choice(&mut self) -> bool {
+        if self.cursor == self.assignments.len() {
+            self.assignments.push(true);
+        }
+        let c = self.assignments[self.cursor];
+        self.cursor += 1;
+        c
+    }
+
+    /// Number of divergent contributions consulted by the last walk.
+    pub fn consulted(&self) -> usize {
+        self.cursor
+    }
+
+    /// Step depth-first to the next untried assignment: entries past
+    /// the last consulted choice are dropped (the failed walk never
+    /// reached them), trailing `false` entries pop (both branches
+    /// tried), and the last remaining `true` flips to `false`.
+    /// Returns `false` when the whole tree is exhausted. Rewinds the
+    /// replay cursor either way.
+    pub fn advance(&mut self) -> bool {
+        self.assignments.truncate(self.cursor);
+        self.cursor = 0;
+        while let Some(last) = self.assignments.pop() {
+            if last {
+                self.assignments.push(false);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Rewind the replay cursor for a fresh walk over the same
+    /// assignment prefix.
+    pub fn rewind(&mut self) {
+        self.cursor = 0;
+    }
+}
+
+/// The T.814 §A.4 constraints on an HT code-block in a MIXED
+/// tile-component, checked at the block's **first non-zero-length
+/// codeword segment**: "the first bit of that codeword segment length
+/// … shall be 0; and Lblock … shall be greater than 3". Both are
+/// one-directional: a violation refutes the HT hypothesis (T.800
+/// §B.10.7.1 places no such bound on its own code-blocks, and NOTE 2
+/// blesses over-wide fields), while compliance confirms nothing.
+fn mixed_ht_first_nonzero_ok(lblock: u32, value: u32, width: u8) -> bool {
+    lblock > 3 && (value >> (width - 1)) == 0
+}
+
+/// Read an HT contribution's §B.10.7 codeword-segment lengths after
+/// the shared increase-`Lblock` prefix has been consumed, returning
+/// the lengths with their §B.2 span partition (coding passes per
+/// segment). `ht_p0` carries the block's §B.1 placeholder resolution
+/// across packets (`None` until the first HT cleanup pass pins it).
+///
+/// `mixed_had_nonzero` is `Some` when the block sits in a T.814 §A.4
+/// MIXED tile-component: the §A.4 first-non-zero-segment constraints
+/// are then enforced on every length read — the caller only reaches
+/// this reader with the HT hypothesis pinned, so a violation rejects
+/// the parse (driving the caller's depth-first re-walk) rather than
+/// falling back.
+fn ht_lengths_after_increment(
+    lblock: u32,
+    ht_p0: &mut Option<u32>,
+    start_pass: u32,
+    passes: u32,
+    reader: &mut PacketBitReader<'_>,
+    mut mixed_had_nonzero: Option<&mut bool>,
+) -> Result<(Vec<u32>, Vec<u32>), Error> {
+    /// §A.4 enforcement on one length field (no-op outside MIXED).
+    fn note_len(
+        lblock: u32,
+        value: u32,
+        width: u8,
+        had: &mut Option<&mut bool>,
+    ) -> Result<(), Error> {
+        if value == 0 {
+            return Ok(());
+        }
+        if let Some(nz) = had.as_deref_mut() {
+            if !*nz && !mixed_ht_first_nonzero_ok(lblock, value, width) {
+                return Err(Error::InvalidPacketHeader);
+            }
+            *nz = true;
+        }
+        Ok(())
+    }
+
+    match *ht_p0 {
+        Some(p0) => {
+            let spans = ht_segment_spans(start_pass, passes, p0);
+            let mut lens = Vec::with_capacity(spans.len());
+            for &sp in &spans {
+                let width = segment_length_width(lblock, sp)?;
+                let v = reader.read_bits(width)?;
+                note_len(lblock, v, width, &mut mixed_had_nonzero)?;
+                lens.push(v);
+            }
+            Ok((lens, spans))
+        }
+        None => match ht_first_cleanup_candidate(start_pass, passes) {
+            None => {
+                // No multiple of 3 inside the contribution: it can
+                // only extend the placeholder run — one zero-length
+                // segment (§B.1).
+                let width = segment_length_width(lblock, passes)?;
+                if reader.read_bits(width)? != 0 {
+                    return Err(Error::InvalidPacketHeader);
+                }
+                Ok((vec![0], vec![passes]))
+            }
+            Some(cup) => {
+                // Trial-read the first field at the cleanup-candidate
+                // width (never wider than the placeholder-run reading,
+                // so the residual widening bits are consumed after the
+                // fact when the run interpretation wins).
+                let span1 = cup - start_pass + 1;
+                let narrow = segment_length_width(lblock, span1)?;
+                let v = reader.read_bits(narrow)?;
+                if v >= 2 {
+                    // First HT cleanup segment (covers the placeholder
+                    // run, if any, plus the cleanup pass at `cup` =
+                    // 3·P0).
+                    note_len(lblock, v, narrow, &mut mixed_had_nonzero)?;
+                    *ht_p0 = Some(cup);
+                    let rem = start_pass + passes - 1 - cup;
+                    let mut lens = vec![v];
+                    let mut spans = vec![span1];
+                    if rem > 0 {
+                        let w2 = segment_length_width(lblock, rem)?;
+                        let v2 = reader.read_bits(w2)?;
+                        note_len(lblock, v2, w2, &mut mixed_had_nonzero)?;
+                        lens.push(v2);
+                        spans.push(rem);
+                    }
+                    Ok((lens, spans))
+                } else if v == 0 {
+                    // Placeholder run: the single field was written at
+                    // the span-`passes` width; consume the residual
+                    // low bits (all zero for a zero length).
+                    let wide = segment_length_width(lblock, passes)?;
+                    if wide > narrow && reader.read_bits(wide - narrow)? != 0 {
+                        return Err(Error::InvalidPacketHeader);
+                    }
+                    Ok((vec![0], vec![passes]))
+                } else {
+                    // A first HT cleanup segment of length 1 violates
+                    // §B.3 under either reading.
+                    Err(Error::InvalidPacketHeader)
+                }
+            }
+        },
+    }
+}
+
+/// Resolve one contribution of a still-[`MixedBlockType::Unknown`]
+/// code-block in a MIXED tile-component.
+///
+/// The T.800 hypothesis always reads **one** length field over the
+/// whole contribution (§A.4 bars its code-blocks from bypass and
+/// per-pass termination, so Table D.8 leaves "termination only on
+/// last pass" — `T = {final included pass}`, `K = 1`); the HT
+/// hypothesis reads the §B.2 set-`T` partition. Wherever the two
+/// readings consume identical bits the parse proceeds without
+/// deciding; the §B.3 / §A.4 constraints refute HT where the shared
+/// value breaks them (pinning T.800); a genuine divergence — the
+/// contribution straddles a set-`T` boundary — consults `choices`.
+#[allow(clippy::too_many_arguments)]
+fn decode_mixed_unknown(
+    lblock: u32,
+    ht_p0: &mut Option<u32>,
+    had_nonzero: &mut bool,
+    start_pass: u32,
+    passes: u32,
+    reader: &mut PacketBitReader<'_>,
+    choices: &mut MixedChoices,
+) -> Result<(Vec<u32>, Vec<u32>, MixedBlockType), Error> {
+    let wide = segment_length_width(lblock, passes)?;
+    // Assemble the wide (T.800) value whose top `narrow` bits were
+    // already consumed as `prefix`.
+    fn finish_wide(
+        prefix: u32,
+        narrow: u8,
+        wide: u8,
+        reader: &mut PacketBitReader<'_>,
+    ) -> Result<u32, Error> {
+        let rest = if wide > narrow {
+            reader.read_bits(wide - narrow)?
+        } else {
+            0
+        };
+        let v = (u64::from(prefix) << (wide - narrow)) | u64::from(rest);
+        u32::try_from(v).map_err(|_| Error::InvalidPacketHeader)
+    }
+
+    match *ht_p0 {
+        Some(p0) => {
+            let spans = ht_segment_spans(start_pass, passes, p0);
+            if spans.len() == 1 {
+                // K(HT) = K(T.800) = 1 over the same span — identical
+                // bits under both hypotheses.
+                let v = reader.read_bits(wide)?;
+                // HT-side refutations on the shared value: a cleanup
+                // segment of length 1 (§B.3 — "0 or greater than 1"),
+                // or a first non-zero segment violating §A.4.
+                let is_cleanup =
+                    (start_pass..start_pass + passes).any(|i| i >= p0 && (i - p0) % 3 == 0);
+                let refuted = (v == 1 && is_cleanup)
+                    || (v > 0 && !*had_nonzero && !mixed_ht_first_nonzero_ok(lblock, v, wide));
+                let resolved = if refuted {
+                    MixedBlockType::T800
+                } else {
+                    MixedBlockType::Unknown
+                };
+                Ok((vec![v], vec![passes], resolved))
+            } else if choices.next_choice() {
+                let (lens, spans) = ht_lengths_after_increment(
+                    lblock,
+                    ht_p0,
+                    start_pass,
+                    passes,
+                    reader,
+                    Some(had_nonzero),
+                )?;
+                Ok((lens, spans, MixedBlockType::Ht))
+            } else {
+                let v = reader.read_bits(wide)?;
+                Ok((vec![v], vec![passes], MixedBlockType::T800))
+            }
+        }
+        None => {
+            let Some(cup) = ht_first_cleanup_candidate(start_pass, passes) else {
+                // Under HT this contribution can only extend the §B.1
+                // placeholder run — a zero-length field over `passes`,
+                // exactly the field the T.800 hypothesis reads.
+                let v = reader.read_bits(wide)?;
+                let resolved = if v == 0 {
+                    MixedBlockType::Unknown
+                } else {
+                    MixedBlockType::T800
+                };
+                return Ok((vec![v], vec![passes], resolved));
+            };
+            let span1 = cup - start_pass + 1;
+            if span1 == passes {
+                // The candidate cleanup pass is the contribution's
+                // last pass — K(HT) = 1 at the T.800 width.
+                let v = reader.read_bits(wide)?;
+                let resolved = if v == 0 {
+                    // Placeholder-run extension stays viable.
+                    MixedBlockType::Unknown
+                } else if v == 1 || (!*had_nonzero && !mixed_ht_first_nonzero_ok(lblock, v, wide)) {
+                    // §B.3 (first cleanup segment longer than 1) or
+                    // §A.4 refutes HT.
+                    MixedBlockType::T800
+                } else {
+                    // Both viable; pin the HT-shadow placeholder count
+                    // for later spans.
+                    *ht_p0 = Some(cup);
+                    MixedBlockType::Unknown
+                };
+                Ok((vec![v], vec![passes], resolved))
+            } else {
+                // The HT reading's first field (the cleanup candidate,
+                // Equation B-19 width over `span1`) is narrower than —
+                // a bit-prefix of — the T.800 wide field. Peek it.
+                let narrow = segment_length_width(lblock, span1)?;
+                let v1 = reader.read_bits(narrow)?;
+                if v1 < 2 {
+                    // HT survives only as a placeholder run (whole
+                    // field zero); a first cleanup length of 1 is
+                    // barred by §B.3. Either way both survivors read
+                    // exactly the wide field.
+                    let v = finish_wide(v1, narrow, wide, reader)?;
+                    let resolved = if v == 0 {
+                        MixedBlockType::Unknown
+                    } else {
+                        MixedBlockType::T800
+                    };
+                    Ok((vec![v], vec![passes], resolved))
+                } else if !*had_nonzero && !mixed_ht_first_nonzero_ok(lblock, v1, narrow) {
+                    // §A.4 refutes HT before the divergence is real.
+                    let v = finish_wide(v1, narrow, wide, reader)?;
+                    Ok((vec![v], vec![passes], MixedBlockType::T800))
+                } else if choices.next_choice() {
+                    // HT hypothesis: `v1` is the first cleanup
+                    // segment's length; the remaining passes form the
+                    // set's refinement segment.
+                    *had_nonzero = true;
+                    *ht_p0 = Some(cup);
+                    let rem = start_pass + passes - 1 - cup;
+                    let mut lens = vec![v1];
+                    let mut spans = vec![span1];
+                    if rem > 0 {
+                        let w2 = segment_length_width(lblock, rem)?;
+                        lens.push(reader.read_bits(w2)?);
+                        spans.push(rem);
+                    }
+                    Ok((lens, spans, MixedBlockType::Ht))
+                } else {
+                    let v = finish_wide(v1, narrow, wide, reader)?;
+                    Ok((vec![v], vec![passes], MixedBlockType::T800))
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Geometry input + per-code-block state — T.800 §B.10.8.
 // ---------------------------------------------------------------------------
 
@@ -799,6 +1176,9 @@ pub struct CodeBlockContribution {
     /// code-block draws from the packet body. Empty iff `included` is
     /// false.
     pub segment_lengths: Vec<u32>,
+    /// T.814 §A.4 MIXED resolution record — `Some` iff the packet was
+    /// read under [`SegmentSplit::Mixed`] and this block contributed.
+    pub mixed: Option<MixedContribution>,
 }
 
 /// Parsed packet header — the structural output of one
@@ -866,8 +1246,18 @@ pub struct SubBandState {
     /// cleanup pass has not yet been seen (every pass contributed so
     /// far was a placeholder pass); `Some(3·P0)` once the first
     /// cleanup pass fixed the placeholder count. Unused outside
-    /// [`SegmentSplit::Ht`].
+    /// [`SegmentSplit::Ht`] and [`SegmentSplit::Mixed`] (where it is
+    /// the HT-hypothesis shadow while the block's lane is
+    /// [`MixedBlockType::Unknown`]).
     pub ht_placeholder_passes: Vec<Option<u32>>,
+    /// T.814 §A.4 MIXED per-code-block lane resolution, indexed
+    /// `y * width + x`. Unused outside [`SegmentSplit::Mixed`].
+    pub mixed_type: Vec<MixedBlockType>,
+    /// Whether the code-block has produced a non-zero-length codeword
+    /// segment in any packet so far — the anchor of the T.814 §A.4
+    /// "first non-zero length codeword segment" constraints, indexed
+    /// `y * width + x`. Unused outside [`SegmentSplit::Mixed`].
+    pub had_nonzero_segment: Vec<bool>,
     /// Sub-band grid dimensions.
     pub geometry: SubBandGeometry,
 }
@@ -883,6 +1273,8 @@ impl SubBandState {
             lblock: vec![LblockState::default(); n],
             passes_so_far: vec![0u32; n],
             ht_placeholder_passes: vec![None; n],
+            mixed_type: vec![MixedBlockType::Unknown; n],
+            had_nonzero_segment: vec![false; n],
             geometry,
         }
     }
@@ -980,6 +1372,28 @@ pub fn decode_packet_header(
     sop_eph: SopEphMode,
     split: SegmentSplit,
 ) -> Result<PacketHeader, Error> {
+    decode_packet_header_with_choices(
+        bytes,
+        geometry,
+        precinct_state,
+        sop_eph,
+        split,
+        &mut MixedChoices::new(),
+    )
+}
+
+/// [`decode_packet_header`] with an explicit [`MixedChoices`] log for
+/// [`SegmentSplit::Mixed`] packets (the caller re-walks with
+/// [`MixedChoices::advance`] on failure; outside MIXED the log is
+/// never consulted).
+pub(crate) fn decode_packet_header_with_choices(
+    bytes: &[u8],
+    geometry: &PacketGeometry,
+    precinct_state: &mut PrecinctState,
+    sop_eph: SopEphMode,
+    split: SegmentSplit,
+    choices: &mut MixedChoices,
+) -> Result<PacketHeader, Error> {
     precinct_state.ensure_layout(geometry)?;
 
     // Optional SOP marker before the packet header (T.800 §A.8.1).
@@ -1022,6 +1436,7 @@ pub fn decode_packet_header(
                     geometry.layer,
                     &mut reader,
                     split,
+                    choices,
                 )?;
                 contributions.push(contribution);
             }
@@ -1044,6 +1459,7 @@ pub fn decode_packet_header(
 }
 
 /// Read one code-block's contribution out of the bit stream.
+#[allow(clippy::too_many_arguments)]
 fn decode_one_code_block(
     sub_band: &mut SubBandState,
     band_idx: u32,
@@ -1052,6 +1468,7 @@ fn decode_one_code_block(
     layer: u16,
     reader: &mut PacketBitReader<'_>,
     split: SegmentSplit,
+    choices: &mut MixedChoices,
 ) -> Result<CodeBlockContribution, Error> {
     let idx = sub_band.idx(x, y);
     let already_in = sub_band.already_included[idx];
@@ -1086,6 +1503,7 @@ fn decode_one_code_block(
             zero_bit_planes,
             coding_passes: 0,
             segment_lengths: Vec::new(),
+            mixed: None,
         });
     }
 
@@ -1119,6 +1537,7 @@ fn decode_one_code_block(
     //   but the spec permits a zero increment on the rest, which
     //   `read_lblock_increment` handles transparently).
     let lblock = &mut sub_band.lblock[idx];
+    let mut mixed_info: Option<MixedContribution> = None;
     let segment_lengths = match split {
         SegmentSplit::Single => vec![decode_segment_length(lblock, passes, reader)?],
         SegmentSplit::PerPass => {
@@ -1175,69 +1594,64 @@ fn decode_one_code_block(
             // bits are read at the narrow width and the residual
             // widening bits (which a placeholder run's zero field pads
             // with zeros) are consumed after the fact.
-            match sub_band.ht_placeholder_passes[idx] {
-                Some(p0) => {
-                    let spans = ht_segment_spans(start_pass, passes, p0);
-                    read_lblock_increment(lblock, reader)?;
-                    let mut lens = Vec::with_capacity(spans.len());
-                    for sp in spans {
-                        lens.push(read_segment_length_value(lblock.lblock, sp, reader)?);
-                    }
-                    lens
+            read_lblock_increment(lblock, reader)?;
+            let (lens, _spans) = ht_lengths_after_increment(
+                lblock.lblock,
+                &mut sub_band.ht_placeholder_passes[idx],
+                start_pass,
+                passes,
+                reader,
+                None,
+            )?;
+            lens
+        }
+        SegmentSplit::Mixed => {
+            // T.814 §A.4 — this code-block is individually HT or
+            // T.800, and only trial decoding can tell (the §A.4
+            // NOTE). Parse the layouts that read identical bits under
+            // both hypotheses without deciding; pin T.800 where the
+            // §B.3 / §A.4 constraints refute HT on the shared value;
+            // consult the depth-first choice log where the two
+            // readings genuinely diverge (the contribution straddles
+            // a §B.2 set-`T` boundary).
+            read_lblock_increment(lblock, reader)?;
+            let lb = lblock.lblock;
+            let (lens, spans, resolved) = match sub_band.mixed_type[idx] {
+                MixedBlockType::T800 => {
+                    let v = read_segment_length_value(lb, passes, reader)?;
+                    (vec![v], vec![passes], MixedBlockType::T800)
                 }
-                None => {
-                    read_lblock_increment(lblock, reader)?;
-                    match ht_first_cleanup_candidate(start_pass, passes) {
-                        None => {
-                            // No multiple of 3 inside the contribution:
-                            // it can only extend the placeholder run —
-                            // one zero-length segment (§B.1).
-                            let len = read_segment_length_value(lblock.lblock, passes, reader)?;
-                            if len != 0 {
-                                return Err(Error::InvalidPacketHeader);
-                            }
-                            vec![0]
-                        }
-                        Some(cup) => {
-                            // Trial-read the first field at the
-                            // cleanup-candidate width.
-                            let span1 = cup - start_pass + 1;
-                            let narrow = segment_length_width(lblock.lblock, span1)?;
-                            let v = reader.read_bits(narrow)?;
-                            if v >= 2 {
-                                // First HT cleanup segment (covers the
-                                // placeholder run, if any, plus the
-                                // cleanup pass at index `cup` = 3·P0).
-                                sub_band.ht_placeholder_passes[idx] = Some(cup);
-                                let rem = start_pass + passes - 1 - cup;
-                                let mut lens = vec![v];
-                                if rem > 0 {
-                                    lens.push(read_segment_length_value(
-                                        lblock.lblock,
-                                        rem,
-                                        reader,
-                                    )?);
-                                }
-                                lens
-                            } else if v == 0 {
-                                // Placeholder run: the single field was
-                                // written at the span-`passes` width;
-                                // consume the residual low bits (all
-                                // zero for a zero length).
-                                let wide = segment_length_width(lblock.lblock, passes)?;
-                                if wide > narrow && reader.read_bits(wide - narrow)? != 0 {
-                                    return Err(Error::InvalidPacketHeader);
-                                }
-                                vec![0]
-                            } else {
-                                // A first HT cleanup segment of length 1
-                                // violates §B.3 under either reading.
-                                return Err(Error::InvalidPacketHeader);
-                            }
-                        }
-                    }
+                MixedBlockType::Ht => {
+                    let (lens, spans) = ht_lengths_after_increment(
+                        lb,
+                        &mut sub_band.ht_placeholder_passes[idx],
+                        start_pass,
+                        passes,
+                        reader,
+                        Some(&mut sub_band.had_nonzero_segment[idx]),
+                    )?;
+                    (lens, spans, MixedBlockType::Ht)
                 }
+                MixedBlockType::Unknown => decode_mixed_unknown(
+                    lb,
+                    &mut sub_band.ht_placeholder_passes[idx],
+                    &mut sub_band.had_nonzero_segment[idx],
+                    start_pass,
+                    passes,
+                    reader,
+                    choices,
+                )?,
+            };
+            if lens.iter().any(|&l| l > 0) {
+                sub_band.had_nonzero_segment[idx] = true;
             }
+            sub_band.mixed_type[idx] = resolved;
+            mixed_info = Some(MixedContribution {
+                spans,
+                resolved,
+                ht_p0: sub_band.ht_placeholder_passes[idx],
+            });
+            lens
         }
     };
 
@@ -1249,6 +1663,7 @@ fn decode_one_code_block(
         zero_bit_planes,
         coding_passes: passes,
         segment_lengths,
+        mixed: mixed_info,
     })
 }
 
@@ -1324,6 +1739,19 @@ pub enum SegmentSplit {
     /// pinned when the first HT cleanup pass appears (its segment
     /// length exceeds 1 while a placeholder run's is 0, §B.3).
     Ht,
+    /// T.814 §A.4 — a **MIXED** tile-component (`SPcod` / `SPcoc` bits
+    /// 6 and 7 both set under a `Ccap15` whose bits 15-14 are `11`):
+    /// each code-block is *individually* either an HT code-block or a
+    /// T.800 code-block. The T.800 blocks always contribute one
+    /// length field (§A.4 bars them from bypass and per-pass
+    /// termination, leaving Table D.8's "termination only on last
+    /// pass"), the HT blocks follow the [`SegmentSplit::Ht`] layout,
+    /// and the reader resolves each block's lane per
+    /// [`MixedBlockType`] — identical-bit layouts parse undecided,
+    /// the §A.4 / §B.3 constraints refute HT where they fire, and a
+    /// genuine set-`T`-straddling divergence consults the caller's
+    /// [`MixedChoices`] depth-first log.
+    Mixed,
 }
 
 /// Marker code — SOP (Start of packet, T.800 §A.8.1, `0xFF91`).
@@ -1423,6 +1851,17 @@ pub fn walk_packet_headers(
     packets: &[(usize, PacketGeometry, SegmentSplit)],
     sop_eph: SopEphMode,
 ) -> Result<Vec<PacketHeader>, Error> {
+    walk_packet_headers_with_choices(body, packets, sop_eph, &mut MixedChoices::new())
+}
+
+/// [`walk_packet_headers`] with an explicit [`MixedChoices`] log for
+/// [`SegmentSplit::Mixed`] packets.
+pub(crate) fn walk_packet_headers_with_choices(
+    body: &[u8],
+    packets: &[(usize, PacketGeometry, SegmentSplit)],
+    sop_eph: SopEphMode,
+    choices: &mut MixedChoices,
+) -> Result<Vec<PacketHeader>, Error> {
     // We don't know up-front how many distinct precinct_index values
     // appear; collect into a sparse map.
     let mut precincts: std::collections::HashMap<usize, PrecinctState> =
@@ -1450,7 +1889,14 @@ pub fn walk_packet_headers(
             }
         }
         let state = precincts.entry(*precinct_index).or_default();
-        let header = decode_packet_header(&body[pos..], geometry, state, sop_eph, *split)?;
+        let header = decode_packet_header_with_choices(
+            &body[pos..],
+            geometry,
+            state,
+            sop_eph,
+            *split,
+            choices,
+        )?;
         pos = pos
             .checked_add(header.bytes_consumed)
             .ok_or(Error::PacketHeaderOverrun)?;
@@ -1512,6 +1958,24 @@ pub fn walk_packet_headers_separate(
     packets: &[(usize, PacketGeometry, SegmentSplit)],
     sop_eph: SopEphMode,
 ) -> Result<Vec<RelocatedPacket>, Error> {
+    walk_packet_headers_separate_with_choices(
+        header_bytes,
+        body,
+        packets,
+        sop_eph,
+        &mut MixedChoices::new(),
+    )
+}
+
+/// [`walk_packet_headers_separate`] with an explicit [`MixedChoices`]
+/// log for [`SegmentSplit::Mixed`] packets.
+pub(crate) fn walk_packet_headers_separate_with_choices(
+    header_bytes: &[u8],
+    body: &[u8],
+    packets: &[(usize, PacketGeometry, SegmentSplit)],
+    sop_eph: SopEphMode,
+    choices: &mut MixedChoices,
+) -> Result<Vec<RelocatedPacket>, Error> {
     // §A.8.1 / §A.8.2: when headers are relocated, SOP (if allowed)
     // sits in the body before each packet's data, and EPH (if
     // required) sits in the header buffer after each header. Split the
@@ -1544,8 +2008,14 @@ pub fn walk_packet_headers_separate(
             }
         }
         let state = precincts.entry(*precinct_index).or_default();
-        let header =
-            decode_packet_header(&header_bytes[hpos..], geometry, state, header_mode, *split)?;
+        let header = decode_packet_header_with_choices(
+            &header_bytes[hpos..],
+            geometry,
+            state,
+            header_mode,
+            *split,
+            choices,
+        )?;
         hpos = hpos
             .checked_add(header.bytes_consumed)
             .ok_or(Error::PacketHeaderOverrun)?;
@@ -1880,6 +2350,7 @@ pub fn encode_segment_lengths(
     state: &mut LblockState,
     segments: &[(u32, u32)],
     writer: &mut PacketBitWriter,
+    mixed_ht_headroom: bool,
 ) {
     let width_extra = |p: u32| -> u32 {
         if p <= 1 {
@@ -1889,17 +2360,30 @@ pub fn encode_segment_lengths(
         }
     };
     // Minimal k so every length fits (and no field exceeds 32 bits).
+    // With `mixed_ht_headroom` — a T.814 §A.4 MIXED HT block whose
+    // first-ever non-zero segment lands in this contribution — the
+    // §A.4 constraints also bind: the first non-zero length's field
+    // keeps its top bit clear (one spare bit of width) and the
+    // post-prefix `Lblock` exceeds 3.
     let mut k = 0u32;
+    let mut first_nonzero_pending = mixed_ht_headroom;
     for &(p, len) in segments {
-        let needed = if len == 0 {
+        let mut needed = if len == 0 {
             1
         } else {
             32 - len.leading_zeros()
         };
+        if first_nonzero_pending && len > 0 {
+            needed += 1;
+            first_nonzero_pending = false;
+        }
         let have = state.lblock + width_extra(p);
         if needed > have + k {
             k = needed - have;
         }
+    }
+    if mixed_ht_headroom && segments.iter().any(|&(_, len)| len > 0) && state.lblock + k <= 3 {
+        k = 4 - state.lblock;
     }
     for _ in 0..k {
         writer.write_bit(1);
@@ -1936,6 +2420,13 @@ pub struct CodeBlockPlan {
     /// under [`SegmentSplit::Bypass`]. The pass counts must sum to
     /// `coding_passes`.
     pub segments: Vec<(u32, u32)>,
+    /// T.814 §A.4 MIXED-set HT-lane marking. When true the writer
+    /// honours the §A.4 encoder-side constraints at this block's first
+    /// non-zero-length codeword segment: the increase-`Lblock` prefix
+    /// is grown so `Lblock` exceeds 3 and the first bit of that length
+    /// field is 0. Leave false outside MIXED tile-components (and for
+    /// their T.800-lane blocks).
+    pub mixed_ht: bool,
 }
 
 /// Per-precinct **encoder** state carried across the packets (layers)
@@ -1961,6 +2452,10 @@ struct SubBandEncoderState {
     zero_bitplane_tree: TagTreeEncoder,
     already_included: Vec<bool>,
     lblock: Vec<LblockState>,
+    /// Whether the block has emitted a non-zero-length codeword
+    /// segment yet — anchors the T.814 §A.4 first-non-zero-segment
+    /// constraints for [`CodeBlockPlan::mixed_ht`] blocks.
+    had_nonzero: Vec<bool>,
 }
 
 /// One sub-band's encoder-side leaf data for
@@ -1994,6 +2489,7 @@ impl PrecinctEncoderState {
                     zero_bitplane_tree: TagTreeEncoder::new(geom.width, geom.height, zbp),
                     already_included: vec![false; n],
                     lblock: vec![LblockState::default(); n],
+                    had_nonzero: vec![false; n],
                 }
             })
             .collect();
@@ -2063,7 +2559,11 @@ pub fn encode_packet_header(
                 }
                 sb.already_included[idx] = true;
                 encode_coding_passes(plan.coding_passes, &mut writer);
-                encode_segment_lengths(&mut sb.lblock[idx], &plan.segments, &mut writer);
+                let headroom = plan.mixed_ht && !sb.had_nonzero[idx];
+                encode_segment_lengths(&mut sb.lblock[idx], &plan.segments, &mut writer, headroom);
+                if plan.segments.iter().any(|&(_, len)| len > 0) {
+                    sb.had_nonzero[idx] = true;
+                }
             }
         }
     }
@@ -2244,6 +2744,7 @@ mod tests {
                         zero_bit_planes: p,
                         coding_passes: *passes,
                         segments: segs.clone(),
+                        mixed_ht: false,
                     })
                     .collect();
                 encode_packet_header(&mut enc, l as u16, &plans)
@@ -2308,6 +2809,7 @@ mod tests {
                         zero_bit_planes: 4,
                         coding_passes: *passes,
                         segments: segs.clone(),
+                        mixed_ht: false,
                     }],
                 )
             })
@@ -2349,6 +2851,7 @@ mod tests {
                 zero_bit_planes: 0,
                 coding_passes: 3,
                 segments: vec![(1, 1), (2, 0)],
+                mixed_ht: false,
             }],
         );
         let geometry = PacketGeometry {
@@ -3494,6 +3997,7 @@ mod tests {
                 zero_bit_planes: zbp[i],
                 coding_passes: (i as u32 % 3) + 1,
                 segments: vec![((i as u32 % 3) + 1, 10 + 40 * i as u32)],
+                mixed_ht: false,
             })
             .collect();
         let mut enc_state = PrecinctEncoderState::new(&[(geom, first_layer, zbp.clone())]);
@@ -3581,6 +4085,7 @@ mod tests {
                     } else {
                         Vec::new()
                     },
+                    mixed_ht: false,
                 });
                 layer_truth.push((
                     included,
@@ -3638,6 +4143,7 @@ mod tests {
             zero_bit_planes: 0,
             coding_passes: 0,
             segments: Vec::new(),
+            mixed_ht: false,
         }];
         let bytes = encode_packet_header(&mut enc_state, 0, &plans);
         assert_eq!(bytes.len(), 1);
@@ -3656,5 +4162,198 @@ mod tests {
         .unwrap();
         assert!(!hdr.non_zero_length);
         assert!(hdr.contributions.is_empty());
+    }
+
+    // -- T.814 §A.4 MIXED tile-component tier-2 -------------------------
+
+    /// Helper: encode a per-layer sequence of one-block contributions
+    /// and decode them under `SegmentSplit::Mixed`, returning the
+    /// decoder precinct state and the per-layer contributions.
+    fn mixed_round_trip(
+        shapes: &[(u32, Vec<(u32, u32)>)],
+        zbp: u32,
+        mixed_ht: bool,
+        choices: &mut MixedChoices,
+    ) -> (PrecinctState, Vec<CodeBlockContribution>) {
+        let geom = SubBandGeometry {
+            width: 1,
+            height: 1,
+        };
+        let mut enc = PrecinctEncoderState::new(&[(geom, vec![0u32], vec![zbp])]);
+        let headers: Vec<Vec<u8>> = shapes
+            .iter()
+            .enumerate()
+            .map(|(l, (passes, segs))| {
+                encode_packet_header(
+                    &mut enc,
+                    l as u16,
+                    &[CodeBlockPlan {
+                        included: true,
+                        zero_bit_planes: zbp,
+                        coding_passes: *passes,
+                        segments: segs.clone(),
+                        mixed_ht,
+                    }],
+                )
+            })
+            .collect();
+        let mut dec = PrecinctState::new();
+        let mut out = Vec::new();
+        for (l, hb) in headers.iter().enumerate() {
+            let geometry = PacketGeometry {
+                sub_bands: vec![geom],
+                layer: l as u16,
+            };
+            let hdr = decode_packet_header_with_choices(
+                hb,
+                &geometry,
+                &mut dec,
+                SopEphMode::None,
+                SegmentSplit::Mixed,
+                choices,
+            )
+            .unwrap();
+            assert_eq!(hdr.contributions.len(), 1, "layer {l}");
+            out.push(hdr.contributions[0].clone());
+        }
+        (dec, out)
+    }
+
+    /// A T.800-lane block in a MIXED tile-component: multi-pass
+    /// contributions carry exactly one length field (§A.4 bars bypass
+    /// and per-pass termination, so Table D.8 leaves "termination only
+    /// on last pass" — `K = 1` always), and the minimal-width first
+    /// field violates the §A.4 HT constraints (`Lblock = 3`), refuting
+    /// the HT hypothesis on the shared bytes — the block pins to the
+    /// T.800 lane with no choice consulted.
+    #[test]
+    fn mixed_t800_block_pins_by_a4_refutation() {
+        let mut choices = MixedChoices::new();
+        let shapes = vec![(7u32, vec![(7u32, 25u32)]), (4, vec![(4, 9)])];
+        let (_, contribs) = mixed_round_trip(&shapes, 2, false, &mut choices);
+        assert_eq!(choices.consulted(), 0, "no divergence should arise");
+        let m0 = contribs[0].mixed.as_ref().unwrap();
+        assert_eq!(m0.resolved, MixedBlockType::T800);
+        assert_eq!(m0.spans, vec![7]);
+        assert_eq!(contribs[0].segment_lengths, vec![25]);
+        let m1 = contribs[1].mixed.as_ref().unwrap();
+        assert_eq!(m1.resolved, MixedBlockType::T800);
+        assert_eq!(contribs[1].segment_lengths, vec![9]);
+    }
+
+    /// An HT-lane block whose contributions never straddle a §B.2
+    /// set-`T` boundary (one cleanup pass, then a SigProp + MagRef
+    /// refinement pair): every layout is byte-identical under both
+    /// hypotheses, so the block stays [`MixedBlockType::Unknown`] —
+    /// tier-1 trial decoding arbitrates, per the §A.4 NOTE.
+    #[test]
+    fn mixed_ht_block_boundary_aligned_stays_unknown() {
+        let mut choices = MixedChoices::new();
+        let shapes = vec![(1u32, vec![(1u32, 8u32)]), (2, vec![(2, 5)])];
+        let (dec, contribs) = mixed_round_trip(&shapes, 1, true, &mut choices);
+        assert_eq!(choices.consulted(), 0);
+        let m0 = contribs[0].mixed.as_ref().unwrap();
+        assert_eq!(m0.resolved, MixedBlockType::Unknown);
+        assert_eq!(m0.ht_p0, Some(0), "HT shadow pinned P0 = 0");
+        let m1 = contribs[1].mixed.as_ref().unwrap();
+        assert_eq!(m1.resolved, MixedBlockType::Unknown);
+        assert_eq!(m1.spans, vec![2], "SigProp + MagRef share one segment");
+        assert_eq!(dec.sub_bands[0].mixed_type[0], MixedBlockType::Unknown);
+    }
+
+    /// An HT-lane block whose first contribution carries the whole
+    /// first set (cleanup + SigProp + MagRef, three passes): the
+    /// contribution straddles the set-`T` boundary at pass 0, the two
+    /// hypotheses genuinely diverge (`K(HT) = 2` vs `K(T.800) = 1`),
+    /// and the §A.4-conformant encoding survives the constraints — the
+    /// HT-first choice pins the HT lane and reads the §B.2 partition.
+    #[test]
+    fn mixed_ht_block_straddling_contribution_consults_choice() {
+        let mut choices = MixedChoices::new();
+        let shapes = vec![(3u32, vec![(1u32, 9u32), (2, 4)])];
+        let (dec, contribs) = mixed_round_trip(&shapes, 1, true, &mut choices);
+        assert_eq!(choices.consulted(), 1, "one divergence");
+        let m0 = contribs[0].mixed.as_ref().unwrap();
+        assert_eq!(m0.resolved, MixedBlockType::Ht);
+        assert_eq!(m0.spans, vec![1, 2]);
+        assert_eq!(m0.ht_p0, Some(0));
+        assert_eq!(contribs[0].segment_lengths, vec![9, 4]);
+        assert_eq!(dec.sub_bands[0].mixed_type[0], MixedBlockType::Ht);
+    }
+
+    /// A §B.1 placeholder run (zero-length contribution covering three
+    /// passes) reads identically under both hypotheses and leaves the
+    /// lane unresolved; the following cleanup pass pins the HT-shadow
+    /// placeholder count without pinning the lane.
+    #[test]
+    fn mixed_placeholder_run_stays_unknown() {
+        let mut choices = MixedChoices::new();
+        let shapes = vec![(3u32, vec![(3u32, 0u32)]), (1, vec![(1, 8)])];
+        let (dec, contribs) = mixed_round_trip(&shapes, 1, true, &mut choices);
+        assert_eq!(choices.consulted(), 0);
+        let m0 = contribs[0].mixed.as_ref().unwrap();
+        assert_eq!(m0.resolved, MixedBlockType::Unknown);
+        assert_eq!(m0.ht_p0, None);
+        assert_eq!(contribs[0].segment_lengths, vec![0]);
+        let m1 = contribs[1].mixed.as_ref().unwrap();
+        assert_eq!(m1.resolved, MixedBlockType::Unknown);
+        assert_eq!(m1.ht_p0, Some(3), "P0 = 1 pinned at the cleanup pass");
+        assert_eq!(dec.sub_bands[0].ht_placeholder_passes[0], Some(3));
+    }
+
+    /// The §A.4 constraints under the writer's `mixed_ht` headroom:
+    /// the emitted first non-zero field carries `Lblock > 3` and a
+    /// clear top bit, and a same-shape stream *without* the headroom
+    /// (minimal widths) refutes HT on the same bytes.
+    #[test]
+    fn mixed_a4_headroom_controls_refutation() {
+        // One cleanup pass, length 8. With headroom: survives as
+        // Unknown. Without: Lblock stays 3 → refuted → T.800.
+        for (headroom, want) in [
+            (true, MixedBlockType::Unknown),
+            (false, MixedBlockType::T800),
+        ] {
+            let mut choices = MixedChoices::new();
+            let shapes = vec![(1u32, vec![(1u32, 8u32)])];
+            let (_, contribs) = mixed_round_trip(&shapes, 1, headroom, &mut choices);
+            let m0 = contribs[0].mixed.as_ref().unwrap();
+            assert_eq!(m0.resolved, want, "headroom {headroom}");
+            assert_eq!(contribs[0].segment_lengths, vec![8]);
+        }
+    }
+
+    /// The depth-first [`MixedChoices`] walk: HT-first defaults,
+    /// [`MixedChoices::advance`] flips the deepest untried branch and
+    /// reports exhaustion.
+    #[test]
+    fn mixed_choices_depth_first_advance() {
+        let mut c = MixedChoices::new();
+        assert!(c.next_choice() && c.next_choice() && c.next_choice());
+        assert_eq!(c.consulted(), 3);
+        // [T T T] → [T T F]
+        assert!(c.advance());
+        assert!(c.next_choice());
+        assert!(c.next_choice());
+        assert!(!c.next_choice());
+        // Suppose the re-walk consulted only two entries this time:
+        // the third is stale and must be dropped on advance.
+        c.rewind();
+        assert!(c.next_choice());
+        assert!(c.next_choice());
+        assert_eq!(c.consulted(), 2);
+        // [T T] → [T F]
+        assert!(c.advance());
+        assert!(c.next_choice());
+        assert!(!c.next_choice());
+        c.rewind();
+        c.next_choice();
+        c.next_choice();
+        // [T F] → [F]
+        assert!(c.advance());
+        assert!(!c.next_choice());
+        c.rewind();
+        c.next_choice();
+        // [F] → exhausted.
+        assert!(!c.advance());
     }
 }

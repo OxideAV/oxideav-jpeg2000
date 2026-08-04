@@ -2542,6 +2542,7 @@ fn encode_core(
                             zero_bit_planes: 0,
                             coding_passes: 0,
                             segments: Vec::new(),
+                            mixed_ht: false,
                         }),
                         Some(lb) => {
                             let (p, range, segs) = &lb.per_layer[desc.layer as usize];
@@ -2551,6 +2552,7 @@ fn encode_core(
                                     zero_bit_planes: lb.zero_bit_planes,
                                     coding_passes: 0,
                                     segments: Vec::new(),
+                                    mixed_ht: false,
                                 });
                             } else {
                                 plans.push(CodeBlockPlan {
@@ -2558,6 +2560,7 @@ fn encode_core(
                                     zero_bit_planes: lb.zero_bit_planes,
                                     coding_passes: *p,
                                     segments: segs.clone(),
+                                    mixed_ht: false,
                                 });
                                 body.extend_from_slice(&lb.bytes[range.clone()]);
                             }
@@ -5985,6 +5988,7 @@ mod tests {
             zero_bit_planes: p_signalled,
             coding_passes: passes,
             segments,
+            mixed_ht: false,
         };
         // L0: set-0 cleanup. L1: set 0's unused SigProp + MagRef
         // (zero-length refinement) then the whole skip set. L2: set-2
