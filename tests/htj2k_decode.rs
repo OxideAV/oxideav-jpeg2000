@@ -410,3 +410,135 @@ fn ht_rgb_unaligned_tiles_precincts_cprl_rev() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// T.814 §A.3.2 stream-level HT signalling (CAP Ccap15 bits 15-14).
+// ---------------------------------------------------------------------------
+
+/// Walk the main-header marker chain of `bytes` and return the offset
+/// of the first occurrence of `marker`'s segment (at its 0xFF byte).
+fn find_marker(bytes: &[u8], marker: u16) -> usize {
+    let mut pos = 2usize; // skip SOC
+    while pos + 4 <= bytes.len() {
+        let m = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]);
+        if m == marker {
+            return pos;
+        }
+        let len = u16::from_be_bytes([bytes[pos + 2], bytes[pos + 3]]) as usize;
+        pos += 2 + len;
+    }
+    panic!("marker {marker:#06x} not found");
+}
+
+/// Return a copy of `bytes` with the main-header COD `SPcod` style
+/// byte replaced by `style` (Table A.12 layout: marker(2) + Lcod(2) +
+/// Scod(1) + SGcod(4) + NL(1) + xcb(1) + ycb(1) + style(1)).
+fn with_cod_style(bytes: &[u8], style: u8) -> Vec<u8> {
+    let cod = find_marker(bytes, 0xFF52);
+    let mut out = bytes.to_vec();
+    out[cod + 12] = style;
+    out
+}
+
+/// Return a copy of `bytes` with the CAP marker's 16-bit `Ccap15`
+/// field replaced (T.814 §A.3: marker(2) + Lcap(2) + Pcap(4) +
+/// Ccap15(2)).
+fn with_ccap15(bytes: &[u8], ccap15: u16) -> Vec<u8> {
+    let cap = find_marker(bytes, 0xFF50);
+    let mut out = bytes.to_vec();
+    out[cap + 8..cap + 10].copy_from_slice(&ccap15.to_be_bytes());
+    out
+}
+
+/// T.814 §A.3.2: under a `Ccap15` whose bits 15-14 are `00` the stream
+/// is HTONLY — **every** code-block is an HT code-block, whatever the
+/// `SPcod` bits 6 / 7 say. The strict §A.3.2 first-branch signalling
+/// carries the style bits as `00` (the CAP alone routes the blocks),
+/// and the §A.3.2 NOTE admits `11`; both must reconstruct identically
+/// to the fixture's native `bit 6 = 1` signalling.
+#[test]
+fn htonly_cap_routes_blocks_regardless_of_spcod_bits() {
+    let bytes = include_bytes!("fixtures/ht_8x8_rev_1decomp.j2c");
+    let baseline = oxideav_jpeg2000::decode_j2k(bytes).expect("baseline decode");
+    for style in [0x00u8, 0xC0] {
+        let patched = with_cod_style(bytes, style);
+        let img = oxideav_jpeg2000::decode_j2k(&patched)
+            .unwrap_or_else(|e| panic!("HTONLY decode with SPcod style {style:#04x}: {e:?}"));
+        assert_eq!(img.components.len(), baseline.components.len());
+        for (a, b) in img.components.iter().zip(baseline.components.iter()) {
+            assert_eq!(a.samples, b.samples, "style {style:#04x}");
+        }
+    }
+}
+
+/// T.814 §A.3.2: under `Ccap15` bits 15-14 = `10` (HTDECLARED) the
+/// per-tile-component bit 6 still selects the lane — and "bit 7 of all
+/// SPcod or SPcoc values is equal to 0", so a set bit 7 is rejected.
+#[test]
+fn htdeclared_ccap_enforces_spcod_bit7_clear() {
+    let bytes = include_bytes!("fixtures/ht_8x8_rev_1decomp.j2c");
+    let baseline = oxideav_jpeg2000::decode_j2k(bytes).expect("baseline decode");
+    let declared = with_ccap15(bytes, 0x8001);
+    let img = oxideav_jpeg2000::decode_j2k(&declared).expect("HTDECLARED decode");
+    assert_eq!(img.components[0].samples, baseline.components[0].samples);
+    // bit 7 set under HTDECLARED → reject.
+    let bad = with_cod_style(&declared, 0xC0);
+    assert!(oxideav_jpeg2000::decode_j2k(&bad).is_err());
+}
+
+/// Table A.2: `Ccap15` bits 15-14 = `01` and bits 10-6 are "Reserved
+/// for future use by ITU-T | ISO/IEC" — a stream that sets them
+/// signals semantics this decoder does not know, and is rejected
+/// rather than mis-decoded.
+#[test]
+fn reserved_ccap15_encodings_rejected() {
+    let bytes = include_bytes!("fixtures/ht_8x8_rev_1decomp.j2c");
+    // Reserved quadrant 01.
+    assert!(oxideav_jpeg2000::decode_j2k(&with_ccap15(bytes, 0x4001)).is_err());
+    // Reserved bit 6.
+    assert!(oxideav_jpeg2000::decode_j2k(&with_ccap15(bytes, 0x0041)).is_err());
+}
+
+/// `Ccap15` bits 15-14 = `11` (MIXED permitted) with a plain
+/// `bit 6 = 1, bit 7 = 0` style byte is still an all-HT tile-component
+/// (Table A.3) — the MIXED reading only turns on per tile-component
+/// via bits 6 + 7 = 11.
+#[test]
+fn mixed_permitted_all_ht_component_decodes() {
+    let bytes = include_bytes!("fixtures/ht_8x8_rev_1decomp.j2c");
+    let baseline = oxideav_jpeg2000::decode_j2k(bytes).expect("baseline decode");
+    let mixed_cap = with_ccap15(bytes, 0xC001);
+    let img = oxideav_jpeg2000::decode_j2k(&mixed_cap).expect("MIXED-permitted decode");
+    assert_eq!(img.components[0].samples, baseline.components[0].samples);
+}
+
+/// T.800 Table A.19 reserves `SPcod` bit 7; without a CAP marker (or
+/// with bit 6 clear under one that permits MIXED) no reading blesses
+/// `bit 7 = 1, bit 6 = 0`.
+#[test]
+fn spcod_bit7_without_bit6_rejected() {
+    let bytes = include_bytes!("fixtures/ht_8x8_rev_1decomp.j2c");
+    assert!(oxideav_jpeg2000::decode_j2k(&with_cod_style(bytes, 0x80)).is_err());
+}
+
+/// The T.814 §A.6 `CPF` (corresponding profile) and T.800 §A.9.1 `CRG`
+/// (component registration) marker segments are informational — CPF
+/// describes the clause-8.8 transcoding correspondence and CRG "has no
+/// effect on decoding the codestream" — so a main header carrying both
+/// decodes identically to one without them.
+#[test]
+fn cpf_and_crg_markers_are_skipped() {
+    let bytes = include_bytes!("fixtures/ht_8x8_rev_1decomp.j2c");
+    let baseline = oxideav_jpeg2000::decode_j2k(bytes).expect("baseline decode");
+    // Insert CPF (marker + Lcpf=4 + Pcpf1) and CRG (marker + Lcrg=6 +
+    // Xcrg + Ycrg for the single component) after the CAP segment.
+    let cap = find_marker(bytes, 0xFF50);
+    let cap_len = u16::from_be_bytes([bytes[cap + 2], bytes[cap + 3]]) as usize;
+    let insert_at = cap + 2 + cap_len;
+    let mut patched = bytes[..insert_at].to_vec();
+    patched.extend_from_slice(&[0xFF, 0x59, 0x00, 0x04, 0x00, 0x03]); // CPF
+    patched.extend_from_slice(&[0xFF, 0x63, 0x00, 0x06, 0x40, 0x00, 0x40, 0x00]); // CRG
+    patched.extend_from_slice(&bytes[insert_at..]);
+    let img = oxideav_jpeg2000::decode_j2k(&patched).expect("decode with CPF + CRG");
+    assert_eq!(img.components[0].samples, baseline.components[0].samples);
+}

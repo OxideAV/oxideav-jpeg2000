@@ -229,6 +229,18 @@ pub const MARKER_PRF: u16 = 0xFF56;
 /// `COM` — Comment (T.800 §A.9.2). Skipped by the round-1 header parser.
 #[doc(hidden)]
 pub const MARKER_COM: u16 = 0xFF64;
+/// `CPF` — Corresponding profile (T.814 §A.6 / Table A.5). Signals the
+/// T.814 clause-8.8 `CPF_X` transcoding correspondence of an HTJ2K
+/// codestream; informational for decoding, so the header parser
+/// length-skips it.
+#[doc(hidden)]
+pub const MARKER_CPF: u16 = 0xFF59;
+/// `CRG` — Component registration (T.800 §A.9.1). Describes the
+/// "centre of mass" of each component's samples for rendering; "this
+/// marker segment has no effect on decoding the codestream" (§A.9.1),
+/// so the header parser length-skips it.
+#[doc(hidden)]
+pub const MARKER_CRG: u16 = 0xFF63;
 
 // ---------------------------------------------------------------------------
 // Error type.
@@ -1477,10 +1489,10 @@ fn skip_marker_segment(reader: &mut Reader<'_>) -> Result<(), Error> {
 /// SOT (Start of tile-part) marker.
 ///
 /// On success returns a [`J2kHeader`] populated from the SIZ, COD and
-/// QCD marker segments. Optional main-header markers (CAP, PRF, COM,
-/// COC, QCC, RGN, POC, PLM, PPM, TLM) are recognised and skipped via
-/// their 16-bit length field, but their contents are not retained by
-/// this round-1 parser.
+/// QCD marker segments. Optional main-header markers (CAP, PRF, CPF,
+/// CRG, COM, COC, QCC, RGN, POC, PLM, PPM, TLM) are recognised and
+/// skipped via their 16-bit length field, but their contents are not
+/// retained by this round-1 parser.
 ///
 /// References: T.800 §A.3 (main-header construction), §A.5 (SIZ /
 /// CAP / PRF), §A.6 (COD / COC / QCD / QCC / RGN / POC), §A.7 (TLM /
@@ -1514,8 +1526,8 @@ pub fn parse_j2k_header(bytes: &[u8]) -> Result<J2kHeader, Error> {
                 break;
             }
             // Optional main-header markers we skip over by length.
-            MARKER_CAP | MARKER_PRF | MARKER_COM | MARKER_COC | MARKER_QCC | 0xFF5E | 0xFF5F
-            | 0xFF55 | 0xFF57 | 0xFF58 | 0xFF60 | 0xFF61 => {
+            MARKER_CAP | MARKER_PRF | MARKER_COM | MARKER_COC | MARKER_QCC | MARKER_CPF
+            | MARKER_CRG | 0xFF5E | 0xFF5F | 0xFF55 | 0xFF57 | 0xFF58 | 0xFF60 | 0xFF61 => {
                 skip_marker_segment(&mut reader)?;
             }
             other => {

@@ -145,10 +145,47 @@ pub struct DecodedImage {
 // Unsupported-feature detection.
 // ---------------------------------------------------------------------------
 
+/// The stream-level HT signalling read from the `CAP` marker's
+/// `Ccap15` field (T.814 §A.3.2, Table A.2 — the two most significant
+/// bits select the clause-8.2 constrained set the codestream may
+/// belong to).
+///
+/// This gates how the `SPcod` / `SPcoc` bits 6 and 7 are interpreted
+/// per tile-component (T.814 §A.4): the MIXED per-code-block reading
+/// of bits `6 + 7 = 11` only arises under [`HtSignalling::MixedPermitted`];
+/// under [`HtSignalling::HtOnly`] every code-block is an HT code-block
+/// whatever the style byte says (the §A.3.2 NOTE — an HTONLY-set
+/// stream "can still contain SPcod or SPcoc values where both bits 6
+/// and 7 are equal to 1"), and under a strict §A.3.2 first-branch
+/// signalling the style bytes carry `bits 6 and 7 … equal to 0` while
+/// the CAP alone routes the blocks to the HT decoder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HtSignalling {
+    /// No `CAP` marker: a plain T.800 codestream. `SPcod` bit 6 is
+    /// honoured as the T.814 HT flag when set (real HTJ2K writers
+    /// always emit the CAP, but the block routing needs no more than
+    /// the style bit); bit 7 is reserved (T.800 Table A.19).
+    None,
+    /// `Ccap15` bits 15-14 = `00` — the codestream is in the HTONLY
+    /// set: **all** code-blocks are HT code-blocks, regardless of the
+    /// per-tile-component style bytes (§A.3.2).
+    HtOnly,
+    /// `Ccap15` bits 15-14 = `10` — HTDECLARED: each tile-component is
+    /// entirely HT or entirely Annex D, selected by its `SPcod` /
+    /// `SPcoc` bit 6; "bit 7 of all SPcod or SPcoc values is equal
+    /// to 0" (§A.3.2), so a set bit 7 is rejected.
+    HtDeclared,
+    /// `Ccap15` bits 15-14 = `11` — the MIXED set is permitted: a
+    /// tile-component whose style byte has bits 6 and 7 both set may
+    /// mix HT and Annex D code-blocks individually (T.814 §A.4).
+    MixedPermitted,
+}
+
 /// Re-scan the main-header byte span for marker segments the wiring
-/// cannot honour yet. [`crate::parse_j2k_header`] length-skips
-/// optional markers; silently ignoring `PPM` / `CAP` would mis-decode
-/// the stream, so their presence is surfaced as
+/// cannot honour yet, and classify the stream-level HT signalling from
+/// the `CAP` marker (T.814 §A.3). [`crate::parse_j2k_header`]
+/// length-skips optional markers; silently ignoring `PPM` / `CAP`
+/// would mis-decode the stream, so their presence is surfaced as
 /// [`Error::NotImplemented`] here.
 ///
 /// `QCC`, `COC`, `RGN` and `POC` are **not** rejected: the main-header
@@ -160,7 +197,11 @@ pub struct DecodedImage {
 /// [`crate::collect_main_header_coc`] / [`resolve_component_coding`],
 /// [`crate::collect_main_header_rgn`] / [`resolve_component_roi_shift`],
 /// and [`crate::collect_main_header_poc`] / [`resolve_tile_coding`].
-fn reject_unsupported_main_header_markers(bytes: &[u8], header_end: usize) -> Result<(), Error> {
+fn reject_unsupported_main_header_markers(
+    bytes: &[u8],
+    header_end: usize,
+) -> Result<HtSignalling, Error> {
+    let mut ht_sig = HtSignalling::None;
     // SOC is 2 bytes with no length field; every other main-header
     // marker segment is `marker(2) + length(2) + payload(length-2)`.
     let mut pos = 2usize; // skip SOC (already validated by the parser)
@@ -183,9 +224,7 @@ fn reject_unsupported_main_header_markers(bytes: &[u8], header_end: usize) -> Re
                 // T.814 §A.3: the only CAP configuration this decoder
                 // honours is one that signals HTJ2K (Pcap bit 15 set). A
                 // CAP segment that signals some *other* capability we do
-                // not implement is rejected; one that signals only HT is
-                // accepted (the HT path is driven by the SPcod bit-6 flag
-                // per tile-component, parsed from COD/COC).
+                // not implement is rejected.
                 let seg_end = pos + 2 + len;
                 if seg_end > header_end || len < 6 {
                     return Err(Error::InvalidMarkerLength);
@@ -204,13 +243,33 @@ fn reject_unsupported_main_header_markers(bytes: &[u8], header_end: usize) -> Re
                 if pcap & !(1u32 << (32 - 15)) != 0 || pcap15 == 0 {
                     return Err(Error::NotImplemented);
                 }
+                // Pcap15 set ⇒ the Ccap15 field follows (§A.3.1: one
+                // 16-bit Ccap field per set Pcap bit).
+                if len < 8 {
+                    return Err(Error::InvalidMarkerLength);
+                }
+                let ccap15 = u16::from_be_bytes([bytes[pos + 8], bytes[pos + 9]]);
+                // Table A.2: bits 10..6 are "reserved for future use";
+                // a stream that sets one signals semantics we do not
+                // know.
+                if ccap15 & 0x07C0 != 0 {
+                    return Err(Error::NotImplemented);
+                }
+                // §A.3.2 — bits 15-14 select the clause-8.2 set.
+                ht_sig = match ccap15 >> 14 {
+                    0b00 => HtSignalling::HtOnly,
+                    0b10 => HtSignalling::HtDeclared,
+                    0b11 => HtSignalling::MixedPermitted,
+                    // 0b01 is "Reserved for future use" (Table A.2).
+                    _ => return Err(Error::NotImplemented),
+                };
             }
             MARKER_SOC | MARKER_SIZ => {}
             _ => {}
         }
         pos += 2 + len;
     }
-    Ok(())
+    Ok(ht_sig)
 }
 
 // ---------------------------------------------------------------------------
@@ -365,6 +424,7 @@ fn resolve_component_coding(
     num_components: usize,
     cod: &crate::Cod,
     cocs: &[crate::Coc],
+    ht_sig: HtSignalling,
 ) -> Result<Vec<ComponentCoding>, Error> {
     let cod_xcb = cod
         .code_block_width_exp
@@ -380,7 +440,7 @@ fn resolve_component_coding(
         ycb: cod_ycb,
         precincts: cod.precincts.clone(),
         transform: cod.transform,
-        style: BlockStyle::from_style_byte(cod.code_block_style),
+        style: BlockStyle::from_style_byte(cod.code_block_style, ht_sig)?,
     };
     let mut out: Vec<ComponentCoding> = (0..num_components).map(|_| default.clone()).collect();
     let mut seen = vec![false; num_components];
@@ -408,7 +468,7 @@ fn resolve_component_coding(
             ycb,
             precincts: coc.precincts.clone(),
             transform: coc.transform,
-            style: BlockStyle::from_style_byte(coc.code_block_style),
+            style: BlockStyle::from_style_byte(coc.code_block_style, ht_sig)?,
         };
     }
     Ok(out)
@@ -633,18 +693,75 @@ struct BlockStyle {
 }
 
 impl BlockStyle {
-    /// Decode a Table A.19 `SPcod` / `SPcoc` style byte.
+    /// Decode a Table A.19 `SPcod` / `SPcoc` style byte under the
+    /// stream-level `CAP` signalling (T.814 §A.3.2 / §A.4).
     ///
-    /// T.814 §A.4: when bit 6 is set the code-blocks are HT code-blocks
-    /// and the Table A.4 reading of the byte applies — bits 0/1/2/4/5
-    /// (bypass / context-reset / per-pass-termination / predictable-
-    /// termination / segmentation-symbols) do NOT apply to HT
-    /// code-blocks. Only the vertically-causal bit 3 carries over.
+    /// T.814 §A.4: when the tile-component's code-blocks are HT
+    /// code-blocks the Table A.3 reading of the byte applies — bits
+    /// 0/1/2/4/5 (bypass / context-reset / per-pass-termination /
+    /// predictable-termination / segmentation-symbols) do NOT apply to
+    /// HT code-blocks. Only the vertically-causal bit 3 carries over.
     /// Force the rest off.
-    fn from_style_byte(byte: u8) -> Self {
+    ///
+    /// Whether the tile-component *is* HT is resolved per §A.3.2:
+    ///
+    /// * [`HtSignalling::HtOnly`] — every code-block in the stream is
+    ///   HT, whatever bits 6 / 7 say (a strict §A.3.2 first-branch
+    ///   stream carries them as `00`; the §A.3.2 NOTE also admits
+    ///   `11`).
+    /// * [`HtSignalling::HtDeclared`] — bit 6 selects the
+    ///   tile-component's lane; bit 7 "is equal to 0", so a set bit 7
+    ///   is rejected.
+    /// * [`HtSignalling::MixedPermitted`] — bits `6 + 7 = 11` mark a
+    ///   MIXED tile-component (individual code-blocks are HT *or*
+    ///   Annex D, T.814 §A.4); `10` is all-HT, `0x` is all-Annex-D.
+    /// * [`HtSignalling::None`] — no CAP: bit 6 alone is honoured as
+    ///   the HT flag; bit 7 is reserved (T.800 Table A.19) and
+    ///   rejected when set.
+    fn from_style_byte(byte: u8, ht_sig: HtSignalling) -> Result<Self, Error> {
         let style_flags = crate::CodeBlockStyle::from_byte(byte);
-        let ht = style_flags.high_throughput();
-        BlockStyle {
+        let bit6 = style_flags.high_throughput();
+        let bit7 = style_flags.ht_mixed();
+        // §A.4 defines bit 7 only when bit 6 is set; T.800 Table A.19
+        // reserves it. No reading blesses `bit 7 = 1, bit 6 = 0`.
+        if bit7 && !bit6 {
+            return Err(Error::NotImplemented);
+        }
+        let (ht, mixed) = match ht_sig {
+            // §A.3.2 first branch: the CAP alone routes every
+            // code-block to the HT decoder.
+            HtSignalling::HtOnly => (true, false),
+            HtSignalling::HtDeclared => {
+                if bit7 {
+                    return Err(Error::NotImplemented);
+                }
+                (bit6, false)
+            }
+            HtSignalling::MixedPermitted => (bit6 && !bit7, bit6 && bit7),
+            HtSignalling::None => {
+                if bit7 {
+                    return Err(Error::NotImplemented);
+                }
+                (bit6, false)
+            }
+        };
+        if mixed {
+            // T.814 §A.4 Table A.4: in a MIXED tile-component the
+            // style bits 0 (selective arithmetic-coding bypass) and 2
+            // (termination on each coding pass) are reserved — and the
+            // §A.4 prose bars the Annex D code-blocks from using
+            // either, which is exactly what keeps the T.800 half of
+            // the packet-header parse at one length field per
+            // contribution.
+            if style_flags.selective_arithmetic_coding_bypass()
+                || style_flags.termination_on_each_coding_pass()
+            {
+                return Err(Error::NotImplemented);
+            }
+            // The per-code-block MIXED decode is not wired yet.
+            return Err(Error::NotImplemented);
+        }
+        Ok(BlockStyle {
             segmentation_symbols: !ht && style_flags.segmentation_symbols(),
             vertically_causal: style_flags.vertically_causal_context(),
             reset_context_probabilities: !ht && style_flags.reset_context_probabilities(),
@@ -660,7 +777,7 @@ impl BlockStyle {
                 && style_flags.selective_arithmetic_coding_bypass(),
             predictable_termination: !ht && style_flags.predictable_termination(),
             high_throughput: ht,
-        }
+        })
     }
 
     /// The §B.10.7 codeword-segment split these style bits select for
@@ -787,6 +904,7 @@ fn gather_ppt_headers(parts: &[&crate::TilePart]) -> Result<Option<Vec<u8>>, Err
 #[allow(clippy::too_many_arguments)]
 fn resolve_tile_coding<'a>(
     num_components: usize,
+    ht_sig: HtSignalling,
     main_rgns: &[crate::Rgn],
     main_poc: Option<&crate::Poc>,
     main_params: &CodingParams,
@@ -868,13 +986,14 @@ fn resolve_tile_coding<'a>(
     // and the tile COCs override per component on top of them.
     let (params, comp_coding) = if let Some(tcod) = tile_cod {
         let params = coding_params_from_cod(tcod)?;
-        let comp_coding = resolve_component_coding(num_components, tcod, &cloned(&tile_cocs))?;
+        let comp_coding =
+            resolve_component_coding(num_components, tcod, &cloned(&tile_cocs), ht_sig)?;
         (params, comp_coding)
     } else {
         // Start from the main-header resolution, then let any tile COC
         // override per component (the tile COC outranks the main COC).
         let mut comp_coding = main_coding.to_vec();
-        apply_coc_overrides(&mut comp_coding, &tile_cocs)?;
+        apply_coc_overrides(&mut comp_coding, &tile_cocs, ht_sig)?;
         (main_params.clone(), comp_coding)
     };
 
@@ -943,6 +1062,7 @@ fn cloned<T: Clone>(refs: &[&T]) -> Vec<T> {
 fn apply_coc_overrides(
     coding: &mut [ComponentCoding],
     tile_cocs: &[&crate::Coc],
+    ht_sig: HtSignalling,
 ) -> Result<(), Error> {
     let mut seen = vec![false; coding.len()];
     for coc in tile_cocs {
@@ -968,7 +1088,7 @@ fn apply_coc_overrides(
             ycb,
             precincts: coc.precincts.clone(),
             transform: coc.transform,
-            style: BlockStyle::from_style_byte(coc.code_block_style),
+            style: BlockStyle::from_style_byte(coc.code_block_style, ht_sig)?,
         };
     }
     Ok(())
@@ -2306,7 +2426,7 @@ fn decode_codestream_impl(
     discard_levels: u8,
     max_layers: u16,
 ) -> Result<DecodedImage, Error> {
-    reject_unsupported_main_header_markers(bytes, cs.header.bytes_consumed)?;
+    let ht_sig = reject_unsupported_main_header_markers(bytes, cs.header.bytes_consumed)?;
 
     let siz = &cs.header.siz;
     let cod = &cs.header.cod;
@@ -2322,7 +2442,7 @@ fn decode_codestream_impl(
     // main-header COC over the main COD for the components it targets
     // (NL / code-block size / precincts / kernel per component).
     let main_cocs = crate::collect_main_header_coc(bytes, cs.header.bytes_consumed, csiz)?;
-    let comp_coding = resolve_component_coding(siz.components.len(), cod, &main_cocs)?;
+    let comp_coding = resolve_component_coding(siz.components.len(), cod, &main_cocs, ht_sig)?;
 
     // §A.6.3 / §H.1: resolve the per-component region-of-interest
     // Maxshift scaling value `s` from any main-header `RGN`. Components
@@ -2498,6 +2618,7 @@ fn decode_codestream_impl(
             parts.first().map(|tp| tp.markers.as_slice()).unwrap_or(&[]);
         let tile_coding = resolve_tile_coding(
             siz.components.len(),
+            ht_sig,
             &main_rgns,
             main_poc.as_ref(),
             &params,
@@ -2675,10 +2796,11 @@ pub(crate) fn relocate_single_tilepart_to_ppt(bytes: &[u8]) -> Result<Vec<u8>, E
     let cod = &cs.header.cod;
     let qcd = &cs.header.qcd;
     let csiz = siz.components.len() as u16;
+    let ht_sig = reject_unsupported_main_header_markers(bytes, cs.header.bytes_consumed)?;
     let main_qccs = crate::collect_main_header_qcc(bytes, cs.header.bytes_consumed, csiz)?;
     let comp_quant = resolve_component_quant(siz.components.len(), qcd, &main_qccs)?;
     let main_cocs = crate::collect_main_header_coc(bytes, cs.header.bytes_consumed, csiz)?;
-    let comp_coding = resolve_component_coding(siz.components.len(), cod, &main_cocs)?;
+    let comp_coding = resolve_component_coding(siz.components.len(), cod, &main_cocs, ht_sig)?;
     let main_poc = crate::collect_main_header_poc(bytes, cs.header.bytes_consumed, csiz)?;
     let main_rgns = crate::collect_main_header_rgn(bytes, cs.header.bytes_consumed, csiz)?;
     let roi_shift = resolve_component_roi_shift(siz.components.len(), &main_rgns)?;
@@ -2686,6 +2808,7 @@ pub(crate) fn relocate_single_tilepart_to_ppt(bytes: &[u8]) -> Result<Vec<u8>, E
 
     let tile_coding = resolve_tile_coding(
         siz.components.len(),
+        ht_sig,
         &main_rgns,
         main_poc.as_ref(),
         &params,
@@ -2799,16 +2922,18 @@ pub(crate) fn relocate_single_tilepart_to_ppm(bytes: &[u8]) -> Result<Vec<u8>, E
     let cod = &cs.header.cod;
     let qcd = &cs.header.qcd;
     let csiz = siz.components.len() as u16;
+    let ht_sig = reject_unsupported_main_header_markers(bytes, cs.header.bytes_consumed)?;
     let main_qccs = crate::collect_main_header_qcc(bytes, cs.header.bytes_consumed, csiz)?;
     let comp_quant = resolve_component_quant(siz.components.len(), qcd, &main_qccs)?;
     let main_cocs = crate::collect_main_header_coc(bytes, cs.header.bytes_consumed, csiz)?;
-    let comp_coding = resolve_component_coding(siz.components.len(), cod, &main_cocs)?;
+    let comp_coding = resolve_component_coding(siz.components.len(), cod, &main_cocs, ht_sig)?;
     let main_poc = crate::collect_main_header_poc(bytes, cs.header.bytes_consumed, csiz)?;
     let main_rgns = crate::collect_main_header_rgn(bytes, cs.header.bytes_consumed, csiz)?;
     let roi_shift = resolve_component_roi_shift(siz.components.len(), &main_rgns)?;
     let params = coding_params_from_cod(cod)?;
     let tile_coding = resolve_tile_coding(
         siz.components.len(),
+        ht_sig,
         &main_rgns,
         main_poc.as_ref(),
         &params,
@@ -3189,8 +3314,16 @@ mod tests {
         // Table A.19 bit 4 (0x10) set in the style byte surfaces as
         // BlockStyle::predictable_termination so the tier-1 driver runs
         // the §D.4.2 conformance check.
-        assert!(BlockStyle::from_style_byte(0x10).predictable_termination);
-        assert!(!BlockStyle::from_style_byte(0x00).predictable_termination);
+        assert!(
+            BlockStyle::from_style_byte(0x10, HtSignalling::None)
+                .unwrap()
+                .predictable_termination
+        );
+        assert!(
+            !BlockStyle::from_style_byte(0x00, HtSignalling::None)
+                .unwrap()
+                .predictable_termination
+        );
     }
 
     #[test]
@@ -3198,7 +3331,7 @@ mod tests {
         // T.814 Table A.13: predictable termination "does not apply to HT
         // code-blocks". bit 6 (HT) + bit 4 (predictable termination) →
         // the builder forces predictable termination off.
-        let style = BlockStyle::from_style_byte(0x50);
+        let style = BlockStyle::from_style_byte(0x50, HtSignalling::None).unwrap();
         assert!(style.high_throughput);
         assert!(!style.predictable_termination);
     }
@@ -3347,7 +3480,7 @@ mod tests {
     fn resolve_component_coding_defaults_to_cod() {
         // §A.6.2: with no COC, every component inherits the COD style.
         let c = cod(3, 2, 2, 0, WaveletTransform::Reversible5x3, &[]);
-        let resolved = resolve_component_coding(3, &c, &[]).expect("resolve");
+        let resolved = resolve_component_coding(3, &c, &[], HtSignalling::None).expect("resolve");
         assert_eq!(resolved.len(), 3);
         for cc in &resolved {
             assert_eq!(cc.n_l, 3);
@@ -3374,7 +3507,8 @@ mod tests {
             &[0x44, 0x33, 0x22],
         );
         let resolved =
-            resolve_component_coding(3, &base, std::slice::from_ref(&c1)).expect("resolve");
+            resolve_component_coding(3, &base, std::slice::from_ref(&c1), HtSignalling::None)
+                .expect("resolve");
         // Components 0 and 2 keep the COD default (xcb = 4 + 2 = 6).
         assert_eq!(resolved[0].n_l, 5);
         assert_eq!(resolved[0].xcb, 6);
@@ -3390,7 +3524,10 @@ mod tests {
     fn resolve_component_coding_rejects_out_of_range_index() {
         let base = cod(3, 2, 2, 0, WaveletTransform::Reversible5x3, &[]);
         let bad = coc(5, 3, 2, 2, 0, WaveletTransform::Reversible5x3, &[]);
-        assert!(resolve_component_coding(3, &base, std::slice::from_ref(&bad)).is_err());
+        assert!(
+            resolve_component_coding(3, &base, std::slice::from_ref(&bad), HtSignalling::None)
+                .is_err()
+        );
     }
 
     #[test]
@@ -3399,7 +3536,7 @@ mod tests {
         let base = cod(3, 2, 2, 0, WaveletTransform::Reversible5x3, &[]);
         let a = coc(0, 3, 2, 2, 0, WaveletTransform::Reversible5x3, &[]);
         let b = coc(0, 2, 1, 1, 0, WaveletTransform::Reversible5x3, &[]);
-        assert!(resolve_component_coding(2, &base, &[a, b]).is_err());
+        assert!(resolve_component_coding(2, &base, &[a, b], HtSignalling::None).is_err());
     }
 
     #[test]
@@ -3411,7 +3548,9 @@ mod tests {
         // component 0 keeps the COD default.
         let base = cod(3, 2, 2, 0x00, WaveletTransform::Reversible5x3, &[]);
         let diverge = coc(1, 3, 2, 2, 0x04, WaveletTransform::Reversible5x3, &[]);
-        let out = resolve_component_coding(2, &base, std::slice::from_ref(&diverge)).unwrap();
+        let out =
+            resolve_component_coding(2, &base, std::slice::from_ref(&diverge), HtSignalling::None)
+                .unwrap();
         assert!(!out[0].style.termination_on_each_coding_pass);
         assert!(out[1].style.termination_on_each_coding_pass);
         assert!(matches!(out[0].style.split(), SegmentSplit::Single));
@@ -3419,7 +3558,9 @@ mod tests {
         // And the T.814 HTDECLARED shape: SPcoc bit 6 on one component
         // only.
         let ht_coc = coc(1, 3, 2, 2, 0x40, WaveletTransform::Reversible5x3, &[]);
-        let out = resolve_component_coding(2, &base, std::slice::from_ref(&ht_coc)).unwrap();
+        let out =
+            resolve_component_coding(2, &base, std::slice::from_ref(&ht_coc), HtSignalling::None)
+                .unwrap();
         assert!(!out[0].style.high_throughput);
         assert!(out[1].style.high_throughput);
         assert!(matches!(out[1].style.split(), SegmentSplit::Ht));
@@ -3443,7 +3584,7 @@ mod tests {
         q: &'a crate::Qcd,
     ) -> (CodingParams, Vec<ComponentCoding>, Vec<ComponentQuant<'a>>) {
         let params = coding_params_from_cod(c).expect("params");
-        let coding = resolve_component_coding(num, c, &[]).expect("coding");
+        let coding = resolve_component_coding(num, c, &[], HtSignalling::None).expect("coding");
         let quant = resolve_component_quant(num, q, &[]).expect("quant");
         (params, coding, quant)
     }
@@ -3456,8 +3597,18 @@ mod tests {
         let q = qcd(QuantizationStyle::None, 2, &[0x40, 0x41, 0x42]);
         let (params, coding, quant) = main_defaults(2, &c, &q);
         let roi = vec![0u32; 2];
-        let resolved = resolve_tile_coding(2, &[], None, &params, &coding, &quant, &roi, &[])
-            .expect("resolve");
+        let resolved = resolve_tile_coding(
+            2,
+            HtSignalling::None,
+            &[],
+            None,
+            &params,
+            &coding,
+            &quant,
+            &roi,
+            &[],
+        )
+        .expect("resolve");
         assert_eq!(resolved.comp_coding[0].n_l, 2);
         assert_eq!(resolved.comp_quant[0].guard_bits, 2);
         assert_eq!(resolved.roi_shift, vec![0, 0]);
@@ -3475,8 +3626,18 @@ mod tests {
         // Tile COD: NL = 4, code-block 8×8 (xcb=ycb=1 → +2 = 3).
         let tile_c = cod(4, 1, 1, 0x00, WaveletTransform::Reversible5x3, &[]);
         let markers = vec![crate::TilePartMarker::Cod(tile_c)];
-        let resolved = resolve_tile_coding(2, &[], None, &params, &coding, &quant, &roi, &markers)
-            .expect("resolve");
+        let resolved = resolve_tile_coding(
+            2,
+            HtSignalling::None,
+            &[],
+            None,
+            &params,
+            &coding,
+            &quant,
+            &roi,
+            &markers,
+        )
+        .expect("resolve");
         for cc in &resolved.comp_coding {
             assert_eq!(cc.n_l, 4);
             assert_eq!(cc.xcb, 3);
@@ -3497,8 +3658,18 @@ mod tests {
             crate::TilePartMarker::Cod(tile_c),
             crate::TilePartMarker::Coc(tile_coc1),
         ];
-        let resolved = resolve_tile_coding(2, &[], None, &params, &coding, &quant, &roi, &markers)
-            .expect("resolve");
+        let resolved = resolve_tile_coding(
+            2,
+            HtSignalling::None,
+            &[],
+            None,
+            &params,
+            &coding,
+            &quant,
+            &roi,
+            &markers,
+        )
+        .expect("resolve");
         // Component 0 follows the tile COD (NL = 4); component 1 the COC.
         assert_eq!(resolved.comp_coding[0].n_l, 4);
         assert_eq!(resolved.comp_coding[1].n_l, 1);
@@ -3515,8 +3686,18 @@ mod tests {
         let roi = vec![0u32; 2];
         let tile_coc0 = coc(0, 1, 1, 1, 0x00, WaveletTransform::Reversible5x3, &[]);
         let markers = vec![crate::TilePartMarker::Coc(tile_coc0)];
-        let resolved = resolve_tile_coding(2, &[], None, &params, &coding, &quant, &roi, &markers)
-            .expect("resolve");
+        let resolved = resolve_tile_coding(
+            2,
+            HtSignalling::None,
+            &[],
+            None,
+            &params,
+            &coding,
+            &quant,
+            &roi,
+            &markers,
+        )
+        .expect("resolve");
         assert_eq!(resolved.comp_coding[0].n_l, 1);
         assert_eq!(resolved.comp_coding[0].xcb, 3);
         // Component 1 keeps the main COD.
@@ -3533,8 +3714,18 @@ mod tests {
         let roi = vec![0u32; 2];
         let tile_q = qcd(QuantizationStyle::None, 4, &[0x50, 0x51, 0x52]);
         let markers = vec![crate::TilePartMarker::Qcd(tile_q)];
-        let resolved = resolve_tile_coding(2, &[], None, &params, &coding, &quant, &roi, &markers)
-            .expect("resolve");
+        let resolved = resolve_tile_coding(
+            2,
+            HtSignalling::None,
+            &[],
+            None,
+            &params,
+            &coding,
+            &quant,
+            &roi,
+            &markers,
+        )
+        .expect("resolve");
         for cq in &resolved.comp_quant {
             assert_eq!(cq.guard_bits, 4);
             assert_eq!(cq.spqcd, &[0x50, 0x51, 0x52]);
@@ -3554,8 +3745,18 @@ mod tests {
             crate::TilePartMarker::Qcd(tile_q),
             crate::TilePartMarker::Qcc(tile_qcc1),
         ];
-        let resolved = resolve_tile_coding(2, &[], None, &params, &coding, &quant, &roi, &markers)
-            .expect("resolve");
+        let resolved = resolve_tile_coding(
+            2,
+            HtSignalling::None,
+            &[],
+            None,
+            &params,
+            &coding,
+            &quant,
+            &roi,
+            &markers,
+        )
+        .expect("resolve");
         // Component 0 follows the tile QCD; component 1 the tile QCC.
         assert_eq!(resolved.comp_quant[0].guard_bits, 4);
         assert_eq!(resolved.comp_quant[1].guard_bits, 5);
@@ -3572,8 +3773,18 @@ mod tests {
         let roi = vec![0u32; 2];
         let tile_qcc0 = qcc(0, QuantizationStyle::None, 6, &[0x70, 0x71, 0x72]);
         let markers = vec![crate::TilePartMarker::Qcc(tile_qcc0)];
-        let resolved = resolve_tile_coding(2, &[], None, &params, &coding, &quant, &roi, &markers)
-            .expect("resolve");
+        let resolved = resolve_tile_coding(
+            2,
+            HtSignalling::None,
+            &[],
+            None,
+            &params,
+            &coding,
+            &quant,
+            &roi,
+            &markers,
+        )
+        .expect("resolve");
         assert_eq!(resolved.comp_quant[0].guard_bits, 6);
         assert_eq!(resolved.comp_quant[1].guard_bits, 2);
     }
@@ -3590,7 +3801,15 @@ mod tests {
         let tile_rgn1 = rgn(1, 0, 7); // component 1 gets s = 7 in this tile.
         let markers = vec![crate::TilePartMarker::Rgn(tile_rgn1)];
         let resolved = resolve_tile_coding(
-            2, &main_rgns, None, &params, &coding, &quant, &roi, &markers,
+            2,
+            HtSignalling::None,
+            &main_rgns,
+            None,
+            &params,
+            &coding,
+            &quant,
+            &roi,
+            &markers,
         )
         .expect("resolve");
         assert_eq!(resolved.roi_shift, vec![3, 7]);
@@ -3610,7 +3829,17 @@ mod tests {
         let tile_rgn = rgn(1, 1, 7); // Srgn = 1 (Part-2 rectangle ROI).
         let markers = vec![crate::TilePartMarker::Rgn(tile_rgn)];
         assert!(matches!(
-            resolve_tile_coding(2, &[], None, &params, &coding, &quant, &roi, &markers),
+            resolve_tile_coding(
+                2,
+                HtSignalling::None,
+                &[],
+                None,
+                &params,
+                &coding,
+                &quant,
+                &roi,
+                &markers
+            ),
             Err(Error::NotImplemented)
         ));
     }
@@ -3628,8 +3857,18 @@ mod tests {
         let roi = vec![0u32; 2];
         let tile_c = cod(2, 2, 2, 0x01, WaveletTransform::Reversible5x3, &[]);
         let markers = vec![crate::TilePartMarker::Cod(tile_c)];
-        let resolved = resolve_tile_coding(2, &[], None, &params, &coding, &quant, &roi, &markers)
-            .expect("resolve");
+        let resolved = resolve_tile_coding(
+            2,
+            HtSignalling::None,
+            &[],
+            None,
+            &params,
+            &coding,
+            &quant,
+            &roi,
+            &markers,
+        )
+        .expect("resolve");
         for cc in &resolved.comp_coding {
             assert!(cc.style.selective_arithmetic_coding_bypass);
         }
@@ -3645,9 +3884,18 @@ mod tests {
         let a = cod(2, 2, 2, 0x00, WaveletTransform::Reversible5x3, &[]);
         let b = cod(3, 1, 1, 0x00, WaveletTransform::Reversible5x3, &[]);
         let markers = vec![crate::TilePartMarker::Cod(a), crate::TilePartMarker::Cod(b)];
-        assert!(
-            resolve_tile_coding(2, &[], None, &params, &coding, &quant, &roi, &markers).is_err()
-        );
+        assert!(resolve_tile_coding(
+            2,
+            HtSignalling::None,
+            &[],
+            None,
+            &params,
+            &coding,
+            &quant,
+            &roi,
+            &markers
+        )
+        .is_err());
     }
 
     /// A `PocProgression` covering the whole component/resolution/layer
@@ -3674,8 +3922,18 @@ mod tests {
         let markers = vec![crate::TilePartMarker::Poc(crate::Poc {
             progressions: vec![poc_entry(ProgressionOrder::Rlcp)],
         })];
-        let resolved = resolve_tile_coding(2, &[], None, &params, &coding, &quant, &roi, &markers)
-            .expect("tile POC resolves");
+        let resolved = resolve_tile_coding(
+            2,
+            HtSignalling::None,
+            &[],
+            None,
+            &params,
+            &coding,
+            &quant,
+            &roi,
+            &markers,
+        )
+        .expect("tile POC resolves");
         assert_eq!(resolved.poc_volumes.len(), 1);
         assert_eq!(resolved.poc_volumes[0].order, ProgressionOrder::Rlcp);
     }
@@ -3696,6 +3954,7 @@ mod tests {
         })];
         let resolved = resolve_tile_coding(
             2,
+            HtSignalling::None,
             &[],
             Some(&main_poc),
             &params,
@@ -3721,9 +3980,18 @@ mod tests {
         let main_poc = crate::Poc {
             progressions: vec![poc_entry(ProgressionOrder::Rpcl)],
         };
-        let resolved =
-            resolve_tile_coding(2, &[], Some(&main_poc), &params, &coding, &quant, &roi, &[])
-                .expect("resolve");
+        let resolved = resolve_tile_coding(
+            2,
+            HtSignalling::None,
+            &[],
+            Some(&main_poc),
+            &params,
+            &coding,
+            &quant,
+            &roi,
+            &[],
+        )
+        .expect("resolve");
         assert_eq!(resolved.poc_volumes.len(), 1);
         assert_eq!(resolved.poc_volumes[0].order, ProgressionOrder::Rpcl);
     }
@@ -3743,8 +4011,17 @@ mod tests {
                 progressions: vec![poc_entry(ProgressionOrder::Rlcp)],
             }),
         ];
-        assert!(
-            resolve_tile_coding(2, &[], None, &params, &coding, &quant, &roi, &markers).is_err()
-        );
+        assert!(resolve_tile_coding(
+            2,
+            HtSignalling::None,
+            &[],
+            None,
+            &params,
+            &coding,
+            &quant,
+            &roi,
+            &markers
+        )
+        .is_err());
     }
 }

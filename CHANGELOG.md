@@ -4,6 +4,30 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- **T.814 §A.3.2 stream-level HT signalling** — the `CAP` marker's
+  `Ccap15` bits 15-14 now classify the codestream (HTONLY / HTDECLARED /
+  MIXED-permitted) and gate how the `SPcod` / `SPcoc` bits 6-7 read:
+  under an HTONLY `Ccap15` **every** code-block routes to the HT
+  decoder whatever the style byte says (the strict §A.3.2 first-branch
+  signalling with `bits 6 and 7 … equal to 0`, and the §A.3.2-NOTE
+  `11` encoding, both decode — previously the CAP body was never
+  consulted and a strict-signalling stream mis-routed to the Annex D
+  tier-1 path); under HTDECLARED a set bit 7 is rejected per §A.3.2;
+  the reserved `01` quadrant and the reserved `Ccap15` bits 10-6 are
+  rejected rather than ignored; and the T.800-reserved `bit 7 = 1,
+  bit 6 = 0` style byte is rejected. A MIXED tile-component
+  (`Ccap15` bits 15-14 = `11` with style bits 6 + 7 both set) is now
+  *recognised* at this gate — the per-code-block decode surfaces
+  `NotImplemented` pending the tier-2 wiring — instead of being
+  conflated with the style-bit reading.
+- **`CPF` (T.814 §A.6) and `CRG` (T.800 §A.9.1) marker segments** are
+  parsed past in the main header: CPF describes the clause-8.8
+  transcoding correspondence and CRG the rendering "centre of mass",
+  neither of which affects decoding; both previously surfaced
+  `UnknownMarker`.
+
 ### Fixed
 
 - **Two decode bugs specific to precinct-unaligned tile edges**, found by
