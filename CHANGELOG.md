@@ -38,6 +38,23 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
   The encoder-side packet writer learned the matching §A.4 headroom
   (`CodeBlockPlan::mixed_ht`) so an emitted HT block's first non-zero
   length field carries `Lblock > 3` with a clear top bit.
+- **HTJ2K MIXED-set encoding** (`EncodeParams::ht_mixed`) — each
+  code-block is coded through both the Annex D MQ passes and the §7.3
+  HT cleanup pass, and per block the HT lane is kept wherever it stays
+  within a throughput budget of one-eighth plus two bytes over the MQ
+  codeword (blocks the MQ coder compresses markedly better stay
+  Annex D), assembling a conformant MIXED codestream: `Rsiz` bit 14,
+  `Ccap15` bits 15-14 = `11` with the measured MAGB bits, `SPcod` /
+  `SPcoc` bits 6 + 7, the §A.4 first-non-zero-segment headroom on the
+  HT-lane blocks, and the derived single length field on the T.800
+  lane. Round-trips bit-exactly through this crate's own MIXED decode
+  across RCT, multi-tile grids, custom precincts, the position-keyed
+  progressions, sub-sampling and SOP / EPH framing; the 9-7 stream
+  reconstructs identically to its pure-Annex-D counterpart (the lane
+  choice never touches a sample), and a re-signalling probe pins that
+  both lanes are genuinely present in the emitted stream. Single
+  quality layer; the §D.6 / §D.4.2 styles, PCRD, ROI and the all-HT
+  mode are rejected in combination.
 
 - **T.814 §A.3.2 stream-level HT signalling** — the `CAP` marker's
   `Ccap15` bits 15-14 now classify the codestream (HTONLY / HTDECLARED /

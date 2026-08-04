@@ -1213,6 +1213,23 @@ pub struct EncodeParams {
     /// back to the full-depth cleanup. Default `false` (cleanup-only,
     /// `Z_blk = 1`).
     pub ht_refinement: bool,
+    /// T.814 §8.2 **MIXED**-set emission (§A.4 `SPcod` bits 6 + 7
+    /// under a `Ccap15` whose bits 15-14 are `11`): each code-block is
+    /// coded **both** ways — the Annex D MQ passes and the §7.3 HT
+    /// cleanup pass — and, per block, the HT lane is kept wherever its
+    /// cleanup segment stays within a throughput budget of one-eighth
+    /// plus two bytes over the Annex D codeword (the preference T.814
+    /// exists for), while blocks the MQ coder compresses markedly
+    /// better — structured content — stay Annex D. The
+    /// packet writer honours the §A.4 encoder-side constraints on the
+    /// HT-lane blocks (first non-zero length field: `Lblock > 3`,
+    /// clear top bit) and the T.800-lane blocks carry the derived
+    /// single length field (§A.4 bars bypass / per-pass termination).
+    /// Single quality layer only; mutually exclusive with
+    /// [`EncodeParams::high_throughput`], [`EncodeParams::ht_refinement`],
+    /// the §D.6 / §D.4.2 styles, PCRD rate control and the Annex H
+    /// ROI. Default `false`.
+    pub ht_mixed: bool,
     /// Annex H region of interest (Maxshift): when set, the masked
     /// coefficients are scaled up by the per-component §H.2.2 value
     /// `s = max(Mb)` and one `RGN` marker segment per component
@@ -1245,6 +1262,7 @@ impl Default for EncodeParams {
             packed_headers: PackedHeaders::InStream,
             high_throughput: false,
             ht_refinement: false,
+            ht_mixed: false,
             roi: None,
         }
     }
@@ -1538,6 +1556,20 @@ fn encode_core(
     if params.ht_refinement && !params.high_throughput {
         return Err(Error::NotImplemented);
     }
+    // T.814 §A.4 MIXED emission: single-layer, style-free, no PCRD,
+    // no ROI, and not together with the all-HT mode (whose HTONLY
+    // signalling it would contradict).
+    if params.ht_mixed
+        && (params.high_throughput
+            || params.ht_refinement
+            || params.bypass
+            || params.terminate_all
+            || params.target_bytes.is_some()
+            || params.layers != 1
+            || params.roi.is_some())
+    {
+        return Err(Error::NotImplemented);
+    }
     // Table A.21: when user-defined precincts are signalled the COD
     // carries exactly NL + 1 bytes, and a zero PPx / PPy nibble is only
     // permitted at the lowest resolution level (r = 0).
@@ -1707,7 +1739,11 @@ fn encode_core(
     }
     let siz = Siz {
         // T.814 §A.2: an HTJ2K codestream sets Rsiz bit 14.
-        rsiz: if params.high_throughput { 0x4000 } else { 0 },
+        rsiz: if params.high_throughput || params.ht_mixed {
+            0x4000
+        } else {
+            0
+        },
         x_size: width,
         y_size: height,
         x_offset: 0,
@@ -2136,7 +2172,7 @@ fn encode_core(
                                     }
                                 }
                             } else {
-                                encode_code_block(
+                                let annexd = encode_code_block(
                                     psb.orientation,
                                     bw,
                                     bh,
@@ -2149,7 +2185,63 @@ fn encode_core(
                                         bypass: params.bypass,
                                         terminate_all: params.terminate_all,
                                     },
-                                )?
+                                )?;
+                                if params.ht_mixed {
+                                    // T.814 §A.4 MIXED: code the block
+                                    // through the §7.3 HT cleanup pass
+                                    // as well and keep the HT lane
+                                    // wherever its cost stays inside
+                                    // the throughput budget — no more
+                                    // than one-eighth plus two bytes
+                                    // over the Annex D codeword (the
+                                    // §A.4 signalling headroom). MQ
+                                    // blocks that compress markedly
+                                    // better (structured content)
+                                    // stay Annex D. §B.3 requires the
+                                    // first HT cleanup segment longer
+                                    // than one byte, so a 0/1-byte HT
+                                    // candidate stays Annex D too.
+                                    let maxmag =
+                                        targets.iter().map(|c| c.magnitude).max().unwrap_or(0);
+                                    let planes = 32 - maxmag.leading_zeros();
+                                    let ht = if maxmag > 0 && planes <= mb {
+                                        let mag: Vec<u32> =
+                                            targets.iter().map(|c| c.magnitude).collect();
+                                        let sgn: Vec<bool> =
+                                            targets.iter().map(|c| c.sign).collect();
+                                        Some(crate::htenc::encode_ht_codeblock(
+                                            &mag, &sgn, bw, bh, false,
+                                        )?)
+                                    } else {
+                                        None
+                                    };
+                                    match (annexd, ht) {
+                                        (Some(a), Some(hb))
+                                            if hb.cleanup.len() >= 2
+                                                && 8 * hb.cleanup.len()
+                                                    <= 9 * a.bytes.len() + 16 =>
+                                        {
+                                            ht_max_bits = ht_max_bits.max(planes - hb.beta);
+                                            let cleanup_len = hb.cleanup.len();
+                                            Some(EncodedBlock {
+                                                zero_bit_planes: mb - 1 - hb.beta,
+                                                coding_passes: 1,
+                                                bytes: hb.cleanup,
+                                                pass_rates: Vec::new(),
+                                                pass_dist: Vec::new(),
+                                                d0: 0.0,
+                                                weight: 1.0,
+                                                ordinal: 0,
+                                                reencode: None,
+                                                ht_cleanup_len: Some(cleanup_len),
+                                                ht_multi: None,
+                                            })
+                                        }
+                                        (a, _) => a,
+                                    }
+                                } else {
+                                    annexd
+                                }
                             };
                             if let Some(enc) = &mut enc {
                                 zbp[bi] = enc.zero_bit_planes;
@@ -2266,6 +2358,9 @@ fn encode_core(
         zero_bit_planes: u32,
         per_layer: Vec<LayerShare>,
         bytes: Vec<u8>,
+        /// T.814 §A.4 MIXED HT-lane block — the packet writer applies
+        /// the §A.4 first-non-zero-segment headroom.
+        mixed_ht: bool,
     }
     struct PrecinctLayered {
         state: PrecinctEncoderState,
@@ -2367,6 +2462,9 @@ fn encode_core(
                         zero_bit_planes: enc.zero_bit_planes,
                         per_layer,
                         bytes: seg,
+                        // MULTIHT layering never combines with the
+                        // MIXED emission (single layer only).
+                        mixed_ht: false,
                     }));
                     continue;
                 }
@@ -2468,6 +2566,7 @@ fn encode_core(
                     zero_bit_planes: enc.zero_bit_planes,
                     per_layer,
                     bytes: seg,
+                    mixed_ht: params.ht_mixed && enc.ht_cleanup_len.is_some(),
                 }));
             }
             let sub_band_plans: Vec<SubBandEncoderPlan> = raw
@@ -2560,7 +2659,7 @@ fn encode_core(
                                     zero_bit_planes: lb.zero_bit_planes,
                                     coding_passes: *p,
                                     segments: segs.clone(),
-                                    mixed_ht: false,
+                                    mixed_ht: lb.mixed_ht,
                                 });
                                 body.extend_from_slice(&lb.bytes[range.clone()]);
                             }
@@ -2636,7 +2735,7 @@ fn encode_core(
         // over the irreversible transform (§A.3.6), and bits 0-4 carry
         // the §8.7.3 / §A.3.7 MAGB parameter P for the measured
         // cleanup-magnitude bound B.
-        if params.high_throughput {
+        if params.high_throughput || params.ht_mixed {
             let irrev = comp_params
                 .iter()
                 .any(|cp| matches!(cp.kernel, EncodeKernel::Lossy9x7 { .. }));
@@ -2648,7 +2747,11 @@ fn encode_core(
             } else {
                 19 + (b - 27).div_ceil(4)
             };
-            let ccap15: u16 = (u16::from(params.layers > 1) << 13)
+            // §A.3.2: bits 15-14 = 11 declare that the codestream may
+            // belong to the MIXED set; 00 (HTONLY) otherwise.
+            let ccap15: u16 = (u16::from(params.ht_mixed) << 15)
+                | (u16::from(params.ht_mixed) << 14)
+                | (u16::from(params.layers > 1) << 13)
                 | (u16::from(params.roi.is_some()) << 12)
                 | (u16::from(irrev) << 5)
                 | (p_bits as u16 & 0x1F);
@@ -2688,8 +2791,10 @@ fn encode_core(
             // coding pass.
             u8::from(params.bypass)
                 | (u8::from(params.terminate_all) << 2)
-                // T.814 §A.4: bit 6 flags HT code-blocks.
-                | (u8::from(params.high_throughput) << 6),
+                // T.814 §A.4: bit 6 flags HT code-blocks; bits 6 + 7
+                // together mark a MIXED tile-component.
+                | (u8::from(params.high_throughput || params.ht_mixed) << 6)
+                | (u8::from(params.ht_mixed) << 7),
             transform_byte, // SPcod: transform (Table A.20)
         ];
         cod_payload.extend_from_slice(&params.precincts); // Table A.21
@@ -2716,7 +2821,8 @@ fn encode_core(
             coc_payload.push(
                 u8::from(params.bypass)
                     | (u8::from(params.terminate_all) << 2)
-                    | (u8::from(params.high_throughput) << 6),
+                    | (u8::from(params.high_throughput || params.ht_mixed) << 6)
+                    | (u8::from(params.ht_mixed) << 7),
             );
             coc_payload.push(match cp.kernel {
                 EncodeKernel::Lossless5x3 => 1u8,
@@ -6167,5 +6273,260 @@ mod tests {
         let one = chunk_packed_headers(&atoms, 1 << 16).expect("chunk");
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].len(), 15);
+    }
+
+    // -- T.814 §8.2 MIXED-set emission ---------------------------------
+
+    /// A half-noise / half-flat plane: the noisy blocks favour the HT
+    /// cleanup lane, the flat blocks the Annex D lane — the shape that
+    /// makes the per-block choice genuinely mixed.
+    fn mixed_content(w: u32, h: u32, seed: u32) -> Vec<u8> {
+        let mut p = noise(w, h, seed);
+        for y in 0..h as usize {
+            for x in (w as usize / 2)..w as usize {
+                p[y * w as usize + x] = if x % 16 == 0 { 3 } else { 0 };
+            }
+        }
+        p
+    }
+
+    /// MIXED emission round-trips bit-exactly through this crate's own
+    /// MIXED decoder, and the codestream signals the set per T.814:
+    /// `Rsiz` bit 14, `Ccap15` bits 15-14 = `11`, `SPcod` bits 6 + 7.
+    #[test]
+    fn mixed_emission_lossless_round_trips_and_signals() {
+        let p = mixed_content(64, 64, 0xA5A5_0001);
+        let params = EncodeParams {
+            decomposition_levels: 2,
+            code_block_exp: (3, 3),
+            ht_mixed: true,
+            ..EncodeParams::default()
+        };
+        let stream = roundtrip_params(&[&p], 64, 64, &params);
+        let header = crate::parse_j2k_header(&stream).expect("header");
+        assert_eq!(header.siz.rsiz & 0x4000, 0x4000, "Rsiz bit 14");
+        assert_eq!(header.cod.code_block_style & 0xC0, 0xC0, "SPcod bits 6 + 7");
+        let (_, ccap15) = cap_marker(&stream).expect("CAP present");
+        assert_eq!(ccap15 >> 14, 0b11, "MIXED-permitted Ccap15");
+        assert_eq!(ccap15 & (1 << 13), 0, "SINGLEHT");
+    }
+
+    /// The per-block choice is genuinely mixed — proven from the
+    /// emitted stream itself: re-signalling the MIXED tile-component
+    /// as all-HT (`SPcod` bit 6 only) or as all-Annex-D (`SPcod`
+    /// bits 6 / 7 clear) must break the parse, which is only possible
+    /// when the packet bodies genuinely interleave both block-coding
+    /// layouts. The Annex D lane also shows as the MIXED stream
+    /// undercutting the all-HT encoding of the same image.
+    #[test]
+    fn mixed_emission_uses_both_lanes() {
+        let p = mixed_content(64, 64, 0xBEEF_0007);
+        let base = EncodeParams {
+            decomposition_levels: 2,
+            code_block_exp: (3, 3),
+            ..EncodeParams::default()
+        };
+        let htonly = encode_j2k(
+            &[&p],
+            64,
+            64,
+            &EncodeParams {
+                high_throughput: true,
+                ..base.clone()
+            },
+        )
+        .expect("ht only");
+        let mixed = encode_j2k(
+            &[&p],
+            64,
+            64,
+            &EncodeParams {
+                ht_mixed: true,
+                ..base
+            },
+        )
+        .expect("mixed");
+        assert!(
+            mixed.len() < htonly.len(),
+            "MQ-favoured blocks must stay Annex D: mixed {} vs ht-only {}",
+            mixed.len(),
+            htonly.len()
+        );
+        // Locate the COD style byte (marker + Lcod + Scod + SGcod(4) +
+        // NL + xcb + ycb → offset 12 into the segment).
+        let mut pos = 2usize;
+        let mut style_at = None;
+        while pos + 4 <= mixed.len() {
+            let m = u16::from_be_bytes([mixed[pos], mixed[pos + 1]]);
+            if m == MARKER_COD {
+                style_at = Some(pos + 12);
+                break;
+            }
+            let len = u16::from_be_bytes([mixed[pos + 2], mixed[pos + 3]]) as usize;
+            pos += 2 + len;
+        }
+        let style_at = style_at.expect("COD present");
+        assert_eq!(mixed[style_at], 0xC0, "MIXED style byte");
+        // A single-set HT contribution and an Annex D contribution
+        // share the same K = 1 packet-header layout, so re-signalling
+        // the lane does not desync tier-2 — it sends every block's
+        // bytes through the wrong tier-1. The truth decode must
+        // survive while each single-lane re-signalling either fails
+        // outright (the HT decoder's framing checks) or reconstructs
+        // different samples (MQ over HT cleanup bytes) — which is
+        // only possible when both lanes are genuinely present.
+        let truth = decode_j2k(&mixed).expect("true MIXED decode");
+        let mut as_ht = mixed.clone();
+        as_ht[style_at] = 0x40;
+        match decode_j2k(&as_ht) {
+            Err(_) => {}
+            Ok(img) => assert_ne!(
+                img.components[0].samples, truth.components[0].samples,
+                "all-HT re-signalling reproduced the image: no T.800-lane blocks present"
+            ),
+        }
+        let mut as_d = mixed.clone();
+        as_d[style_at] = 0x00;
+        match decode_j2k(&as_d) {
+            Err(_) => {}
+            Ok(img) => assert_ne!(
+                img.components[0].samples, truth.components[0].samples,
+                "all-Annex-D re-signalling reproduced the image: no HT-lane blocks present"
+            ),
+        }
+    }
+
+    /// MIXED emission composes with the RCT, multi-tile grids, custom
+    /// precincts, the position-keyed progressions, sub-sampling and
+    /// SOP / EPH framing — every shape lossless through the MIXED
+    /// decode path.
+    #[test]
+    fn mixed_emission_composes() {
+        let r = mixed_content(48, 40, 1);
+        let g = mixed_content(48, 40, 2);
+        let b = mixed_content(48, 40, 3);
+        // RCT + RPCL + precincts.
+        roundtrip_params(
+            &[&r, &g, &b],
+            48,
+            40,
+            &EncodeParams {
+                decomposition_levels: 2,
+                code_block_exp: (3, 3),
+                mct: true,
+                progression: ProgressionOrder::Rpcl,
+                precincts: vec![0x33, 0x44, 0x44],
+                ht_mixed: true,
+                ..EncodeParams::default()
+            },
+        );
+        // Multi-tile + SOP/EPH + PCRL.
+        roundtrip_params(
+            &[&r],
+            48,
+            40,
+            &EncodeParams {
+                decomposition_levels: 1,
+                code_block_exp: (3, 3),
+                tile_size: Some((17, 19)),
+                sop: true,
+                eph: true,
+                progression: ProgressionOrder::Pcrl,
+                ht_mixed: true,
+                ..EncodeParams::default()
+            },
+        );
+        // Sub-sampled chroma, CPRL.
+        let half = mixed_content(24, 20, 9);
+        roundtrip_params(
+            &[&r, &half, &half],
+            48,
+            40,
+            &EncodeParams {
+                decomposition_levels: 1,
+                code_block_exp: (3, 3),
+                sub_sampling: vec![(1, 1), (2, 2), (2, 2)],
+                progression: ProgressionOrder::Cprl,
+                ht_mixed: true,
+                ..EncodeParams::default()
+            },
+        );
+    }
+
+    /// The irreversible 9-7 MIXED stream reconstructs identically to
+    /// the plain Annex D stream of the same parameters — both lanes
+    /// are lossless transports of the same quantized coefficients, so
+    /// the lane choice must never change a single sample.
+    #[test]
+    fn mixed_emission_9x7_matches_annex_d_reconstruction() {
+        let p = mixed_content(64, 48, 0x9797_0001);
+        let base = EncodeParams {
+            decomposition_levels: 2,
+            code_block_exp: (3, 3),
+            kernel: EncodeKernel::Lossy9x7 { fine_bits: 3 },
+            ..EncodeParams::default()
+        };
+        let plain = encode_j2k(&[&p], 64, 48, &base).expect("annex d");
+        let mixed = encode_j2k(
+            &[&p],
+            64,
+            48,
+            &EncodeParams {
+                ht_mixed: true,
+                ..base
+            },
+        )
+        .expect("mixed");
+        let a = decode_j2k(&plain).expect("decode plain");
+        let b = decode_j2k(&mixed).expect("decode mixed");
+        assert_eq!(
+            a.components[0].samples, b.components[0].samples,
+            "9-7 reconstruction must not depend on the lane choice"
+        );
+    }
+
+    /// The barred combinations reject cleanly (§A.4 / scope): layers,
+    /// the §D.6 / §D.4.2 styles, PCRD, ROI, and the all-HT mode.
+    #[test]
+    fn mixed_emission_rejects_barred_combinations() {
+        let p = noise(16, 16, 5);
+        for params in [
+            EncodeParams {
+                ht_mixed: true,
+                layers: 2,
+                ..EncodeParams::default()
+            },
+            EncodeParams {
+                ht_mixed: true,
+                bypass: true,
+                ..EncodeParams::default()
+            },
+            EncodeParams {
+                ht_mixed: true,
+                terminate_all: true,
+                ..EncodeParams::default()
+            },
+            EncodeParams {
+                ht_mixed: true,
+                target_bytes: Some(200),
+                ..EncodeParams::default()
+            },
+            EncodeParams {
+                ht_mixed: true,
+                high_throughput: true,
+                ..EncodeParams::default()
+            },
+            EncodeParams {
+                ht_mixed: true,
+                ht_refinement: true,
+                high_throughput: true,
+                ..EncodeParams::default()
+            },
+        ] {
+            assert!(
+                encode_j2k(&[&p], 16, 16, &params).is_err(),
+                "combination must be rejected"
+            );
+        }
     }
 }
