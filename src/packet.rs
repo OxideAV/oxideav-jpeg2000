@@ -4356,4 +4356,87 @@ mod tests {
         // [F] → exhausted.
         assert!(!c.advance());
     }
+
+    /// Walker-level integration of the depth-first search: a
+    /// T.800-lane block whose first contribution survives the §A.4
+    /// checks (written with the `mixed_ht` headroom) and whose second
+    /// contribution straddles a §B.2 set-`T` boundary forces a
+    /// genuine divergence. The HT-first walk misparses the trailing
+    /// sibling block's fields and fails; advancing the choice log and
+    /// re-walking recovers the written layout exactly.
+    #[test]
+    fn mixed_divergence_backtracks_to_t800() {
+        let geom = SubBandGeometry {
+            width: 2,
+            height: 1,
+        };
+        type Shape = (u32, Vec<(u32, u32)>, bool);
+        // (passes, segments, headroom) per block per layer.
+        let shapes: [[Shape; 2]; 2] = [
+            [(1, vec![(1, 8)], true), (2, vec![(2, 9)], false)],
+            [(3, vec![(3, 7)], false), (1, vec![(1, 6)], false)],
+        ];
+        let mut enc = PrecinctEncoderState::new(&[(geom, vec![0u32, 0], vec![1u32, 2])]);
+        let mut body = Vec::new();
+        for (l, row) in shapes.iter().enumerate() {
+            let plans: Vec<CodeBlockPlan> = row
+                .iter()
+                .zip([1u32, 2])
+                .map(|((passes, segs, headroom), zbp)| CodeBlockPlan {
+                    included: true,
+                    zero_bit_planes: zbp,
+                    coding_passes: *passes,
+                    segments: segs.clone(),
+                    mixed_ht: *headroom,
+                })
+                .collect();
+            body.extend_from_slice(&encode_packet_header(&mut enc, l as u16, &plans));
+            let data: usize = row
+                .iter()
+                .flat_map(|(_, segs, _)| segs.iter().map(|&(_, len)| len as usize))
+                .sum();
+            body.extend(std::iter::repeat_n(0xAAu8, data));
+        }
+        let packets: Vec<(usize, PacketGeometry, SegmentSplit)> = (0..2)
+            .map(|l| {
+                (
+                    0usize,
+                    PacketGeometry {
+                        sub_bands: vec![geom],
+                        layer: l as u16,
+                    },
+                    SegmentSplit::Mixed,
+                )
+            })
+            .collect();
+        // The decode-driver loop in miniature.
+        let mut choices = MixedChoices::new();
+        let mut attempts = 0;
+        let headers = loop {
+            attempts += 1;
+            assert!(attempts <= 8, "search must terminate quickly");
+            match walk_packet_headers_with_choices(&body, &packets, SopEphMode::None, &mut choices)
+            {
+                Ok(h) => break h,
+                Err(_) => assert!(choices.advance(), "tree exhausted"),
+            }
+        };
+        assert!(
+            attempts > 1,
+            "the HT-first walk must fail before the T.800 re-walk"
+        );
+        for (l, row) in shapes.iter().enumerate() {
+            for (b, (passes, segs, _)) in row.iter().enumerate() {
+                let c = &headers[l].contributions[b];
+                assert_eq!(c.coding_passes, *passes, "layer {l} block {b}");
+                let want: Vec<u32> = segs.iter().map(|s| s.1).collect();
+                assert_eq!(c.segment_lengths, want, "layer {l} block {b}");
+            }
+        }
+        // The straddling block resolved to the T.800 lane.
+        assert_eq!(
+            headers[1].contributions[0].mixed.as_ref().unwrap().resolved,
+            MixedBlockType::T800
+        );
+    }
 }

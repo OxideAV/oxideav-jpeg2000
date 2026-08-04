@@ -3573,6 +3573,62 @@ mod tests {
         assert!(!style.predictable_termination);
     }
 
+    /// The T.814 §A.3.2 / §A.4 style-byte matrix under each CAP
+    /// signalling class: HTONLY routes every reading to HT, HTDECLARED
+    /// and the no-CAP reading reject bit 7, and only MIXED-permitted
+    /// bits 6 + 7 yield the per-code-block MIXED lane (with Table
+    /// A.4's bits applying to the T.800-lane blocks and the barred
+    /// bits 0 / 2 rejected).
+    #[test]
+    fn style_byte_resolution_follows_a32_matrix() {
+        use HtSignalling::*;
+        // HTONLY: 0x00 / 0x40 / 0xC0 all decode all-HT.
+        for byte in [0x00u8, 0x40, 0xC0] {
+            let st = BlockStyle::from_style_byte(byte, HtOnly).unwrap();
+            assert!(st.high_throughput && !st.mixed, "byte {byte:#04x}");
+        }
+        // HTDECLARED: bit 6 selects; bit 7 rejects.
+        assert!(
+            !BlockStyle::from_style_byte(0x00, HtDeclared)
+                .unwrap()
+                .high_throughput
+        );
+        assert!(
+            BlockStyle::from_style_byte(0x40, HtDeclared)
+                .unwrap()
+                .high_throughput
+        );
+        assert!(BlockStyle::from_style_byte(0xC0, HtDeclared).is_err());
+        // No CAP: bit 6 honoured, bit 7 reserved.
+        assert!(
+            BlockStyle::from_style_byte(0x40, None)
+                .unwrap()
+                .high_throughput
+        );
+        assert!(BlockStyle::from_style_byte(0xC0, None).is_err());
+        assert!(BlockStyle::from_style_byte(0x80, None).is_err());
+        // MIXED-permitted: 6+7 → mixed; 6 alone → all-HT; bit 7 alone
+        // is still reserved.
+        let st = BlockStyle::from_style_byte(0xC0, MixedPermitted).unwrap();
+        assert!(st.mixed && !st.high_throughput);
+        assert_eq!(st.split(), SegmentSplit::Mixed);
+        let st = BlockStyle::from_style_byte(0x40, MixedPermitted).unwrap();
+        assert!(st.high_throughput && !st.mixed);
+        assert!(BlockStyle::from_style_byte(0x80, MixedPermitted).is_err());
+        // Table A.4: bits 1 / 3 / 4 / 5 carry through to the MIXED
+        // component's T.800-lane blocks; bits 0 / 2 are barred.
+        let st =
+            BlockStyle::from_style_byte(0xC0 | 0x02 | 0x08 | 0x10 | 0x20, MixedPermitted).unwrap();
+        assert!(
+            st.reset_context_probabilities
+                && st.vertically_causal
+                && st.predictable_termination
+                && st.segmentation_symbols
+        );
+        assert!(BlockStyle::from_style_byte(0xC1, MixedPermitted).is_err());
+        assert!(BlockStyle::from_style_byte(0xC4, MixedPermitted).is_err());
+    }
+
     #[test]
     fn spqcd_index_follows_f31_order() {
         assert_eq!(spqcd_index(0, SubBandOrientation::LL), 0);
