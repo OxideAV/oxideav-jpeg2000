@@ -44,10 +44,12 @@ skipped), **MCT-off**
 RGB, **signed 8- and 12-bit** and **unsigned 16-bit** depths,
 all-component **reference-grid sub-sampling** (XRsiz = 2 planes pinned
 against §B.2.6 PGX reference decodes), the **JP2 container** from a
-real encoder, and all six Table A.19 code-block style combinations —
-alongside the progression-order, precinct, quality-layer, bypass /
-termination, ROI, POC, PPM / PPT and HT fixtures listed throughout
-this README.
+real encoder, all six Table A.19 code-block style combinations, and
+the ISO/IEC 15444-4 **Ed. 4** electronic insert's three **HTJ2K
+MIXED-set** codestreams (the only MIXED streams in that corpus,
+carried with the corpus notice) — alongside the progression-order,
+precinct, quality-layer, bypass / termination, ROI, POC, PPM / PPT
+and HT fixtures listed throughout this README.
 
 What is implemented:
 
@@ -74,7 +76,9 @@ What is implemented:
 - **Main header** — `SOC`, `SIZ`, `COD`, `QCD`, plus the typed
   tile-part-header markers (`COD`, `COC`, `QCD`, `QCC`, `RGN`, `POC`,
   `PLT`, `PPT`, `COM`); 8- vs 16-bit component-index width is selected
-  from `Csiz`.
+  from `Csiz`. The informational `CPF` (T.814 §A.6 corresponding
+  profile) and `CRG` (§A.9.1 component registration) segments are
+  accepted and length-skipped — neither affects decoding.
 - **Tile-part chain** — `SOT` / `SOD` / `EOC` walk, both fixed-`Psot`
   and `Psot = 0` ("body until EOC") framings.
 - **Geometry** — SIZ-derived tile / tile-component bounds, per-resolution
@@ -283,7 +287,37 @@ What is implemented:
   available opaque HTJ2K decoders are SINGLEHT-only and decline these
   streams, so the MULTIHT shapes are validated against this crate's own
   encoder plus spec-level unit tests of the split and the `P0`
-  pinning.) The long-standing small-block / high-energy /
+  pinning.) The `CAP` marker's `Ccap15` bits 15-14 classify the
+  stream per §A.3.2 — HTONLY / HTDECLARED / MIXED-permitted — and
+  gate the style-byte reading: under an HTONLY `Ccap15` **every**
+  code-block routes to the HT decoder whatever `SPcod` says (both the
+  strict first-branch signalling with style bits `00` and the
+  §A.3.2-NOTE `11` encoding), HTDECLARED enforces bit 7 = 0, and the
+  reserved encodings reject. **MIXED-set codestreams (§8.2 / §A.4)
+  decode**: a tile-component whose style byte carries bits 6 + 7
+  under a MIXED-permitting CAP holds code-blocks that are
+  *individually* HT or T.800 Annex D, with no per-block signalling —
+  the packet reader runs both tier-2 hypotheses (the derived
+  `K(T.800) = 1`, since §A.4 bars bypass and per-pass termination,
+  against the §B.2 set-`T` partition), parses the one-field layouts
+  that read identical bits under both without deciding, pins the
+  T.800 lane where the §A.4 constraints (`Lblock > 3`, clear first
+  length bit) or §B.3 refute HT on the shared bytes, and resolves the
+  genuine set-`T` straddles by a depth-first HT-first hypothesis
+  search re-walked on any downstream failure; blocks still unresolved
+  at tier-1 are arbitrated exactly as the §A.4 NOTE prescribes (trial
+  HT decode, Annex D fallback). The three `hm` MIXED codestreams of
+  the ISO/IEC 15444-4 Ed. 4 electronic insert — the only MIXED
+  streams in that corpus, committed as fixtures — decode end-to-end
+  on the first assignment (0 / 7 / 24 divergent choices per tile, no
+  backtracking); with every available opaque decoder declining the
+  MIXED style byte, they are cross-validated through the corpus's own
+  controlled redundancy: the two `p0_06` transcodes reconstruct their
+  losslessly carried components **byte-identically across the two
+  independent encodings**, component 3 lands at the ≈40 dB the
+  bundle's statistics record, and the layer-progressive /
+  reduced-resolution surfaces compose (monotone MSE over every layer
+  prefix). The long-standing small-block / high-energy /
   non-power-of-two decode divergence is **resolved**: differential
   tracing against this crate's own independently written HT *encoder*
   isolated it to the §7.3.4 / §7.3.6 first-line-pair interleave — when
@@ -473,6 +507,25 @@ opaque HTJ2K decoders** (gray reversible at 0–3 decomposition levels,
 the `Z_blk = 3` refinement shape, and the 9-7 irreversible path —
 single-layer shapes; the decoders decline multi-layer HT).
 
+The encoder also emits **MIXED-set codestreams**
+(`EncodeParams::ht_mixed`, T.814 §8.2 / §A.4): every code-block is
+coded through both the Annex D MQ passes and the §7.3 HT cleanup pass,
+and per block the HT lane is kept wherever it stays within a
+throughput budget of one-eighth plus two bytes over the MQ codeword —
+blocks the MQ coder compresses markedly better stay Annex D. The
+stream signals `Rsiz` bit 14, a MIXED-permitting `Ccap15`
+(bits 15-14 = `11`, measured MAGB), `SPcod` / `SPcoc` bits 6 + 7, the
+§A.4 first-non-zero-segment headroom on the HT-lane blocks
+(`Lblock > 3`, clear top length bit) and the derived single length
+field on the T.800 lane. Round-trips bit-exactly through this crate's
+own MIXED decoder across RCT, multi-tile grids, custom precincts, the
+position-keyed progressions, sub-sampling and SOP / EPH framing; the
+9-7 stream reconstructs identically to its pure-Annex-D counterpart
+(the lane choice never touches a sample), and a re-signalling probe
+pins that both lanes are genuinely present. Single quality layer; the
+§D.6 / §D.4.2 styles, PCRD, ROI and the all-HT mode are rejected in
+combination.
+
 ### Not yet implemented
 
 These surface a clean `Error::NotImplemented` rather than mis-decoding:
@@ -497,11 +550,6 @@ These surface a clean `Error::NotImplemented` rather than mis-decoding:
   for those two orders, so a non-power-of-two factor there is rejected.
   **CPRL** (§B.12.1.5) carries no such restriction and *is* decoded at
   any integer sub-sampling.
-- HTJ2K MIXED-set codestreams (T.814 §8.2: `SPcod` bits 6 + 7 marking
-  a tile-component whose code-blocks are *individually* either HT or
-  T.800 Annex D blocks, distinguished only by trial decoding). The
-  HTONLY sets — including MULTIHT and placeholder passes — *are*
-  decoded (see above).
 
 ## Public API
 

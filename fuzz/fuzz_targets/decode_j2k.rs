@@ -10,9 +10,12 @@
 //!   framing when signalled.
 //! * The §B.10.7 codeword-segment accumulation for every
 //!   [`SegmentSplit`] shape — single-segment, §D.4.2 per-pass, §D.6
-//!   bypass spans, and the T.814 HT set-`T` split including the §B.1
+//!   bypass spans, the T.814 HT set-`T` split including the §B.1
 //!   placeholder-pass pinning and the §B.3 MULTIHT set grouping whose
-//!   per-set allocations are bounded by the band's bit-plane budget.
+//!   per-set allocations are bounded by the band's bit-plane budget,
+//!   and the §A.4 MIXED per-code-block lane search (dual-hypothesis
+//!   length reads, refutations, and the depth-first re-walk whose
+//!   attempt budget bounds hostile straddle chains).
 //! * Tier-1 itself: the Annex C MQ decoder + Annex D passes on T.800
 //!   blocks, and the T.814 clause-7 HT block decoder (MEL / VLC /
 //!   MagSgn / SigProp / MagRef bit-stream recovery) on HT blocks.
