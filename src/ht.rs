@@ -976,9 +976,22 @@ pub fn decode_ht_codeblock(
             // Position the bits at their true §E.1 weight: shift up by
             // (Mb − Nb) so the least-significant decoded bit sits at
             // 2^(Mb − Nb), matching the Annex D convention. Clamp when
-            // Nb ≥ Mb (full decode — no shift).
+            // Nb ≥ Mb (full decode — no shift). A non-zero magnitude
+            // whose positioned value cannot fit the 31-bit lane
+            // (`Mb − Nb ≥ 32`, or high bits pushed out) is not
+            // representable — reject it rather than overflowing; the
+            // whole-codestream driver bounds `M'b ≤ 31` before calling
+            // in, so this only fires for direct (hostile) invocations.
             let mag = if mb > sample_nb {
-                bits << (mb - sample_nb)
+                let shift = mb - sample_nb;
+                if bits != 0 && shift > bits.leading_zeros() {
+                    return Err(Error::HtCorruptSegment);
+                }
+                if bits == 0 {
+                    0
+                } else {
+                    bits << shift
+                }
             } else {
                 bits
             };
@@ -1235,6 +1248,33 @@ impl<'a> MagRefReader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fuzz regression (ht_block_decode harness): a direct invocation
+    /// with the Equation E-2 extreme `Mb = 37` and `S_blk = 0`
+    /// positions a 1-bit magnitude 36 planes up — past the 31-bit
+    /// `u32` lane. The whole-codestream driver bounds `M'b ≤ 31`
+    /// before dispatching, but the public block decoder must reject
+    /// the unrepresentable shift itself rather than overflow it.
+    #[test]
+    fn positioning_shift_past_the_lane_is_rejected() {
+        let seg =
+            crate::htenc::encode_ht_cleanup_segment(&[1, 0, 0, 1], &[false; 4], 2, 2).unwrap();
+        let r = decode_ht_codeblock(SubBandOrientation::HL, 2, 2, 37, &seg, &[], 1, 0);
+        assert!(matches!(r, Err(Error::HtCorruptSegment)));
+        // An all-zero block under the same extreme budget stays a
+        // clean decode (nothing to position).
+        let zero = crate::htenc::encode_ht_cleanup_segment(&[0; 4], &[false; 4], 2, 2);
+        if let Ok(zseg) = zero {
+            let (block, _) =
+                decode_ht_codeblock(SubBandOrientation::HL, 2, 2, 37, &zseg, &[], 1, 0)
+                    .expect("all-zero block decodes at any budget");
+            for y in 0..2 {
+                for x in 0..2 {
+                    assert_eq!(block.coefficient(x, y).magnitude, 0);
+                }
+            }
+        }
+    }
 
     /// MEL_E table matches Table 2 verbatim.
     #[test]

@@ -80,6 +80,20 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Fixed
 
+- **Magnitude-lane overflow on extreme quantisation budgets**
+  (fuzz-found by the new `ht_block_decode` harness, then traced to the
+  whole-stream Annex D path as well): Equation E-2 admits `Mb` up to
+  37 (`SPqcd` exponent 31 with 7 guard bits — a parseable, if absurd,
+  codestream), but tier-1 assembles magnitudes into a 31-bit `u32`
+  lane, so the §D.3 weight `2^(M'b − 1 − P)` and the §7.6 HT
+  positioning shift `Mb − Nb` overflowed the shift — a panic in debug
+  builds and a silently wrapped (mis-decoded) shift in release. The
+  block-decode driver now rejects a coded budget `M'b > 31` cleanly
+  (`NotImplemented` — a representation limit, before any tier-1 work),
+  and `ht::decode_ht_codeblock` itself refuses an unrepresentable
+  positioning shift (`HtCorruptSegment`) so direct invocations are
+  safe too. Regressions: a committed fixture re-signalled at the
+  extreme budget, and the direct block-decoder shape.
 - **§D.6 bypass segment attribution off by a flush byte** (fuzz-found
   by the new `roundtrip_encode` harness, exact-repro pinned by
   `bypass_tiny_blocks_exact_segment_attribution`): a mid-span Annex

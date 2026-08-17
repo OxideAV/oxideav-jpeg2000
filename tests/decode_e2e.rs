@@ -3053,3 +3053,28 @@ fn layer_limited_zero_is_rejected() {
         Err(Error::InvalidMarkerLength)
     );
 }
+
+#[test]
+fn magnitude_lane_overflow_budget_is_rejected() {
+    // Fuzz regression (round 447): Equation E-2 admits Mb up to 37
+    // (SPqcd exponent 31 with 7 guard bits), but tier-1 assembles
+    // magnitudes into a 31-bit u32 lane — the §D.3 weight
+    // `2^(Mb − 1 − P)` overflowed the shift for a parseable stream.
+    // Patch a committed reversible fixture's QCD to the extreme
+    // budget and require a clean error instead of a panic (debug) or
+    // a wrapped shift (release).
+    let mut bytes = GRAY_53.to_vec();
+    let qcd = bytes
+        .windows(2)
+        .position(|w| w == [0xFF, 0x5C])
+        .expect("fixture carries a QCD");
+    let len = u16::from_be_bytes([bytes[qcd + 2], bytes[qcd + 3]]) as usize;
+    bytes[qcd + 4] = 7 << 5; // Sqcd: style 0 (reversible), 7 guard bits
+    for spqcd in &mut bytes[qcd + 5..qcd + 2 + len] {
+        *spqcd = 31 << 3; // εb = 31 for every sub-band
+    }
+    assert_eq!(
+        oxideav_jpeg2000::decode_j2k(&bytes),
+        Err(oxideav_jpeg2000::Error::NotImplemented)
+    );
+}

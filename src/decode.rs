@@ -2133,6 +2133,16 @@ fn decode_tile_from_plan(
         // and `mb_coded == mb`.
         let s = roi_shift.get(*c as usize).copied().unwrap_or(0);
         let mb_coded = mb.saturating_add(s);
+        // Implementation limit: tier-1 assembles magnitudes into a
+        // 31-bit `u32` lane (sign carried separately), so the §D.3 /
+        // §7.6 bit-plane weights `2^(M'b − 1 − P) … 2^0` must fit it.
+        // Equation E-2 admits `Mb` up to 37 (`εb = 31`, 7 guard bits)
+        // and an `RGN` shift stacks on top — a coded budget past the
+        // lane cannot be represented, so it is rejected cleanly here
+        // rather than overflowing the pass weights downstream.
+        if mb_coded > 31 {
+            return Err(Error::NotImplemented);
+        }
         let p = acc.p.ok_or(Error::InvalidPacketHeader)?;
         if p >= mb_coded {
             return Err(Error::InvalidPacketHeader);
