@@ -80,6 +80,23 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Fixed
 
+- **§D.6 bypass segment attribution off by a flush byte** (fuzz-found
+  by the new `roundtrip_encode` harness, exact-repro pinned by
+  `bypass_tiny_blocks_exact_segment_attribution`): a mid-span Annex
+  J.13.4 flush snapshot is not monotone — a §C.2.9 flush can *shrink*
+  as further decisions arrive — so an interior snapshot could exceed
+  the exact rate at the span's own terminated end, and the assembly's
+  forward monotone clamp then inflated that exact §B.10.7.2 boundary.
+  The emitted stream signalled the AC segment one byte long and the
+  following raw span zero-length; a conforming decoder's §D.4.1 fill
+  fabricated 1-bits for the starved span (observed as +2/+4 sample
+  drift on 4×4-code-block bypass streams, both through this crate's
+  decoder and a black-box reference). Terminated passes now pin their
+  rate to the exact committed byte count, and styled blocks cap each
+  mid-span snapshot by its successor (backward), so segment boundaries
+  always match the emitted bytes; a capped value equals a later pass's
+  valid §C.2.9 truncation length, keeping every layer / PCRD cut
+  decodable.
 - **Two decode bugs specific to precinct-unaligned tile edges**, found by
   a 400-case black-box conformance sweep (5 progression orders × tiling ×
   code-block / precinct shapes × layers × image-origin offsets × both

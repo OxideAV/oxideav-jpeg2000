@@ -822,6 +822,13 @@ fn encode_code_block(
                 Sink::Mq(e) => e.flush(),
                 Sink::Raw(w) => w.finish(),
             });
+            if pass_rates {
+                // The pass that just terminated has an *exact* rate:
+                // the committed byte count. Pin it over the snapshot —
+                // §B.10.7.2 segment attribution derives from these
+                // boundaries, so they must match the emitted bytes.
+                *rates.last_mut().expect("pass recorded") = committed.len() as u32;
+            }
             if capture.bypass && crate::packet::bypass_pass_is_raw(i + 1) {
                 sink = Sink::Raw(crate::t1::RawBitWriter::new());
             }
@@ -837,6 +844,27 @@ fn encode_code_block(
         // The last snapshot and the final flush share the same coder
         // state, so they agree; pin it exactly regardless.
         *rates.last_mut().expect("at least one pass") = bytes.len() as u32;
+        if styled {
+            // A mid-span §C.2.9 flush snapshot is *not* monotone — a
+            // flush can shrink as further decisions arrive (SETBITS may
+            // need one byte fewer), so an interior snapshot can exceed
+            // the exact rate of the span's own terminated end. Left
+            // uncapped, the forward monotone clamp in the assembly's
+            // `cum_r` would then inflate the exact terminated boundary
+            // and mis-attribute the following raw / AC segment's bytes
+            // to the earlier segment (the decoder's §D.4.1 fill then
+            // fabricates 1-bits for the starved segment). Cap each
+            // pass's rate by its successor's, backward: terminated
+            // boundaries only grow, so they are untouched, and a
+            // capped mid-span value equals some later pass's valid
+            // §C.2.9 truncation length — a prefix that decodes more
+            // passes decodes fewer.
+            for n in (0..rates.len() - 1).rev() {
+                if rates[n] > rates[n + 1] {
+                    rates[n] = rates[n + 1];
+                }
+            }
+        }
     }
     let d0 = if pass_dist {
         targets
@@ -2420,7 +2448,12 @@ fn encode_core(
                         },
                     )?
                     .expect("non-empty block re-encodes");
-                    debug_assert_eq!(re.bytes.len() as u32, enc.pass_rates[n_eff as usize - 1]);
+                    // For a styled block truncated mid-span, the stored
+                    // rate was capped backward to the span-covering
+                    // truncation length, so the re-encode (whose final
+                    // partial-span flush is the uncapped snapshot) may
+                    // run a byte or two longer; elsewhere they agree.
+                    debug_assert!(re.bytes.len() as u32 >= enc.pass_rates[n_eff as usize - 1]);
                     re.bytes
                 } else {
                     let cut = (enc.pass_rates[n_eff as usize - 1] as usize).min(enc.bytes.len());
@@ -3987,6 +4020,48 @@ mod tests {
             ..EncodeParams::default()
         };
         roundtrip_params(&[&p], 64, 64, &params);
+    }
+
+    #[test]
+    fn bypass_tiny_blocks_exact_segment_attribution() {
+        // Fuzz regression (roundtrip_encode harness): §D.6 bypass with
+        // 4×4 code-blocks. A mid-span Annex J.13.4 flush snapshot
+        // exceeded the exact rate of its span's terminated end (a
+        // §C.2.9 flush can shrink as more decisions arrive), and the
+        // assembly's monotone clamp then inflated the exact boundary —
+        // the AC segment was signalled one byte long, starving the
+        // following raw span, whose §D.4.1 fill fabricated 1-bits on
+        // decode. The layer count is irrelevant (the original finding
+        // used 4 layers; a single layer reproduces identically).
+        let mut s = 0u8;
+        let p: Vec<u8> = (0..41u32 * 11)
+            .map(|k| {
+                s = s.wrapping_mul(197).wrapping_add(k as u8);
+                s
+            })
+            .collect();
+        for layers in [1u16, 4] {
+            let params = EncodeParams {
+                decomposition_levels: 1,
+                code_block_exp: (2, 2),
+                bypass: true,
+                layers,
+                ..EncodeParams::default()
+            };
+            roundtrip_params(&[&p], 41, 11, &params);
+        }
+        // The 4×4-image distillation: one 2×2 block per band; the LL
+        // block's pass-9 boundary is the one the clamp used to inflate.
+        let tiny: Vec<u8> = vec![
+            45, 171, 162, 182, 223, 206, 186, 87, 58, 254, 211, 189, 130, 143, 145, 28,
+        ];
+        let params = EncodeParams {
+            decomposition_levels: 1,
+            code_block_exp: (2, 2),
+            bypass: true,
+            ..EncodeParams::default()
+        };
+        roundtrip_params(&[&tiny], 4, 4, &params);
     }
 
     #[test]

@@ -29,6 +29,21 @@ cargo-fuzz = true
 # `Result` (or completes infallibly) rather than panicking,
 # integer-overflowing (debug), indexing out of bounds, or allocating an
 # attacker-controlled buffer.
+#
+# Beyond the parse-only surface the battery carries:
+# * `decode_j2k` / `decode_jp2` — the full tier-2 + tier-1 + reassembly
+#   decode paths on arbitrary bytes (geometry-capped);
+# * `decode_variants` — the ISO/IEC 15444-4 §B.2.3 reduced-resolution
+#   and layer-progressive decode walks on the same seeds;
+# * `ht_block_decode` — the T.814 clause-7 HT block decoder fed raw
+#   cleanup / refinement segments under fuzz-chosen geometry;
+# * `roundtrip_encode` — a structure-aware ENCODER harness: fuzz bytes
+#   script an `EncodeParams` across the whole surface (both kernels,
+#   MCT, progressions + POC, precincts, layers, PCRD, tiles +
+#   tile-part splits, styles, SOP/EPH, PPM/PPT, sub-sampling, COC/QCC
+#   overrides, ROI, and the T.814 HT / MULTIHT / MIXED lanes), and
+#   `decode(encode(x))` must succeed — bit-exactly on the reversible
+#   full-rate path.
 [dependencies]
 libfuzzer-sys = "0.4"
 
@@ -81,6 +96,27 @@ bench = false
 [[bin]]
 name = "decode_jp2"
 path = "fuzz_targets/decode_jp2.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_variants"
+path = "fuzz_targets/decode_variants.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ht_block_decode"
+path = "fuzz_targets/ht_block_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "roundtrip_encode"
+path = "fuzz_targets/roundtrip_encode.rs"
 test = false
 doc = false
 bench = false
