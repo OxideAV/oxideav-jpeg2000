@@ -433,9 +433,12 @@ pub(crate) fn magnitude_exponent(mu: u32) -> u32 {
     if mu == 0 {
         return 0;
     }
-    // Smallest E with 2^E > 2μ − 1, i.e. 2^E ≥ 2μ.
-    let t = 2 * mu - 1;
-    32 - t.leading_zeros()
+    // Smallest E with 2^E > 2μ − 1, i.e. 2^E ≥ 2μ. Compute in u64 so a
+    // corrupt / non-conformant μ near the top of the u32 lane (which a
+    // hostile MagSgn stream can recover before the §7.6 lane bound
+    // rejects it) does not overflow `2μ`.
+    let t = 2 * u64::from(mu) - 1;
+    64 - t.leading_zeros()
 }
 
 // ---------------------------------------------------------------------------
@@ -1367,6 +1370,11 @@ mod tests {
         for mu in 17..=32 {
             assert_eq!(magnitude_exponent(mu), 6, "μ={mu}");
         }
+        // Fuzz regression (decode_variants harness): a corrupt MagSgn
+        // stream can recover a μ near the top of the u32 lane before
+        // the §7.6 bound rejects it; `2μ − 1` must not overflow.
+        assert_eq!(magnitude_exponent(u32::MAX), 33);
+        assert_eq!(magnitude_exponent(1 << 31), 32);
     }
 
     /// An all-zero / empty HT cleanup segment with `z_blk == 0` yields a

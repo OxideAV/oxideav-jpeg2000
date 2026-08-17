@@ -80,6 +80,13 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Fixed
 
+- **HT magnitude-exponent overflow on a corrupt MagSgn recovery**
+  (fuzz-found by the new `decode_variants` harness): the §7.3.2 Table 1
+  exponent `E_n = 64 − clz(2μ − 1)` computed `2μ − 1` in `u32`, but a
+  hostile MagSgn stream can recover a `μ` near the top of the lane
+  before the §7.6 bound rejects it, so `2μ` overflowed (a debug panic
+  in the reduced-resolution decode walk). The doubling now runs in
+  `u64`; regression pins `μ = 2³¹` and `μ = u32::MAX`.
 - **Magnitude-lane overflow on extreme quantisation budgets**
   (fuzz-found by the new `ht_block_decode` harness, then traced to the
   whole-stream Annex D path as well): Equation E-2 admits `Mb` up to
