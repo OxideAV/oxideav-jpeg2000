@@ -19,6 +19,22 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
   bit-exact through this crate's decoder and byte-identical through
   an opaque black-box decoder. The T.814 lanes reject them together
   with the other Annex D styles.
+- **Encoder: `PLT` / `TLM` pointer markers** — `EncodeParams::plt`
+  emits §A.7.3 packet-length lists in every tile-part header (Table
+  A.36 `Iplt` — SOP + header + EPH + data in-stream, SOP + data under
+  PPM / PPT relocation — cut into `Zplt`-indexed segments on completed
+  entries) and `EncodeParams::tlm` a main-header §A.7.1 `TLM` series
+  (`ST = 1` up to 255 tiles, `ST = 2` beyond, `SP = 1`, `Ptlm = Psot`)
+  computed before emission. Both satisfy this crate's own pointer
+  cross-validation across framings, relocations, tile-part splits,
+  styles, PCRD, ROI and the HT lanes; an opaque-encoder SOP + EPH +
+  PLT + TLM tiled stream is vendored as a decode fixture pinning that
+  the `Iplt` span starts at the SOP.
+
+### Changed
+
+- Clippy 1.98 `manual_slice_fill` sweep in the tier-1 pass-state
+  resets.
 - **HTJ2K MIXED-set decode (T.814 §8.2 / §A.4)** — a tile-component
   whose style byte carries bits 6 + 7 under a MIXED-permitting
   `Ccap15` now decodes: each code-block is *individually* an HT or a

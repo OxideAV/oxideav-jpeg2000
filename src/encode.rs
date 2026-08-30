@@ -996,6 +996,24 @@ fn chunk_packed_headers(atoms: &[PackedAtom], max_payload: usize) -> Result<Vec<
     Ok(out)
 }
 
+/// Table A.36 `Iplt` / `Iplm` encoding of one packet length: 7-bit
+/// groups from the most significant non-zero group down, bit 7 set on
+/// every byte but the last.
+fn iplt_bytes(len: u64) -> Vec<u8> {
+    let groups = (64 - len.leading_zeros()).div_ceil(7).max(1);
+    (0..groups)
+        .rev()
+        .map(|g| {
+            let bits = ((len >> (7 * g)) & 0x7F) as u8;
+            if g == 0 {
+                bits
+            } else {
+                bits | 0x80
+            }
+        })
+        .collect()
+}
+
 fn push_segment(out: &mut Vec<u8>, marker: u16, payload: &[u8]) {
     out.extend_from_slice(&marker.to_be_bytes());
     out.extend_from_slice(&((payload.len() as u16 + 2).to_be_bytes()));
@@ -1301,6 +1319,23 @@ pub struct EncodeParams {
     /// packet headers stay in-stream (default), move to per-tile `PPT`
     /// marker segments, or move to main-header `PPM` marker segments.
     pub packed_headers: PackedHeaders,
+    /// §A.7.3 packet-length pointer marker: every tile-part header
+    /// carries `PLT` marker segment(s) listing the Table A.36 `Iplt`
+    /// length of each packet in that tile-part — the packet's `SOP`
+    /// (when signalled), its §B.10 header (with `EPH`) and its data
+    /// for in-stream headers; `SOP` + data only when the headers are
+    /// relocated into `PPM` / `PPT` (Table A.36 note). A list that
+    /// outgrows one segment's 16-bit length continues in further
+    /// `Zplt`-indexed segments, each cut on a completed `Iplt`.
+    /// Default `false`.
+    pub plt: bool,
+    /// §A.7.1 tile-part-length pointer marker: a main-header `TLM`
+    /// marker segment (`Ztlm`-indexed series when the entry count
+    /// outgrows one segment) lists every tile-part's `(Ttlm, Ptlm)` in
+    /// codestream order — `Ptlm` equal to the tile-part's `Psot` —
+    /// with `ST = 1` (8-bit `Ttlm`) while every tile index fits, else
+    /// `ST = 2`, and `SP = 1` (32-bit `Ptlm`). Default `false`.
+    pub tlm: bool,
     /// T.814 HTJ2K block coding (SPcod bit 6): every code-block is
     /// coded by the §7.3 HT cleanup forward coder (plus, with
     /// [`EncodeParams::ht_refinement`], the §7.4 / §7.5 refinement
@@ -1371,6 +1406,8 @@ impl Default for EncodeParams {
             poc: Vec::new(),
             component_overrides: Vec::new(),
             packed_headers: PackedHeaders::InStream,
+            plt: false,
+            tlm: false,
             high_throughput: false,
             ht_refinement: false,
             ht_mixed: false,
@@ -2719,6 +2756,10 @@ fn encode_core(
             /// Packet data (each packet's §A.8.1 SOP, when signalled,
             /// precedes its data here).
             body: Vec<u8>,
+            /// §A.7.3 `Iplt` per packet: the packet's whole in-body
+            /// span (SOP + header + EPH + data in-stream; SOP + data
+            /// when the header is relocated).
+            packet_lens: Vec<usize>,
         }
         let relocate = params.packed_headers != PackedHeaders::InStream;
         let mut tile_bodies: Vec<Vec<PartStream>> = Vec::with_capacity(orders.len());
@@ -2726,6 +2767,7 @@ fn encode_core(
             let mut parts: Vec<PartStream> = vec![PartStream {
                 headers: Vec::new(),
                 body: Vec::new(),
+                packet_lens: Vec::new(),
             }];
             let mut last_axis: Option<u32> = None;
             // §A.8.1 Nsop: zero-based per coded tile (continuing across
@@ -2742,6 +2784,7 @@ fn encode_core(
                     parts.push(PartStream {
                         headers: Vec::new(),
                         body: Vec::new(),
+                        packet_lens: Vec::new(),
                     });
                 }
                 last_axis = Some(axis);
@@ -2784,6 +2827,7 @@ fn encode_core(
                     }
                 }
                 let mut header = encode_packet_header(&mut pa.state, desc.layer, &plans);
+                let body_start = part.body.len();
                 if params.sop {
                     // §A.8.1 / Table A.40: SOP, Lsop = 4, Nsop. With
                     // relocated headers the SOP stays in the body,
@@ -2805,6 +2849,7 @@ fn encode_core(
                     part.body.extend_from_slice(&header);
                 }
                 part.body.extend_from_slice(&body);
+                part.packet_lens.push(part.body.len() - body_start);
             }
             if parts.len() > 255 {
                 // TNsot is an 8-bit field (Table A.6).
@@ -3109,15 +3154,19 @@ fn encode_core(
             }
         }
 
-        // SOT + SOD per tile-part (§A.4.2): Psot spans SOT → end of the
-        // part's body; TPsot counts up in codestream order and every
-        // part carries the tile's final TNsot. Under the §A.7.5 PPT
-        // relocation the tile's packet headers ride in PPT marker
-        // segments inside its first tile-part header (before the SOD),
-        // "in the same tile-part header or one with a lower TPsot
-        // value" than any packet data they describe.
-        for (t, parts) in tile_bodies.iter().enumerate() {
-            let tnsot = parts.len() as u8;
+        // Tile-part headers (§A.4.2): per tile the §A.7.5 PPT chunks
+        // (first tile-part only — "in the same tile-part header or one
+        // with a lower TPsot value" than any packet data they
+        // describe), per tile-part the §A.7.3 PLT chunks, and each
+        // part's Psot (SOT → end of the part's body). Computed before
+        // emission so a §A.7.1 TLM can announce every Psot up front.
+        struct PartLayout {
+            ppt_chunks: Vec<Vec<u8>>,
+            plt_chunks: Vec<Vec<u8>>,
+            psot: u32,
+        }
+        let mut layouts: Vec<Vec<PartLayout>> = Vec::with_capacity(tile_bodies.len());
+        for parts in &tile_bodies {
             let mut ppt_chunks: Vec<Vec<u8>> = Vec::new();
             if params.packed_headers == PackedHeaders::Ppt {
                 let atoms: Vec<PackedAtom> = parts
@@ -3134,28 +3183,107 @@ fn encode_core(
                     return Err(Error::NotImplemented);
                 }
             }
+            let mut tile_layout = Vec::with_capacity(parts.len());
             for (i, part) in parts.iter().enumerate() {
-                // Marker + Lppt + Zppt + payload, per PPT segment in
-                // this part's header (first part only).
-                let ppt_bytes: usize = if i == 0 {
-                    ppt_chunks.iter().map(|c| 5 + c.len()).sum()
+                let ppt_chunks = if i == 0 {
+                    std::mem::take(&mut ppt_chunks)
                 } else {
-                    0
+                    Vec::new()
                 };
-                let psot = 12u32 + ppt_bytes as u32 + 2 + part.body.len() as u32;
+                let plt_chunks = if params.plt {
+                    // Table A.36 Iplt: 7-bit groups, most significant
+                    // first, continuation bit on all but the last.
+                    let atoms: Vec<PackedAtom> = part
+                        .packet_lens
+                        .iter()
+                        .map(|&len| PackedAtom {
+                            bytes: iplt_bytes(len as u64),
+                            boundary: true,
+                        })
+                        .collect();
+                    // Lplt = 2 + 1 (Zplt) + payload ≤ 65 535.
+                    let chunks = chunk_packed_headers(&atoms, 65_535 - 3)?;
+                    if chunks.len() > 256 {
+                        // Zplt is an 8-bit index (Table A.37).
+                        return Err(Error::NotImplemented);
+                    }
+                    chunks
+                } else {
+                    Vec::new()
+                };
+                // Marker + length + Z index + payload per segment.
+                let ppt_bytes: usize = ppt_chunks.iter().map(|c| 5 + c.len()).sum();
+                let plt_bytes: usize = plt_chunks.iter().map(|c| 5 + c.len()).sum();
+                let psot = 12usize + ppt_bytes + plt_bytes + 2 + part.body.len();
+                let psot = u32::try_from(psot).map_err(|_| Error::NotImplemented)?;
+                tile_layout.push(PartLayout {
+                    ppt_chunks,
+                    plt_chunks,
+                    psot,
+                });
+            }
+            layouts.push(tile_layout);
+        }
+
+        // TLM (§A.7.1, Tables A.33 / A.34): one (Ttlm, Ptlm) per
+        // tile-part in codestream order, Ptlm = Psot. ST = 1 while
+        // every Isot fits the 8-bit Ttlm range 0..=254, else ST = 2;
+        // SP = 1 (32-bit Ptlm). Ltlm ≤ 65 535 bounds the entries per
+        // segment; further entries continue in Ztlm-indexed segments.
+        if params.tlm {
+            let entries: Vec<(u16, u32)> = layouts
+                .iter()
+                .enumerate()
+                .flat_map(|(t, parts)| parts.iter().map(move |p| (t as u16, p.psot)))
+                .collect();
+            let st: u8 = if layouts.len() <= 255 { 1 } else { 2 };
+            let entry_len = usize::from(st) + 4;
+            let per_segment = (65_535 - 4) / entry_len;
+            let segments = entries.chunks(per_segment);
+            if segments.len() > 256 {
+                // Ztlm is an 8-bit index (Table A.33).
+                return Err(Error::NotImplemented);
+            }
+            for (z, chunk) in segments.enumerate() {
+                let mut payload = Vec::with_capacity(2 + chunk.len() * entry_len);
+                payload.push(z as u8); // Ztlm
+                payload.push((st << 4) | 0x40); // Stlm: ST, SP = 1
+                for &(tile, psot) in chunk {
+                    if st == 1 {
+                        payload.push(tile as u8);
+                    } else {
+                        payload.extend_from_slice(&tile.to_be_bytes());
+                    }
+                    payload.extend_from_slice(&psot.to_be_bytes());
+                }
+                push_segment(&mut out, crate::MARKER_TLM, &payload);
+            }
+        }
+
+        // SOT + SOD per tile-part (§A.4.2): TPsot counts up in
+        // codestream order and every part carries the tile's final
+        // TNsot; the PPT segments (first part) and PLT segments sit in
+        // the tile-part header before the SOD.
+        for (t, (parts, layout)) in tile_bodies.iter().zip(&layouts).enumerate() {
+            let tnsot = parts.len() as u8;
+            for (i, (part, lay)) in parts.iter().zip(layout).enumerate() {
                 let mut sot_payload = Vec::with_capacity(8);
                 sot_payload.extend_from_slice(&(t as u16).to_be_bytes()); // Isot
-                sot_payload.extend_from_slice(&psot.to_be_bytes());
+                sot_payload.extend_from_slice(&lay.psot.to_be_bytes());
                 sot_payload.push(i as u8); // TPsot
                 sot_payload.push(tnsot); // TNsot
                 push_segment(&mut out, MARKER_SOT, &sot_payload);
-                if i == 0 {
-                    for (z, chunk) in ppt_chunks.iter().enumerate() {
-                        let mut payload = Vec::with_capacity(1 + chunk.len());
-                        payload.push(z as u8); // Zppt
-                        payload.extend_from_slice(chunk);
-                        push_segment(&mut out, crate::MARKER_PPT, &payload);
-                    }
+                for (z, chunk) in lay.ppt_chunks.iter().enumerate() {
+                    let mut payload = Vec::with_capacity(1 + chunk.len());
+                    payload.push(z as u8); // Zppt
+                    payload.extend_from_slice(chunk);
+                    push_segment(&mut out, crate::MARKER_PPT, &payload);
+                }
+                for (z, chunk) in lay.plt_chunks.iter().enumerate() {
+                    let mut payload = Vec::with_capacity(1 + chunk.len());
+                    payload.push(z as u8); // Zplt
+                    payload.extend_from_slice(chunk);
+                    push_segment(&mut out, crate::MARKER_PLT, &payload);
                 }
                 out.extend_from_slice(&MARKER_SOD.to_be_bytes());
                 out.extend_from_slice(&part.body);
@@ -4075,6 +4203,175 @@ mod tests {
                     assert!(max_err <= 1, "bypass lossy error {max_err}")
                 }
             }
+        }
+    }
+
+    // -- §A.7.1 TLM / §A.7.3 PLT pointer markers on encode ---------------
+
+    #[test]
+    fn iplt_encoding_follows_table_a36() {
+        // Table A.36 worked examples: 128 → 1000 0001 0000 0000, 512 →
+        // 1000 0100 0000 0000; a zero length is one clear byte.
+        assert_eq!(iplt_bytes(0), vec![0x00]);
+        assert_eq!(iplt_bytes(0x7F), vec![0x7F]);
+        assert_eq!(iplt_bytes(128), vec![0x81, 0x00]);
+        assert_eq!(iplt_bytes(512), vec![0x84, 0x00]);
+        assert_eq!(iplt_bytes(0x3FFF), vec![0xFF, 0x7F]);
+        assert_eq!(iplt_bytes(0x4000), vec![0x81, 0x80, 0x00]);
+    }
+
+    /// Every tile-part header carries a PLT, every main header a TLM
+    /// whose entries mirror the SOT chain — and the decoder's §A.7.1 /
+    /// §A.7.3 cross-validation accepts the stream.
+    fn assert_pointer_markers(stream: &[u8], expect_plt: bool, expect_tlm: bool) {
+        let cs = crate::parse_codestream(stream).expect("parse");
+        for tp in &cs.tile_parts {
+            let has_plt = tp
+                .markers
+                .iter()
+                .any(|m| matches!(m, crate::TilePartMarker::Plt(_)));
+            assert_eq!(has_plt, expect_plt, "PLT presence per tile-part");
+        }
+        let tlm =
+            crate::collect_main_header_tlm(stream, cs.header.bytes_consumed).expect("TLM parses");
+        assert_eq!(tlm.is_some(), expect_tlm, "TLM presence");
+        if let Some(entries) = tlm {
+            assert_eq!(entries.len(), cs.tile_parts.len());
+            for (e, tp) in entries.iter().zip(&cs.tile_parts) {
+                assert_eq!(e.tile, Some(tp.sot.tile_index));
+                assert_eq!(e.length, tp.sot.psot);
+            }
+        }
+    }
+
+    #[test]
+    fn plt_and_tlm_round_trip_across_framings_and_relocations() {
+        // In-stream / PPT / PPM headers × SOP / EPH: the Iplt spans
+        // SOP + header + EPH + data in-stream and SOP + data once the
+        // headers are relocated (Table A.36 note); the TLM lists every
+        // tile-part's Psot across a tile grid split by resolution.
+        let (w, h) = (48u32, 40u32);
+        let p = noise(w, h, 0x9A17_0D0D);
+        for packed in [
+            PackedHeaders::InStream,
+            PackedHeaders::Ppt,
+            PackedHeaders::Ppm,
+        ] {
+            for (sop, eph) in [(false, false), (true, false), (false, true), (true, true)] {
+                let params = EncodeParams {
+                    decomposition_levels: 2,
+                    code_block_exp: (3, 3),
+                    layers: 2,
+                    tile_size: Some((32, 24)),
+                    tile_parts: TilePartSplit::ByResolution,
+                    packed_headers: packed,
+                    sop,
+                    eph,
+                    plt: true,
+                    tlm: true,
+                    ..EncodeParams::default()
+                };
+                let stream = roundtrip_params(&[&p], w, h, &params);
+                assert_pointer_markers(&stream, true, true);
+                // The pointers are load-bearing: a corrupted Iplt or
+                // Ptlm is rejected by the decoder's cross-check.
+                let mut bad = stream.clone();
+                let plt_off = bad.windows(2).position(|x| x == [0xFF, 0x58]).expect("PLT");
+                bad[plt_off + 5] ^= 0x01;
+                assert_eq!(decode_j2k(&bad), Err(Error::PltMismatch));
+                let mut bad = stream.clone();
+                let tlm_off = bad.windows(2).position(|x| x == [0xFF, 0x55]).expect("TLM");
+                bad[tlm_off + 9] ^= 0x01;
+                assert_eq!(decode_j2k(&bad), Err(Error::TlmMismatch));
+            }
+        }
+        // Each pointer marker alone.
+        for (plt, tlm) in [(true, false), (false, true)] {
+            let params = EncodeParams {
+                plt,
+                tlm,
+                ..EncodeParams::default()
+            };
+            let stream = roundtrip_params(&[&p], w, h, &params);
+            assert_pointer_markers(&stream, plt, tlm);
+        }
+    }
+
+    #[test]
+    fn tlm_switches_to_16_bit_ttlm_past_255_tiles() {
+        // 32×32 over 2×2 tiles = 256 tiles: Ttlm no longer fits 8 bits
+        // (Table A.33: 0..=254), so ST = 2.
+        let p = noise(32, 32, 0x7117_E5E5);
+        let params = EncodeParams {
+            decomposition_levels: 0,
+            tile_size: Some((2, 2)),
+            plt: true,
+            tlm: true,
+            ..EncodeParams::default()
+        };
+        let stream = roundtrip_params(&[&p], 32, 32, &params);
+        let tlm_off = stream
+            .windows(2)
+            .position(|x| x == [0xFF, 0x55])
+            .expect("TLM");
+        assert_eq!(stream[tlm_off + 5], 0x60, "Stlm: ST = 2, SP = 1");
+        assert_pointer_markers(&stream, true, true);
+    }
+
+    #[test]
+    fn plt_composes_with_styles_layers_pcrd_roi_and_ht() {
+        // PLT / TLM are packet-layout pointers, independent of what the
+        // packets carry: Annex D styles + PCRD, the Annex H ROI, and the
+        // T.814 lanes (HT, MULTIHT, MIXED) all keep the cross-check
+        // satisfied.
+        let (w, h) = (40u32, 40u32);
+        let p = noise(w, h, 0x1E77_A11A);
+        let shapes = [
+            EncodeParams {
+                bypass: true,
+                terminate_all: true,
+                segmentation_symbols: true,
+                layers: 3,
+                target_bytes: Some(900),
+                ..EncodeParams::default()
+            },
+            EncodeParams {
+                roi: Some(RoiRegion {
+                    x0: 4,
+                    y0: 4,
+                    x1: 20,
+                    y1: 24,
+                }),
+                ..EncodeParams::default()
+            },
+            EncodeParams {
+                high_throughput: true,
+                ht_refinement: true,
+                ..EncodeParams::default()
+            },
+            EncodeParams {
+                high_throughput: true,
+                layers: 2,
+                ..EncodeParams::default()
+            },
+            EncodeParams {
+                ht_mixed: true,
+                sop: true,
+                eph: true,
+                ..EncodeParams::default()
+            },
+        ];
+        for shape in shapes {
+            let params = EncodeParams {
+                decomposition_levels: 2,
+                code_block_exp: (3, 3),
+                plt: true,
+                tlm: true,
+                ..shape
+            };
+            let stream = encode_j2k(&[&p], w, h, &params).expect("encode");
+            decode_j2k(&stream).expect("decode with pointer cross-check");
+            assert_pointer_markers(&stream, true, true);
         }
     }
 

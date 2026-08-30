@@ -868,12 +868,8 @@ impl CodeBlock {
         // *this* pass will be visible to the *next* magnitude refinement
         // pass. The §D.3.4 π pass-membership flags reset on the same
         // boundary: a new bit-plane's SP pass owns a fresh membership.
-        for flag in &mut self.newly_significant {
-            *flag = false;
-        }
-        for flag in &mut self.sp_visited {
-            *flag = false;
-        }
+        self.newly_significant.fill(false);
+        self.sp_visited.fill(false);
 
         let weight: u32 = 1u32 << bitplane;
         let mut newly = 0usize;
@@ -1178,12 +1174,8 @@ impl CodeBlock {
         encoder: &mut MqEncoder,
         ctx: &mut [MqContext; NUM_CONTEXTS],
     ) {
-        for flag in &mut self.newly_significant {
-            *flag = false;
-        }
-        for flag in &mut self.sp_visited {
-            *flag = false;
-        }
+        self.newly_significant.fill(false);
+        self.sp_visited.fill(false);
         let weight: u32 = 1u32 << bitplane;
         let mut v0 = 0usize;
         while v0 < self.height {
@@ -1267,12 +1259,8 @@ impl CodeBlock {
         targets: &[Coefficient],
         raw: &mut RawBitWriter,
     ) {
-        for flag in &mut self.newly_significant {
-            *flag = false;
-        }
-        for flag in &mut self.sp_visited {
-            *flag = false;
-        }
+        self.newly_significant.fill(false);
+        self.sp_visited.fill(false);
         let weight: u32 = 1u32 << bitplane;
         let mut v0 = 0usize;
         while v0 < self.height {
@@ -1484,12 +1472,8 @@ impl CodeBlock {
         // pass" carry at the start of every new SP pass; the §D.6 raw
         // path keeps the same MR-skip semantics as the AC path. The
         // §D.3.4 π pass-membership flags reset on the same boundary.
-        for flag in &mut self.newly_significant {
-            *flag = false;
-        }
-        for flag in &mut self.sp_visited {
-            *flag = false;
-        }
+        self.newly_significant.fill(false);
+        self.sp_visited.fill(false);
 
         let weight: u32 = 1u32 << bitplane;
         let mut newly = 0usize;

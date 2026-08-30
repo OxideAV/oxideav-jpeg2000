@@ -2219,6 +2219,14 @@ const GRAY_OFF31_97_REF_PGX: &[u8] = include_bytes!("data/gray-33x29-off31-97-re
 const GRAY_OFFTILED_53: &[u8] = include_bytes!("data/gray-96x80-offtiled-53.j2k");
 const GRAY_TP_LAYERS_53: &[u8] = include_bytes!("data/gray-64x64-tp-layers-53.j2k");
 const GRAY_PLT_53: &[u8] = include_bytes!("data/gray-64x64-plt-53.j2k");
+/// Opaque-encoder stream (round 452): 32×32 gray over 16×16 tiles,
+/// three layers, SOP + EPH framing, a PLT per tile-part and a main
+/// header TLM (`ST = 1`, `SP = 1`) — pins that the §A.7.3 `Iplt` span
+/// starts at the packet's SOP marker segment.
+const GRAY_OPJ_SOP_EPH_PLT_TLM_TILED: &[u8] =
+    include_bytes!("data/gray-32x32-opj-sop-eph-plt-tlm-tiled-53.j2k");
+const GRAY_OPJ_SOP_EPH_PLT_TLM_TILED_SRC: &[u8] =
+    include_bytes!("data/gray-32x32-opj-sop-eph-plt-tlm-tiled-53-src.pgm");
 const GRAY_TLM_53: &[u8] = include_bytes!("data/gray-96x80-tlm-53.j2k");
 const RGB_MCT0_53: &[u8] = include_bytes!("data/rgb-48x32-mct0-53.j2k");
 const GRAY_S8_53: &[u8] = include_bytes!("data/gray-32x32-s8-53.j2k");
@@ -2370,6 +2378,25 @@ fn gray_53_plt_pointer_marker_is_pixel_exact() {
     );
     let img = decode_j2k(GRAY_PLT_53).expect("decode PLT stream");
     assert_eq!(img.components[0].samples, gray_pattern(64, 64));
+}
+
+#[test]
+fn opaque_sop_eph_plt_tlm_tiled_stream_is_pixel_exact() {
+    let cs = parse_codestream(GRAY_OPJ_SOP_EPH_PLT_TLM_TILED).expect("parse");
+    assert_eq!(cs.tile_parts.len(), 4);
+    assert!(cs.tile_parts.iter().all(|tp| tp
+        .markers
+        .iter()
+        .any(|m| matches!(m, oxideav_jpeg2000::TilePartMarker::Plt(_)))));
+    assert!(GRAY_OPJ_SOP_EPH_PLT_TLM_TILED
+        .windows(2)
+        .any(|w| w == [0xFF, 0x55]));
+    let img = decode_j2k(GRAY_OPJ_SOP_EPH_PLT_TLM_TILED).expect("decode");
+    // P5 header: three newline-terminated lines, then 1024 samples.
+    let src =
+        &GRAY_OPJ_SOP_EPH_PLT_TLM_TILED_SRC[GRAY_OPJ_SOP_EPH_PLT_TLM_TILED_SRC.len() - 1024..];
+    let want: Vec<i32> = src.iter().map(|&b| i32::from(b)).collect();
+    assert_eq!(img.components[0].samples, want);
 }
 
 /// §A.7.1 / §A.7.3 pointer-marker **exploitation** (round 416): the

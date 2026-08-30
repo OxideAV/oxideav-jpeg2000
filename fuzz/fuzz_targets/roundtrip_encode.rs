@@ -18,7 +18,8 @@
 //! * all six Table A.19 Annex D styles — §D.6 bypass, context reset,
 //!   §D.4.2 per-pass termination, §D.7 vertically causal contexts,
 //!   predictable termination, §D.5 segmentation symbols — SOP / EPH
-//!   framing, §A.7.4 / §A.7.5 PPM / PPT header relocation;
+//!   framing, §A.7.4 / §A.7.5 PPM / PPT header relocation, the §A.7.1
+//!   TLM / §A.7.3 PLT pointer markers;
 //! * SIZ component sub-sampling, per-component `COC` / `QCC`
 //!   overrides (mixed kernels included), the Annex H Maxshift ROI;
 //! * the T.814 lanes — HTONLY (`high_throughput`), the `Z_blk = 3`
@@ -244,6 +245,8 @@ fuzz_target!(|data: &[u8]| {
         poc,
         component_overrides: component_overrides.clone(),
         packed_headers,
+        plt: c.bool(),
+        tlm: c.bool(),
         high_throughput: ht && !mixed,
         ht_refinement: mode == 5,
         ht_mixed: mixed,
