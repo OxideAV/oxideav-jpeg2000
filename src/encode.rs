@@ -1704,7 +1704,7 @@ fn encode_core(
     }
     if params
         .target_psnr
-        .is_some_and(|p| !(p > 0.0) || !p.is_finite())
+        .is_some_and(|p| p.is_nan() || p.is_infinite() || p <= 0.0)
     {
         return Err(Error::NotImplemented);
     }
