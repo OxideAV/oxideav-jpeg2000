@@ -31,8 +31,18 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
   PLT + TLM tiled stream is vendored as a decode fixture pinning that
   the `Iplt` span starts at the SOP.
 
+- **Encoder: PCRD PSNR floor** — `EncodeParams::target_psnr` (dB)
+  bisects the same Equation J-13 slope threshold as `target_bytes`
+  towards the smallest stream whose *decoded* PSNR (this crate's own
+  decoder on each exactly-assembled candidate, all components, in the
+  input sample domain) still reaches the floor; a floor the quantiser
+  cannot reach yields the full-rate stream. Mutually exclusive with
+  `target_bytes`; rejected by the HT lanes like the byte budget.
+
 ### Changed
 
+- `EncodeParams` no longer derives `Eq` (the PSNR floor is an `f64`);
+  `PartialEq` stays.
 - Clippy 1.98 `manual_slice_fill` sweep in the tier-1 pass-state
   resets.
 - **HTJ2K MIXED-set decode (T.814 §8.2 / §A.4)** — a tile-component

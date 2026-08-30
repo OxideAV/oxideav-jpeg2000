@@ -1185,7 +1185,7 @@ pub struct ComponentOverride {
 /// ([`encode_j2k_lossless`], [`encode_j2k_lossless_rct`],
 /// [`encode_j2k_lossy`], [`encode_j2k_lossy_ict`]) construct one
 /// internally.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct EncodeParams {
     /// `NL` — wavelet decomposition levels (SPcod, Table A.15;
     /// `0..=32`). Default `3`.
@@ -1235,6 +1235,19 @@ pub struct EncodeParams {
     /// effort). Composes with `layers` (the layer split then divides
     /// the *retained* passes). Default `None` (no rate control).
     pub target_bytes: Option<usize>,
+    /// PCRD quality control: a whole-image **PSNR floor in dB**,
+    /// measured on the reconstruction (this crate's own decoder run on
+    /// each candidate) against the input samples over every component
+    /// — `10·log10(peak² / MSE)` with `peak = 2^depth − 1`. The same
+    /// Equation J-13 slope threshold λ as [`EncodeParams::target_bytes`]
+    /// is bisected, here towards the **smallest** stream whose decoded
+    /// PSNR still reaches the target; every candidate is assembled
+    /// exactly (§C.2.9-terminated truncations), so the measurement is
+    /// the stream's real quality rather than a model estimate. A target
+    /// the full-rate stream itself cannot reach (the quantiser's own
+    /// distortion) yields the full stream. Mutually exclusive with
+    /// `target_bytes`. Default `None`.
+    pub target_psnr: Option<f64>,
     /// Tile grid `(XTsiz, YTsiz)` anchored at the reference-grid origin
     /// (T.800 §B.3 / Table A.9). Each tile transforms and codes
     /// independently and lands in its own `SOT`/`SOD` tile-part, in
@@ -1392,6 +1405,7 @@ impl Default for EncodeParams {
             precincts: Vec::new(),
             layers: 1,
             target_bytes: None,
+            target_psnr: None,
             tile_size: None,
             bypass: false,
             terminate_all: false,
@@ -1684,6 +1698,16 @@ fn encode_core(
     if params.layers == 0 {
         return Err(Error::NotImplemented);
     }
+    // One PCRD objective at a time, and a finite positive PSNR floor.
+    if params.target_bytes.is_some() && params.target_psnr.is_some() {
+        return Err(Error::NotImplemented);
+    }
+    if params
+        .target_psnr
+        .is_some_and(|p| !(p > 0.0) || !p.is_finite())
+    {
+        return Err(Error::NotImplemented);
+    }
     // T.814 Table A.4 / §8: the §D.6 / §D.4.2 styles do not apply to
     // HT code-blocks, and the PCRD machinery is Annex-D-pass based —
     // reject the combinations rather than mis-encode. (The Annex H ROI
@@ -1702,6 +1726,7 @@ fn encode_core(
     if params.high_throughput
         && (annex_d_styles
             || params.target_bytes.is_some()
+            || params.target_psnr.is_some()
             || (params.layers != 1 && params.ht_refinement))
     {
         return Err(Error::NotImplemented);
@@ -1717,6 +1742,7 @@ fn encode_core(
             || params.ht_refinement
             || annex_d_styles
             || params.target_bytes.is_some()
+            || params.target_psnr.is_some()
             || params.layers != 1
             || params.roi.is_some())
     {
@@ -2048,7 +2074,7 @@ fn encode_core(
     }
     use std::collections::BTreeMap;
     let layer_count = params.layers;
-    let rate_control = params.target_bytes.is_some();
+    let rate_control = params.target_bytes.is_some() || params.target_psnr.is_some();
     // Per-pass rates are needed to split layers, to rate-control, and —
     // with a termination style — to size each terminated codeword
     // segment (§B.10.7.2).
@@ -3295,12 +3321,42 @@ fn encode_core(
     };
 
     // -- PCRD rate control (T.800 Annex J.13.3) -------------------------
-    let Some(target) = params.target_bytes else {
-        return assemble(None, true);
+    enum Objective {
+        Bytes(usize),
+        Psnr(f64),
+    }
+    let objective = match (params.target_bytes, params.target_psnr) {
+        (Some(b), _) => Objective::Bytes(b),
+        (None, Some(p)) => Objective::Psnr(p),
+        (None, None) => return assemble(None, true),
+    };
+    // Decoded PSNR of a candidate stream against the input planes
+    // (all components, in the input sample domain).
+    let psnr_of = |stream: &[u8]| -> Result<f64, Error> {
+        let img = crate::decode::decode_j2k(stream)?;
+        let mut sse = 0.0f64;
+        let mut count = 0usize;
+        for (comp, plane) in img.components.iter().zip(planes) {
+            if comp.samples.len() != plane.len() {
+                return Err(Error::InvalidPacketHeader);
+            }
+            for (i, &got) in comp.samples.iter().enumerate() {
+                let e = f64::from(got - plane.get(i));
+                sse += e * e;
+            }
+            count += plane.len();
+        }
+        let peak = f64::from((1u32 << precision) - 1);
+        if sse == 0.0 || count == 0 {
+            return Ok(f64::INFINITY);
+        }
+        Ok(10.0 * (peak * peak / (sse / count as f64)).log10())
     };
     let full = assemble(None, true)?;
-    if full.len() <= target {
-        return Ok(full);
+    match objective {
+        Objective::Bytes(target) if full.len() <= target => return Ok(full),
+        Objective::Psnr(target) if psnr_of(&full)? < target => return Ok(full),
+        _ => {}
     }
     // Per-block monotone-slope truncation sets N_i (J.13.3): the subset
     // of pass boundaries whose rate-distortion slopes S = ΔD / ΔR are
@@ -3372,21 +3428,45 @@ fn encode_core(
         // Nothing coded anywhere — the minimal stream is the answer.
         return assemble(Some(&vec![0; num_blocks]), true);
     }
-    // Bisect λ in log space: len(λ) is non-increasing in λ, so keep the
-    // largest stream not exceeding the budget. J.13.3 notes the
-    // residual gap is small (typically well under 100 bytes).
+    // Bisect λ in log space: len(λ) and the decoded quality are both
+    // non-increasing in λ. For a byte budget keep the largest stream
+    // not exceeding it (J.13.3 notes the residual gap is small,
+    // typically well under 100 bytes); for a PSNR floor keep the
+    // smallest stream still reaching it — each candidate assembled
+    // exactly and decoded, so the floor is measured, not modelled.
     let mut lo = min_slope.ln() - 1.0; // ≈ include everything
     let mut hi = max_slope.ln() + 1.0; // include nothing
     let mut best: Option<Vec<u32>> = None;
-    for _ in 0..48 {
-        let mid = 0.5 * (lo + hi);
-        let trunc = pick(mid.exp());
-        let s = assemble(Some(&trunc), false)?;
-        if s.len() <= target {
-            best = Some(trunc);
-            hi = mid;
-        } else {
-            lo = mid;
+    match objective {
+        Objective::Bytes(target) => {
+            for _ in 0..48 {
+                let mid = 0.5 * (lo + hi);
+                let trunc = pick(mid.exp());
+                let s = assemble(Some(&trunc), false)?;
+                if s.len() <= target {
+                    best = Some(trunc);
+                    hi = mid;
+                } else {
+                    lo = mid;
+                }
+            }
+        }
+        Objective::Psnr(target) => {
+            for _ in 0..28 {
+                let mid = 0.5 * (lo + hi);
+                let trunc = pick(mid.exp());
+                let s = assemble(Some(&trunc), true)?;
+                if psnr_of(&s)? >= target {
+                    best = Some(trunc);
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            if best.is_none() {
+                // Only the untruncated stream reaches the floor.
+                return Ok(full);
+            }
         }
     }
     let trunc = best.unwrap_or_else(|| vec![0; num_blocks]);
@@ -4203,6 +4283,137 @@ mod tests {
                     assert!(max_err <= 1, "bypass lossy error {max_err}")
                 }
             }
+        }
+    }
+
+    // -- PCRD PSNR floor -------------------------------------------------
+
+    fn psnr_db(img: &crate::DecodedImage, planes: &[&[u8]]) -> f64 {
+        let mut sse = 0.0f64;
+        let mut n = 0usize;
+        for (c, p) in img.components.iter().zip(planes) {
+            for (&g, &w) in c.samples.iter().zip(p.iter()) {
+                sse += f64::from(g - i32::from(w)).powi(2);
+            }
+            n += p.len();
+        }
+        if sse == 0.0 {
+            return f64::INFINITY;
+        }
+        10.0 * (255.0 * 255.0 / (sse / n as f64)).log10()
+    }
+
+    #[test]
+    fn target_psnr_yields_smallest_stream_reaching_the_floor() {
+        // Rising floors cost monotonically more bytes, each decoded
+        // stream really reaches its floor, and the next-coarser λ step
+        // would not (the search is tight to one truncation step).
+        let (w, h) = (48u32, 48u32);
+        let p = noise(w, h, 0x2B5A_3A11);
+        for kernel in [
+            EncodeKernel::Lossless5x3,
+            // Δb = 1: genuinely lossy on noise (finer steps reconstruct
+            // this 8-bit input exactly after rounding, which would make
+            // every floor reachable).
+            EncodeKernel::Lossy9x7 { fine_bits: 0 },
+        ] {
+            let base = EncodeParams {
+                decomposition_levels: 2,
+                code_block_exp: (4, 4),
+                kernel,
+                layers: 2,
+                ..EncodeParams::default()
+            };
+            let full = encode_j2k(&[&p], w, h, &base).expect("full");
+            let mut prev_len = 0usize;
+            for target in [22.0, 30.0, 38.0] {
+                let params = EncodeParams {
+                    target_psnr: Some(target),
+                    ..base.clone()
+                };
+                let stream = encode_j2k(&[&p], w, h, &params).expect("psnr encode");
+                let img = decode_j2k(&stream).expect("decode");
+                let got = psnr_db(&img, &[&p]);
+                assert!(got >= target, "{kernel:?} target {target}: got {got}");
+                assert!(
+                    got < target + 6.0,
+                    "{kernel:?} target {target}: loose {got}"
+                );
+                assert!(stream.len() < full.len(), "truncated below full rate");
+                assert!(stream.len() > prev_len, "more bytes for a higher floor");
+                prev_len = stream.len();
+            }
+            // A floor the 9-7 quantiser cannot reach hands back the full
+            // stream; the reversible kernel reaches any finite floor —
+            // still bit-exact, never longer than the full stream (a
+            // trailing pass that changes no reconstructed sample may go).
+            let params = EncodeParams {
+                target_psnr: Some(200.0),
+                ..base.clone()
+            };
+            let stream = encode_j2k(&[&p], w, h, &params).expect("200 dB floor");
+            match kernel {
+                EncodeKernel::Lossy9x7 { .. } => {
+                    assert!(psnr_db(&decode_j2k(&full).expect("decode"), &[&p]).is_finite());
+                    assert_eq!(stream, full);
+                }
+                EncodeKernel::Lossless5x3 => {
+                    assert!(stream.len() <= full.len());
+                    let img = decode_j2k(&stream).expect("decode");
+                    assert!(psnr_db(&img, &[&p]).is_infinite());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn target_psnr_composes_with_rct_tiles_styles_and_rejects_conflicts() {
+        let (w, h) = (40u32, 36u32);
+        let r = noise(w, h, 11);
+        let g = noise(w, h, 12);
+        let b = noise(w, h, 13);
+        let params = EncodeParams {
+            decomposition_levels: 2,
+            code_block_exp: (3, 3),
+            mct: true,
+            tile_size: Some((24, 20)),
+            bypass: true,
+            terminate_all: true,
+            sop: true,
+            plt: true,
+            target_psnr: Some(32.0),
+            ..EncodeParams::default()
+        };
+        let stream = encode_j2k(&[&r, &g, &b], w, h, &params).expect("encode");
+        let img = decode_j2k(&stream).expect("decode");
+        let got = psnr_db(&img, &[&r, &g, &b]);
+        assert!((32.0..40.0).contains(&got), "{got}");
+        for bad in [
+            EncodeParams {
+                target_bytes: Some(1000),
+                ..params.clone()
+            },
+            EncodeParams {
+                target_psnr: Some(0.0),
+                ..params.clone()
+            },
+            EncodeParams {
+                target_psnr: Some(f64::NAN),
+                ..params.clone()
+            },
+            EncodeParams {
+                mct: false,
+                tile_size: None,
+                bypass: false,
+                terminate_all: false,
+                high_throughput: true,
+                ..params.clone()
+            },
+        ] {
+            assert!(matches!(
+                encode_j2k(&[&r, &g, &b], w, h, &bad),
+                Err(Error::NotImplemented)
+            ));
         }
     }
 

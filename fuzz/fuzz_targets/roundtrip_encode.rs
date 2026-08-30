@@ -13,7 +13,7 @@
 //!   `fine_bits` step) and the Table A.17 MCT pairings;
 //! * all five §B.12.1 progression orders, §B.6 user precinct
 //!   partitions, §A.6.6 full-coverage `POC` entries;
-//! * quality layers, Annex J.13.3 PCRD byte budgets, multi-tile
+//! * quality layers, Annex J.13.3 PCRD byte budgets and PSNR floors, multi-tile
 //!   grids, §A.4.2 tile-part splits on every axis;
 //! * all six Table A.19 Annex D styles — §D.6 bypass, context reset,
 //!   §D.4.2 per-pass termination, §D.7 vertically causal contexts,
@@ -221,6 +221,12 @@ fuzz_target!(|data: &[u8]| {
     } else {
         None
     };
+    // PCRD PSNR floor (exclusive with the byte budget by contract).
+    let target_psnr = if !ht && target_bytes.is_none() && c.bool() {
+        Some(15.0 + f64::from(c.u8() % 40))
+    } else {
+        None
+    };
 
     let params = EncodeParams {
         decomposition_levels: nl,
@@ -231,6 +237,7 @@ fuzz_target!(|data: &[u8]| {
         precincts,
         layers,
         target_bytes,
+        target_psnr,
         tile_size,
         bypass,
         terminate_all,
@@ -284,7 +291,7 @@ fuzz_target!(|data: &[u8]| {
 
     // Reversible full-rate path: bit-exact round trip.
     let reversible = matches!(kernel, EncodeKernel::Lossless5x3) && !lossy_override;
-    if reversible && target_bytes.is_none() {
+    if reversible && target_bytes.is_none() && target_psnr.is_none() {
         for (comp, plane) in planes_data.iter().enumerate() {
             let dc = &img.components[comp];
             assert_eq!(
