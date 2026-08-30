@@ -88,15 +88,17 @@
 //! each k` — given the per-component `(NL_i, numprecincts(r, i))`
 //! input. [`progression::lrcp_packet_order`] returns the typed
 //! [`progression::PacketDescriptor`] sequence the §B.10 packet reader
-//! consumes. The other four §B.12 progression orders (RLCP / RPCL /
-//! PCRL / CPRL) land in later rounds.
+//! consumes; all five §B.12.1 orders (and the §B.12.2 POC volume walk)
+//! have dedicated drivers alongside it.
 //!
 //! Full codestream-body decoding (tier-1 / tier-2 entropy decoding,
 //! dequantisation, the inverse DWT and MCT) is wired end-to-end in the
 //! [`decode`] module ([`decode_jpeg2000`] / [`decode_j2k`]), and the
-//! [`encode`] module provides a **lossless** reversible-5-3 encoder
-//! ([`encode_jpeg2000`] / [`encode::encode_j2k_lossless`]) whose output
-//! round-trips bit-exactly through the decoder.
+//! [`encode`] module carries the full forward path — lossless 5-3,
+//! lossy 9-7, the T.814 HT block coder, every Table A.19 coding style,
+//! quality layers with PCRD byte / PSNR control, the pointer and
+//! framing markers, and the Annex I JP2 / T.814 Annex D JPH container
+//! writer ([`jp2::write_jp2`]) — see the README's Encoder section.
 //!
 //! ## Clean-room provenance
 //!

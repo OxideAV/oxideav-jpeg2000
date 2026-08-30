@@ -6,7 +6,7 @@ rust-version = "1.80"
 license = "MIT"
 repository = "https://github.com/OxideAV/oxideav-jpeg2000"
 authors = ["Mark Karpeles"]
-description = "Pure-Rust JPEG 2000 (J2K + JP2) codec — orphan-rebuild scaffold pending clean-room re-implementation."
+description = "Pure-Rust JPEG 2000 codec — Part 1 (T.800) + HTJ2K (T.814) decoder and encoder, J2K / JP2 / JPH containers."
 
 readme = "README.md"
 homepage = "https://github.com/OxideAV/oxideav-jpeg2000"

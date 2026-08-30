@@ -255,6 +255,7 @@ fuzz_target!(|data: &[u8]| {
         packed_headers,
         plt: c.bool(),
         tlm: c.bool(),
+        comment: c.bool().then(|| "fuzz".into()),
         high_throughput: ht && !mixed,
         ht_refinement: mode == 5,
         ht_mixed: mixed,

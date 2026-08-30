@@ -347,12 +347,20 @@ it):
   progressive state stays in lock-step by construction. A segmented
   scheduler terminates codeword segments per Table D.9 / §D.4.2 when a
   termination style is signalled.
-- **Coding styles on encode** — the §D.6 **selective
-  arithmetic-coding bypass** (Table A.19 bit 0: SP / MR passes from
+- **All six Table A.19 coding styles on encode** — the §D.6
+  **selective arithmetic-coding bypass** (bit 0: SP / MR passes from
   bit-plane 5 write raw bits through a §D.6 stuff-bit writer while
-  cleanups stay MQ) and §D.4.2 **termination on each coding pass**
-  (bit 2), separately or composed, with the §B.10.7.2 multi-segment
-  length sequences written by the generalised tier-2 writer.
+  cleanups stay MQ), **context reset on every pass boundary** (bit 1,
+  the Table D.7 states), §D.4.2 **termination on each coding pass**
+  (bit 2), §D.7 **vertically causal context formation** (bit 3),
+  §D.4.2 **predictable termination** (bit 4 — the reproducible MQ
+  termination procedure, and the §D.6 alternating 0/1 fill with the
+  post-`0xFF` stuffed byte on raw segments), and the §D.5
+  **segmentation symbol** (bit 5, the four UNIFORM-context bits of
+  `0xA` closing every cleanup pass) — separately or composed, with
+  the §B.10.7.2 multi-segment length sequences written by the
+  generalised tier-2 writer. Mis-signalling probes pin that the
+  decision-changing bits are really in the coded stream.
 - **Forward DWT** (§F.4) — 1-D + 2-D 5-3 (bit-exact inverse pair) and
   9-7 (round-off-exact) analysis over the same PSEO extension, with the
   lifting parity and Table B.1 band corners anchored at each tile's
@@ -383,6 +391,13 @@ it):
     independent decoder's layer-limited decodes improve monotonically
     (measured MSE 4373 → 50 → 1.3 → exact on a lossless 4-layer
     stream) while full decode stays bit-exact.
+  - **PCRD quality control** (`target_psnr`): the same Equation J-13
+    threshold λ bisected the other way — each candidate is assembled
+    exactly and decoded through this crate's own decoder, and the
+    smallest stream whose *measured* PSNR (all components, input
+    sample domain) still reaches the floor wins; a floor the
+    quantiser cannot reach yields the full-rate stream, and rising
+    floors cost monotonically more bytes.
   - **PCRD rate control** (Annex J.13.3): per-block monotone-slope
     truncation sets over `(R^n, D^n)` — distortions from a §E.1.1.2
     midpoint-reconstruction model weighted by the sub-band
@@ -431,6 +446,19 @@ it):
     lane (all 8-bit shapes fit; 9-7 up to `fine_bits = 4`, deeper
     inputs up to 12-bit) — an overflowing combination is cleanly
     rejected. Composes with RCT, tiles, sub-sampling and PPM / PPT.
+  - **`PLT` / `TLM` pointer markers** (§A.7.3 / §A.7.1): `plt` puts
+    packet-length lists in every tile-part header (Table A.36 `Iplt`
+    — SOP + header + EPH + data in-stream, SOP + data under PPM / PPT
+    relocation — chunked into `Zplt`-indexed segments on completed
+    entries) and `tlm` a main-header `Ztlm` series announcing every
+    tile-part's `Psot` (`ST = 1` up to 255 tiles, `ST = 2` beyond,
+    32-bit `Ptlm`), laid out before emission. Both satisfy this
+    decoder's §A.7 pointer cross-validation (which rejects any
+    corrupted entry) across framings, relocations, splits, styles,
+    PCRD, ROI and the HT lanes; an opaque-encoder SOP + EPH + PLT +
+    TLM fixture pins the `Iplt`-spans-from-SOP convention.
+  - **`COM` comment** (§A.9.2): a main-header `Rcom = 1` Latin text
+    segment via `EncodeParams::comment`.
   - **Packed packet headers** (§A.7.4 / §A.7.5): every §B.10 packet
     header relocated out of the tile-part bodies into per-tile `PPT`
     marker segments (carried in the tile's first tile-part header) or
@@ -460,8 +488,33 @@ it):
   knob sets the uniform Equation E-3 step `Δb = 2^(−fine_bits)`.
   Optional §G.3.1 **ICT** (`encode_j2k_lossy_ict`, MCT = 1 with the
   9-7 kernel per Table A.17).
+- **JP2 / JPH container writer** (`jp2::write_jp2`, T.800 Annex I /
+  T.814 Annex D): Signature + File Type (`'jp2 '`, or the `'jph '`
+  brand with `'jp2 '` compatibility when `Rsiz` signals HTJ2K) + JP2
+  Header — `ihdr` derived from the codestream's `SIZ` (`bpcc` when
+  component depths diverge), enumerated / restricted-ICC `colr`
+  boxes (plus the T.814 Table D.1 Any-ICC and parameterized methods,
+  JPH-only), `pclr` + `cmap` palettes, `cdef` channel definitions,
+  `res` capture / display grids — + the Contiguous Codestream box.
+  The writer re-parses its own output, so a returned file always
+  reads; `Jp2WriteOptions::for_components` supplies the conventional
+  greyscale / sRGB (+ opacity `cdef`) header and `encode_jp2` /
+  `encode_jp2_with` / `encode_jp2_u16` go straight from planes to a
+  file. An opaque decoder reproduces every shape byte-exactly —
+  including the `cdef` BGR reorder, the palette expansion, the alpha
+  channels (emitted as RGBA / grey + alpha), and the JPH file
+  through two independent HT decoders.
+- The §G.2 / §G.3 **MCT covers any plane count ≥ 3** (components
+  0–2 transform; further components — alpha — code untouched).
 - The `oxideav-core` registry installs the **`Encoder` trait** impl
-  alongside the decoder (`make_encoder`), and the historical
+  alongside the decoder (`make_encoder`): one packed interleaved
+  plane per frame in `Gray8` / `Rgb24` / `Bgr24` / `Rgba` / `Bgra`
+  or the little-endian `Gray10Le` / `Gray12Le` / `Gray16Le` /
+  `Rgb48Le` / `Rgba64Le` layouts, `bit_rate` (over `frame_rate`, or
+  per frame) as a PCRD byte budget, and a `CodecOptions` bag
+  (`lossless`, `fine_bits`, `psnr`, `target_bytes`, `levels`,
+  `layers`, `progression`, `tile`, `ht`, `plt` / `tlm` / `sop` /
+  `eph`, `comment`, `container = jp2`). The historical
   `encode_jpeg2000(pixels, w, h)` byte-vector entry point encodes 1-
   (gray) and 3-component (RGB via RCT) interleaved 8-bit input.
 
@@ -530,6 +583,11 @@ combination.
 
 These surface a clean `Error::NotImplemented` rather than mis-decoding:
 
+- **`PLM`** (§A.7.2, main-header packet lengths): not emitted — this
+  crate's decoder treats a `PLM` as an opaque main-header segment
+  rather than cross-validating it, so an emitted `PLM` would be
+  unverifiable here; `PLT` + `TLM` carry the same information in
+  validated form.
 - A mixed-kernel tile that also signals a multiple-component transform
   (`Rmct = 1`) — the RCT / ICT requires one kernel across components
   0–2. (The `COC` overrides themselves — per-component `NL` /

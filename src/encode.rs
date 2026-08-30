@@ -860,8 +860,17 @@ fn encode_code_block(
             ctx = reset_contexts();
         }
         if pass_rates {
+            // Mid-span truncation estimate (§D.4.3): always the §C.2.9
+            // FLUSH length. The §D.4.2 predictable procedure applies
+            // only to *real* terminations — its length can run a byte
+            // short of what a prefix decode of the ongoing segment
+            // needs, which starved layer-limited decodes when the
+            // predictable style was set without per-pass termination
+            // (fuzz find, r452). Boundaries the coder actually
+            // terminates are pinned to the exact committed length
+            // below, so this estimate never mislabels them.
             let pending = match &sink {
-                Sink::Mq(e) => flush_mq(e.clone()).len(),
+                Sink::Mq(e) => e.clone().flush().len(),
                 Sink::Raw(w) => finish_raw(w.clone()).len(),
             };
             rates.push((committed.len() + pending) as u32);
@@ -4577,6 +4586,39 @@ mod tests {
                 Err(Error::NotImplemented)
             ));
         }
+    }
+
+    #[test]
+    fn predictable_termination_with_layers_keeps_prefix_decodes_alive() {
+        // Fuzz regression (roundtrip_encode, r452): reset + predictable
+        // + segmentation symbols over 3 quality layers WITHOUT per-pass
+        // termination — the layer cuts land mid-segment, so their rates
+        // are §D.4.3 length estimates and must use the §C.2.9 FLUSH
+        // length (the §D.4.2 predictable length can run a byte short
+        // and starve the layer-1 prefix decode).
+        let (w, h) = (31u32, 32u32);
+        let mut seed = 0u8;
+        let p: Vec<u8> = (0..w * h)
+            .map(|k| {
+                seed = seed.wrapping_mul(197).wrapping_add(k as u8);
+                seed
+            })
+            .collect();
+        let params = EncodeParams {
+            decomposition_levels: 3,
+            code_block_exp: (5, 5),
+            progression: ProgressionOrder::Rlcp,
+            layers: 3,
+            reset_probabilities: true,
+            predictable_termination: true,
+            segmentation_symbols: true,
+            ..EncodeParams::default()
+        };
+        let stream = roundtrip_params(&[&p], w, h, &params);
+        for l in 1..=3 {
+            crate::decode_j2k_layers(&stream, l).expect("layer-limited decode");
+        }
+        crate::decode_j2k_reduced(&stream, 1).expect("reduced decode");
     }
 
     // -- §A.7.1 TLM / §A.7.3 PLT pointer markers on encode ---------------

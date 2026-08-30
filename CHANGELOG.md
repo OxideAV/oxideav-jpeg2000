@@ -72,8 +72,26 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
   images into the matching little-endian formats instead of refusing
   them.
 
+### Fixed
+
+- **Fuzz find (r452 round-trip harness): layer-limited decodes of a
+  segmentation-symbol stream without per-pass termination** could
+  surface `SegmentationSymbolMismatch` — a quality-layer cut is a
+  §D.4.3 *length estimate* mid-segment, so the prefix's tail decisions
+  may diverge under the §D.4.1 fill and the §D.5 symbol then flags the
+  deliberate truncation as corruption. The mid-span layer-cut rates
+  now always use the §C.2.9 FLUSH length (the §D.4.2 predictable
+  procedure applies only to real terminations), and the tier-1 driver
+  treats a mismatch on the *final* accumulated segment of a block whose
+  later-layer contributions were deliberately dropped as the §J.7
+  keep-what-decoded truncation artefact; full decodes still surface
+  every mismatch.
+
 ### Changed
 
+- README encoder section, crate description and module docs rewritten
+  to the current encoder surface (all six Table A.19 styles, PLT /
+  TLM, PSNR control, COM, JP2 / JPH writer, registry parameters).
 - `EncodeParams` no longer derives `Eq` (the PSNR floor is an `f64`);
   `PartialEq` stays.
 - Clippy 1.98 `manual_slice_fill` sweep in the tier-1 pass-state

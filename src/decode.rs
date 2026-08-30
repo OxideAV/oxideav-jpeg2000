@@ -563,6 +563,13 @@ struct BlockAccum {
     /// (`Some` iff the block sits in a MIXED tile-component; the last
     /// contribution's verdict — the resolution is monotone).
     mixed: Option<crate::packet::MixedBlockType>,
+    /// Set when a layer-limited decode dropped one of this block's
+    /// later-layer contributions: the accumulated segments are a
+    /// deliberate prefix of the coded data, so a §D.5 segmentation
+    /// symbol at the very tail may be unverifiable (the decisions past
+    /// the cut diverge under the §D.4.1 fill) — the tier-1 driver then
+    /// keeps the decoded passes instead of surfacing the mismatch.
+    layer_truncated: bool,
 }
 
 /// One accumulated §C.3 codeword segment for a code-block.
@@ -1839,9 +1846,6 @@ fn decode_tile_from_plan(
             // §B.12.2 per-precinct "next unsent layer" cursor is
             // monotone), so this is a per-block prefix truncation —
             // the same decode shape as a rate-truncated stream.
-            if desc.layer >= max_layers {
-                continue;
-            }
             let key: BlockKey = (
                 desc.component,
                 desc.resolution,
@@ -1850,6 +1854,16 @@ fn decode_tile_from_plan(
                 contrib.x,
                 contrib.y,
             );
+            if desc.layer >= max_layers {
+                // A dropped later-layer contribution leaves any earlier
+                // accumulation a deliberate prefix.
+                if contrib.coding_passes > 0 {
+                    if let Some(entry) = accum.get_mut(&key) {
+                        entry.layer_truncated = true;
+                    }
+                }
+                continue;
+            }
             let entry = accum.entry(key).or_default();
             entry.passes = entry
                 .passes
@@ -2276,7 +2290,8 @@ fn decode_tile_from_plan(
         // carrying every pass; the §D.4.2 per-pass case is one iteration
         // per terminated pass; the §D.6 bypass case alternates AC and
         // raw spans (each raw span opens a fresh RawBitReader instead).
-        for seg in segments {
+        let last_coded = segments.iter().rposition(|seg| seg.passes > 0);
+        for (si, seg) in segments.iter().enumerate() {
             if seg.passes == 0 {
                 continue;
             }
@@ -2287,7 +2302,23 @@ fn decode_tile_from_plan(
                 seq.decode_passes_raw(&mut block, &mut raw, seg.passes)?;
             } else {
                 let mut decoder = crate::mq::MqDecoder::new(&seg.bytes);
-                seq.decode_passes(&mut block, &mut decoder, &mut ctx, seg.passes)?;
+                match seq.decode_passes(&mut block, &mut decoder, &mut ctx, seg.passes) {
+                    Ok(_) => {}
+                    // §D.5 positions the segmentation symbol as error
+                    // *detection*. On a layer-limited decode the final
+                    // accumulated pass is a deliberate prefix cut whose
+                    // tail decisions may diverge under the §D.4.1 fill,
+                    // so a mismatch on the last coded segment is the
+                    // expected truncation artefact (§J.7 resilience:
+                    // keep the decoded passes), not stream corruption.
+                    // A full decode still surfaces it.
+                    Err(Error::SegmentationSymbolMismatch)
+                        if acc.layer_truncated && Some(si) == last_coded =>
+                    {
+                        break;
+                    }
+                    Err(e) => return Err(e),
+                }
                 // §D.4.2 predictable termination (Table A.19 bit 4)
                 // constrains the *encoder's* flush procedure only — the
                 // decode path is unchanged and the §D.4.1 synthesised
