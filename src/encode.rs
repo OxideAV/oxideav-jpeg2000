@@ -1350,6 +1350,11 @@ pub struct EncodeParams {
     /// with `ST = 1` (8-bit `Ttlm`) while every tile index fits, else
     /// `ST = 2`, and `SP = 1` (32-bit `Ptlm`). Default `false`.
     pub tlm: bool,
+    /// §A.9.2 comment: when set, one main-header `COM` marker segment
+    /// with `Rcom = 1` (Table A.44, ISO/IEC 8859-15 text) carries the
+    /// string — ASCII only here (a subset of 8859-15), non-empty, at
+    /// most 65 531 bytes. Default `None`.
+    pub comment: Option<String>,
     /// T.814 HTJ2K block coding (SPcod bit 6): every code-block is
     /// coded by the §7.3 HT cleanup forward coder (plus, with
     /// [`EncodeParams::ht_refinement`], the §7.4 / §7.5 refinement
@@ -1423,6 +1428,7 @@ impl Default for EncodeParams {
             packed_headers: PackedHeaders::InStream,
             plt: false,
             tlm: false,
+            comment: None,
             high_throughput: false,
             ht_refinement: false,
             ht_mixed: false,
@@ -1747,6 +1753,14 @@ fn encode_core(
     }
     // Table A.14: at least one quality layer.
     if params.layers == 0 {
+        return Err(Error::NotImplemented);
+    }
+    // Table A.43 / A.44: a non-empty Latin comment that fits Lcom.
+    if params
+        .comment
+        .as_ref()
+        .is_some_and(|c| c.is_empty() || !c.is_ascii() || c.len() > 65_535 - 4)
+    {
         return Err(Error::NotImplemented);
     }
     // One PCRD objective at a time, and a finite positive PSNR floor.
@@ -3302,6 +3316,14 @@ fn encode_core(
             layouts.push(tile_layout);
         }
 
+        // COM (§A.9.2, Tables A.43 / A.44): Rcom = 1, Latin text.
+        if let Some(text) = &params.comment {
+            let mut payload = Vec::with_capacity(2 + text.len());
+            payload.extend_from_slice(&1u16.to_be_bytes());
+            payload.extend_from_slice(text.as_bytes());
+            push_segment(&mut out, crate::MARKER_COM, &payload);
+        }
+
         // TLM (§A.7.1, Tables A.33 / A.34): one (Ttlm, Ptlm) per
         // tile-part in codestream order, Ptlm = Psot. ST = 1 while
         // every Isot fits the 8-bit Ttlm range 0..=254, else ST = 2;
@@ -4334,6 +4356,41 @@ mod tests {
                     assert!(max_err <= 1, "bypass lossy error {max_err}")
                 }
             }
+        }
+    }
+
+    // -- §A.9.2 COM ----------------------------------------------------
+
+    #[test]
+    fn comment_lands_in_the_main_header_with_rcom_1() {
+        let p = noise(16, 16, 5);
+        let params = EncodeParams {
+            comment: Some("oxideav-jpeg2000 r452".into()),
+            ..EncodeParams::default()
+        };
+        let stream = roundtrip_params(&[&p], 16, 16, &params);
+        let off = stream
+            .windows(2)
+            .position(|x| x == [0xFF, 0x64])
+            .expect("COM");
+        let sot = stream
+            .windows(2)
+            .position(|x| x == [0xFF, 0x90])
+            .expect("SOT");
+        assert!(off < sot, "main header");
+        let lcom = usize::from(u16::from_be_bytes([stream[off + 2], stream[off + 3]]));
+        assert_eq!(lcom, 2 + 2 + "oxideav-jpeg2000 r452".len());
+        assert_eq!(&stream[off + 4..off + 6], &[0, 1], "Rcom = 1");
+        assert_eq!(&stream[off + 6..off + 2 + lcom], b"oxideav-jpeg2000 r452");
+        for bad in ["", "caf\u{e9}"] {
+            let params = EncodeParams {
+                comment: Some(bad.into()),
+                ..EncodeParams::default()
+            };
+            assert!(matches!(
+                encode_j2k(&[&p], 16, 16, &params),
+                Err(Error::NotImplemented)
+            ));
         }
     }
 

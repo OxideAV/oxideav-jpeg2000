@@ -59,6 +59,19 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
   (an RGBA image keeps its alpha plane untouched) instead of requiring
   exactly three planes.
 
+- **Encoder: `COM` marker** — `EncodeParams::comment` writes one
+  main-header §A.9.2 comment segment (`Rcom = 1`, ASCII text).
+- **Registry `Encoder` honours `CodecParameters`** — packed `Gray8` /
+  `Rgb24` / `Bgr24` / `Rgba` / `Bgra` and the 16-bit `Gray16Le` /
+  `Gray10Le` / `Gray12Le` / `Rgb48Le` / `Rgba64Le` layouts (BGR orders
+  re-mapped onto components), `bit_rate` (+ `frame_rate`) as a
+  per-frame PCRD budget, and a `CodecOptions` bag (`lossless`,
+  `fine_bits`, `psnr`, `target_bytes`, `levels`, `layers`,
+  `progression`, `tile`, `ht`, `plt` / `tlm` / `sop` / `eph`,
+  `comment`, `container = jp2`). The registry `Decoder` packs 9–16-bit
+  images into the matching little-endian formats instead of refusing
+  them.
+
 ### Changed
 
 - `EncodeParams` no longer derives `Eq` (the PSNR floor is an `f64`);
