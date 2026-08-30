@@ -1301,6 +1301,333 @@ fn apply_channel_mapping(
     })
 }
 
+// ---------------------------------------------------------------------------
+// JP2 / JPH writer (T.800 Annex I, T.814 Annex D).
+// ---------------------------------------------------------------------------
+
+/// What [`write_jp2`] puts into the JP2 Header superbox around a
+/// codestream (T.800 §I.5.3): the mandatory Image Header box is derived
+/// from the codestream's `SIZ`; everything here is the caller's
+/// colour / channel / resolution description.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Jp2WriteOptions {
+    /// Colour Specification boxes (§I.5.3.3), in precedence order. A
+    /// Part-1 JP2 file needs at least one; a JPH file (T.814 Annex D.2)
+    /// may omit them when [`Self::colourspace_unknown`] is set. The
+    /// enumerated method carries [`Colr::enumerated`], the restricted
+    /// ICC method [`Colr::icc_profile`]; the Any-ICC (`METH = 3`) and
+    /// parameterized (`METH = 5`) methods of T.814 Table D.1 are
+    /// written only into JPH files.
+    pub colour: Vec<Colr>,
+    /// Palette box (§I.5.3.4); requires [`Self::component_mapping`].
+    pub palette: Option<Pclr>,
+    /// Component Mapping box (§I.5.3.5); requires [`Self::palette`].
+    pub component_mapping: Option<Vec<CmapEntry>>,
+    /// Channel Definition box (§I.5.3.6).
+    pub channel_definitions: Option<Vec<ChannelDef>>,
+    /// Resolution superbox (§I.5.3.7) with its capture / display
+    /// grids.
+    pub resolution: Option<Resolution>,
+    /// `ihdr` `UnkC` (§I.5.3.1): the colour specification is only an
+    /// approximation of an unknown colourspace.
+    pub colourspace_unknown: bool,
+}
+
+impl Jp2WriteOptions {
+    /// A single enumerated Colour Specification box (`METH = 1`,
+    /// `PREC = 0`, `APPROX = 0`, Table I.10).
+    pub fn enumerated(cs: EnumCs) -> Self {
+        Jp2WriteOptions {
+            colour: vec![Colr {
+                method: ColrMethod::Enumerated,
+                precedence: 0,
+                approximation: 0,
+                enumerated: Some(cs),
+                icc_profile: None,
+                parameterized: None,
+            }],
+            palette: None,
+            component_mapping: None,
+            channel_definitions: None,
+            resolution: None,
+            colourspace_unknown: false,
+        }
+    }
+
+    /// The conventional description for a component count (§I.2.3 /
+    /// §I.2.4): 1 → greyscale, 2 → greyscale + one opacity channel, 3
+    /// → sRGB, 4 → sRGB + one opacity channel (a Channel Definition
+    /// box associating the trailing channel as whole-image opacity).
+    /// Other counts get no Colour Specification box and
+    /// `colourspace_unknown` set — writable only into a JPH file, or
+    /// after the caller supplies [`Self::colour`].
+    pub fn for_components(count: usize) -> Self {
+        let cs = match count {
+            1 | 2 => EnumCs::Greyscale,
+            3 | 4 => EnumCs::Srgb,
+            _ => {
+                return Jp2WriteOptions {
+                    colour: Vec::new(),
+                    palette: None,
+                    component_mapping: None,
+                    channel_definitions: None,
+                    resolution: None,
+                    colourspace_unknown: true,
+                }
+            }
+        };
+        let mut opts = Self::enumerated(cs);
+        if count == 2 || count == 4 {
+            let colours = (count - 1) as u16;
+            let mut defs: Vec<ChannelDef> = (0..colours)
+                .map(|c| ChannelDef {
+                    channel: c,
+                    channel_type: ChannelDef::TYPE_COLOUR,
+                    association: c + 1,
+                })
+                .collect();
+            defs.push(ChannelDef {
+                channel: colours,
+                channel_type: ChannelDef::TYPE_OPACITY,
+                association: 0,
+            });
+            opts.channel_definitions = Some(defs);
+        }
+        opts
+    }
+}
+
+/// Append one box (§I.4): `LBox` (32-bit, or `1` + 64-bit `XLBox`
+/// when the content outgrows it), `TBox`, then the content.
+fn push_box(out: &mut Vec<u8>, box_type: u32, content: &[u8]) {
+    let total = content.len() as u64 + 8;
+    if let Ok(lbox) = u32::try_from(total) {
+        out.extend_from_slice(&lbox.to_be_bytes());
+        out.extend_from_slice(&box_type.to_be_bytes());
+    } else {
+        out.extend_from_slice(&1u32.to_be_bytes());
+        out.extend_from_slice(&box_type.to_be_bytes());
+        out.extend_from_slice(&(total + 8).to_be_bytes());
+    }
+    out.extend_from_slice(content);
+}
+
+fn colr_content(colr: &Colr, jph: bool) -> Result<Vec<u8>, Error> {
+    let mut c = Vec::new();
+    match colr.method {
+        ColrMethod::Enumerated => {
+            let cs = colr.enumerated.ok_or(Error::NotImplemented)?;
+            c.push(1);
+            c.push(colr.precedence as u8);
+            c.push(colr.approximation);
+            let code = match cs {
+                EnumCs::Srgb => 16,
+                EnumCs::Greyscale => 17,
+                EnumCs::Sycc => 18,
+                EnumCs::Reserved(v) => v,
+            };
+            c.extend_from_slice(&code.to_be_bytes());
+        }
+        ColrMethod::RestrictedIccProfile | ColrMethod::AnyIcc => {
+            let profile = colr.icc_profile.as_ref().ok_or(Error::NotImplemented)?;
+            if profile.is_empty() || (colr.method == ColrMethod::AnyIcc && !jph) {
+                return Err(Error::NotImplemented);
+            }
+            c.push(if colr.method == ColrMethod::AnyIcc {
+                3
+            } else {
+                2
+            });
+            c.push(colr.precedence as u8);
+            c.push(colr.approximation);
+            c.extend_from_slice(profile);
+        }
+        ColrMethod::Parameterized => {
+            let p = colr.parameterized.ok_or(Error::NotImplemented)?;
+            if !jph {
+                return Err(Error::NotImplemented);
+            }
+            c.push(5);
+            c.push(colr.precedence as u8);
+            c.push(colr.approximation);
+            c.extend_from_slice(&p.colour_primaries.to_be_bytes());
+            c.extend_from_slice(&p.transfer_characteristics.to_be_bytes());
+            c.extend_from_slice(&p.matrix_coefficients.to_be_bytes());
+            c.push(if p.video_full_range { 0x80 } else { 0 });
+        }
+        ColrMethod::Reserved(_) => return Err(Error::NotImplemented),
+    }
+    Ok(c)
+}
+
+fn pclr_content(pclr: &Pclr) -> Result<Vec<u8>, Error> {
+    let ne = pclr.entries();
+    if !(1..=1024).contains(&ne) || pclr.columns.is_empty() || pclr.columns.len() > 255 {
+        return Err(Error::NotImplemented);
+    }
+    let mut c = Vec::new();
+    c.extend_from_slice(&(ne as u16).to_be_bytes());
+    c.push(pclr.columns.len() as u8);
+    for col in &pclr.columns {
+        if !(1..=38).contains(&col.bit_depth) || col.values.len() != ne {
+            return Err(Error::NotImplemented);
+        }
+        c.push((col.bit_depth - 1) | if col.signed { 0x80 } else { 0 });
+    }
+    for e in 0..ne {
+        for col in &pclr.columns {
+            let width = u32::from(col.bit_depth);
+            let v = i64::from(col.values[e]);
+            let (lo, hi) = if col.signed {
+                (-(1i64 << (width - 1)), (1i64 << (width - 1)) - 1)
+            } else {
+                (0, (1i64 << width) - 1)
+            };
+            if v < lo || v > hi {
+                return Err(Error::NotImplemented);
+            }
+            let raw = (v as u64) & ((1u64 << width) - 1);
+            let nbytes = usize::from(col.bit_depth).div_ceil(8);
+            for k in (0..nbytes).rev() {
+                c.push(((raw >> (8 * k)) & 0xFF) as u8);
+            }
+        }
+    }
+    Ok(c)
+}
+
+fn grid_resolution_content(g: &GridResolution) -> Vec<u8> {
+    let mut c = Vec::with_capacity(10);
+    c.extend_from_slice(&g.vertical_numerator.to_be_bytes());
+    c.extend_from_slice(&g.vertical_denominator.to_be_bytes());
+    c.extend_from_slice(&g.horizontal_numerator.to_be_bytes());
+    c.extend_from_slice(&g.horizontal_denominator.to_be_bytes());
+    c.push(g.vertical_exponent as u8);
+    c.push(g.horizontal_exponent as u8);
+    c
+}
+
+/// Wrap a J2K codestream into a **JP2** file (T.800 Annex I) — or a
+/// **JPH** file (T.814 Annex D) when the codestream's `SIZ` signals the
+/// HTJ2K capability (`Rsiz` bit 14).
+///
+/// Emits, in order: the Signature box, the File Type box (`BR` /
+/// `CLi` = `'jp2 '`, or `'jph '` with `'jp2 '` compatibility for an
+/// HT codestream; `MinV = 0`), the JP2 Header superbox — `ihdr`
+/// derived from `SIZ` (`HEIGHT = Ysiz − YOsiz`, `WIDTH = Xsiz − XOsiz`,
+/// `NC = Csiz`, `BPC` from the uniform `Ssiz` or `255` plus a `bpcc`
+/// box when the components differ, `C = 7`, `UnkC`, `IPR = 0`), then
+/// the boxes `options` describes (`colr`+, `pclr` + `cmap`, `cdef`,
+/// `res`) — and the Contiguous Codestream box. Every option is
+/// validated the way [`parse_jp2`] validates a file (the output is
+/// re-parsed before it is returned), so a returned file always parses.
+pub fn write_jp2(codestream: &[u8], options: &Jp2WriteOptions) -> Result<Vec<u8>, Error> {
+    let header = crate::parse_j2k_header(codestream)?;
+    let siz = &header.siz;
+    let jph = siz.rsiz & 0x4000 != 0;
+    let nc = siz.components.len();
+    if nc == 0 || nc > 16_384 {
+        return Err(Error::InvalidComponentCount);
+    }
+    if options.colour.is_empty() && !(jph && options.colourspace_unknown) {
+        return Err(Error::NotImplemented);
+    }
+    if options.palette.is_some() != options.component_mapping.is_some() {
+        return Err(Error::NotImplemented);
+    }
+
+    let mut out = Vec::with_capacity(codestream.len() + 128);
+    push_box(&mut out, BOX_TYPE_JP2_SIGNATURE, &JP2_SIGNATURE_MAGIC);
+
+    // File Type box (§I.5.2 / T.814 Annex D.3).
+    let mut ftyp = Vec::with_capacity(16);
+    if jph {
+        ftyp.extend_from_slice(&BRAND_JPH.to_be_bytes());
+        ftyp.extend_from_slice(&0u32.to_be_bytes());
+        ftyp.extend_from_slice(&BRAND_JPH.to_be_bytes());
+        ftyp.extend_from_slice(&BRAND_JP2.to_be_bytes());
+    } else {
+        ftyp.extend_from_slice(&BRAND_JP2.to_be_bytes());
+        ftyp.extend_from_slice(&0u32.to_be_bytes());
+        ftyp.extend_from_slice(&BRAND_JP2.to_be_bytes());
+    }
+    push_box(&mut out, BOX_TYPE_FTYP, &ftyp);
+
+    // JP2 Header superbox (§I.5.3).
+    let bpc_of =
+        |c: &crate::SizComponent| (c.precision_bits - 1) | if c.is_signed { 0x80 } else { 0 };
+    let first = bpc_of(&siz.components[0]);
+    let uniform = siz.components.iter().all(|c| bpc_of(c) == first);
+    let mut jp2h = Vec::new();
+    let mut ihdr = Vec::with_capacity(14);
+    ihdr.extend_from_slice(&(siz.y_size - siz.y_offset).to_be_bytes());
+    ihdr.extend_from_slice(&(siz.x_size - siz.x_offset).to_be_bytes());
+    ihdr.extend_from_slice(&(nc as u16).to_be_bytes());
+    ihdr.push(if uniform { first } else { 0xFF });
+    ihdr.push(7); // C
+    ihdr.push(u8::from(options.colourspace_unknown)); // UnkC
+    ihdr.push(0); // IPR
+    push_box(&mut jp2h, BOX_TYPE_IHDR, &ihdr);
+    if !uniform {
+        let bpcc: Vec<u8> = siz.components.iter().map(bpc_of).collect();
+        push_box(&mut jp2h, BOX_TYPE_BPCC, &bpcc);
+    }
+    for colr in &options.colour {
+        push_box(&mut jp2h, BOX_TYPE_COLR, &colr_content(colr, jph)?);
+    }
+    if let Some(pclr) = &options.palette {
+        push_box(&mut jp2h, BOX_TYPE_PCLR, &pclr_content(pclr)?);
+    }
+    if let Some(entries) = &options.component_mapping {
+        if entries.is_empty() {
+            return Err(Error::NotImplemented);
+        }
+        let mut c = Vec::with_capacity(entries.len() * 4);
+        for e in entries {
+            c.extend_from_slice(&e.component.to_be_bytes());
+            match e.mapping {
+                CmapMapping::Direct => c.extend_from_slice(&[0, 0]),
+                CmapMapping::Palette { column } => c.extend_from_slice(&[1, column]),
+            }
+        }
+        push_box(&mut jp2h, BOX_TYPE_CMAP, &c);
+    }
+    if let Some(defs) = &options.channel_definitions {
+        if defs.is_empty() || defs.len() > 0xFFFF {
+            return Err(Error::NotImplemented);
+        }
+        let mut c = Vec::with_capacity(2 + defs.len() * 6);
+        c.extend_from_slice(&(defs.len() as u16).to_be_bytes());
+        for d in defs {
+            c.extend_from_slice(&d.channel.to_be_bytes());
+            c.extend_from_slice(&d.channel_type.to_be_bytes());
+            c.extend_from_slice(&d.association.to_be_bytes());
+        }
+        push_box(&mut jp2h, BOX_TYPE_CDEF, &c);
+    }
+    if let Some(res) = &options.resolution {
+        let mut c = Vec::new();
+        if let Some(g) = &res.capture {
+            push_box(&mut c, BOX_TYPE_RESC, &grid_resolution_content(g));
+        }
+        if let Some(g) = &res.display {
+            push_box(&mut c, BOX_TYPE_RESD, &grid_resolution_content(g));
+        }
+        if c.is_empty() {
+            return Err(Error::NotImplemented);
+        }
+        push_box(&mut jp2h, BOX_TYPE_RES, &c);
+    }
+    push_box(&mut out, BOX_TYPE_JP2H, &jp2h);
+
+    // Contiguous Codestream box (§I.5.4).
+    push_box(&mut out, BOX_TYPE_JP2C, codestream);
+
+    // The writer's contract: what it emits, its own reader accepts.
+    parse_jp2(&out)?;
+    Ok(out)
+}
+
 /// Decode a JP2 / JPH **file** end-to-end: parse the Annex I box
 /// structure ([`parse_jp2`]), decode the contiguous codestream
 /// ([`crate::decode_j2k`]), then apply the JP2-Header channel
@@ -1334,6 +1661,389 @@ pub fn decode_jp2(bytes: &[u8]) -> Result<crate::DecodedImage, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- write_jp2 --------------------------------------------------------
+
+    fn plane(w: u32, h: u32, seed: u32) -> Vec<u8> {
+        let mut s = seed;
+        (0..w * h)
+            .map(|_| {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (s >> 24) as u8
+            })
+            .collect()
+    }
+
+    fn codestream(planes: &[&[u8]], w: u32, h: u32, ht: bool) -> Vec<u8> {
+        let params = crate::encode::EncodeParams {
+            decomposition_levels: 2,
+            high_throughput: ht,
+            ..crate::encode::EncodeParams::default()
+        };
+        crate::encode::encode_j2k(planes, w, h, &params).expect("encode")
+    }
+
+    fn assert_samples(img: &crate::DecodedImage, planes: &[&[u8]]) {
+        assert_eq!(img.components.len(), planes.len());
+        for (c, p) in img.components.iter().zip(planes) {
+            let got: Vec<u8> = c.samples.iter().map(|&v| v as u8).collect();
+            assert_eq!(got, *p);
+        }
+    }
+
+    #[test]
+    fn write_jp2_default_headers_per_component_count() {
+        let (w, h) = (20u32, 12u32);
+        let planes: Vec<Vec<u8>> = (0..4).map(|k| plane(w, h, 7 + k)).collect();
+        for n in 1..=4usize {
+            let refs: Vec<&[u8]> = planes[..n].iter().map(Vec::as_slice).collect();
+            let cs = codestream(&refs, w, h, false);
+            let file = write_jp2(&cs, &Jp2WriteOptions::for_components(n)).expect("write");
+            assert!(crate::looks_like_jp2(&file));
+            let c = parse_jp2(&file).expect("parse");
+            assert_eq!(c.ftyp.brand, BRAND_JP2);
+            assert_eq!(c.ftyp.minor_version, 0);
+            assert!(c.ftyp.is_jp2_compatible());
+            assert!(!c.ftyp.is_jph_compatible());
+            assert_eq!(c.header.ihdr.width, w);
+            assert_eq!(c.header.ihdr.height, h);
+            assert_eq!(usize::from(c.header.ihdr.component_count), n);
+            assert_eq!(c.header.ihdr.bpc, 7);
+            assert_eq!(c.header.ihdr.compression, 7);
+            assert_eq!(c.header.ihdr.colourspace_unknown, 0);
+            assert_eq!(c.header.ihdr.ipr, 0);
+            assert!(c.header.bpcc.is_none());
+            let expect_cs = if n <= 2 {
+                EnumCs::Greyscale
+            } else {
+                EnumCs::Srgb
+            };
+            assert_eq!(c.header.colr.len(), 1);
+            assert_eq!(c.header.colr[0].method, ColrMethod::Enumerated);
+            assert_eq!(c.header.colr[0].enumerated, Some(expect_cs));
+            if n == 2 || n == 4 {
+                let defs = c.header.cdef.as_ref().expect("opacity cdef");
+                assert_eq!(defs.len(), n);
+                assert_eq!(defs[n - 1].channel_type, ChannelDef::TYPE_OPACITY);
+                assert_eq!(defs[n - 1].association, 0);
+            } else {
+                assert!(c.header.cdef.is_none());
+            }
+            assert_eq!(
+                &file[c.codestream_offset..c.codestream_offset + c.codestream_len],
+                &cs[..]
+            );
+            assert_samples(&decode_jp2(&file).expect("decode"), &refs);
+        }
+        // Five components: no conventional colour description.
+        let refs: Vec<&[u8]> = planes.iter().map(Vec::as_slice).collect();
+        let five = [refs[0], refs[1], refs[2], refs[3], refs[0]];
+        let cs = codestream(&five, w, h, false);
+        let opts = Jp2WriteOptions::for_components(5);
+        assert!(opts.colour.is_empty() && opts.colourspace_unknown);
+        assert_eq!(write_jp2(&cs, &opts), Err(Error::NotImplemented));
+        let explicit = Jp2WriteOptions {
+            colourspace_unknown: true,
+            ..Jp2WriteOptions::enumerated(EnumCs::Srgb)
+        };
+        let file = write_jp2(&cs, &explicit).expect("explicit colr");
+        assert_eq!(
+            parse_jp2(&file)
+                .expect("parse")
+                .header
+                .ihdr
+                .colourspace_unknown,
+            1
+        );
+    }
+
+    #[test]
+    fn write_jp2_cdef_reorders_bgr_and_palette_expands() {
+        let (w, h) = (16u32, 16u32);
+        let r = plane(w, h, 1);
+        let g = plane(w, h, 2);
+        let b = plane(w, h, 3);
+        // Stored B, G, R; cdef associates channel 0 → colour 3 (blue),
+        // 1 → 2, 2 → 1, so the reader hands back R, G, B.
+        let cs = codestream(&[&b, &g, &r], w, h, false);
+        let opts = Jp2WriteOptions {
+            channel_definitions: Some(vec![
+                ChannelDef {
+                    channel: 0,
+                    channel_type: ChannelDef::TYPE_COLOUR,
+                    association: 3,
+                },
+                ChannelDef {
+                    channel: 1,
+                    channel_type: ChannelDef::TYPE_COLOUR,
+                    association: 2,
+                },
+                ChannelDef {
+                    channel: 2,
+                    channel_type: ChannelDef::TYPE_COLOUR,
+                    association: 1,
+                },
+            ]),
+            ..Jp2WriteOptions::enumerated(EnumCs::Srgb)
+        };
+        let file = write_jp2(&cs, &opts).expect("write");
+        assert_samples(&decode_jp2(&file).expect("decode"), &[&r, &g, &b]);
+
+        // Palette: a 4-entry index plane expands to three 8-bit
+        // colour channels through pclr + cmap.
+        let idx: Vec<u8> = (0..w * h).map(|k| (k % 4) as u8).collect();
+        let cs = codestream(&[&idx], w, h, false);
+        let lut = [[10i32, 20, 30], [200, 100, 0], [0, 0, 255], [255, 255, 255]];
+        let pclr = Pclr {
+            columns: (0..3)
+                .map(|c| PclrColumn {
+                    bit_depth: 8,
+                    signed: false,
+                    values: lut.iter().map(|e| e[c]).collect(),
+                })
+                .collect(),
+        };
+        let cmap: Vec<CmapEntry> = (0..3)
+            .map(|c| CmapEntry {
+                component: 0,
+                mapping: CmapMapping::Palette { column: c },
+            })
+            .collect();
+        let opts = Jp2WriteOptions {
+            palette: Some(pclr.clone()),
+            component_mapping: Some(cmap.clone()),
+            ..Jp2WriteOptions::enumerated(EnumCs::Srgb)
+        };
+        let file = write_jp2(&cs, &opts).expect("write palette");
+        let c = parse_jp2(&file).expect("parse");
+        assert_eq!(c.header.pclr.as_ref(), Some(&pclr));
+        assert_eq!(c.header.cmap.as_ref(), Some(&cmap));
+        let img = decode_jp2(&file).expect("decode");
+        assert_eq!(img.components.len(), 3);
+        for (ch, comp) in img.components.iter().enumerate() {
+            for (k, &v) in comp.samples.iter().enumerate() {
+                assert_eq!(v, lut[k % 4][ch]);
+            }
+        }
+        // A palette without its mapping (or vice versa) is refused.
+        let half = Jp2WriteOptions {
+            palette: Some(pclr),
+            ..Jp2WriteOptions::enumerated(EnumCs::Srgb)
+        };
+        assert_eq!(write_jp2(&cs, &half), Err(Error::NotImplemented));
+    }
+
+    #[test]
+    fn write_jp2_palette_wide_and_signed_entries_round_trip() {
+        // 12-bit and signed 10-bit columns: two bytes per value,
+        // two's complement masked to the column width.
+        let idx: Vec<u8> = (0..64).map(|k| (k % 3) as u8).collect();
+        let cs = codestream(&[&idx], 8, 8, false);
+        let pclr = Pclr {
+            columns: vec![
+                PclrColumn {
+                    bit_depth: 12,
+                    signed: false,
+                    values: vec![0, 4095, 2048],
+                },
+                PclrColumn {
+                    bit_depth: 10,
+                    signed: true,
+                    values: vec![-512, 511, -1],
+                },
+            ],
+        };
+        let opts = Jp2WriteOptions {
+            palette: Some(pclr.clone()),
+            component_mapping: Some(vec![
+                CmapEntry {
+                    component: 0,
+                    mapping: CmapMapping::Palette { column: 0 },
+                },
+                CmapEntry {
+                    component: 0,
+                    mapping: CmapMapping::Palette { column: 1 },
+                },
+            ]),
+            ..Jp2WriteOptions::enumerated(EnumCs::Greyscale)
+        };
+        let file = write_jp2(&cs, &opts).expect("write");
+        assert_eq!(parse_jp2(&file).expect("parse").header.pclr, Some(pclr));
+        // Out-of-range entries are refused.
+        let bad = Jp2WriteOptions {
+            palette: Some(Pclr {
+                columns: vec![PclrColumn {
+                    bit_depth: 8,
+                    signed: false,
+                    values: vec![256, 0, 0],
+                }],
+            }),
+            component_mapping: Some(vec![CmapEntry {
+                component: 0,
+                mapping: CmapMapping::Palette { column: 0 },
+            }]),
+            ..Jp2WriteOptions::enumerated(EnumCs::Greyscale)
+        };
+        assert_eq!(write_jp2(&cs, &bad), Err(Error::NotImplemented));
+    }
+
+    #[test]
+    fn write_jp2_resolution_icc_and_bpcc_round_trip() {
+        let (w, h) = (12u32, 10u32);
+        let a = plane(w, h, 21);
+        let b = plane(w, h, 22);
+        let mut cs = codestream(&[&a, &b], w, h, false);
+        let res = Resolution {
+            capture: Some(GridResolution {
+                vertical_numerator: 300,
+                vertical_denominator: 1,
+                horizontal_numerator: 300,
+                horizontal_denominator: 1,
+                vertical_exponent: 2,
+                horizontal_exponent: 2,
+            }),
+            display: Some(GridResolution {
+                vertical_numerator: 72,
+                vertical_denominator: 254,
+                horizontal_numerator: 72,
+                horizontal_denominator: 254,
+                vertical_exponent: 4,
+                horizontal_exponent: 4,
+            }),
+        };
+        let profile: Vec<u8> = (0..300u32).map(|k| (k * 7) as u8).collect();
+        let opts = Jp2WriteOptions {
+            colour: vec![
+                Colr {
+                    method: ColrMethod::Enumerated,
+                    precedence: 0,
+                    approximation: 0,
+                    enumerated: Some(EnumCs::Greyscale),
+                    icc_profile: None,
+                    parameterized: None,
+                },
+                Colr {
+                    method: ColrMethod::RestrictedIccProfile,
+                    precedence: 1,
+                    approximation: 1,
+                    enumerated: None,
+                    icc_profile: Some(profile.clone()),
+                    parameterized: None,
+                },
+            ],
+            resolution: Some(res),
+            ..Jp2WriteOptions::for_components(2)
+        };
+        let file = write_jp2(&cs, &opts).expect("write");
+        let c = parse_jp2(&file).expect("parse");
+        assert_eq!(c.header.resolution, Some(res));
+        assert_eq!(c.header.colr.len(), 2);
+        assert_eq!(c.header.colr[1].method, ColrMethod::RestrictedIccProfile);
+        assert_eq!(c.header.colr[1].icc_profile.as_deref(), Some(&profile[..]));
+        assert_eq!(c.header.colr[1].precedence, 1);
+        assert_eq!(c.header.ihdr.bpc, 7);
+
+        // Components of differing depth: BPC = 255 + a bpcc box. Patch
+        // the second Ssiz of the SIZ (8-bit samples still fit 12 bits).
+        let siz = cs.windows(2).position(|x| x == [0xFF, 0x51]).expect("SIZ");
+        // Marker (2) + Lsiz (2) + Rsiz (2) + eight u32 (32) + Csiz (2)
+        // + component 0 (3) → component 1's Ssiz.
+        let ssiz1 = siz + 43;
+        assert_eq!(cs[ssiz1], 7);
+        cs[ssiz1] = 11;
+        let file = write_jp2(&cs, &Jp2WriteOptions::for_components(2)).expect("write");
+        let c = parse_jp2(&file).expect("parse");
+        assert!(c.header.ihdr.varies_in_bit_depth());
+        assert_eq!(
+            c.header.bpcc.as_ref().map(|b| b.bpci.clone()),
+            Some(vec![7, 11])
+        );
+        // (The patched component now decodes with a 12-bit DC shift —
+        // only the header description is under test here.)
+        assert_eq!(decode_jp2(&file).expect("decode").components.len(), 2);
+        // An empty resolution superbox or ICC payload is refused.
+        for bad in [
+            Jp2WriteOptions {
+                resolution: Some(Resolution {
+                    capture: None,
+                    display: None,
+                }),
+                ..Jp2WriteOptions::for_components(2)
+            },
+            Jp2WriteOptions {
+                colour: vec![Colr {
+                    method: ColrMethod::RestrictedIccProfile,
+                    precedence: 0,
+                    approximation: 0,
+                    enumerated: None,
+                    icc_profile: Some(Vec::new()),
+                    parameterized: None,
+                }],
+                ..Jp2WriteOptions::for_components(2)
+            },
+        ] {
+            assert_eq!(write_jp2(&cs, &bad), Err(Error::NotImplemented));
+        }
+    }
+
+    #[test]
+    fn write_jp2_brands_jph_for_ht_codestreams() {
+        let (w, h) = (16u32, 16u32);
+        let p = plane(w, h, 99);
+        let ht = codestream(&[&p], w, h, true);
+        let plain = codestream(&[&p], w, h, false);
+        let file = write_jp2(&ht, &Jp2WriteOptions::for_components(1)).expect("jph");
+        let c = parse_jp2(&file).expect("parse");
+        assert_eq!(c.ftyp.brand, BRAND_JPH);
+        assert!(c.ftyp.is_jph_compatible() && c.ftyp.is_jp2_compatible());
+        assert_samples(&decode_jp2(&file).expect("decode"), &[&p]);
+        // T.814 Annex D.2: a JPH file may omit the colr box when UnkC
+        // is set; a JP2 file may not. T.814 Table D.1 METH 3 / 5 are
+        // JPH-only.
+        let unknown = Jp2WriteOptions {
+            colour: Vec::new(),
+            colourspace_unknown: true,
+            ..Jp2WriteOptions::for_components(1)
+        };
+        let file = write_jp2(&ht, &unknown).expect("jph without colr");
+        assert!(parse_jp2(&file).expect("parse").header.colr.is_empty());
+        assert_eq!(write_jp2(&plain, &unknown), Err(Error::NotImplemented));
+        let any_icc = Jp2WriteOptions {
+            colour: vec![Colr {
+                method: ColrMethod::AnyIcc,
+                precedence: 0,
+                approximation: 0,
+                enumerated: None,
+                icc_profile: Some(vec![1, 2, 3, 4]),
+                parameterized: None,
+            }],
+            ..Jp2WriteOptions::for_components(1)
+        };
+        let param = Jp2WriteOptions {
+            colour: vec![Colr {
+                method: ColrMethod::Parameterized,
+                precedence: 0,
+                approximation: 0,
+                enumerated: None,
+                icc_profile: None,
+                parameterized: Some(ParameterizedColour {
+                    colour_primaries: 1,
+                    transfer_characteristics: 13,
+                    matrix_coefficients: 0,
+                    video_full_range: true,
+                }),
+            }],
+            ..Jp2WriteOptions::for_components(1)
+        };
+        for opts in [&any_icc, &param] {
+            let file = write_jp2(&ht, opts).expect("jph colr");
+            let c = parse_jp2(&file).expect("parse");
+            assert_eq!(c.header.colr[0].method, opts.colour[0].method);
+            assert_eq!(c.header.colr[0].parameterized, opts.colour[0].parameterized);
+            assert_eq!(c.header.colr[0].icc_profile, opts.colour[0].icc_profile);
+            assert_eq!(write_jp2(&plain, opts), Err(Error::NotImplemented));
+        }
+    }
 
     /// Append a standard (8-byte header) box with the given type and
     /// payload to `out`.

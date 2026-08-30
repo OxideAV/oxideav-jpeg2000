@@ -39,6 +39,26 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
   cannot reach yields the full-rate stream. Mutually exclusive with
   `target_bytes`; rejected by the HT lanes like the byte budget.
 
+- **JP2 / JPH writer** — `jp2::write_jp2(codestream, &Jp2WriteOptions)`
+  wraps a codestream into a T.800 Annex I JP2 file (Signature, File
+  Type, JP2 Header — `ihdr` derived from `SIZ` with `bpcc` when the
+  component depths differ, `colr` enumerated / restricted-ICC, `pclr`
+  + `cmap`, `cdef`, `res` with `resc` / `resd` — and the Contiguous
+  Codestream box), or a T.814 Annex D **JPH** file (`'jph '` brand,
+  optional `colr` under `UnkC`, the Table D.1 Any-ICC and
+  parameterized colour methods) when `Rsiz` signals HTJ2K; the writer
+  re-parses its own output. `Jp2WriteOptions::for_components` gives
+  the conventional greyscale / sRGB (+ opacity `cdef`) header and
+  `encode::encode_jp2` / `encode_jp2_with` / `encode_jp2_u16` go from
+  planes to a file. Opaque decoders reproduce every shape byte-exactly
+  (greyscale, RGB, RGBA and grey + alpha with the opacity channel
+  honoured, `cdef` BGR reorder, palette expansion, JPH through two HT
+  decoders).
+- **Encoder: MCT with more than three components** — `mct` now applies
+  the §G.2 RCT / §G.3 ICT to components 0–2 of any plane count ≥ 3
+  (an RGBA image keeps its alpha plane untouched) instead of requiring
+  exactly three planes.
+
 ### Changed
 
 - `EncodeParams` no longer derives `Eq` (the PSNR floor is an `f64`);

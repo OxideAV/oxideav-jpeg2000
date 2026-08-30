@@ -24,7 +24,8 @@
 //!   overrides (mixed kernels included), the Annex H Maxshift ROI;
 //! * the T.814 lanes — HTONLY (`high_throughput`), the `Z_blk = 3`
 //!   refinement shape (`ht_refinement`), MULTIHT quality layers, and
-//!   the §8.2 / §A.4 MIXED set (`ht_mixed`).
+//!   the §8.2 / §A.4 MIXED set (`ht_mixed`);
+//! * the Annex I JP2 / T.814 Annex D JPH container wrap.
 //!
 //! Illegal combinations must surface a clean `Err` from the encoder
 //! (also fuzzed here); a successful encode is then decoded three ways
@@ -284,6 +285,20 @@ fuzz_target!(|data: &[u8]| {
         // Illegal combination — the clean reject is the tested contract.
         return;
     };
+
+    // JP2 / JPH wrapping with the conventional header: the container
+    // writer re-parses its own output, and the container decoder must
+    // hand back the same image the raw codestream does.
+    if c.bool() {
+        let file = oxideav_jpeg2000::jp2::write_jp2(
+            &stream,
+            &oxideav_jpeg2000::jp2::Jp2WriteOptions::for_components(ncomp),
+        )
+        .expect("conventional wrap of an own codestream");
+        let via_container = oxideav_jpeg2000::jp2::decode_jp2(&file).expect("container decode");
+        let via_raw = decode_j2k(&stream).expect("own encode must decode");
+        assert_eq!(via_container, via_raw, "container decode matches raw decode");
+    }
 
     // A stream this encoder emitted must decode.
     let img = decode_j2k(&stream).expect("own encode must decode");

@@ -1198,8 +1198,9 @@ pub struct EncodeParams {
     pub kernel: EncodeKernel,
     /// `SGcod` multiple-component-transformation flag (Table A.17):
     /// pairs the §G.2 RCT with the 5-3 kernel and the §G.3.1 ICT with
-    /// the 9-7 kernel, across components 0–2 (requires exactly three
-    /// planes). Default `false`.
+    /// the 9-7 kernel, across components 0–2 (§G.1 — at least three
+    /// planes; any further components code untouched). Default
+    /// `false`.
     pub mct: bool,
     /// `SGcod` progression order (Table A.16) the tile's packets are
     /// emitted in — any of the five §B.12.1 orders. Default LRCP.
@@ -1551,6 +1552,54 @@ impl SamplePlane<'_> {
     }
 }
 
+/// Encode 8-bit planes per `params` and wrap the codestream into a
+/// **JP2** file (T.800 Annex I) — or a **JPH** file (T.814 Annex D)
+/// for an HT codestream — with the conventional header for the
+/// component count ([`crate::jp2::Jp2WriteOptions::for_components`]:
+/// greyscale / sRGB, plus an opacity channel definition for 2 or 4
+/// components). Other component counts need [`encode_jp2_with`].
+pub fn encode_jp2(
+    planes: &[&[u8]],
+    width: u32,
+    height: u32,
+    params: &EncodeParams,
+) -> Result<Vec<u8>, Error> {
+    encode_jp2_with(
+        planes,
+        width,
+        height,
+        params,
+        &crate::jp2::Jp2WriteOptions::for_components(planes.len()),
+    )
+}
+
+/// [`encode_jp2`] with an explicit JP2 Header description
+/// ([`crate::jp2::write_jp2`]).
+pub fn encode_jp2_with(
+    planes: &[&[u8]],
+    width: u32,
+    height: u32,
+    params: &EncodeParams,
+    options: &crate::jp2::Jp2WriteOptions,
+) -> Result<Vec<u8>, Error> {
+    let codestream = encode_j2k(planes, width, height, params)?;
+    crate::jp2::write_jp2(&codestream, options)
+}
+
+/// [`encode_j2k_u16`] wrapped into a JP2 / JPH file (see
+/// [`encode_jp2`]).
+pub fn encode_jp2_u16(
+    planes: &[&[u16]],
+    width: u32,
+    height: u32,
+    precision: u8,
+    params: &EncodeParams,
+    options: &crate::jp2::Jp2WriteOptions,
+) -> Result<Vec<u8>, Error> {
+    let codestream = encode_j2k_u16(planes, width, height, precision, params)?;
+    crate::jp2::write_jp2(&codestream, options)
+}
+
 /// Encode 8-bit unsigned component planes (all `width × height`, 1:1
 /// sub-sampling) into a Part-1 J2K codestream per `params`.
 ///
@@ -1621,7 +1670,9 @@ fn encode_core(
     // the §G.3.1 ICT with the 9-7 kernel, always across components 0–2.
     let use_rct = mct && matches!(kernel, EncodeKernel::Lossless5x3);
     let use_ict = mct && matches!(kernel, EncodeKernel::Lossy9x7 { .. });
-    if mct && planes.len() != 3 {
+    // §G.1: the transform is applied to the first three components;
+    // any further components (alpha, extra channels) code untouched.
+    if mct && planes.len() < 3 {
         return Err(Error::NotImplemented);
     }
     if let EncodeKernel::Lossy9x7 { fine_bits } = kernel {
@@ -1874,7 +1925,7 @@ fn encode_core(
                 return 0;
             }
             let cp = &comp_params[ci];
-            let ri = if use_rct && ci > 0 {
+            let ri = if use_rct && (ci == 1 || ci == 2) {
                 u32::from(precision) + 1
             } else {
                 u32::from(precision)
@@ -2173,7 +2224,7 @@ fn encode_core(
                         };
                         // §G.2: RCT chrominance carries one extra bit of
                         // dynamic range, signalled via this component's QCC.
-                        let ri = if use_rct && ci > 0 {
+                        let ri = if use_rct && (ci == 1 || ci == 2) {
                             u32::from(precision) + 1
                         } else {
                             u32::from(precision)
@@ -3071,7 +3122,7 @@ fn encode_core(
         // changes its table too.
         for (ci, cp) in comp_params.iter().enumerate() {
             // §G.2: RCT chrominance dynamic range grows by one bit.
-            let ri = if use_rct && ci > 0 {
+            let ri = if use_rct && (ci == 1 || ci == 2) {
                 precision + 1
             } else {
                 precision
@@ -4284,6 +4335,60 @@ mod tests {
                 }
             }
         }
+    }
+
+    // -- JP2 / JPH wrapping --------------------------------------------
+
+    #[test]
+    fn encode_jp2_wraps_the_codestream_the_container_decoder_reads_back() {
+        let (w, h) = (24u32, 20u32);
+        let r = noise(w, h, 31);
+        let g = noise(w, h, 32);
+        let b = noise(w, h, 33);
+        let a = noise(w, h, 34);
+        for (planes, mct) in [
+            (vec![&r[..]], false),
+            (vec![&r[..], &a[..]], false),
+            (vec![&r[..], &g[..], &b[..]], true),
+            (vec![&r[..], &g[..], &b[..], &a[..]], true),
+        ] {
+            let params = EncodeParams {
+                mct,
+                plt: true,
+                ..EncodeParams::default()
+            };
+            let file = encode_jp2(&planes, w, h, &params).expect("jp2");
+            assert!(crate::looks_like_jp2(&file));
+            let img = crate::jp2::decode_jp2(&file).expect("decode container");
+            assert_eq!(img.components.len(), planes.len());
+            for (c, p) in img.components.iter().zip(&planes) {
+                let got: Vec<u8> = c.samples.iter().map(|&v| v as u8).collect();
+                assert_eq!(&got[..], *p);
+            }
+            // The byte-vector entry point takes the container too.
+            let flat = crate::decode_jpeg2000(&file).expect("registry decode");
+            assert_eq!(flat.len(), (w * h) as usize * planes.len());
+        }
+        // 16-bit depth through the u16 path.
+        let p16: Vec<u16> = (0..w * h).map(|k| (k * 977 % 4096) as u16).collect();
+        let file = encode_jp2_u16(
+            &[&p16],
+            w,
+            h,
+            12,
+            &EncodeParams::default(),
+            &crate::jp2::Jp2WriteOptions::for_components(1),
+        )
+        .expect("jp2 u16");
+        let c = crate::jp2::parse_jp2(&file).expect("parse");
+        assert_eq!(c.header.ihdr.bit_depth(), 12);
+        let img = crate::jp2::decode_jp2(&file).expect("decode");
+        let got: Vec<u16> = img.components[0]
+            .samples
+            .iter()
+            .map(|&v| v as u16)
+            .collect();
+        assert_eq!(got, p16);
     }
 
     // -- PCRD PSNR floor -------------------------------------------------
