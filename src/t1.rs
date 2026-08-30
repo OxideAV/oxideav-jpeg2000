@@ -159,6 +159,17 @@ pub const NUM_CONTEXTS: usize = 19;
 /// not the bit-plane carries an error per §D.5.
 pub const SEGMENTATION_SYMBOL: u8 = 0xA;
 
+/// Encode the T.800 §D.5 error-resilience segmentation symbol — the
+/// exact forward of [`decode_segmentation_symbol`]: the four bits of
+/// `0xA` (`1, 0, 1, 0`, most significant first) each coded with the
+/// UNIFORM context at the end of a cleanup pass when the Table A.19
+/// `segmentation_symbols` style bit is signalled.
+pub fn encode_segmentation_symbol(encoder: &mut MqEncoder, ctx: &mut [MqContext; NUM_CONTEXTS]) {
+    for shift in (0..4).rev() {
+        encoder.encode(&mut ctx[UNIFORM_CTX], (SEGMENTATION_SYMBOL >> shift) & 1);
+    }
+}
+
 /// Decode the T.800 §D.5 error-resilience segmentation symbol.
 ///
 /// Reads four bits from `decoder` against the UNIFORM context (Table
@@ -418,6 +429,34 @@ impl RawBitWriter {
         }
         if self.out.last() == Some(&0xFF) {
             self.out.push(0x00);
+        }
+        self.out
+    }
+
+    /// Terminate the raw segment under the §D.6 **predictable
+    /// termination** rule (Table A.19 bit 4 together with bit 0): the
+    /// unused bits of the last byte are filled with the alternating
+    /// sequence `0, 1, 0, 1, …` — starting with a `0` whatever the
+    /// count — and, when the last assembled byte is `0xFF`, the
+    /// bit-stuffing routine appends one more byte whose most
+    /// significant bit is the stuffed `0` and whose remaining bits
+    /// carry the same alternating fill (§D.6 NOTE 2), so the segment
+    /// never ends on `0xFF` and every emitted bit is reproducible.
+    pub fn finish_predictable(mut self) -> Vec<u8> {
+        if self.filled > 0 {
+            let mut alt = 0u8;
+            while self.filled < 8 {
+                self.current |= alt << (7 - self.filled);
+                self.filled += 1;
+                alt ^= 1;
+            }
+            self.out.push(self.current);
+            self.current = 0;
+            self.filled = 0;
+        }
+        if self.out.last() == Some(&0xFF) {
+            // Stuffed 0 in the MSB, then 0,1,0,1,0,1,0.
+            self.out.push(0b0010_1010);
         }
         self.out
     }
@@ -4323,6 +4362,38 @@ mod tests {
     fn segmentation_symbol_constant_matches_d5() {
         // §D.5 fixes the symbol at the four-bit value `1010` = 0xA.
         assert_eq!(SEGMENTATION_SYMBOL, 0x0A);
+    }
+
+    #[test]
+    fn raw_writer_predictable_finish_pads_alternating_and_stuffs_after_0xff() {
+        // §D.6 with predictable termination: unused bits fill 0,1,0,…
+        // starting with 0; a trailing 0xFF grows a stuffed byte whose
+        // MSB is 0 and whose remaining bits carry the same fill.
+        let mut w = RawBitWriter::new();
+        for b in [1u8, 1, 1] {
+            w.write_bit(b);
+        }
+        assert_eq!(w.finish_predictable(), vec![0b1110_1010]);
+        let mut w = RawBitWriter::new();
+        for _ in 0..8 {
+            w.write_bit(1);
+        }
+        assert_eq!(w.finish_predictable(), vec![0xFF, 0b0010_1010]);
+        let mut w = RawBitWriter::new();
+        w.write_bit(0);
+        assert_eq!(w.finish_predictable(), vec![0b0010_1010]);
+        assert_eq!(RawBitWriter::new().finish_predictable(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn segmentation_symbol_encodes_as_its_own_decoder_expects() {
+        let mut enc = MqEncoder::new();
+        let mut ectx = reset_contexts();
+        encode_segmentation_symbol(&mut enc, &mut ectx);
+        let bytes = enc.flush();
+        let mut dec = MqDecoder::new(&bytes);
+        let mut dctx = reset_contexts();
+        decode_segmentation_symbol(&mut dec, &mut dctx).expect("0xA round-trips");
     }
 
     #[test]

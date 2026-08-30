@@ -15,7 +15,9 @@
 //!   partitions, §A.6.6 full-coverage `POC` entries;
 //! * quality layers, Annex J.13.3 PCRD byte budgets, multi-tile
 //!   grids, §A.4.2 tile-part splits on every axis;
-//! * the §D.6 bypass / §D.4.2 per-pass-termination styles, SOP / EPH
+//! * all six Table A.19 Annex D styles — §D.6 bypass, context reset,
+//!   §D.4.2 per-pass termination, §D.7 vertically causal contexts,
+//!   predictable termination, §D.5 segmentation symbols — SOP / EPH
 //!   framing, §A.7.4 / §A.7.5 PPM / PPT header relocation;
 //! * SIZ component sub-sampling, per-component `COC` / `QCC`
 //!   overrides (mixed kernels included), the Annex H Maxshift ROI;
@@ -136,6 +138,12 @@ fuzz_target!(|data: &[u8]| {
     // exercise both the accept and the clean-reject path).
     let bypass = c.bool() && (!ht || c.bool());
     let terminate_all = c.bool() && (!ht || c.bool());
+    // Table A.19 bits 1 / 3 / 4 / 5 — the coder-shaping styles.
+    let style_bits = c.u8();
+    let reset_probabilities = style_bits & 1 != 0 && (!ht || c.bool());
+    let vertically_causal = style_bits & 2 != 0 && (!ht || c.bool());
+    let predictable_termination = style_bits & 4 != 0 && (!ht || c.bool());
+    let segmentation_symbols = style_bits & 8 != 0 && (!ht || c.bool());
 
     let sop = c.bool();
     let eph = c.bool();
@@ -225,6 +233,10 @@ fuzz_target!(|data: &[u8]| {
         tile_size,
         bypass,
         terminate_all,
+        reset_probabilities,
+        vertically_causal,
+        predictable_termination,
+        segmentation_symbols,
         sop,
         eph,
         sub_sampling: sub_sampling.clone(),

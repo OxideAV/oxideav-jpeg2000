@@ -259,6 +259,36 @@ impl MqEncoder {
         }
         self.out
     }
+
+    /// Predictable termination — T.800 §D.4.2 (Table A.19 code-block
+    /// style bit 4). Consumes the encoder.
+    ///
+    /// The §D.4.2 procedure, in the §C.2 notation: `k = (11 − CT) + 1`
+    /// bits of the code register still have to leave through the byte
+    /// buffer; while `k > 0` the register is shifted left by `CT`, one
+    /// BYTEOUT runs (which resets `CT` to the number of bits it cleared)
+    /// and `k` shrinks by that `CT`. The final BYTEOUT that would push
+    /// the byte buffer itself out is skipped when that byte is `0xFF`
+    /// — so, as with FLUSH, a trailing `0xFF` is never emitted. The
+    /// truncation length is then exactly the number of bytes emitted,
+    /// and (unlike §C.2.9 FLUSH) no byte of the result is a free
+    /// choice: the decoder can reproduce the tail bit-for-bit, which is
+    /// what makes the termination "predictable" for §D.5-style error
+    /// detection. No SETBITS runs — the register carries only decided
+    /// bits.
+    pub fn flush_predictable(mut self) -> Vec<u8> {
+        let mut k: i32 = (11 - self.ct) + 1;
+        while k > 0 {
+            self.c <<= self.ct;
+            self.ct = 0;
+            self.byteout();
+            k -= self.ct;
+        }
+        if self.out.last() == Some(&0xFF) {
+            self.out.pop();
+        }
+        self.out
+    }
 }
 
 impl Default for MqEncoder {
@@ -364,6 +394,35 @@ mod tests {
         ];
         for (i, &(ctx, bit)) in plan.iter().enumerate() {
             assert_eq!(dec.decode(&mut dcx[ctx]), bit, "step {i}");
+        }
+    }
+
+    #[test]
+    fn predictable_termination_round_trips_and_never_ends_on_0xff() {
+        // §D.4.2: the reproducible termination must still hand the
+        // decoder every decided bit, across biased and balanced
+        // decision streams and every register phase.
+        let mut state: u32 = 0x1357_9BDF;
+        for len in [0usize, 1, 2, 3, 7, 8, 9, 31, 64, 200, 777, 3000] {
+            for bias in [1u32, 2, 8] {
+                let mut enc = MqEncoder::new();
+                let mut ecx = MqContext::default();
+                let mut d = Vec::with_capacity(len);
+                for _ in 0..len {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    d.push(u8::from((state >> 16) % bias == 0));
+                }
+                for &b in &d {
+                    enc.encode(&mut ecx, b);
+                }
+                let bytes = enc.flush_predictable();
+                assert_ne!(bytes.last(), Some(&0xFF));
+                let mut dec = MqDecoder::new(&bytes);
+                let mut dcx = MqContext::default();
+                for (i, &b) in d.iter().enumerate() {
+                    assert_eq!(dec.decode(&mut dcx), b, "len {len} bias {bias} step {i}");
+                }
+            }
         }
     }
 

@@ -697,6 +697,33 @@ struct PassCapture {
     bypass: bool,
     /// §D.4.2 termination on each coding pass (Table A.19 bit 2).
     terminate_all: bool,
+    /// Table A.19 bit 1: reset the Annex D context states to Table
+    /// D.7 at the end of every coding pass.
+    reset_probabilities: bool,
+    /// Table A.19 bit 3: §D.7 vertically causal context formation.
+    vertically_causal: bool,
+    /// Table A.19 bit 4: §D.4.2 predictable termination (every
+    /// codeword-segment termination — MQ and raw — is reproducible).
+    predictable_termination: bool,
+    /// Table A.19 bit 5: §D.5 segmentation symbol after each cleanup
+    /// pass.
+    segmentation_symbols: bool,
+}
+
+impl PassCapture {
+    /// The Table A.19 style bits of `params` (the segment-shaping
+    /// bits 0 / 2 and the coder-shaping bits 1 / 3 / 4 / 5).
+    fn styles(params: &EncodeParams) -> Self {
+        PassCapture {
+            bypass: params.bypass,
+            terminate_all: params.terminate_all,
+            reset_probabilities: params.reset_probabilities,
+            vertically_causal: params.vertically_causal,
+            predictable_termination: params.predictable_termination,
+            segmentation_symbols: params.segmentation_symbols,
+            ..PassCapture::default()
+        }
+    }
 }
 
 fn encode_code_block(
@@ -728,7 +755,8 @@ fn encode_code_block(
     if limit == 0 {
         return Ok(None);
     }
-    let mut enc_block = CodeBlock::new(orientation, width, height);
+    let mut enc_block = CodeBlock::new(orientation, width, height)
+        .with_vertically_causal_context(capture.vertically_causal);
     let encoder = MqEncoder::new();
     let mut ctx = reset_contexts();
     let mut rates: Vec<u32> = Vec::new();
@@ -773,6 +801,25 @@ fn encode_code_block(
         Raw(crate::t1::RawBitWriter),
     }
     let styled = capture.bypass || capture.terminate_all;
+    // §D.4.2: with the predictable-termination style every segment
+    // (and every rate snapshot, which models a segment ending there)
+    // terminates through the reproducible procedure instead of FLUSH;
+    // raw segments pad with the §D.6 alternating fill.
+    let predictable = capture.predictable_termination;
+    let flush_mq = |e: MqEncoder| -> Vec<u8> {
+        if predictable {
+            e.flush_predictable()
+        } else {
+            e.flush()
+        }
+    };
+    let finish_raw = |w: crate::t1::RawBitWriter| -> Vec<u8> {
+        if predictable {
+            w.finish_predictable()
+        } else {
+            w.finish()
+        }
+    };
     let mut sink = Sink::Mq(encoder);
     let mut committed: Vec<u8> = Vec::new();
     let mut coded = 0u32;
@@ -785,6 +832,11 @@ fn encode_code_block(
             (Sink::Mq(e), false) => {
                 if i == 0 || (i - 1) % 3 == 2 {
                     enc_block.cleanup_encode(p, targets, e, &mut ctx);
+                    if capture.segmentation_symbols {
+                        // §D.5: the symbol closes every bit-plane,
+                        // coded before any pass-boundary reset.
+                        crate::t1::encode_segmentation_symbol(e, &mut ctx);
+                    }
                 } else if (i - 1) % 3 == 0 {
                     enc_block.significance_propagation_encode(p, targets, e, &mut ctx);
                 } else {
@@ -801,10 +853,16 @@ fn encode_code_block(
             _ => unreachable!("sink type switches only at terminated boundaries"),
         }
         coded += 1;
+        if capture.reset_probabilities {
+            // Table A.19 bit 1: Table D.7 states at every pass end —
+            // the decoder resets after each pass regardless of the
+            // sink, so the raw passes reset too.
+            ctx = reset_contexts();
+        }
         if pass_rates {
             let pending = match &sink {
-                Sink::Mq(e) => e.clone().flush().len(),
-                Sink::Raw(w) => w.clone().finish().len(),
+                Sink::Mq(e) => flush_mq(e.clone()).len(),
+                Sink::Raw(w) => finish_raw(w.clone()).len(),
             };
             rates.push((committed.len() + pending) as u32);
         }
@@ -819,8 +877,8 @@ fn encode_code_block(
             // the next pass needs (Table D.9 / §D.4.2).
             let old = std::mem::replace(&mut sink, Sink::Mq(MqEncoder::new()));
             committed.extend_from_slice(&match old {
-                Sink::Mq(e) => e.flush(),
-                Sink::Raw(w) => w.finish(),
+                Sink::Mq(e) => flush_mq(e),
+                Sink::Raw(w) => finish_raw(w),
             });
             if pass_rates {
                 // The pass that just terminated has an *exact* rate:
@@ -837,8 +895,8 @@ fn encode_code_block(
     debug_assert_eq!(coded, limit);
     let mut bytes = committed;
     bytes.extend_from_slice(&match sink {
-        Sink::Mq(e) => e.flush(),
-        Sink::Raw(w) => w.finish(),
+        Sink::Mq(e) => flush_mq(e),
+        Sink::Raw(w) => finish_raw(w),
     });
     if pass_rates {
         // The last snapshot and the final flush share the same coder
@@ -1176,6 +1234,27 @@ pub struct EncodeParams {
     /// which makes every layer / rate-control cut land on an exactly
     /// terminated boundary. Default `false`.
     pub terminate_all: bool,
+    /// Table A.19 code-block style bit 1: reset the Annex D context
+    /// probabilities to their Table D.7 initial states at the end of
+    /// every coding pass (§C.3.6 — the decoder mirrors it). Default
+    /// `false`.
+    pub reset_probabilities: bool,
+    /// Table A.19 code-block style bit 3: §D.7 vertically causal
+    /// context formation — the bottom row of every four-row stripe
+    /// treats the next stripe's neighbours as insignificant. Default
+    /// `false`.
+    pub vertically_causal: bool,
+    /// Table A.19 code-block style bit 4: §D.4.2 predictable
+    /// termination — every codeword-segment termination runs the
+    /// reproducible §D.4.2 procedure (MQ segments) or the §D.6
+    /// alternating-fill padding (raw segments) instead of the
+    /// free-tail §C.2.9 FLUSH, so a decoder can verify the tail of
+    /// each segment. Default `false`.
+    pub predictable_termination: bool,
+    /// Table A.19 code-block style bit 5: §D.5 error-resilience
+    /// segmentation symbol — the four UNIFORM-context bits `1010`
+    /// coded at the end of every cleanup pass. Default `false`.
+    pub segmentation_symbols: bool,
     /// §A.8.1 SOP packet framing (`Scod` bit 1, Table A.13): every
     /// packet is preceded by a 6-byte `SOP` marker segment carrying the
     /// packet's sequence number `Nsop` (zero-based per coded tile,
@@ -1281,6 +1360,10 @@ impl Default for EncodeParams {
             tile_size: None,
             bypass: false,
             terminate_all: false,
+            reset_probabilities: false,
+            vertically_causal: false,
+            predictable_termination: false,
+            segmentation_symbols: false,
             sop: false,
             eph: false,
             sub_sampling: Vec::new(),
@@ -1573,9 +1656,14 @@ fn encode_core(
     // carries one §B.1 HT set per code-block (a MULTIHT codestream,
     // with §B.1 placeholder passes aligning shallow blocks), built
     // below — but not together with the ht_refinement segment shape.
+    let annex_d_styles = params.bypass
+        || params.terminate_all
+        || params.reset_probabilities
+        || params.vertically_causal
+        || params.predictable_termination
+        || params.segmentation_symbols;
     if params.high_throughput
-        && (params.bypass
-            || params.terminate_all
+        && (annex_d_styles
             || params.target_bytes.is_some()
             || (params.layers != 1 && params.ht_refinement))
     {
@@ -1590,8 +1678,7 @@ fn encode_core(
     if params.ht_mixed
         && (params.high_throughput
             || params.ht_refinement
-            || params.bypass
-            || params.terminate_all
+            || annex_d_styles
             || params.target_bytes.is_some()
             || params.layers != 1
             || params.roi.is_some())
@@ -2210,8 +2297,7 @@ fn encode_core(
                                         rates: want_rates,
                                         dist: rate_control,
                                         max_passes: None,
-                                        bypass: params.bypass,
-                                        terminate_all: params.terminate_all,
+                                        ..PassCapture::styles(params)
                                     },
                                 )?;
                                 if params.ht_mixed {
@@ -2442,9 +2528,7 @@ fn encode_core(
                         *mb,
                         PassCapture {
                             max_passes: Some(n_eff),
-                            bypass: params.bypass,
-                            terminate_all: params.terminate_all,
-                            ..PassCapture::default()
+                            ..PassCapture::styles(params)
                         },
                     )?
                     .expect("non-empty block re-encodes");
@@ -2807,6 +2891,19 @@ fn encode_core(
         };
         // Scod (Table A.13): bit 0 = user-defined precincts, bit 1 =
         // §A.8.1 SOP markers allowed, bit 2 = §A.8.2 EPH markers used.
+        // Table A.19 code-block style byte: bit 0 §D.6 bypass, bit 1
+        // context reset, bit 2 §D.4.2 per-pass termination, bit 3
+        // §D.7 vertically causal contexts, bit 4 predictable
+        // termination, bit 5 §D.5 segmentation symbols; T.814 §A.4
+        // bit 6 = HT code-blocks, bits 6 + 7 = MIXED.
+        let style_byte = u8::from(params.bypass)
+            | (u8::from(params.reset_probabilities) << 1)
+            | (u8::from(params.terminate_all) << 2)
+            | (u8::from(params.vertically_causal) << 3)
+            | (u8::from(params.predictable_termination) << 4)
+            | (u8::from(params.segmentation_symbols) << 5)
+            | (u8::from(params.high_throughput || params.ht_mixed) << 6)
+            | (u8::from(params.ht_mixed) << 7);
         let scod = u8::from(!params.precincts.is_empty())
             | (u8::from(params.sop) << 1)
             | (u8::from(params.eph) << 2);
@@ -2819,15 +2916,10 @@ fn encode_core(
             nl,                         // SPcod: NL
             xcb - 2,                    // SPcod: xcb − 2
             ycb - 2,                    // SPcod: ycb − 2
-            // SPcod code-block style (Table A.19): bit 0 = §D.6
-            // selective AC bypass, bit 2 = §D.4.2 termination on each
-            // coding pass.
-            u8::from(params.bypass)
-                | (u8::from(params.terminate_all) << 2)
-                // T.814 §A.4: bit 6 flags HT code-blocks; bits 6 + 7
-                // together mark a MIXED tile-component.
-                | (u8::from(params.high_throughput || params.ht_mixed) << 6)
-                | (u8::from(params.ht_mixed) << 7),
+            // SPcod code-block style (Table A.19): the six Annex D
+            // bits, plus the T.814 §A.4 bit 6 (HT code-blocks) and
+            // bits 6 + 7 together (a MIXED tile-component).
+            style_byte,
             transform_byte, // SPcod: transform (Table A.20)
         ];
         cod_payload.extend_from_slice(&params.precincts); // Table A.21
@@ -2851,12 +2943,7 @@ fn encode_core(
             coc_payload.push(cp.nl);
             coc_payload.push(cp.xcb - 2);
             coc_payload.push(cp.ycb - 2);
-            coc_payload.push(
-                u8::from(params.bypass)
-                    | (u8::from(params.terminate_all) << 2)
-                    | (u8::from(params.high_throughput || params.ht_mixed) << 6)
-                    | (u8::from(params.ht_mixed) << 7),
-            );
+            coc_payload.push(style_byte);
             coc_payload.push(match cp.kernel {
                 EncodeKernel::Lossless5x3 => 1u8,
                 EncodeKernel::Lossy9x7 { .. } => 0u8,
@@ -3988,6 +4075,182 @@ mod tests {
                     assert!(max_err <= 1, "bypass lossy error {max_err}")
                 }
             }
+        }
+    }
+
+    // -- Table A.19 bits 1 / 3 / 4 / 5 on encode ------------------------
+
+    /// Clear one Table A.19 bit in the main-header COD of `stream`
+    /// (single COD, no COC) so the decoder reads the block data under
+    /// the wrong style — a presence probe for the coded style.
+    fn clear_cod_style_bit(stream: &[u8], bit: u8) -> Vec<u8> {
+        let mut out = stream.to_vec();
+        let mut i = 2usize;
+        loop {
+            let marker = u16::from_be_bytes([out[i], out[i + 1]]);
+            let len = usize::from(u16::from_be_bytes([out[i + 2], out[i + 3]]));
+            if marker == MARKER_COD {
+                // Scod, SGcod (4), NL, xcb, ycb, style.
+                let style = i + 4 + 1 + 4 + 3;
+                assert_ne!(out[style] & (1 << bit), 0, "bit {bit} signalled");
+                out[style] &= !(1 << bit);
+                return out;
+            }
+            i += 2 + len;
+        }
+    }
+
+    fn style_params(bit: u8) -> EncodeParams {
+        EncodeParams {
+            decomposition_levels: 2,
+            code_block_exp: (4, 4),
+            reset_probabilities: bit == 1,
+            vertically_causal: bit == 3,
+            predictable_termination: bit == 4,
+            segmentation_symbols: bit == 5,
+            ..EncodeParams::default()
+        }
+    }
+
+    #[test]
+    fn coder_style_bits_round_trip_individually_and_are_load_bearing() {
+        // Each of Table A.19 bits 1 (context reset), 3 (§D.7 vertically
+        // causal), 4 (§D.4.2 predictable termination) and 5 (§D.5
+        // segmentation symbols) round-trips bit-exactly on its own and
+        // is signalled in the COD; the bits that change the coded
+        // decisions (1, 3, 5) are proven present by mis-signalling
+        // them — the decoder then cannot reproduce the samples.
+        let p = noise(48, 40, 0x5EED_5EED);
+        for bit in [1u8, 3, 4, 5] {
+            let params = style_params(bit);
+            let stream = roundtrip_params(&[&p], 48, 40, &params);
+            let flags = crate::parse_j2k_header(&stream)
+                .expect("header")
+                .cod
+                .code_block_style_flags();
+            assert_eq!(flags.raw(), 1 << bit, "bit {bit} alone in the style byte");
+            assert_eq!(flags.reset_context_probabilities(), bit == 1);
+            assert_eq!(flags.vertically_causal_context(), bit == 3);
+            assert_eq!(flags.predictable_termination(), bit == 4);
+            assert_eq!(flags.segmentation_symbols(), bit == 5);
+            if bit == 4 {
+                // Predictable termination changes only how the tail of
+                // each segment is produced; the decoder needs no
+                // signalling to consume it.
+                continue;
+            }
+            let wrong = clear_cod_style_bit(&stream, bit);
+            let exact = decode_j2k(&wrong).is_ok_and(|img| {
+                img.components[0]
+                    .samples
+                    .iter()
+                    .zip(p.iter())
+                    .all(|(&g, &w)| g == i32::from(w))
+            });
+            assert!(!exact, "bit {bit} must be load-bearing");
+        }
+    }
+
+    #[test]
+    fn all_six_annex_d_style_bits_compose_with_layers_and_pcrd() {
+        // All Table A.19 bits 0–5 together, both kernels, across layers
+        // and under a PCRD budget: every segment (AC and raw) then
+        // terminates through the §D.4.2 predictable procedure with a
+        // §D.5 symbol per plane and Table D.7 resets per pass.
+        let p = noise(56, 48, 0xA11B_1755);
+        for kernel in [
+            EncodeKernel::Lossless5x3,
+            EncodeKernel::Lossy9x7 { fine_bits: 6 },
+        ] {
+            let params = EncodeParams {
+                decomposition_levels: 2,
+                code_block_exp: (3, 4),
+                kernel,
+                layers: 3,
+                bypass: true,
+                terminate_all: true,
+                reset_probabilities: true,
+                vertically_causal: true,
+                predictable_termination: true,
+                segmentation_symbols: true,
+                ..EncodeParams::default()
+            };
+            let stream = encode_j2k(&[&p], 56, 48, &params).expect("encode");
+            let flags = crate::parse_j2k_header(&stream)
+                .expect("header")
+                .cod
+                .code_block_style_flags();
+            assert_eq!(flags.raw(), 0x3F);
+            let img = decode_j2k(&stream).expect("decode");
+            let max_err = img.components[0]
+                .samples
+                .iter()
+                .zip(p.iter())
+                .map(|(&g, &w)| (g - i32::from(w)).unsigned_abs())
+                .max()
+                .unwrap();
+            match kernel {
+                EncodeKernel::Lossless5x3 => assert_eq!(max_err, 0),
+                EncodeKernel::Lossy9x7 { .. } => assert!(max_err <= 1, "{max_err}"),
+            }
+            // Layer-limited decodes stay decodable and improve.
+            let mse = |img: &crate::DecodedImage| -> f64 {
+                img.components[0]
+                    .samples
+                    .iter()
+                    .zip(p.iter())
+                    .map(|(&g, &w)| f64::from(g - i32::from(w)).powi(2))
+                    .sum::<f64>()
+                    / p.len() as f64
+            };
+            let l1 = mse(&crate::decode_j2k_layers(&stream, 1).expect("layer 1"));
+            let l2 = mse(&crate::decode_j2k_layers(&stream, 2).expect("layer 2"));
+            assert!(l1 >= l2, "layer 1 mse {l1} >= layer 2 mse {l2}");
+            // PCRD under the full style set.
+            let target = stream.len() / 2;
+            let budget = EncodeParams {
+                target_bytes: Some(target),
+                ..params
+            };
+            let cut = encode_j2k(&[&p], 56, 48, &budget).expect("encode budget");
+            assert!(cut.len() <= target, "{} > {target}", cut.len());
+            decode_j2k(&cut).expect("decode budget");
+        }
+    }
+
+    #[test]
+    fn coder_style_bits_compose_with_rct_tiles_and_ht_rejects_them() {
+        // Bits 1 / 3 / 4 / 5 with the RCT over a tile grid stay
+        // bit-exact; the T.814 lanes reject them like the other Annex
+        // D styles.
+        let (w, h) = (40u32, 36u32);
+        let r = noise(w, h, 1);
+        let g = noise(w, h, 2);
+        let b = noise(w, h, 3);
+        let params = EncodeParams {
+            decomposition_levels: 1,
+            code_block_exp: (3, 3),
+            mct: true,
+            tile_size: Some((24, 20)),
+            reset_probabilities: true,
+            vertically_causal: true,
+            predictable_termination: true,
+            segmentation_symbols: true,
+            ..EncodeParams::default()
+        };
+        roundtrip_params(&[&r, &g, &b], w, h, &params);
+        for ht in [true, false] {
+            let bad = EncodeParams {
+                mct: false,
+                tile_size: None,
+                high_throughput: ht,
+                ht_mixed: !ht,
+                ..params.clone()
+            };
+            assert!(matches!(
+                encode_j2k(&[&r], w, h, &bad),
+                Err(Error::NotImplemented)
+            ));
         }
     }
 

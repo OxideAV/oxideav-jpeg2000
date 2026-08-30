@@ -6,6 +6,19 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+- **Encoder: the remaining Table A.19 code-block styles** —
+  `EncodeParams::reset_probabilities` (bit 1, Table D.7 context reset
+  at every pass end), `vertically_causal` (bit 3, §D.7 context
+  formation), `predictable_termination` (bit 4, the §D.4.2
+  reproducible MQ termination through `MqEncoder::flush_predictable`
+  plus the §D.6 alternating-fill raw padding of
+  `RawBitWriter::finish_predictable`) and `segmentation_symbols`
+  (bit 5, the §D.5 `0xA` UNIFORM-context symbol after each cleanup
+  pass via `t1::encode_segmentation_symbol`). All six Annex D bits
+  compose with each other, quality layers and PCRD; round-trip
+  bit-exact through this crate's decoder and byte-identical through
+  an opaque black-box decoder. The T.814 lanes reject them together
+  with the other Annex D styles.
 - **HTJ2K MIXED-set decode (T.814 §8.2 / §A.4)** — a tile-component
   whose style byte carries bits 6 + 7 under a MIXED-permitting
   `Ccap15` now decodes: each code-block is *individually* an HT or a
