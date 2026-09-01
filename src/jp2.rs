@@ -47,46 +47,62 @@ use crate::Error;
 // ---------------------------------------------------------------------------
 
 /// JPEG 2000 Signature box type — `'jP  '` (0x6A50_2020).
+#[doc(hidden)]
 pub const BOX_TYPE_JP2_SIGNATURE: u32 = 0x6A50_2020;
 /// File Type box type — `'ftyp'` (0x6674_7970).
+#[doc(hidden)]
 pub const BOX_TYPE_FTYP: u32 = 0x6674_7970;
 /// JP2 Header superbox type — `'jp2h'` (0x6A70_3268).
+#[doc(hidden)]
 pub const BOX_TYPE_JP2H: u32 = 0x6A70_3268;
 /// Image Header box type — `'ihdr'` (0x6968_6472).
+#[doc(hidden)]
 pub const BOX_TYPE_IHDR: u32 = 0x6968_6472;
 /// Bits Per Component box type — `'bpcc'` (0x6270_6363).
+#[doc(hidden)]
 pub const BOX_TYPE_BPCC: u32 = 0x6270_6363;
 /// Colour Specification box type — `'colr'` (0x636F_6C72).
+#[doc(hidden)]
 pub const BOX_TYPE_COLR: u32 = 0x636F_6C72;
 /// Contiguous Codestream box type — `'jp2c'` (0x6A70_3263).
+#[doc(hidden)]
 pub const BOX_TYPE_JP2C: u32 = 0x6A70_3263;
 /// Palette box type — `'pclr'` (0x7063_6C72). T.800 §I.5.3.4.
+#[doc(hidden)]
 pub const BOX_TYPE_PCLR: u32 = 0x7063_6C72;
 /// Component Mapping box type — `'cmap'` (0x636D_6170). T.800 §I.5.3.5.
+#[doc(hidden)]
 pub const BOX_TYPE_CMAP: u32 = 0x636D_6170;
 /// Channel Definition box type — `'cdef'` (0x6364_6566). T.800 §I.5.3.6.
+#[doc(hidden)]
 pub const BOX_TYPE_CDEF: u32 = 0x6364_6566;
 /// Resolution superbox type — `'res '` (0x7265_7320). T.800 §I.5.3.7.
+#[doc(hidden)]
 pub const BOX_TYPE_RES: u32 = 0x7265_7320;
 /// Capture Resolution box type — `'resc'` (0x7265_7363).
 /// T.800 §I.5.3.7.1.
+#[doc(hidden)]
 pub const BOX_TYPE_RESC: u32 = 0x7265_7363;
 /// Default Display Resolution box type — `'resd'` (0x7265_7364).
 /// T.800 §I.5.3.7.2.
+#[doc(hidden)]
 pub const BOX_TYPE_RESD: u32 = 0x7265_7364;
 
 /// Brand value declared by a conforming JP2 file — `'jp2 '`
 /// (0x6A70_3220). T.800 Annex I §I.5.2 / Table I.3.
+#[doc(hidden)]
 pub const BRAND_JP2: u32 = 0x6A70_3220;
 
 /// Brand value declared by a conforming JPH (HTJ2K) file — `'jph '`
 /// (0x6A70_6820). T.814 Annex D §D.3.
+#[doc(hidden)]
 pub const BRAND_JPH: u32 = 0x6A70_6820;
 
 /// Magic 4-byte contents of the JPEG 2000 Signature box — the
 /// `\x0D\x0A\x87\x0A` byte string defined in T.800 §I.5.1. The whole
 /// box (LBox + TBox + DBox) is therefore the fixed 12-byte literal
 /// `00 00 00 0C 6A 50 20 20 0D 0A 87 0A`.
+#[doc(hidden)]
 pub const JP2_SIGNATURE_MAGIC: [u8; 4] = [0x0D, 0x0A, 0x87, 0x0A];
 
 // ---------------------------------------------------------------------------
