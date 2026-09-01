@@ -4,6 +4,12 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ## [Unreleased]
 
+## [0.0.17](https://github.com/OxideAV/oxideav-jpeg2000/compare/v0.0.16...v0.0.17) - 2026-09-01
+
+### Other
+
+- hide internal pub surface from rustdoc/semver (fleet rule 2026-09-01)
+
 ## [0.0.16](https://github.com/OxideAV/oxideav-jpeg2000/compare/v0.0.15...v0.0.16) - 2026-08-30
 
 ### Other
