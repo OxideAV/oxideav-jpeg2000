@@ -4,6 +4,66 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ## [Unreleased]
 
+## [0.0.16](https://github.com/OxideAV/oxideav-jpeg2000/compare/v0.0.15...v0.0.16) - 2026-08-30
+
+### Other
+
+- fuzz find — a quality-layer cut is a §D.4.3 length estimate, not a §D.4.2 termination; §D.5 symbols stop flagging deliberate layer truncation
+- §A.9.2 COM on encode; registry Encoder honours CodecParameters — ten packed pixel formats, bit_rate budget, CodecOptions coding shape, JP2 container
+- JP2 / JPH writer — Annex I boxes from SIZ + caller colour / palette / channel / resolution description, JPH brand for HT codestreams; MCT over any plane count ≥ 3
+- spell the PSNR-floor validity check without a negated partial-order comparison (clippy neg_cmp_op_on_partial_ord)
+- PCRD PSNR floor — target_psnr bisects the J-13 slope threshold on the decoded reconstruction
+- emit the §A.7.3 PLT and §A.7.1 TLM pointer markers on encode — Iplt spans from the SOP, Ptlm = Psot precomputed per tile-part
+- encode the remaining Table A.19 styles — context reset, §D.7 vertically causal contexts, §D.4.2 predictable termination, §D.5 segmentation symbols
+- compute the §7.3.2 magnitude exponent in u64 — a corrupt MagSgn μ near the lane top overflowed 2μ−1
+- reject magnitude budgets past the 31-bit lane — Equation E-2's Mb=37 extreme overflowed the tier-1 shifts
+- fuzz-depth round — structure-aware encoder round-trip harness finds a §D.6 bypass segment-attribution defect
+- pin the MIXED search edges — walker-level divergence backtracks to the T.800 lane via MixedChoices::advance, full A.3.2/A.4 style-byte matrix under every CAP class
+- MIXED through the Annex I container route — JP2-wrapped conformance stream matches the raw-codestream decode; the interleaved entry point's signed-channel contract pinned
+- README — MIXED-set decode + emission documented, Not-yet-implemented entry retired; fuzz decode_j2k doc covers the A.4 lane search (6-min seeded session clean)
+- MIXED-set encoder — EncodeParams::ht_mixed codes every block both ways and keeps the HT lane inside a throughput budget; conformant Ccap15/SPcod signalling, A.4 headroom, round-trips bit-exact with a re-signalling probe pinning both lanes
+- decode the T.814 MIXED set end-to-end — per-block lane search wired through the tile driver, A.4-NOTE trial tier-1 with Annex D fallback; the three 15444-4 Ed.4 hm conformance streams decode, cross-validated byte-exact on their losslessly shared components
+- T.814 A.4 MIXED-set tier-2 — dual-hypothesis packet-header parse (K(T.800)=1 vs the B.2 set-T partition), A.4/B.3 refutations on shared bytes, depth-first choice log for genuine straddles, writer-side A.4 headroom
+- T.814 A.3.2 CAP-driven HT signalling — Ccap15 classifies HTONLY / HTDECLARED / MIXED-permitted, strict HTONLY signalling routes all blocks to HT, CPF / CRG markers accepted
+- fuzz the end-to-end JP2 file decode — new decode_jp2 target covering the Annex I box surface, palette application and cdef reorder
+- exploit TLM / PLT pointer markers — T.800 A.7.1/A.7.3 lengths cross-validated against the walked tile-parts and packets; corrupted pointers rejected
+- record the HT unaligned-tile sweep + reduced-resolution pinning
+- HT-lane sweep of the precinct-unaligned shapes — 80 whole-codestream cases byte-exact, reduced-resolution r1/r2 pinned on 240 cases across both lanes
+- fix two precinct-unaligned-tile decode bugs found by a 400-case black-box sweep — position-order partial-first-precinct keys on the tile edge (B.12.1.3-5), precinct anchor projects the B.6 resolution-level cell
+- mixed HT / Annex D lanes at tile granularity — T.814 8.2 HTDECLARED across a multi-tile grid via first-tile-part COD overrides, bit-exact both orientations
+- T.800 A.4.2 tile-part interleaving — round-robin cross-tile orderings decode bit-exact; TPsot order / TNsot count faults rejected
+- complete the T.800 Annex I jp2h box surface — pclr / cmap / cdef / res parse, decode_jp2 applies palette expansion + channel ordering byte-exact vs black-box reference decodes
+- Mark internal codec plumbing #[doc(hidden)]
+- pin reduced-resolution decode through the HT lane — multi-tile r1 and offset-anchored r2 byte-exact vs the black-box HT decoder
+- layer-limited decode — decode_j2k_layers(bytes, max_layers), byte-exact at every layer prefix
+- ISO/IEC 15444-4 §B.2.3 reduced-resolution decode — decode_j2k_reduced(bytes, discard_levels)
+- ISO/IEC 15444-4-style conformance corpus — SIZ offsets, layer tile-parts, PLT/TLM, MCT-off, signed/deep depths, sub-sampling, JP2
+- whole-codestream HTJ2K depth — multi-tile, SIZ offsets, tile-part R/RC chains, TLM, PCRL, 16-bit pinned bit-exact on real HT codestreams
+- pin the 9-7 path byte-exact against a second independent reference — the ±1 was inter-reference rounding latitude
+- reject PPx/PPy = 0 above r = 0 (T.800 §B.6 / Table A.21) — new Error::InvalidPrecinctSize
+- §D.4.2 predictable termination is an encoder-side flush contract — drop the invented decode-time landing check
+- per-component Table A.19 code-block style — T.814 HTDECLARED HT/Annex-D component mix decodes
+- decode_j2k fuzz harness + two HT MagSgn shift-overflow fixes + MULTIHT allocation bound
+- MULTIHT edge-shape coverage — placeholder/skip-set/split-refinement header round-trips + hand-assembled skip-set codestream
+- T.814 MULTIHT + placeholder-pass HT decode (§B.1/§B.3) + MULTIHT encode via quality layers
+- fix T.814 §7.3.4/§7.3.6 first-line-pair u2-bit interleave — resolves the known HT decode divergence
+- T.814 Annex D JPH file format (brand, colr exemption, METH 3/5)
+- HT + Annex H ROI composition (T.814 §A.5) + sub-sampling/COC coverage
+- T.814 HTJ2K codestream assembly on encode (CAP + SPcod bit 6)
+- T.814 §7.4/§7.5 HT refinement forward passes + §B.2 segment split
+- Annex H Maxshift region of interest on encode (RGN)
+- §A.7.4 / §A.7.5 packed packet headers on encode (PPM / PPT)
+- add CI / crates.io / docs.rs / MIT-license badges
+- README — round-388 encoder surface (sub-sampling, deep input, framing, POC, tile-parts, COC/QCC, HT cleanup encoder)
+- HTJ2K forward block coder — T.814 §7.3 cleanup-pass encoder
+- §A.6.2 / §A.6.5 per-component COC / QCC overrides on encode
+- §A.6.6 POC emission (progression-order changes on encode)
+- §A.4.2 multi-tile-part emission (TPsot > 0)
+- drop stray debug fixture committed by mistake
+- §B.2 component sub-sampling on encode (SIZ XRsiz / YRsiz)
+- >8-bit input on encode (encode_j2k_u16, 1..=16-bit Ssiz)
+- §A.8.1 SOP / §A.8.2 EPH packet framing on encode
+
 ### Added
 
 - **Encoder: the remaining Table A.19 code-block styles** —
