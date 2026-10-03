@@ -44,3 +44,6 @@ jobs:
 
       - name: Test (no-default-features)
         run: cargo test --no-default-features --lib --verbose
+
+      - name: Clippy (no-default-features)
+        run: cargo clippy --no-default-features --all-targets --no-deps -- -D warnings
