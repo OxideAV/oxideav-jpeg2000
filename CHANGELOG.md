@@ -4,6 +4,67 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- The image-crate API contract (`IMAGE_CRATE_API`) at the crate root:
+  `probe`, `info -> ImageInfo`, `decode` / `decode_with(&DecodeOptions)`
+  -> `Jpeg2000Image`, `decode_rgb8` / `decode_rgba8`, `decode_from`,
+  `encode(&Jpeg2000Image, &EncodeOptions)`, `encode_rgb8` /
+  `encode_rgba8`, `encode_to`; types `Jpeg2000Image` (alias `J2kImage`:
+  `width, height, format, planes, color, metadata, palette, bit_depth`),
+  `Jpeg2000PixelFormat` (= `PixelFormat`, alias `J2kPixelFormat`; packed
+  gray / gray+alpha / RGB / RGBA at 8 and 16 bits, `Gray10Le` /
+  `Gray12Le`, `Pal8`, the planar `Yuv*` / `Yuva*` 4:4:4 / 4:2:2 / 4:2:0
+  / 4:4:0 / 4:1:1 families), `Plane`, `ColorInfo`, `ColorRange`,
+  `Metadata`, `Palette`, `RgbImage`, `RgbaImage`, `ImageInfo`,
+  `DecodeOptions` (limits, `strict`, `reduce`, `layers`), `Container`.
+- JP2 colour on the image: enumerated sRGB / greyscale / sYCC and T.814
+  parameterized `colr` boxes map to H.273 code points, ICC profiles land
+  on `Metadata.icc`; JP2 palettes with ≤ 256 entries of ≤ 8-bit columns
+  decode as `Pal8` + `Palette` and encode back to `pclr` + `cmap`.
+- Registry: `make_encoder` / `Jpeg2000Encoder` exported at the root,
+  `From<Jpeg2000Image> for VideoFrame`, `Jpeg2000Image::from_video_frame`
+  + `TryFrom<(&VideoFrame, &CodecParameters)>`, every
+  `Jpeg2000PixelFormat` on the encoder (planar YCbCr, `Ya8`, …), the
+  significant-bits / colour-signal / palette side-channels on decoded
+  frames, decoder options `reduce` / `layers` / `strict`, framework
+  `DecoderLimits` tightening the standalone limits, `.jp2` / `.jph`
+  extension hints, a `CodecOptionsStruct` schema for the encoder keys.
+- `tests/contract_api.rs` (layout derivation on every fixture against
+  the depth API, lossless round trips over every layout, limits /
+  strict / reduce / layers, colour and ICC through the JP2 header,
+  hostile prefixes) and the `contract` fuzz target (`probe` / `info` /
+  `decode` / `decode_with`); CI `ci-standalone` now also runs clippy.
+- `Cargo.toml` excludes `/tests` and `/fuzz` from the published crate.
+
+### Changed
+
+- `Error` is now the alias of `Jpeg2000Error`, which gains the contract
+  variants `InvalidData(String)`, `Unsupported(String)`,
+  `LimitExceeded(String)` and `Io(std::io::Error)` (+ `From<io::Error>`,
+  `source()`), is `#[non_exhaustive]` and no longer derives `Clone` /
+  `Copy` / `PartialEq` / `Eq`; match on variants or `Display`.
+- `encode::EncodeParams` is renamed `EncodeOptions` (re-exported at the
+  root), `#[non_exhaustive]` with `with_*` builders, and gains
+  `container: Container` (JP2 by default for the contract `encode`;
+  the registry encoder keeps `j2k` as its default); `mct` is now
+  `Option<bool>` (`None` = automatic: on for the RGB layouts through
+  `encode`, `false` through the plane-level `encode_j2k` family).
+- The registry decoder emits the native layout with side-channels
+  (planar YCbCr for chroma-sub-sampled codestreams, `Pal8` + palette
+  for palettized JP2 files) instead of only packed Gray / RGB / RGBA.
+- Hostile-input fixes found by the new fuzz target: a `SIZ` with
+  `XOsiz > Xsiz` underflowed the strict `ihdr` cross-check; the
+  working-set estimate overflowed `u64` on `2^32`-sized components.
+
+### Deprecated
+
+- `decode_jpeg2000` → `decode` / `decode_rgb8`; `encode_jpeg2000` →
+  `encode_rgb8` / `encode` (note the JP2 default container — pass
+  `Container::J2k` for a bare codestream); `looks_like_jp2` → `probe`
+  (+ `info().jp2`); `encode::EncodeParams` → `EncodeOptions`. All stay
+  as thin wrappers for one release.
+
 ## [0.0.16](https://github.com/OxideAV/oxideav-jpeg2000/compare/v0.0.15...v0.0.16) - 2026-08-30
 
 ### Other

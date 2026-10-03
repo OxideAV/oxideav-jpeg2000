@@ -2,13 +2,230 @@
 
 [![CI](https://github.com/OxideAV/oxideav-jpeg2000/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-jpeg2000/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-jpeg2000.svg)](https://crates.io/crates/oxideav-jpeg2000) [![docs.rs](https://docs.rs/oxideav-jpeg2000/badge.svg)](https://docs.rs/oxideav-jpeg2000) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Pure-Rust JPEG 2000 (J2K codestream + JP2 file format) decoder **and
-encoder** for the
-[oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
-Written from scratch against the ITU-T T.800 / ISO-IEC 15444-1 standard
+Pure-Rust JPEG 2000 for the
+[oxideav](https://github.com/OxideAV/oxideav-workspace) workspace: the
+ITU-T T.800 | ISO/IEC 15444-1 Part-1 codestream **decoder and
+encoder**, the T.814 | 15444-15 **HTJ2K** block coder (HTONLY,
+HTDECLARED and MIXED sets), and the Annex I **JP2** / T.814 Annex D
+**JPH** file formats. Written from scratch against the standards
 documents under `docs/image/jpeg2000/` only.
 
-## Capability
+The crate root follows the OxideAV
+[image-crate API contract](../../IMAGE_CRATE_API.md): `decode` hands
+back the picture in the layout its component set describes (packed
+gray / RGB / RGBA at 8 or 16 bits, planar YCbCr when the chroma
+components are sub-sampled, `Pal8` for a JP2 palette) with the JP2
+header's colour and ICC profile, and `encode` takes the same shape.
+The JPEG 2000 depth — per-component `i32` planes for any component
+set, every `SIZ` / `COD` / `QCD` / tile-part marker, the full Annex I
+box surface, raw-plane encoders with every coding-style knob — lives
+under its own names alongside.
+
+## Standalone use
+
+```toml
+oxideav-jpeg2000 = { version = "0.0", default-features = false }
+```
+
+```rust
+let bytes = std::fs::read("in.jp2")?;             // a JP2 / JPH file or a bare .j2k codestream
+if oxideav_jpeg2000::probe(&bytes) {
+    let info = oxideav_jpeg2000::info(&bytes)?;    // header only: size, layout, depth, colour, tiles, layers
+    let img = oxideav_jpeg2000::decode(&bytes)?;   // Jpeg2000Image, native layout
+    let rgba: Vec<u8> = img.to_rgba8();            // tightly packed RGBA, 4 * width bytes per row
+    let (w, h) = (img.width(), img.height());
+
+    let opts = oxideav_jpeg2000::EncodeOptions::default()   // lossless 5-3, JP2 container
+        .with_lossy(6)                                       // 9-7 kernel, Δb = 2^-6
+        .with_layers(3)
+        .with_target_psnr(42.0);
+    std::fs::write("out.jp2", oxideav_jpeg2000::encode_rgba8(w, h, &rgba, &opts)?)?;
+}
+# Ok::<(), oxideav_jpeg2000::Error>(())
+```
+
+Root vocabulary: `probe`, `info -> ImageInfo`, `decode -> Jpeg2000Image`,
+`decode_with(&DecodeOptions)`, `decode_rgb8 -> RgbImage`,
+`decode_rgba8 -> RgbaImage`, `decode_from<R: Read>`,
+`encode(&Jpeg2000Image, &EncodeOptions)`, `encode_rgb8`, `encode_rgba8`,
+`encode_to<W: Write>`; types `Jpeg2000Image { width, height, format,
+planes, color, metadata, palette, bit_depth }` (alias `J2kImage`),
+`Plane`, `ColorInfo`, `ColorRange`, `Metadata`, `Palette`, `RgbImage`,
+`RgbaImage`, `ImageInfo`, `PixelFormat` (= `Jpeg2000PixelFormat`,
+alias `J2kPixelFormat`), `EncodeOptions` + `Container`, `DecodeOptions`,
+`Jpeg2000Error` (= `Error`: `InvalidData`, `Unsupported`,
+`LimitExceeded`, `Io`, plus the T.800 diagnostics). A JP2 file holds
+one codestream, so there is no `decode_all`.
+
+`Jpeg2000Image` is built with the fallible constructors `new` /
+`packed` / `from_rgb8` / `from_rgba8` (geometry validated, so `to_rgb8`
+/ `to_rgba8` never fail); `with_color` / `with_metadata` /
+`with_palette` / `with_bit_depth` fill the rest in; `as_bytes()` is the
+single plane of a packed layout (`None` for the planar YCbCr layouts),
+`into_raw()` concatenates the planes.
+
+### The native layout and the depth API
+
+A codestream is a list of components (`SIZ`), each with its own
+precision and reference-grid sub-sampling; a JP2 header may map them
+through a palette and reorder them (`cmap` / `cdef`). `decode` derives
+the contract layout from that list:
+
+| Channels | Sub-sampling | Precision | `Jpeg2000Image::format` |
+|---|---|---|---|
+| 1 | any, uniform | 1–8 / 10 / 12 / 9–16 | `Gray8` / `Gray10Le` / `Gray12Le` / `Gray16Le` |
+| 2 | uniform | 1–8 / 9–16 | `Ya8` / `Ya16Le` (second channel = alpha) |
+| 3 | uniform, RGB signalling | 1–8 / 9–16 | `Rgb24` / `Rgb48Le` |
+| 4 | uniform, RGB signalling | 1–8 / 9–16 | `Rgba` / `Rgba64Le` |
+| 3 / 4 | uniform, sYCC or parameterized YCC `colr` | 8 / 10 / 12 / 16 | `Yuv444P` / `Yuva444P` families |
+| 3 / 4 | chroma 2×2 (alpha full) | 8 / 10 / 12 / 16 | `Yuv420P` / `Yuva420P` families |
+| 3 / 4 | chroma 2×1 | 8 / 10 / 12 / 16 | `Yuv422P` / `Yuva422P` families |
+| 3 | chroma 1×2 | 8 / 10 / 12 / 16 | `Yuv440P` family |
+| 3 | chroma 4×1 | 8 | `Yuv411P` |
+| 1 index + JP2 `pclr` (≤ 256 entries, 1 / 3 / 4 unsigned ≤ 8-bit columns) | — | 1–8 | `Pal8` + `palette` |
+
+"Uniform" sub-sampling means every component shares one `(XRsiz,
+YRsiz)`; the picture is then the component grid (a 3× sub-sampled
+24×24 codestream is an 8×8 image). Samples are stored LSB-aligned at
+their exact value: `bit_depth` carries the `Ssiz` precision (a 4-bit
+file rides `Gray8` with `bit_depth = 4`, a 14-bit one `Gray16Le` with
+`14`; `Gray10Le` / `Gray12Le` and the 10 / 12-bit YUV labels are used
+when the precision matches exactly). Every other component set —
+signed samples, more than 16 bits, mixed precisions, five or more
+components, chroma geometry outside the table — is
+`Error::Unsupported` from `info` and `decode`, naming the set; the depth
+API decodes them all: `decode_j2k` / `jp2::decode_jp2` /
+`decode_j2k_reduced` / `decode_j2k_layers -> DecodedImage` (one `i32`
+plane per component or JP2 channel), `parse_j2k_header` /
+`parse_codestream` (typed markers), `jp2::parse_jp2` (every Annex I
+box), and on the encode side `encode::encode_j2k` / `encode_j2k_u16` /
+`encode_jp2` / `encode_jp2_with` / `jp2::write_jp2` (raw planes with any
+`SIZ` sub-sampling, `COC` / `QCC` overrides, ROI, `POC`, tile-part
+splits, relocated headers).
+
+The pre-contract entry points `decode_jpeg2000` (interleaved bytes,
+dimensions dropped), `encode_jpeg2000` and `looks_like_jp2`, and the
+option type name `EncodeParams`, remain for one release as deprecated
+wrappers; see the CHANGELOG for the mapping.
+
+## Framework use
+
+```toml
+oxideav-jpeg2000 = "0.0"    # default `registry` feature: pulls oxideav-core
+```
+
+`oxideav_jpeg2000::register(&mut RuntimeContext)` installs the
+`jpeg2000` codec (decoder + encoder, `jpeg2000_sw`) and the `.j2k` /
+`.j2c` / `.jp2` / `.jph` extension hints; `register_codecs` /
+`register_containers` take the individual registries, `make_decoder` /
+`make_encoder` are the factories. `oxideav_meta::register_all` calls
+`register` for you.
+
+The framework `Decoder` and `Encoder` are thin adapters over
+`decode_with` / `encode` (one implementation). Each packet is one
+complete file or codestream (the framing is sniffed); the decoder
+emits the native layout above as a `VideoFrame` — one packed plane, or
+one plane per component for the YCbCr layouts — with the palette
+side-channel for `Pal8`, the colour signal when the JP2 header carried
+one, and the per-plane significant-bits side-channel when `bit_depth`
+differs from the label's depth. Decoder options: `reduce`, `layers`,
+`strict`; the framework `DecoderLimits` tighten the standalone limits.
+The encoder accepts every `Jpeg2000PixelFormat` (plus `Bgr24` / `Bgra`,
+re-ordered) and the `CodecOptions` keys `lossless`, `fine_bits`,
+`psnr`, `target_bytes` (or `bit_rate` / `frame_rate`), `levels`,
+`layers`, `progression`, `tile`, `ht`, `plt`, `tlm`, `sop`, `eph`,
+`comment`, `container` (default `j2k` — the framework carries colour on
+the frame; `jp2` / `jph` wrap the file). `From<Jpeg2000Image> for
+VideoFrame`, `Jpeg2000Image::from_video_frame(&VideoFrame,
+&CodecParameters)` and `TryFrom<(&VideoFrame, &CodecParameters)>` bridge
+the two worlds.
+
+## Supported layouts
+
+Decode — every row of the table above; `Pal8` only from a JP2 file.
+Deep layouts are little-endian 16-bit words; `to_rgb8` / `to_rgba8`
+scale by `round(v × 255 / (2^bit_depth − 1))`, expand the palette,
+replicate gray, and convert YCbCr with the signalled H.273 matrix
+(BT.709 = 1, BT.2020 = 9, otherwise BT.601 — the sYCC coefficients) at
+the signalled range (limited only when a parameterized `colr` says so),
+chroma replicated nearest-sample.
+
+Encode — the same table, in both containers:
+
+| `format` | Codestream | JP2 header |
+|---|---|---|
+| `Gray8` / `Gray10Le` / `Gray12Le` / `Gray16Le` | 1 component at `bit_depth` | greyscale `colr` |
+| `Ya8` / `Ya16Le` | 2 components | greyscale `colr` + opacity `cdef` |
+| `Rgb24` / `Rgb48Le` | 3 components, RCT / ICT on by default | sRGB `colr` |
+| `Rgba` / `Rgba64Le` | 4 components, RCT / ICT across the first three | sRGB `colr` + opacity `cdef` |
+| `Yuv*` / `Yuva*` | components 1–2 at the layout's `XRsiz` / `YRsiz`, no MCT (T.800 J.14.1) | sYCC `colr` (+ opacity `cdef`) |
+| `Pal8` | the index component at `bit_depth` | `pclr` + `cmap` (+ opacity `cdef`); `Container::J2k` is `Unsupported` |
+
+`encode_rgb8` / `encode_rgba8` write `Rgb24` / `Rgba`. `encode` never
+converts a layout: what you pass is what the `SIZ` describes. Lossless
+(`EncodeKernel::Lossless5x3`, the default) round-trips `decode(encode(img))
+== img` for every layout above, pinned by `tests/contract_api.rs`
+(strides come back tight; the JP2 header stamps the conventional
+colourspace on an unsignalled image).
+
+## Options
+
+`DecodeOptions { max_width, max_height, max_pixels, max_bytes, strict,
+reduce, layers }` — limits are checked against the `SIZ` geometry
+(after `reduce`) before any sample plane is allocated; `max_bytes`
+bounds the decoder's `i32` working set (4 bytes per sample over every
+component). Defaults: 65 535 × 65 535, no pixel cap, 1 GiB, lenient,
+full resolution, all layers; `None` lifts a limit (`unlimited()` lifts
+all). `strict` rejects trailing bytes after `EOC` and a JP2 `ihdr` that
+disagrees with `SIZ`. `reduce = n` discards the `n` highest resolution
+levels (dimensions `ceil(full / 2^n)`); `layers = Some(n)` decodes the
+first `n` quality layers.
+
+`EncodeOptions` — `container` (`Jp2` default / `J2k`), `kernel`
+(`Lossless5x3` / `Lossy9x7 { fine_bits }` via `with_lossless` /
+`with_lossy`), `mct` (`None` = on for the RGB layouts, off otherwise),
+`decomposition_levels` (3), `code_block_exp` ((6, 6)), `progression`
+(LRCP), `precincts`, `layers` (1), `target_bytes` / `target_psnr` (PCRD
+rate control), `tile_size`, the Table A.19 style flags (`bypass`,
+`terminate_all`, `reset_probabilities`, `vertically_causal`,
+`predictable_termination`, `segmentation_symbols`), `sop` / `eph`,
+`plt` / `tlm`, `comment`, `high_throughput` / `ht_refinement` /
+`ht_mixed` (T.814), `tile_parts`, `poc`, `packed_headers`, `roi`,
+`sub_sampling` and `component_overrides` (the last two for the
+plane-level encoders; `encode` derives sub-sampling from the layout).
+
+## Metadata and colour
+
+`ColorInfo { range, primaries, transfer, matrix }` comes from the JP2
+Colour Specification box: enumerated sRGB (16) → BT.709 primaries,
+sRGB transfer, identity matrix, full range; greyscale (17) → the same
+code points on one channel; sYCC (18) → BT.709 / sRGB / BT.601 matrix,
+full range; a T.814 parameterized box (`METH = 5`) is copied verbatim;
+an ICC-only box leaves the code points unspecified and puts the profile
+on `Metadata.icc`. A bare codestream carries no colour information
+(`ColorInfo::unspecified()`), so chroma-sub-sampled raw codestreams
+decode as YCbCr with unspecified colour and `to_rgb8` applies the sYCC
+(BT.601, full-range) convention. On encode the JP2 header carries the
+image's `ColorInfo` as the matching enumerated colourspace, the ICC
+profile as a restricted-ICC `colr`, any other description verbatim as a
+parameterized box in a JPH (HT) file, or the conventional colourspace
+flagged `UnkC` in a plain JP2. `Metadata.exif` / `xmp` / `gamma` are
+always `None`: Exif and XMP ride vendor `uuid` boxes whose identifiers
+the staged specifications do not define.
+
+## Limits
+
+Hostile input never panics (fuzz targets `contract`, `decode_j2k`,
+`decode_jp2`, `decode_variants`, `parse_*`, `mq_decoder`,
+`ht_block_decode`, `roundtrip_encode`). `probe` is total and
+allocation-free; `info` reads the main header and JP2 boxes only; the
+decode limits fire before the first plane is allocated. Geometry that
+overflows `usize` is `Unsupported`; a configured limit is
+`LimitExceeded`.
+
+## Format specifics
+
+### Capability
 
 The decoder reconstructs **pixel-exact** images across the core Part-1
 decode path, validated against committed end-to-end fixtures (gray,
@@ -70,8 +287,8 @@ What is implemented:
   `jp2::decode_jp2` decodes a JP2 / JPH **file** end-to-end and
   applies the channel semantics — palette expansion and `cdef`
   colour-ordering — **byte-exact against black-box reference decodes**
-  of committed palettized and BGR + `cdef` fixtures; the historical
-  `decode_jpeg2000` entry point and the registry decoder sniff the
+  of committed palettized and BGR + `cdef` fixtures; the contract
+  `decode` / `info` / `probe` and the registry decoder sniff the
   12-byte JP2 signature and route files through the same path.
 - **Main header** — `SOC`, `SIZ`, `COD`, `QCD`, plus the typed
   tile-part-header markers (`COD`, `COC`, `QCD`, `QCC`, `RGN`, `POC`,
@@ -328,7 +545,7 @@ What is implemented:
   decomposition levels, 4×4–64×64 code-blocks, full-range noise)
   decodes byte-identical.
 
-## Encoder
+### Encoder
 
 The crate carries a full **encode** path built from the same clean-room
 spec surface, round-trip-validated against this crate's own decoder and
@@ -374,7 +591,7 @@ it):
   per-tile `SOT` / `SOD` / `EOC` in the §A.3 order; geometry and packet
   order are derived from the same `geometry` / `progression` code the
   decoder uses.
-- **Structured parameters** (`encode::EncodeParams` +
+- **Structured parameters** (`EncodeOptions` +
   `encode::encode_j2k`) — decomposition levels, code-block exponents,
   kernel, MCT, and:
   - **All five §B.12.1 progression orders** (LRCP / RLCP / RPCL /
@@ -432,7 +649,7 @@ it):
     position-order projections, and the RPCL / PCRL power-of-two
     gate; 4:2:0 / 4:2:2 / asymmetric layouts round-trip bit-exactly.
   - **Region of interest** (Annex H, Maxshift): a reference-grid
-    rectangle (`EncodeParams::roi`) is traced backwards through the
+    rectangle (`EncodeOptions::roi`) is traced backwards through the
     wavelet cascade into each component's §H.3.1 coefficient mask
     (5-3 reach `L(n)…L(n+1)` / `H(n−1)…H(n+1)`, 9-7 reach
     `L(n−1)…L(n+2)` / `H(n−2)…H(n+2)`, per level and axis), the
@@ -458,7 +675,7 @@ it):
     PCRD, ROI and the HT lanes; an opaque-encoder SOP + EPH + PLT +
     TLM fixture pins the `Iplt`-spans-from-SOP convention.
   - **`COM` comment** (§A.9.2): a main-header `Rcom = 1` Latin text
-    segment via `EncodeParams::comment`.
+    segment via `EncodeOptions::comment`.
   - **Packed packet headers** (§A.7.4 / §A.7.5): every §B.10 packet
     header relocated out of the tile-part bodies into per-tile `PPT`
     marker segments (carried in the tile's first tile-part header) or
@@ -514,12 +731,12 @@ it):
   per frame) as a PCRD byte budget, and a `CodecOptions` bag
   (`lossless`, `fine_bits`, `psnr`, `target_bytes`, `levels`,
   `layers`, `progression`, `tile`, `ht`, `plt` / `tlm` / `sop` /
-  `eph`, `comment`, `container = jp2`). The historical
-  `encode_jpeg2000(pixels, w, h)` byte-vector entry point encodes 1-
-  (gray) and 3-component (RGB via RCT) interleaved 8-bit input.
+  `eph`, `comment`, `container = jp2`); the contract `encode_rgb8` /
+  `encode_rgba8` / `encode` are the standalone doors to the same
+  pipeline.
 
 The crate also **encodes HTJ2K** (T.814): setting
-`EncodeParams::high_throughput` routes every code-block through the
+`EncodeOptions::high_throughput` routes every code-block through the
 HT forward block coder and assembles a conformant HTJ2K codestream.
 The forward coder covers the §7.3 cleanup pass
 (`htenc::encode_ht_cleanup_segment` — the three §7.1 bit-stream
@@ -530,7 +747,7 @@ interleave, and §7.3.8 MagSgn emission) **and** the §7.4 SigProp +
 §7.5 MagRef refinement passes (`htenc::encode_ht_refinement_segment`
 — forward duals of the stripe-oriented scans writing the §7.1.5
 forward and §7.1.6 backward refinement bit-streams, both stuffing
-state machines included). With `EncodeParams::ht_refinement` each
+state machines included). With `EncodeOptions::ht_refinement` each
 block's cleanup stops one bit-plane short and a `Z_blk = 3`
 refinement segment carries bit-plane 0 wherever that stays lossless
 (blocks with a SigProp-unreachable `mag = 1` sample fall back to the
@@ -561,7 +778,7 @@ the `Z_blk = 3` refinement shape, and the 9-7 irreversible path —
 single-layer shapes; the decoders decline multi-layer HT).
 
 The encoder also emits **MIXED-set codestreams**
-(`EncodeParams::ht_mixed`, T.814 §8.2 / §A.4): every code-block is
+(`EncodeOptions::ht_mixed`, T.814 §8.2 / §A.4): every code-block is
 coded through both the Annex D MQ passes and the §7.3 HT cleanup pass,
 and per block the HT lane is kept wherever it stays within a
 throughput budget of one-eighth plus two bytes over the MQ codeword —
@@ -579,7 +796,7 @@ pins that both lanes are genuinely present. Single quality layer; the
 §D.6 / §D.4.2 styles, PCRD, ROI and the all-HT mode are rejected in
 combination.
 
-### Not yet implemented
+#### Not yet implemented
 
 These surface a clean `Error::NotImplemented` rather than mis-decoding:
 
@@ -608,42 +825,6 @@ These surface a clean `Error::NotImplemented` rather than mis-decoding:
   for those two orders, so a non-power-of-two factor there is rejected.
   **CPRL** (§B.12.1.5) carries no such restriction and *is* decoded at
   any integer sub-sampling.
-
-## Public API
-
-```rust
-let codestream = oxideav_jpeg2000::parse_codestream(bytes)?;
-let header     = oxideav_jpeg2000::parse_j2k_header(bytes)?;
-let container  = oxideav_jpeg2000::jp2::parse_jp2(bytes)?;
-let image      = oxideav_jpeg2000::jp2::decode_jp2(bytes)?; // file → channels
-# Ok::<(), oxideav_jpeg2000::Error>(())
-```
-
-Decoding: `decode_j2k` (planar) / `decode_jpeg2000` (interleaved
-bytes) / `decode_j2k_reduced(bytes, discard_levels)` — the ISO/IEC
-15444-4 §B.2.3 **reduced-resolution decode** (the `rN` reference-image
-surface): the §F.3.1 synthesis stops `discard_levels` short, every
-grid corner maps through the Equation B-14 ceiling division (image
-and tile origin offsets included), the discarded levels' code-blocks
-skip tier-1, and the reduced planes are validated byte-exact against
-black-box reference decodes at the same reduction (multi-tile,
-offset-anchored, multi-layer, RCT, sub-sampled and 9-7 shapes); and
-`decode_j2k_layers(bytes, max_layers)` — the layer-progressive
-counterpart: each code-block decodes exactly the coding passes its
-first `max_layers` quality layers carried (the truncated
-per-coefficient `Nb(u, v)` reconstruction), byte-exact against
-black-box reference decodes at every layer prefix of the committed
-multi-layer fixtures, with monotone non-increasing MSE toward the
-lossless full decode.
-Encoding: `encode::encode_j2k` with `encode::EncodeParams` (kernel,
-MCT, progression order, precincts, quality layers, PCRD
-`target_bytes`, tile grid, bypass / termination styles), the
-`encode_j2k_lossless` / `encode_j2k_lossless_rct` / `encode_j2k_lossy`
-/ `encode_j2k_lossy_ict` wrappers, or the historical
-`encode_jpeg2000(pixels, w, h)`.
-
-The crate also registers a software decoder **and encoder** through the
-standard `oxideav-core` registry path.
 
 ## Clean-room provenance
 
