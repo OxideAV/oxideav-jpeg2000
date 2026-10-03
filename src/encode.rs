@@ -18,7 +18,7 @@
 //!
 //! The produced codestream is a Part-1 J2K stream: single tile at the
 //! reference-grid origin, one quality layer, any of the five §B.12.1
-//! progression orders ([`EncodeParams::progression`]), maximum
+//! progression orders ([`EncodeOptions::progression`]), maximum
 //! precincts (`PPx = PPy = 15`), optional Table A.17 MCT, and either
 //! the reversible 5-3 kernel with the "no quantization" style (T.800
 //! Table A.28 style 0 — fully **lossless**: decoding reproduces the
@@ -713,7 +713,7 @@ struct PassCapture {
 impl PassCapture {
     /// The Table A.19 style bits of `params` (the segment-shaping
     /// bits 0 / 2 and the coder-shaping bits 1 / 3 / 4 / 5).
-    fn styles(params: &EncodeParams) -> Self {
+    fn styles(params: &EncodeOptions) -> Self {
         PassCapture {
             bypass: params.bypass,
             terminate_all: params.terminate_all,
@@ -1051,10 +1051,10 @@ pub fn encode_j2k_lossless(
         planes,
         width,
         height,
-        &EncodeParams {
+        &EncodeOptions {
             decomposition_levels: nl,
             code_block_exp: cb_exp,
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         },
     )
 }
@@ -1159,13 +1159,13 @@ pub struct RoiRegion {
 /// (Table A.23) and — whenever the quantisation table it implies
 /// differs from the QCD's — a main-header `QCC` (Table A.31).
 ///
-/// `None` fields inherit the [`EncodeParams`] value. The Table A.19
+/// `None` fields inherit the [`EncodeOptions`] value. The Table A.19
 /// code-block **style** byte stays tile-wide (the crate's decoder
 /// rejects a COC whose style diverges from the COD, so the encoder
 /// never emits one); the wavelet kernel *may* differ per component
 /// when no MCT is signalled (the §G.2 / §G.3 transforms pair with one
 /// kernel across components 0–2, so kernel overrides under
-/// [`EncodeParams::mct`] must match the tile-wide kernel).
+/// [`EncodeOptions::mct`] must match the tile-wide kernel).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComponentOverride {
     /// Component index (`Ccoc` / `Cqcc`) this override applies to.
@@ -1186,16 +1186,46 @@ pub struct ComponentOverride {
     pub kernel: Option<EncodeKernel>,
 }
 
-/// Structured encoder parameters — the T.800 §A.6.1 COD fields the
-/// encoder honours, with spec-shaped defaults.
+/// Which file shape [`crate::encode()`] writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum Container {
+    /// A JP2 file (T.800 Annex I) — Image Header + Colour Specification
+    /// (+ palette / channel-definition) boxes around the codestream;
+    /// the JPH brand (T.814 Annex D) when the codestream signals the
+    /// HT block coder. The only shape that carries the image's
+    /// [`crate::ColorInfo`] / ICC profile / palette. The default.
+    #[default]
+    Jp2,
+    /// A bare Annex A codestream (`.j2k` / `.j2c`): no colour or
+    /// metadata; the component set alone describes the picture.
+    J2k,
+}
+
+/// Encoder options — the T.800 §A.6.1 `COD` / `SIZ` fields the encoder
+/// honours, the Annex J rate-control knobs, the T.814 HT lanes and
+/// the file [`Container`], with spec-shaped defaults.
 ///
-/// Build one with [`EncodeParams::default`] and override the fields of
-/// interest, then call [`encode_j2k`]. The convenience wrappers
-/// ([`encode_j2k_lossless`], [`encode_j2k_lossless_rct`],
-/// [`encode_j2k_lossy`], [`encode_j2k_lossy_ict`]) construct one
-/// internally.
+/// Build one with [`EncodeOptions::default`] and the `with_*` builders
+/// (or assign the fields), then call [`crate::encode()`] with a
+/// [`crate::Jpeg2000Image`] or [`encode_j2k`] with raw planes. The
+/// convenience wrappers ([`encode_j2k_lossless`],
+/// [`encode_j2k_lossless_rct`], [`encode_j2k_lossy`],
+/// [`encode_j2k_lossy_ict`]) construct one internally.
+///
+/// Behaviour variants are fields, never function suffixes: the kernel
+/// ([`Self::kernel`] — reversible 5-3 or irreversible 9-7), the MCT,
+/// layers, rate / PSNR targets, tiles, progression, precincts, HT and
+/// the container all live here.
 #[derive(Debug, Clone, PartialEq)]
-pub struct EncodeParams {
+#[non_exhaustive]
+pub struct EncodeOptions {
+    /// File shape: JP2 / JPH wrapper (default) or bare codestream.
+    /// Only [`crate::encode()`] / [`crate::encode_rgb8`] /
+    /// [`crate::encode_rgba8`] / [`crate::encode_to`] honour it; the
+    /// plane-level [`encode_j2k`] always writes a codestream and
+    /// [`encode_jp2`] always a file.
+    pub container: Container,
     /// `NL` — wavelet decomposition levels (SPcod, Table A.15;
     /// `0..=32`). Default `3`.
     pub decomposition_levels: u8,
@@ -1208,9 +1238,13 @@ pub struct EncodeParams {
     /// `SGcod` multiple-component-transformation flag (Table A.17):
     /// pairs the §G.2 RCT with the 5-3 kernel and the §G.3.1 ICT with
     /// the 9-7 kernel, across components 0–2 (§G.1 — at least three
-    /// planes; any further components code untouched). Default
-    /// `false`.
-    pub mct: bool,
+    /// planes; any further components code untouched). `None` (the
+    /// default) lets the entry point decide: [`crate::encode()`] /
+    /// [`crate::encode_rgb8`] / [`crate::encode_rgba8`] turn it on for
+    /// the RGB layouts (`Rgb24` / `Rgb48Le` / `Rgba` / `Rgba64Le`) and
+    /// off for gray, palette and YCbCr (T.800 J.14.1); the plane-level
+    /// [`encode_j2k`] family reads `None` as `false`.
+    pub mct: Option<bool>,
     /// `SGcod` progression order (Table A.16) the tile's packets are
     /// emitted in — any of the five §B.12.1 orders. Default LRCP.
     pub progression: ProgressionOrder,
@@ -1249,7 +1283,7 @@ pub struct EncodeParams {
     /// measured on the reconstruction (this crate's own decoder run on
     /// each candidate) against the input samples over every component
     /// — `10·log10(peak² / MSE)` with `peak = 2^depth − 1`. The same
-    /// Equation J-13 slope threshold λ as [`EncodeParams::target_bytes`]
+    /// Equation J-13 slope threshold λ as [`EncodeOptions::target_bytes`]
     /// is bisected, here towards the **smallest** stream whose decoded
     /// PSNR still reaches the target; every candidate is assembled
     /// exactly (§C.2.9-terminated truncations), so the measurement is
@@ -1312,7 +1346,7 @@ pub struct EncodeParams {
     /// (§B.2 component-grid extent at zero image offset). Each tile
     /// codes the §B.3 Equation B-12 tile-component region
     /// `⌈tx0/XRsiz⌉..⌈tx1/XRsiz⌉ × ⌈ty0/YRsiz⌉..⌈ty1/YRsiz⌉`. When
-    /// [`EncodeParams::mct`] is set, components 0–2 must share the
+    /// [`EncodeOptions::mct`] is set, components 0–2 must share the
     /// same factors (§G.2 / §G.3: "the same separation on the
     /// reference grid").
     pub sub_sampling: Vec<(u8, u8)>,
@@ -1366,7 +1400,7 @@ pub struct EncodeParams {
     pub comment: Option<String>,
     /// T.814 HTJ2K block coding (SPcod bit 6): every code-block is
     /// coded by the §7.3 HT cleanup forward coder (plus, with
-    /// [`EncodeParams::ht_refinement`], the §7.4 / §7.5 refinement
+    /// [`EncodeOptions::ht_refinement`], the §7.4 / §7.5 refinement
     /// passes) instead of the Annex D MQ passes, and the codestream
     /// signals the capability through `Rsiz` bit 14 and a `CAP` marker
     /// segment (`Pcap15`, HTONLY / SINGLEHT / HOMOGENEOUS `Ccap15`
@@ -1375,7 +1409,7 @@ pub struct EncodeParams {
     /// styles and ROI do not apply to HT code-blocks here and are
     /// rejected in combination. Default `false`.
     pub high_throughput: bool,
-    /// With [`EncodeParams::high_throughput`]: stop each block's HT
+    /// With [`EncodeOptions::high_throughput`]: stop each block's HT
     /// cleanup pass one bit-plane short and carry bit-plane 0 in a
     /// §7.4 SigProp + §7.5 MagRef refinement segment (`Z_blk = 3`)
     /// wherever that stays lossless (see
@@ -1396,7 +1430,7 @@ pub struct EncodeParams {
     /// clear top bit) and the T.800-lane blocks carry the derived
     /// single length field (§A.4 bars bypass / per-pass termination).
     /// Single quality layer only; mutually exclusive with
-    /// [`EncodeParams::high_throughput`], [`EncodeParams::ht_refinement`],
+    /// [`EncodeOptions::high_throughput`], [`EncodeOptions::ht_refinement`],
     /// the §D.6 / §D.4.2 styles, PCRD rate control and the Annex H
     /// ROI. Default `false`.
     pub ht_mixed: bool,
@@ -1409,13 +1443,14 @@ pub struct EncodeParams {
     pub roi: Option<RoiRegion>,
 }
 
-impl Default for EncodeParams {
+impl Default for EncodeOptions {
     fn default() -> Self {
-        EncodeParams {
+        EncodeOptions {
+            container: Container::Jp2,
             decomposition_levels: 3,
             code_block_exp: (6, 6),
             kernel: EncodeKernel::Lossless5x3,
-            mct: false,
+            mct: None,
             progression: ProgressionOrder::Lrcp,
             precincts: Vec::new(),
             layers: 1,
@@ -1446,6 +1481,136 @@ impl Default for EncodeParams {
     }
 }
 
+impl EncodeOptions {
+    /// The defaults (lossless 5-3, three levels, 64×64 code-blocks, one
+    /// layer, LRCP, JP2 container).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the file shape.
+    pub fn with_container(mut self, container: Container) -> Self {
+        self.container = container;
+        self
+    }
+
+    /// Set the wavelet kernel / quantisation family.
+    pub fn with_kernel(mut self, kernel: EncodeKernel) -> Self {
+        self.kernel = kernel;
+        self
+    }
+
+    /// Reversible 5-3 (lossless) coding — [`EncodeKernel::Lossless5x3`].
+    pub fn with_lossless(mut self) -> Self {
+        self.kernel = EncodeKernel::Lossless5x3;
+        self
+    }
+
+    /// Irreversible 9-7 coding with the Annex E step `Δb = 2^(−fine_bits)`
+    /// — [`EncodeKernel::Lossy9x7`] (`fine_bits` 0..=8; `6` is
+    /// near-lossless).
+    pub fn with_lossy(mut self, fine_bits: u8) -> Self {
+        self.kernel = EncodeKernel::Lossy9x7 { fine_bits };
+        self
+    }
+
+    /// Set (or clear, `None` = automatic) the multiple-component-transform
+    /// flag (RCT with 5-3, ICT with 9-7, across components 0–2).
+    pub fn with_mct(mut self, mct: impl Into<Option<bool>>) -> Self {
+        self.mct = mct.into();
+        self
+    }
+
+    /// Set the decomposition-level count `NL` (0..=32).
+    pub fn with_decomposition_levels(mut self, levels: u8) -> Self {
+        self.decomposition_levels = levels;
+        self
+    }
+
+    /// Set the code-block exponents `(xcb, ycb)`.
+    pub fn with_code_block_exp(mut self, exp: (u8, u8)) -> Self {
+        self.code_block_exp = exp;
+        self
+    }
+
+    /// Set the progression order.
+    pub fn with_progression(mut self, progression: ProgressionOrder) -> Self {
+        self.progression = progression;
+        self
+    }
+
+    /// Set the user-defined precinct partition (one byte per level).
+    pub fn with_precincts(mut self, precincts: Vec<u8>) -> Self {
+        self.precincts = precincts;
+        self
+    }
+
+    /// Set the quality-layer count (1..=65535).
+    pub fn with_layers(mut self, layers: u16) -> Self {
+        self.layers = layers;
+        self
+    }
+
+    /// Set (or clear) the PCRD byte budget for the whole codestream.
+    pub fn with_target_bytes(mut self, bytes: impl Into<Option<usize>>) -> Self {
+        self.target_bytes = bytes.into();
+        self
+    }
+
+    /// Set (or clear) the PCRD PSNR floor in dB.
+    pub fn with_target_psnr(mut self, psnr: impl Into<Option<f64>>) -> Self {
+        self.target_psnr = psnr.into();
+        self
+    }
+
+    /// Set (or clear) the tile size `(width, height)` on the reference
+    /// grid.
+    pub fn with_tile_size(mut self, tile: impl Into<Option<(u32, u32)>>) -> Self {
+        self.tile_size = tile.into();
+        self
+    }
+
+    /// Select the T.814 HT block coder (`high_throughput`).
+    pub fn with_high_throughput(mut self, ht: bool) -> Self {
+        self.high_throughput = ht;
+        self
+    }
+
+    /// Emit `SOP` marker segments before every packet.
+    pub fn with_sop(mut self, sop: bool) -> Self {
+        self.sop = sop;
+        self
+    }
+
+    /// Emit `EPH` markers after every packet header.
+    pub fn with_eph(mut self, eph: bool) -> Self {
+        self.eph = eph;
+        self
+    }
+
+    /// Emit `PLT` packet-length pointer markers.
+    pub fn with_plt(mut self, plt: bool) -> Self {
+        self.plt = plt;
+        self
+    }
+
+    /// Emit a main-header `TLM` tile-part-length marker.
+    pub fn with_tlm(mut self, tlm: bool) -> Self {
+        self.tlm = tlm;
+        self
+    }
+
+    /// Set (or clear) the `COM` marker text.
+    pub fn with_comment(mut self, comment: impl Into<Option<String>>) -> Self {
+        self.comment = comment.into();
+        self
+    }
+}
+
+/// Pre-contract name of [`EncodeOptions`].
+#[deprecated(note = "use oxideav_jpeg2000::EncodeOptions (IMAGE_CRATE_API)")]
+pub type EncodeParams = EncodeOptions;
+
 /// Encode 8-bit unsigned component planes into a **lossy** Part-1 J2K
 /// codestream using the irreversible 9-7 kernel (T.800 §F.4.8.2) and
 /// Annex E scalar-expounded quantisation (Table A.28 style 2).
@@ -1467,11 +1632,11 @@ pub fn encode_j2k_lossy(
         planes,
         width,
         height,
-        &EncodeParams {
+        &EncodeOptions {
             decomposition_levels: nl,
             code_block_exp: cb_exp,
             kernel: EncodeKernel::Lossy9x7 { fine_bits },
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         },
     )
 }
@@ -1502,12 +1667,12 @@ pub fn encode_j2k_lossy_ict(
         planes.as_slice(),
         width,
         height,
-        &EncodeParams {
+        &EncodeOptions {
             decomposition_levels: nl,
             code_block_exp: cb_exp,
             kernel: EncodeKernel::Lossy9x7 { fine_bits },
-            mct: true,
-            ..EncodeParams::default()
+            mct: Some(true),
+            ..EncodeOptions::default()
         },
     )
 }
@@ -1534,11 +1699,11 @@ pub fn encode_j2k_lossless_rct(
         planes.as_slice(),
         width,
         height,
-        &EncodeParams {
+        &EncodeOptions {
             decomposition_levels: nl,
             code_block_exp: cb_exp,
-            mct: true,
-            ..EncodeParams::default()
+            mct: Some(true),
+            ..EncodeOptions::default()
         },
     )
 }
@@ -1577,7 +1742,7 @@ pub fn encode_jp2(
     planes: &[&[u8]],
     width: u32,
     height: u32,
-    params: &EncodeParams,
+    params: &EncodeOptions,
 ) -> Result<Vec<u8>, Error> {
     encode_jp2_with(
         planes,
@@ -1594,7 +1759,7 @@ pub fn encode_jp2_with(
     planes: &[&[u8]],
     width: u32,
     height: u32,
-    params: &EncodeParams,
+    params: &EncodeOptions,
     options: &crate::jp2::Jp2WriteOptions,
 ) -> Result<Vec<u8>, Error> {
     let codestream = encode_j2k(planes, width, height, params)?;
@@ -1608,7 +1773,7 @@ pub fn encode_jp2_u16(
     width: u32,
     height: u32,
     precision: u8,
-    params: &EncodeParams,
+    params: &EncodeOptions,
     options: &crate::jp2::Jp2WriteOptions,
 ) -> Result<Vec<u8>, Error> {
     let codestream = encode_j2k_u16(planes, width, height, precision, params)?;
@@ -1623,12 +1788,12 @@ pub fn encode_jp2_u16(
 ///
 /// With the (default) reversible 5-3 kernel the output decodes back
 /// **bit-exactly**; the 9-7 kernel quantises per Annex E. See
-/// [`EncodeParams`] for the coding-style knobs.
+/// [`EncodeOptions`] for the coding-style knobs.
 pub fn encode_j2k(
     planes: &[&[u8]],
     width: u32,
     height: u32,
-    params: &EncodeParams,
+    params: &EncodeOptions,
 ) -> Result<Vec<u8>, Error> {
     let wrapped: Vec<SamplePlane> = planes.iter().map(|p| SamplePlane::U8(p)).collect();
     encode_core(&wrapped, width, height, 8, params)
@@ -1646,14 +1811,14 @@ pub fn encode_j2k(
 /// `Δb = 2^(−fine_bits)` to the wider dynamic range unchanged (the
 /// `SPqcd` exponents `εb = Rb + gain + fine_bits` stay within the
 /// 5-bit Table A.28 field). The Table A.17 MCT pairings (§G.2 RCT /
-/// §G.3.1 ICT via [`EncodeParams::mct`]) compose with deep input —
+/// §G.3.1 ICT via [`EncodeOptions::mct`]) compose with deep input —
 /// the RCT chrominance `QCC` exponents build on `precision_bits + 1`.
 pub fn encode_j2k_u16(
     planes: &[&[u16]],
     width: u32,
     height: u32,
     precision_bits: u8,
-    params: &EncodeParams,
+    params: &EncodeOptions,
 ) -> Result<Vec<u8>, Error> {
     if !(1..=16).contains(&precision_bits) {
         return Err(Error::InvalidSamplePrecision);
@@ -1675,12 +1840,12 @@ fn encode_core(
     width: u32,
     height: u32,
     precision: u8,
-    params: &EncodeParams,
+    params: &EncodeOptions,
 ) -> Result<Vec<u8>, Error> {
     let nl = params.decomposition_levels;
     let (xcb, ycb) = params.code_block_exp;
     let kernel = params.kernel;
-    let mct = params.mct;
+    let mct = params.mct.unwrap_or(false);
     // Table A.17: MCT = 1 pairs the §G.2 RCT with the 5-3 kernel and
     // the §G.3.1 ICT with the 9-7 kernel, always across components 0–2.
     let use_rct = mct && matches!(kernel, EncodeKernel::Lossless5x3);
@@ -3830,11 +3995,11 @@ mod tests {
             planes,
             w,
             h,
-            &EncodeParams {
+            &EncodeOptions {
                 decomposition_levels: nl,
                 code_block_exp: (4, 4),
                 progression: order,
-                ..EncodeParams::default()
+                ..EncodeOptions::default()
             },
         )
         .expect("encode");
@@ -3903,11 +4068,11 @@ mod tests {
             &[&p],
             4,
             4,
-            &EncodeParams {
+            &EncodeOptions {
                 decomposition_levels: 1,
                 code_block_exp: (4, 4),
                 progression: crate::ProgressionOrder::Reserved(9),
-                ..EncodeParams::default()
+                ..EncodeOptions::default()
             },
         );
         assert!(r.is_err());
@@ -3917,7 +4082,7 @@ mod tests {
 
     /// Encode with `params`, decode with this crate's decoder, assert
     /// bit-exact recovery, and return the stream.
-    fn roundtrip_params(planes: &[&[u8]], w: u32, h: u32, params: &EncodeParams) -> Vec<u8> {
+    fn roundtrip_params(planes: &[&[u8]], w: u32, h: u32, params: &EncodeOptions) -> Vec<u8> {
         let stream = encode_j2k(planes, w, h, params).expect("encode");
         let img = decode_j2k(&stream).expect("decode own stream");
         for (ci, (comp, plane)) in img.components.iter().zip(planes).enumerate() {
@@ -3934,11 +4099,11 @@ mod tests {
         // levels split into effective 2^(3−1) = 4-sample precinct spans,
         // so every resolution carries several packets.
         let p = noise(64, 48, 0xFACE_FEED);
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 2,
             code_block_exp: (2, 2),
             precincts: vec![0x22, 0x33, 0x33],
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         let stream = roundtrip_params(&[&p], 64, 48, &params);
         let header = crate::parse_j2k_header(&stream).expect("header");
@@ -3961,12 +4126,12 @@ mod tests {
         use crate::ProgressionOrder::*;
         let mut streams = Vec::new();
         for o in [Lrcp, Rlcp, Rpcl, Pcrl, Cprl] {
-            let params = EncodeParams {
+            let params = EncodeOptions {
                 decomposition_levels: 2,
                 code_block_exp: (2, 2),
                 progression: o,
                 precincts: vec![0x22, 0x33, 0x44],
-                ..EncodeParams::default()
+                ..EncodeOptions::default()
             };
             streams.push(roundtrip_params(&planes, w, h, &params));
         }
@@ -3984,12 +4149,12 @@ mod tests {
     fn multi_precinct_lossy_round_trips() {
         // The 9-7 path over a multi-precinct partition.
         let p = noise(48, 48, 0x0BAD_CAFE);
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 2,
             code_block_exp: (3, 3),
             kernel: EncodeKernel::Lossy9x7 { fine_bits: 6 },
             precincts: vec![0x33, 0x44, 0x44],
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         let stream = encode_j2k(&[&p], 48, 48, &params).expect("encode");
         let img = decode_j2k(&stream).expect("decode");
@@ -4007,27 +4172,27 @@ mod tests {
     fn precinct_validation_rejects_malformed() {
         let p = vec![0u8; 16 * 16];
         // Wrong byte count (NL + 1 = 3 required).
-        let bad_len = EncodeParams {
+        let bad_len = EncodeOptions {
             decomposition_levels: 2,
             code_block_exp: (2, 2),
             precincts: vec![0x33, 0x33],
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         assert!(encode_j2k(&[&p], 16, 16, &bad_len).is_err());
         // Zero PPx nibble above r = 0 (Table A.21 note).
-        let bad_zero = EncodeParams {
+        let bad_zero = EncodeOptions {
             decomposition_levels: 1,
             code_block_exp: (2, 2),
             precincts: vec![0x33, 0x30],
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         assert!(encode_j2k(&[&p], 16, 16, &bad_zero).is_err());
         // A zero nibble at r = 0 alone is fine.
-        let ok_zero = EncodeParams {
+        let ok_zero = EncodeOptions {
             decomposition_levels: 1,
             code_block_exp: (2, 2),
             precincts: vec![0x00, 0x33],
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         assert!(encode_j2k(&[&p], 16, 16, &ok_zero).is_ok());
     }
@@ -4040,11 +4205,11 @@ mod tests {
         // across layers at the J.13.4 truncation rates; decoding all
         // layers must remain bit-exact.
         let p = noise(64, 48, 0xD1CE_D1CE);
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 2,
             code_block_exp: (4, 4),
             layers: 3,
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         let stream = roundtrip_params(&[&p], 64, 48, &params);
         let header = crate::parse_j2k_header(&stream).expect("header");
@@ -4054,12 +4219,12 @@ mod tests {
     #[test]
     fn multi_layer_lossy_round_trips() {
         let p = noise(48, 40, 0xFEED_F00D);
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 2,
             code_block_exp: (4, 4),
             kernel: EncodeKernel::Lossy9x7 { fine_bits: 6 },
             layers: 4,
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         let stream = encode_j2k(&[&p], 48, 40, &params).expect("encode");
         let img = decode_j2k(&stream).expect("decode");
@@ -4089,13 +4254,13 @@ mod tests {
             crate::ProgressionOrder::Rpcl,
             crate::ProgressionOrder::Cprl,
         ] {
-            let params = EncodeParams {
+            let params = EncodeOptions {
                 decomposition_levels: 2,
                 code_block_exp: (2, 2),
                 progression: o,
                 precincts: vec![0x22, 0x33, 0x44],
                 layers: 3,
-                ..EncodeParams::default()
+                ..EncodeOptions::default()
             };
             roundtrip_params(&planes, w, h, &params);
         }
@@ -4107,11 +4272,11 @@ mod tests {
         // layers receive no passes anywhere (empty packets) and blocks
         // skip layers between contributions.
         let p = gradient(32, 32);
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 1,
             code_block_exp: (4, 4),
             layers: 8,
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         roundtrip_params(&[&p], 32, 32, &params);
     }
@@ -4120,11 +4285,11 @@ mod tests {
     fn multi_layer_flat_image_all_empty() {
         // Flat mid-grey: every packet of every layer is empty.
         let p = vec![128u8; 24 * 24];
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 2,
             code_block_exp: (4, 4),
             layers: 4,
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         roundtrip_params(&[&p], 24, 24, &params);
     }
@@ -4139,10 +4304,10 @@ mod tests {
             &[&p],
             64,
             64,
-            &EncodeParams {
+            &EncodeOptions {
                 decomposition_levels: 2,
                 code_block_exp: (4, 4),
-                ..EncodeParams::default()
+                ..EncodeOptions::default()
             },
         )
         .unwrap();
@@ -4150,11 +4315,11 @@ mod tests {
             &[&p],
             64,
             64,
-            &EncodeParams {
+            &EncodeOptions {
                 decomposition_levels: 2,
                 code_block_exp: (4, 4),
                 layers: 4,
-                ..EncodeParams::default()
+                ..EncodeOptions::default()
             },
         )
         .unwrap();
@@ -4170,11 +4335,11 @@ mod tests {
     #[test]
     fn zero_layers_rejected() {
         let p = vec![0u8; 16];
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 1,
             code_block_exp: (2, 2),
             layers: 0,
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         assert!(encode_j2k(&[&p], 4, 4, &params).is_err());
     }
@@ -4186,11 +4351,11 @@ mod tests {
         // A 3×2 tile grid (last column/row partial) over noise: every
         // tile transforms and codes independently; decode is bit-exact.
         let p = noise(50, 34, 0x71E5_71E5);
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 2,
             code_block_exp: (3, 3),
             tile_size: Some((20, 17)),
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         let stream = roundtrip_params(&[&p], 50, 34, &params);
         let header = crate::parse_j2k_header(&stream).expect("header");
@@ -4204,11 +4369,11 @@ mod tests {
         // corners, exercising the §F.4 lifting parity and the
         // Table B.1 band-corner splits away from the origin.
         let p = noise(23, 19, 0x0DDF_00D5);
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 3,
             code_block_exp: (2, 2),
             tile_size: Some((7, 5)),
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         roundtrip_params(&[&p], 23, 19, &params);
     }
@@ -4221,12 +4386,12 @@ mod tests {
         let r = gradient(w, h);
         let g = noise(w, h, 0x1234_ABCD);
         let b: Vec<u8> = gradient(w, h).iter().map(|&v| 255 - v).collect();
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 2,
             code_block_exp: (3, 3),
-            mct: true,
+            mct: Some(true),
             tile_size: Some((16, 16)),
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         roundtrip_params(&[&r, &g, &b], w, h, &params);
     }
@@ -4235,13 +4400,13 @@ mod tests {
     fn multi_tile_lossy_layers_round_trip() {
         // Tiles × 9-7 × quality layers.
         let p = noise(48, 48, 0x9876_5432);
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 2,
             code_block_exp: (3, 3),
             kernel: EncodeKernel::Lossy9x7 { fine_bits: 6 },
             layers: 3,
             tile_size: Some((32, 32)),
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         let stream = encode_j2k(&[&p], 48, 48, &params).expect("encode");
         let img = decode_j2k(&stream).expect("decode");
@@ -4259,11 +4424,11 @@ mod tests {
     fn multi_tile_rate_control_meets_budget() {
         // PCRD across tiles: the hulls span all tiles' code-blocks.
         let p = noise(64, 48, 0x1029_3847);
-        let base = EncodeParams {
+        let base = EncodeOptions {
             decomposition_levels: 2,
             code_block_exp: (3, 3),
             tile_size: Some((32, 24)),
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         let full = encode_j2k(&[&p], 64, 48, &base).unwrap();
         let target = full.len() * 6 / 10;
@@ -4271,7 +4436,7 @@ mod tests {
             &[&p],
             64,
             48,
-            &EncodeParams {
+            &EncodeOptions {
                 target_bytes: Some(target),
                 ..base
             },
@@ -4285,11 +4450,11 @@ mod tests {
     #[test]
     fn zero_tile_size_rejected() {
         let p = vec![0u8; 16];
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 1,
             code_block_exp: (2, 2),
             tile_size: Some((0, 8)),
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         assert!(encode_j2k(&[&p], 4, 4, &params).is_err());
     }
@@ -4301,11 +4466,11 @@ mod tests {
         // Table A.19 bit 2: every pass its own terminated segment; the
         // packet header signals one length per pass (§B.10.7.2).
         let p = noise(48, 40, 0x7E57_7E57);
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 2,
             code_block_exp: (4, 4),
             terminate_all: true,
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         let stream = roundtrip_params(&[&p], 48, 40, &params);
         let header = crate::parse_j2k_header(&stream).expect("header");
@@ -4318,10 +4483,10 @@ mod tests {
             &[&p],
             48,
             40,
-            &EncodeParams {
+            &EncodeOptions {
                 decomposition_levels: 2,
                 code_block_exp: (4, 4),
-                ..EncodeParams::default()
+                ..EncodeOptions::default()
             },
         )
         .unwrap();
@@ -4338,12 +4503,12 @@ mod tests {
             EncodeKernel::Lossless5x3,
             EncodeKernel::Lossy9x7 { fine_bits: 6 },
         ] {
-            let params = EncodeParams {
+            let params = EncodeOptions {
                 decomposition_levels: 2,
                 code_block_exp: (4, 4),
                 kernel,
                 bypass: true,
-                ..EncodeParams::default()
+                ..EncodeOptions::default()
             };
             let stream = encode_j2k(&[&p], 48, 48, &params).expect("encode");
             let header = crate::parse_j2k_header(&stream).expect("header");
@@ -4373,9 +4538,9 @@ mod tests {
     #[test]
     fn comment_lands_in_the_main_header_with_rcom_1() {
         let p = noise(16, 16, 5);
-        let params = EncodeParams {
+        let params = EncodeOptions {
             comment: Some("oxideav-jpeg2000 r452".into()),
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         let stream = roundtrip_params(&[&p], 16, 16, &params);
         let off = stream
@@ -4392,9 +4557,9 @@ mod tests {
         assert_eq!(&stream[off + 4..off + 6], &[0, 1], "Rcom = 1");
         assert_eq!(&stream[off + 6..off + 2 + lcom], b"oxideav-jpeg2000 r452");
         for bad in ["", "caf\u{e9}"] {
-            let params = EncodeParams {
+            let params = EncodeOptions {
                 comment: Some(bad.into()),
-                ..EncodeParams::default()
+                ..EncodeOptions::default()
             };
             assert!(matches!(
                 encode_j2k(&[&p], 16, 16, &params),
@@ -4418,22 +4583,23 @@ mod tests {
             (vec![&r[..], &g[..], &b[..]], true),
             (vec![&r[..], &g[..], &b[..], &a[..]], true),
         ] {
-            let params = EncodeParams {
-                mct,
+            let params = EncodeOptions {
+                mct: Some(mct),
                 plt: true,
-                ..EncodeParams::default()
+                ..EncodeOptions::default()
             };
             let file = encode_jp2(&planes, w, h, &params).expect("jp2");
-            assert!(crate::looks_like_jp2(&file));
+            assert!(crate::probe(&file) && crate::info(&file).expect("info").jp2);
             let img = crate::jp2::decode_jp2(&file).expect("decode container");
             assert_eq!(img.components.len(), planes.len());
             for (c, p) in img.components.iter().zip(&planes) {
                 let got: Vec<u8> = c.samples.iter().map(|&v| v as u8).collect();
                 assert_eq!(&got[..], *p);
             }
-            // The byte-vector entry point takes the container too.
-            let flat = crate::decode_jpeg2000(&file).expect("registry decode");
-            assert_eq!(flat.len(), (w * h) as usize * planes.len());
+            // The contract entry point takes the container too.
+            let img = crate::decode(&file).expect("contract decode");
+            assert_eq!(img.components(), planes.len());
+            assert_eq!(img.into_raw().len(), (w * h) as usize * planes.len());
         }
         // 16-bit depth through the u16 path.
         let p16: Vec<u16> = (0..w * h).map(|k| (k * 977 % 4096) as u16).collect();
@@ -4442,7 +4608,7 @@ mod tests {
             w,
             h,
             12,
-            &EncodeParams::default(),
+            &EncodeOptions::default(),
             &crate::jp2::Jp2WriteOptions::for_components(1),
         )
         .expect("jp2 u16");
@@ -4488,17 +4654,17 @@ mod tests {
             // every floor reachable).
             EncodeKernel::Lossy9x7 { fine_bits: 0 },
         ] {
-            let base = EncodeParams {
+            let base = EncodeOptions {
                 decomposition_levels: 2,
                 code_block_exp: (4, 4),
                 kernel,
                 layers: 2,
-                ..EncodeParams::default()
+                ..EncodeOptions::default()
             };
             let full = encode_j2k(&[&p], w, h, &base).expect("full");
             let mut prev_len = 0usize;
             for target in [22.0, 30.0, 38.0] {
-                let params = EncodeParams {
+                let params = EncodeOptions {
                     target_psnr: Some(target),
                     ..base.clone()
                 };
@@ -4518,7 +4684,7 @@ mod tests {
             // stream; the reversible kernel reaches any finite floor —
             // still bit-exact, never longer than the full stream (a
             // trailing pass that changes no reconstructed sample may go).
-            let params = EncodeParams {
+            let params = EncodeOptions {
                 target_psnr: Some(200.0),
                 ..base.clone()
             };
@@ -4543,37 +4709,37 @@ mod tests {
         let r = noise(w, h, 11);
         let g = noise(w, h, 12);
         let b = noise(w, h, 13);
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 2,
             code_block_exp: (3, 3),
-            mct: true,
+            mct: Some(true),
             tile_size: Some((24, 20)),
             bypass: true,
             terminate_all: true,
             sop: true,
             plt: true,
             target_psnr: Some(32.0),
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         let stream = encode_j2k(&[&r, &g, &b], w, h, &params).expect("encode");
         let img = decode_j2k(&stream).expect("decode");
         let got = psnr_db(&img, &[&r, &g, &b]);
         assert!((32.0..40.0).contains(&got), "{got}");
         for bad in [
-            EncodeParams {
+            EncodeOptions {
                 target_bytes: Some(1000),
                 ..params.clone()
             },
-            EncodeParams {
+            EncodeOptions {
                 target_psnr: Some(0.0),
                 ..params.clone()
             },
-            EncodeParams {
+            EncodeOptions {
                 target_psnr: Some(f64::NAN),
                 ..params.clone()
             },
-            EncodeParams {
-                mct: false,
+            EncodeOptions {
+                mct: Some(false),
                 tile_size: None,
                 bypass: false,
                 terminate_all: false,
@@ -4604,7 +4770,7 @@ mod tests {
                 seed
             })
             .collect();
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 3,
             code_block_exp: (5, 5),
             progression: ProgressionOrder::Rlcp,
@@ -4612,7 +4778,7 @@ mod tests {
             reset_probabilities: true,
             predictable_termination: true,
             segmentation_symbols: true,
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         let stream = roundtrip_params(&[&p], w, h, &params);
         for l in 1..=3 {
@@ -4673,7 +4839,7 @@ mod tests {
             PackedHeaders::Ppm,
         ] {
             for (sop, eph) in [(false, false), (true, false), (false, true), (true, true)] {
-                let params = EncodeParams {
+                let params = EncodeOptions {
                     decomposition_levels: 2,
                     code_block_exp: (3, 3),
                     layers: 2,
@@ -4684,7 +4850,7 @@ mod tests {
                     eph,
                     plt: true,
                     tlm: true,
-                    ..EncodeParams::default()
+                    ..EncodeOptions::default()
                 };
                 let stream = roundtrip_params(&[&p], w, h, &params);
                 assert_pointer_markers(&stream, true, true);
@@ -4693,19 +4859,19 @@ mod tests {
                 let mut bad = stream.clone();
                 let plt_off = bad.windows(2).position(|x| x == [0xFF, 0x58]).expect("PLT");
                 bad[plt_off + 5] ^= 0x01;
-                assert_eq!(decode_j2k(&bad), Err(Error::PltMismatch));
+                assert!(matches!(decode_j2k(&bad), Err(Error::PltMismatch)));
                 let mut bad = stream.clone();
                 let tlm_off = bad.windows(2).position(|x| x == [0xFF, 0x55]).expect("TLM");
                 bad[tlm_off + 9] ^= 0x01;
-                assert_eq!(decode_j2k(&bad), Err(Error::TlmMismatch));
+                assert!(matches!(decode_j2k(&bad), Err(Error::TlmMismatch)));
             }
         }
         // Each pointer marker alone.
         for (plt, tlm) in [(true, false), (false, true)] {
-            let params = EncodeParams {
+            let params = EncodeOptions {
                 plt,
                 tlm,
-                ..EncodeParams::default()
+                ..EncodeOptions::default()
             };
             let stream = roundtrip_params(&[&p], w, h, &params);
             assert_pointer_markers(&stream, plt, tlm);
@@ -4717,12 +4883,12 @@ mod tests {
         // 32×32 over 2×2 tiles = 256 tiles: Ttlm no longer fits 8 bits
         // (Table A.33: 0..=254), so ST = 2.
         let p = noise(32, 32, 0x7117_E5E5);
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 0,
             tile_size: Some((2, 2)),
             plt: true,
             tlm: true,
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         let stream = roundtrip_params(&[&p], 32, 32, &params);
         let tlm_off = stream
@@ -4742,42 +4908,42 @@ mod tests {
         let (w, h) = (40u32, 40u32);
         let p = noise(w, h, 0x1E77_A11A);
         let shapes = [
-            EncodeParams {
+            EncodeOptions {
                 bypass: true,
                 terminate_all: true,
                 segmentation_symbols: true,
                 layers: 3,
                 target_bytes: Some(900),
-                ..EncodeParams::default()
+                ..EncodeOptions::default()
             },
-            EncodeParams {
+            EncodeOptions {
                 roi: Some(RoiRegion {
                     x0: 4,
                     y0: 4,
                     x1: 20,
                     y1: 24,
                 }),
-                ..EncodeParams::default()
+                ..EncodeOptions::default()
             },
-            EncodeParams {
+            EncodeOptions {
                 high_throughput: true,
                 ht_refinement: true,
-                ..EncodeParams::default()
+                ..EncodeOptions::default()
             },
-            EncodeParams {
+            EncodeOptions {
                 high_throughput: true,
                 layers: 2,
-                ..EncodeParams::default()
+                ..EncodeOptions::default()
             },
-            EncodeParams {
+            EncodeOptions {
                 ht_mixed: true,
                 sop: true,
                 eph: true,
-                ..EncodeParams::default()
+                ..EncodeOptions::default()
             },
         ];
         for shape in shapes {
-            let params = EncodeParams {
+            let params = EncodeOptions {
                 decomposition_levels: 2,
                 code_block_exp: (3, 3),
                 plt: true,
@@ -4812,15 +4978,15 @@ mod tests {
         }
     }
 
-    fn style_params(bit: u8) -> EncodeParams {
-        EncodeParams {
+    fn style_params(bit: u8) -> EncodeOptions {
+        EncodeOptions {
             decomposition_levels: 2,
             code_block_exp: (4, 4),
             reset_probabilities: bit == 1,
             vertically_causal: bit == 3,
             predictable_termination: bit == 4,
             segmentation_symbols: bit == 5,
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         }
     }
 
@@ -4874,7 +5040,7 @@ mod tests {
             EncodeKernel::Lossless5x3,
             EncodeKernel::Lossy9x7 { fine_bits: 6 },
         ] {
-            let params = EncodeParams {
+            let params = EncodeOptions {
                 decomposition_levels: 2,
                 code_block_exp: (3, 4),
                 kernel,
@@ -4885,7 +5051,7 @@ mod tests {
                 vertically_causal: true,
                 predictable_termination: true,
                 segmentation_symbols: true,
-                ..EncodeParams::default()
+                ..EncodeOptions::default()
             };
             let stream = encode_j2k(&[&p], 56, 48, &params).expect("encode");
             let flags = crate::parse_j2k_header(&stream)
@@ -4920,7 +5086,7 @@ mod tests {
             assert!(l1 >= l2, "layer 1 mse {l1} >= layer 2 mse {l2}");
             // PCRD under the full style set.
             let target = stream.len() / 2;
-            let budget = EncodeParams {
+            let budget = EncodeOptions {
                 target_bytes: Some(target),
                 ..params
             };
@@ -4939,21 +5105,21 @@ mod tests {
         let r = noise(w, h, 1);
         let g = noise(w, h, 2);
         let b = noise(w, h, 3);
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 1,
             code_block_exp: (3, 3),
-            mct: true,
+            mct: Some(true),
             tile_size: Some((24, 20)),
             reset_probabilities: true,
             vertically_causal: true,
             predictable_termination: true,
             segmentation_symbols: true,
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         roundtrip_params(&[&r, &g, &b], w, h, &params);
         for ht in [true, false] {
-            let bad = EncodeParams {
-                mct: false,
+            let bad = EncodeOptions {
+                mct: Some(false),
                 tile_size: None,
                 high_throughput: ht,
                 ht_mixed: !ht,
@@ -4971,12 +5137,12 @@ mod tests {
         // §D.6 prose: with bit 2 set every pass terminates, including
         // both raw passes.
         let p = noise(40, 32, 0xC0DE_C0DE);
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 1,
             code_block_exp: (4, 4),
             bypass: true,
             terminate_all: true,
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         roundtrip_params(&[&p], 40, 32, &params);
     }
@@ -4986,13 +5152,13 @@ mod tests {
         // Layer cuts land after cleanup passes — terminated boundaries
         // in the bypass region — across a 2x2 tile grid.
         let p = noise(64, 64, 0x600D_600D);
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 2,
             code_block_exp: (4, 4),
             bypass: true,
             layers: 3,
             tile_size: Some((32, 32)),
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         roundtrip_params(&[&p], 64, 64, &params);
     }
@@ -5016,12 +5182,12 @@ mod tests {
             })
             .collect();
         for layers in [1u16, 4] {
-            let params = EncodeParams {
+            let params = EncodeOptions {
                 decomposition_levels: 1,
                 code_block_exp: (2, 2),
                 bypass: true,
                 layers,
-                ..EncodeParams::default()
+                ..EncodeOptions::default()
             };
             roundtrip_params(&[&p], 41, 11, &params);
         }
@@ -5030,11 +5196,11 @@ mod tests {
         let tiny: Vec<u8> = vec![
             45, 171, 162, 182, 223, 206, 186, 87, 58, 254, 211, 189, 130, 143, 145, 28,
         ];
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 1,
             code_block_exp: (2, 2),
             bypass: true,
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         roundtrip_params(&[&tiny], 4, 4, &params);
     }
@@ -5044,11 +5210,11 @@ mod tests {
         // Termination styles compose with PCRD truncation (every
         // boundary is exactly terminated).
         let p = noise(64, 48, 0x0FF5_0FF5);
-        let base = EncodeParams {
+        let base = EncodeOptions {
             decomposition_levels: 2,
             code_block_exp: (4, 4),
             terminate_all: true,
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         let full = encode_j2k(&[&p], 64, 48, &base).unwrap();
         let target = full.len() * 6 / 10;
@@ -5056,7 +5222,7 @@ mod tests {
             &[&p],
             64,
             48,
-            &EncodeParams {
+            &EncodeOptions {
                 target_bytes: Some(target),
                 ..base
             },
@@ -5082,10 +5248,10 @@ mod tests {
     #[test]
     fn rate_control_meets_budget_and_uses_it() {
         let p = noise(64, 64, 0x7A57_7A57);
-        let base = EncodeParams {
+        let base = EncodeOptions {
             decomposition_levels: 2,
             code_block_exp: (4, 4),
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         let full = encode_j2k(&[&p], 64, 64, &base).unwrap();
         let target = full.len() * 6 / 10;
@@ -5093,7 +5259,7 @@ mod tests {
             &[&p],
             64,
             64,
-            &EncodeParams {
+            &EncodeOptions {
                 target_bytes: Some(target),
                 ..base
             },
@@ -5111,10 +5277,10 @@ mod tests {
     #[test]
     fn rate_control_quality_monotone_in_budget() {
         let p = noise(64, 64, 0x0DD5_0DD5);
-        let base = EncodeParams {
+        let base = EncodeOptions {
             decomposition_levels: 2,
             code_block_exp: (4, 4),
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         let full_len = encode_j2k(&[&p], 64, 64, &base).unwrap().len();
         let mut last_mse = f64::INFINITY;
@@ -5124,7 +5290,7 @@ mod tests {
                 &[&p],
                 64,
                 64,
-                &EncodeParams {
+                &EncodeOptions {
                     target_bytes: Some(target),
                     ..base.clone()
                 },
@@ -5145,17 +5311,17 @@ mod tests {
     #[test]
     fn rate_control_generous_budget_stays_lossless() {
         let p = gradient(48, 32);
-        let base = EncodeParams {
+        let base = EncodeOptions {
             decomposition_levels: 2,
             code_block_exp: (4, 4),
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         let full = encode_j2k(&[&p], 48, 32, &base).unwrap();
         let rc = encode_j2k(
             &[&p],
             48,
             32,
-            &EncodeParams {
+            &EncodeOptions {
                 target_bytes: Some(full.len() + 100),
                 ..base
             },
@@ -5177,11 +5343,11 @@ mod tests {
             &[&p],
             32,
             32,
-            &EncodeParams {
+            &EncodeOptions {
                 decomposition_levels: 2,
                 code_block_exp: (4, 4),
                 target_bytes: Some(30),
-                ..EncodeParams::default()
+                ..EncodeOptions::default()
             },
         )
         .unwrap();
@@ -5193,12 +5359,12 @@ mod tests {
     #[test]
     fn rate_control_composes_with_layers_and_97() {
         let p = noise(64, 48, 0xCAB1_CAB1);
-        let base = EncodeParams {
+        let base = EncodeOptions {
             decomposition_levels: 2,
             code_block_exp: (4, 4),
             kernel: EncodeKernel::Lossy9x7 { fine_bits: 6 },
             layers: 3,
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         let full_len = encode_j2k(&[&p], 64, 48, &base).unwrap().len();
         let target = full_len * 7 / 10;
@@ -5206,7 +5372,7 @@ mod tests {
             &[&p],
             64,
             48,
-            &EncodeParams {
+            &EncodeOptions {
                 target_bytes: Some(target),
                 ..base
             },
@@ -5320,11 +5486,11 @@ mod tests {
         // NL = 2, single component, LRCP → NL + 1 = 3 packets. Every
         // packet gets a 6-byte SOP with sequential Nsop.
         let p = noise(32, 24, 0x5011_5011);
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 2,
             code_block_exp: (4, 4),
             sop: true,
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         let stream = roundtrip_params(&[&p], 32, 24, &params);
         let header = crate::parse_j2k_header(&stream).expect("header");
@@ -5343,7 +5509,7 @@ mod tests {
             &[&p],
             32,
             24,
-            &EncodeParams {
+            &EncodeOptions {
                 sop: false,
                 ..params
             },
@@ -5354,11 +5520,11 @@ mod tests {
     #[test]
     fn eph_framing_round_trips() {
         let p = noise(32, 24, 0xE9E9_0101);
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 1,
             code_block_exp: (4, 4),
             eph: true,
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         let stream = roundtrip_params(&[&p], 32, 24, &params);
         let header = crate::parse_j2k_header(&stream).expect("header");
@@ -5369,7 +5535,7 @@ mod tests {
             &[&p],
             32,
             24,
-            &EncodeParams {
+            &EncodeOptions {
                 eph: false,
                 ..params
             },
@@ -5385,7 +5551,7 @@ mod tests {
         let w = 48u32;
         let h = 32u32;
         let p = noise(w, h, 0xF00D_F00D);
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 1,
             code_block_exp: (3, 3),
             precincts: vec![0x33, 0x44],
@@ -5393,7 +5559,7 @@ mod tests {
             tile_size: Some((24, 16)),
             sop: true,
             eph: true,
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         let stream = roundtrip_params(&[&p], w, h, &params);
         let nsops: Vec<u16> = stream
@@ -5429,14 +5595,14 @@ mod tests {
         // Framing composes with the §D.6 / §D.4.2 styled segments.
         let p = noise(40, 40, 0xBEEF_0808);
         for (bypass, term) in [(true, false), (false, true), (true, true)] {
-            let params = EncodeParams {
+            let params = EncodeOptions {
                 decomposition_levels: 2,
                 code_block_exp: (4, 4),
                 bypass,
                 terminate_all: term,
                 sop: true,
                 eph: true,
-                ..EncodeParams::default()
+                ..EncodeOptions::default()
             };
             roundtrip_params(&[&p], 40, 40, &params);
         }
@@ -5457,7 +5623,7 @@ mod tests {
         w: u32,
         h: u32,
         bits: u8,
-        params: &EncodeParams,
+        params: &EncodeOptions,
     ) -> Vec<u8> {
         let stream = encode_j2k_u16(planes, w, h, bits, params).expect("encode");
         let img = decode_j2k(&stream).expect("decode own stream");
@@ -5479,10 +5645,10 @@ mod tests {
                 33,
                 27,
                 bits,
-                &EncodeParams {
+                &EncodeOptions {
                     decomposition_levels: 3,
                     code_block_exp: (4, 4),
-                    ..EncodeParams::default()
+                    ..EncodeOptions::default()
                 },
             );
         }
@@ -5497,7 +5663,7 @@ mod tests {
         let p: Vec<u16> = (0..w * h)
             .map(|i| if (i % w) < w / 2 { 0 } else { 0xFFFF })
             .collect();
-        roundtrip_u16(&[&p], w, h, 16, &EncodeParams::default());
+        roundtrip_u16(&[&p], w, h, 16, &EncodeOptions::default());
     }
 
     #[test]
@@ -5513,11 +5679,11 @@ mod tests {
             w,
             h,
             16,
-            &EncodeParams {
+            &EncodeOptions {
                 decomposition_levels: 2,
                 code_block_exp: (4, 4),
-                mct: true,
-                ..EncodeParams::default()
+                mct: Some(true),
+                ..EncodeOptions::default()
             },
         );
         let header = crate::parse_j2k_header(&stream).expect("header");
@@ -5532,11 +5698,11 @@ mod tests {
         let w = 40u32;
         let h = 32u32;
         let p = noise16(w, h, 12, 0xD00D_1212);
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 2,
             code_block_exp: (4, 4),
             kernel: EncodeKernel::Lossy9x7 { fine_bits: 6 },
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         let stream = encode_j2k_u16(&[&p], w, h, 12, &params).expect("encode");
         let img = decode_j2k(&stream).expect("decode");
@@ -5560,12 +5726,12 @@ mod tests {
         let r: Vec<u16> = y.iter().map(|&v| v.saturating_add(900)).collect();
         let g = y.clone();
         let b: Vec<u16> = y.iter().map(|&v| v.saturating_sub(1200)).collect();
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 2,
             code_block_exp: (4, 4),
             kernel: EncodeKernel::Lossy9x7 { fine_bits: 6 },
-            mct: true,
-            ..EncodeParams::default()
+            mct: Some(true),
+            ..EncodeOptions::default()
         };
         let stream = encode_j2k_u16(&[&r, &g, &b], w, h, 16, &params).expect("encode");
         let img = decode_j2k(&stream).expect("decode");
@@ -5593,7 +5759,7 @@ mod tests {
             w,
             h,
             12,
-            &EncodeParams {
+            &EncodeOptions {
                 decomposition_levels: 1,
                 code_block_exp: (3, 3),
                 progression: crate::ProgressionOrder::Rpcl,
@@ -5601,7 +5767,7 @@ mod tests {
                 tile_size: Some((20, 24)),
                 sop: true,
                 eph: true,
-                ..EncodeParams::default()
+                ..EncodeOptions::default()
             },
         );
     }
@@ -5610,7 +5776,7 @@ mod tests {
 
     /// Encode sub-sampled planes, decode, assert bit-exact per plane
     /// with the expected §B.2 sub-sampled dimensions.
-    fn roundtrip_subsampled(planes: &[&[u8]], w: u32, h: u32, params: &EncodeParams) -> Vec<u8> {
+    fn roundtrip_subsampled(planes: &[&[u8]], w: u32, h: u32, params: &EncodeOptions) -> Vec<u8> {
         let stream = encode_j2k(planes, w, h, params).expect("encode");
         let img = decode_j2k(&stream).expect("decode own stream");
         assert_eq!(img.components.len(), planes.len());
@@ -5639,11 +5805,11 @@ mod tests {
             &[&y, &cb, &cr],
             w,
             h,
-            &EncodeParams {
+            &EncodeOptions {
                 decomposition_levels: 2,
                 code_block_exp: (4, 4),
                 sub_sampling: vec![(1, 1), (2, 2), (2, 2)],
-                ..EncodeParams::default()
+                ..EncodeOptions::default()
             },
         );
         // Wire shape: the SIZ carries the separations.
@@ -5665,11 +5831,11 @@ mod tests {
             &[&a, &b, &c],
             w,
             h,
-            &EncodeParams {
+            &EncodeOptions {
                 decomposition_levels: 3,
                 code_block_exp: (3, 3),
                 sub_sampling: vec![(1, 1), (2, 1), (3, 1)],
-                ..EncodeParams::default()
+                ..EncodeOptions::default()
             },
         );
     }
@@ -5688,12 +5854,12 @@ mod tests {
             &[&y, &c],
             w,
             h,
-            &EncodeParams {
+            &EncodeOptions {
                 decomposition_levels: 1,
                 code_block_exp: (3, 3),
                 tile_size: Some((20, 16)),
                 sub_sampling: vec![(1, 1), (2, 2)],
-                ..EncodeParams::default()
+                ..EncodeOptions::default()
             },
         );
     }
@@ -5714,13 +5880,13 @@ mod tests {
                 &[&y, &c],
                 w,
                 h,
-                &EncodeParams {
+                &EncodeOptions {
                     decomposition_levels: 2,
                     code_block_exp: (3, 3),
                     progression: o,
                     precincts: vec![0x22, 0x33, 0x33],
                     sub_sampling: vec![(1, 1), (2, 2)],
-                    ..EncodeParams::default()
+                    ..EncodeOptions::default()
                 },
             );
         }
@@ -5732,12 +5898,12 @@ mod tests {
         let h = 28u32;
         let y = noise(w, h, 0x1055_1055);
         let c = noise(18, 14, 0x1055_0002);
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 2,
             code_block_exp: (4, 4),
             kernel: EncodeKernel::Lossy9x7 { fine_bits: 6 },
             sub_sampling: vec![(1, 1), (2, 2)],
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         let stream = encode_j2k(&[&y, &c], w, h, &params).expect("encode");
         let img = decode_j2k(&stream).expect("decode");
@@ -5760,11 +5926,11 @@ mod tests {
         let h = 17u32;
         let y = noise16(w, h, 12, 0x1216_0001);
         let c = noise16(13, 9, 12, 0x1216_0002);
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 2,
             code_block_exp: (4, 4),
             sub_sampling: vec![(1, 1), (2, 2)],
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         let stream = encode_j2k_u16(&[&y, &c], w, h, 12, &params).expect("encode");
         let img = decode_j2k(&stream).expect("decode");
@@ -5789,12 +5955,12 @@ mod tests {
             &[&r, &g, &b],
             w,
             h,
-            &EncodeParams {
+            &EncodeOptions {
                 decomposition_levels: 2,
                 code_block_exp: (4, 4),
-                mct: true,
+                mct: Some(true),
                 sub_sampling: vec![(2, 2), (2, 2), (2, 2)],
-                ..EncodeParams::default()
+                ..EncodeOptions::default()
             },
         );
     }
@@ -5808,9 +5974,9 @@ mod tests {
             &[&y, &c],
             16,
             16,
-            &EncodeParams {
+            &EncodeOptions {
                 sub_sampling: vec![(1, 1)],
-                ..EncodeParams::default()
+                ..EncodeOptions::default()
             }
         )
         .is_err());
@@ -5819,9 +5985,9 @@ mod tests {
             &[&y, &c],
             16,
             16,
-            &EncodeParams {
+            &EncodeOptions {
                 sub_sampling: vec![(1, 1), (0, 2)],
-                ..EncodeParams::default()
+                ..EncodeOptions::default()
             }
         )
         .is_err());
@@ -5830,9 +5996,9 @@ mod tests {
             &[&y, &y],
             16,
             16,
-            &EncodeParams {
+            &EncodeOptions {
                 sub_sampling: vec![(1, 1), (2, 2)],
-                ..EncodeParams::default()
+                ..EncodeOptions::default()
             }
         )
         .is_err());
@@ -5842,10 +6008,10 @@ mod tests {
             &[&y, &g, &c],
             16,
             16,
-            &EncodeParams {
-                mct: true,
+            &EncodeOptions {
+                mct: Some(true),
                 sub_sampling: vec![(1, 1), (1, 1), (2, 2)],
-                ..EncodeParams::default()
+                ..EncodeOptions::default()
             }
         )
         .is_err());
@@ -5859,7 +6025,7 @@ mod tests {
         planes: &[&[u8]],
         w: u32,
         h: u32,
-        params: &EncodeParams,
+        params: &EncodeOptions,
     ) -> Vec<(u16, u8, u8)> {
         let stream = roundtrip_params(planes, w, h, params);
         let cs = crate::parse_codestream(&stream).expect("parse");
@@ -5884,12 +6050,12 @@ mod tests {
             &[&p],
             48,
             40,
-            &EncodeParams {
+            &EncodeOptions {
                 decomposition_levels: 2,
                 code_block_exp: (4, 4),
                 progression: crate::ProgressionOrder::Rlcp,
                 tile_parts: TilePartSplit::ByResolution,
-                ..EncodeParams::default()
+                ..EncodeOptions::default()
             },
         );
         assert_eq!(sots, vec![(0, 0, 3), (0, 1, 3), (0, 2, 3)]);
@@ -5903,12 +6069,12 @@ mod tests {
             &[&p],
             48,
             40,
-            &EncodeParams {
+            &EncodeOptions {
                 decomposition_levels: 2,
                 code_block_exp: (4, 4),
                 layers: 3,
                 tile_parts: TilePartSplit::ByLayer,
-                ..EncodeParams::default()
+                ..EncodeOptions::default()
             },
         );
         assert_eq!(sots, vec![(0, 0, 3), (0, 1, 3), (0, 2, 3)]);
@@ -5924,12 +6090,12 @@ mod tests {
             &[&p],
             32,
             32,
-            &EncodeParams {
+            &EncodeOptions {
                 decomposition_levels: 2,
                 code_block_exp: (4, 4),
                 layers: 2,
                 tile_parts: TilePartSplit::ByResolution,
-                ..EncodeParams::default()
+                ..EncodeOptions::default()
             },
         );
         assert_eq!(sots.len(), 6);
@@ -5947,12 +6113,12 @@ mod tests {
             &[&r, &g, &b],
             24,
             24,
-            &EncodeParams {
+            &EncodeOptions {
                 decomposition_levels: 1,
                 code_block_exp: (4, 4),
                 progression: crate::ProgressionOrder::Cprl,
                 tile_parts: TilePartSplit::ByComponent,
-                ..EncodeParams::default()
+                ..EncodeOptions::default()
             },
         );
         assert_eq!(
@@ -5970,7 +6136,7 @@ mod tests {
         let h = 24u32;
         let y = noise(w, h, 0x7BA7_0007);
         let c = noise(20, 12, 0x7BA7_0008);
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 1,
             code_block_exp: (3, 3),
             progression: crate::ProgressionOrder::Rlcp,
@@ -5979,7 +6145,7 @@ mod tests {
             sop: true,
             eph: true,
             tile_parts: TilePartSplit::ByResolution,
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         let stream = encode_j2k(&[&y, &c], w, h, &params).expect("encode");
         let img = decode_j2k(&stream).expect("decode own stream");
@@ -5999,14 +6165,14 @@ mod tests {
     fn tile_parts_with_rate_control() {
         // PCRD accounts the extra SOT + SOD framing of every part.
         let p = noise(64, 64, 0x7BA7_0009);
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 2,
             code_block_exp: (4, 4),
             kernel: EncodeKernel::Lossy9x7 { fine_bits: 6 },
             progression: crate::ProgressionOrder::Rlcp,
             target_bytes: Some(1600),
             tile_parts: TilePartSplit::ByResolution,
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         let stream = encode_j2k(&[&p], 64, 64, &params).expect("encode");
         assert!(stream.len() <= 1600, "budget binds: {} B", stream.len());
@@ -6018,12 +6184,12 @@ mod tests {
         // 300 layers split by layer → 300 > 255 tile-parts (Table A.6
         // TNsot is 8-bit).
         let p = noise(64, 64, 0x7BA7_000A);
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 1,
             code_block_exp: (4, 4),
             layers: 300,
             tile_parts: TilePartSplit::ByLayer,
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         assert!(encode_j2k(&[&p], 64, 64, &params).is_err());
     }
@@ -6054,14 +6220,14 @@ mod tests {
         // together they cover all NL + 1 = 3 resolutions once.
         use crate::ProgressionOrder::*;
         let p = noise(48, 40, 0x90C0_0001);
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 2,
             code_block_exp: (4, 4),
             poc: vec![
                 poc_entry(0, 1, 0, 1, 1, Lrcp),
                 poc_entry(1, 3, 0, 1, 1, Cprl),
             ],
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         let stream = roundtrip_params(&[&p], 48, 40, &params);
         // Wire shape: a main-header POC with both entries.
@@ -6084,7 +6250,7 @@ mod tests {
         let r = noise(32, 24, 0x90C0_0002);
         let g = noise(32, 24, 0x90C0_0003);
         let b = noise(32, 24, 0x90C0_0004);
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 1,
             code_block_exp: (4, 4),
             layers: 2,
@@ -6092,7 +6258,7 @@ mod tests {
                 poc_entry(0, 2, 0, 3, 1, Lrcp),
                 poc_entry(0, 2, 0, 3, 2, Cprl),
             ],
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         roundtrip_params(&[&r, &g, &b], 32, 24, &params);
     }
@@ -6103,7 +6269,7 @@ mod tests {
         // LRCP tail volume — positions must agree with the decoder.
         use crate::ProgressionOrder::*;
         let p = noise(56, 40, 0x90C0_0005);
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 2,
             code_block_exp: (2, 2),
             precincts: vec![0x22, 0x33, 0x44],
@@ -6111,7 +6277,7 @@ mod tests {
                 poc_entry(0, 2, 0, 1, 1, Rpcl),
                 poc_entry(2, 3, 0, 1, 1, Lrcp),
             ],
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         roundtrip_params(&[&p], 56, 40, &params);
     }
@@ -6121,7 +6287,7 @@ mod tests {
         // POC + multi-tile + SOP/EPH + per-resolution tile-parts.
         use crate::ProgressionOrder::*;
         let p = noise(40, 32, 0x90C0_0006);
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 1,
             code_block_exp: (3, 3),
             tile_size: Some((20, 32)),
@@ -6132,7 +6298,7 @@ mod tests {
                 poc_entry(0, 1, 0, 1, 1, Lrcp),
                 poc_entry(1, 2, 0, 1, 1, Rlcp),
             ],
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         let stream = roundtrip_params(&[&p], 40, 32, &params);
         let cs = crate::parse_codestream(&stream).expect("parse");
@@ -6145,11 +6311,11 @@ mod tests {
         // top resolution would never be emitted.
         use crate::ProgressionOrder::*;
         let p = noise(32, 32, 0x90C0_0007);
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 2,
             code_block_exp: (4, 4),
             poc: vec![poc_entry(0, 2, 0, 1, 1, Lrcp)],
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         assert!(encode_j2k(&[&p], 32, 32, &params).is_err());
     }
@@ -6158,31 +6324,31 @@ mod tests {
     fn poc_invalid_entries_rejected() {
         use crate::ProgressionOrder::*;
         let p = noise(16, 16, 0x90C0_0008);
-        let base = EncodeParams {
+        let base = EncodeOptions {
             decomposition_levels: 1,
             code_block_exp: (4, 4),
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         // REpoc <= RSpoc.
-        let bad1 = EncodeParams {
+        let bad1 = EncodeOptions {
             poc: vec![poc_entry(1, 1, 0, 1, 1, Lrcp)],
             ..base.clone()
         };
         assert!(encode_j2k(&[&p], 16, 16, &bad1).is_err());
         // CEpoc <= CSpoc.
-        let bad2 = EncodeParams {
+        let bad2 = EncodeOptions {
             poc: vec![poc_entry(0, 2, 1, 1, 1, Lrcp)],
             ..base.clone()
         };
         assert!(encode_j2k(&[&p], 16, 16, &bad2).is_err());
         // LYEpoc == 0.
-        let bad3 = EncodeParams {
+        let bad3 = EncodeOptions {
             poc: vec![poc_entry(0, 2, 0, 1, 0, Lrcp)],
             ..base.clone()
         };
         assert!(encode_j2k(&[&p], 16, 16, &bad3).is_err());
         // Reserved Ppoc.
-        let bad4 = EncodeParams {
+        let bad4 = EncodeOptions {
             poc: vec![poc_entry(
                 0,
                 2,
@@ -6214,14 +6380,14 @@ mod tests {
         // its COC carries NL and its QCC the shorter band list.
         let a = noise(40, 32, 0xC0C0_0001);
         let b = noise(40, 32, 0xC0C0_0002);
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 3,
             code_block_exp: (4, 4),
             component_overrides: vec![ComponentOverride {
                 decomposition_levels: Some(1),
                 ..ov(1)
             }],
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         let stream = roundtrip_params(&[&a, &b], 40, 32, &params);
         let cs = crate::parse_codestream(&stream).expect("parse");
@@ -6239,14 +6405,14 @@ mod tests {
     fn override_code_block_size_round_trips() {
         let a = noise(48, 32, 0xC0C0_0003);
         let b = noise(48, 32, 0xC0C0_0004);
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 2,
             code_block_exp: (5, 5),
             component_overrides: vec![ComponentOverride {
                 code_block_exp: Some((2, 3)),
                 ..ov(0)
             }],
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         let stream = roundtrip_params(&[&a, &b], 48, 32, &params);
         let cs = crate::parse_codestream(&stream).expect("parse");
@@ -6266,7 +6432,7 @@ mod tests {
         let a = noise(64, 48, 0xC0C0_0005);
         let b = noise(64, 48, 0xC0C0_0006);
         let c = noise(64, 48, 0xC0C0_0007);
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 2,
             code_block_exp: (2, 2),
             precincts: vec![0x22, 0x33, 0x33],
@@ -6280,7 +6446,7 @@ mod tests {
                     ..ov(2)
                 },
             ],
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         roundtrip_params(&[&a, &b, &c], 64, 48, &params);
     }
@@ -6292,14 +6458,14 @@ mod tests {
         // fine_bits = 6) — different kernels per component, MCT off.
         let a = noise(40, 40, 0xC0C0_0008);
         let b = noise(40, 40, 0xC0C0_0009);
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 2,
             code_block_exp: (4, 4),
             component_overrides: vec![ComponentOverride {
                 kernel: Some(EncodeKernel::Lossy9x7 { fine_bits: 6 }),
                 ..ov(1)
             }],
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         let stream = encode_j2k(&[&a, &b], 40, 40, &params).expect("encode");
         let img = decode_j2k(&stream).expect("decode");
@@ -6332,7 +6498,7 @@ mod tests {
         let h = 32u32;
         let a = noise(w, h, 0xC0C0_000A);
         let b = noise(24, 16, 0xC0C0_000B);
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 2,
             code_block_exp: (4, 4),
             progression: crate::ProgressionOrder::Rlcp,
@@ -6346,7 +6512,7 @@ mod tests {
                 code_block_exp: Some((3, 3)),
                 ..ov(1)
             }],
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         roundtrip_subsampled(&[&a, &b], w, h, &params);
     }
@@ -6361,15 +6527,15 @@ mod tests {
         let r = noise(w, h, 0xC0C0_000C);
         let g: Vec<u8> = r.iter().map(|&v| v.wrapping_add(7)).collect();
         let b: Vec<u8> = r.iter().map(|&v| v ^ 0x21).collect();
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 3,
             code_block_exp: (4, 4),
-            mct: true,
+            mct: Some(true),
             component_overrides: vec![ComponentOverride {
                 decomposition_levels: Some(1),
                 ..ov(2)
             }],
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         let stream = roundtrip_params(&[&r, &g, &b], w, h, &params);
         let cs = crate::parse_codestream(&stream).expect("parse");
@@ -6382,26 +6548,26 @@ mod tests {
     #[test]
     fn override_validation() {
         let p = vec![0u8; 16 * 16];
-        let base = EncodeParams {
+        let base = EncodeOptions {
             decomposition_levels: 2,
             code_block_exp: (4, 4),
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         // Component index out of range.
-        let bad1 = EncodeParams {
+        let bad1 = EncodeOptions {
             component_overrides: vec![ov(1)],
             ..base.clone()
         };
         assert!(encode_j2k(&[&p], 16, 16, &bad1).is_err());
         // Two overrides for one component.
-        let bad2 = EncodeParams {
+        let bad2 = EncodeOptions {
             component_overrides: vec![ov(0), ov(0)],
             ..base.clone()
         };
         assert!(encode_j2k(&[&p], 16, 16, &bad2).is_err());
         // Kernel override diverging under MCT.
-        let bad3 = EncodeParams {
-            mct: true,
+        let bad3 = EncodeOptions {
+            mct: Some(true),
             component_overrides: vec![ComponentOverride {
                 kernel: Some(EncodeKernel::Lossy9x7 { fine_bits: 6 }),
                 ..ov(1)
@@ -6411,7 +6577,7 @@ mod tests {
         assert!(encode_j2k(&[&p, &p, &p], 16, 16, &bad3).is_err());
         // NL override with an inherited tile-wide partition that no
         // longer fits the component's NL + 1 byte count.
-        let bad4 = EncodeParams {
+        let bad4 = EncodeOptions {
             precincts: vec![0x22, 0x33, 0x33],
             component_overrides: vec![ComponentOverride {
                 decomposition_levels: Some(1),
@@ -6421,7 +6587,7 @@ mod tests {
         };
         assert!(encode_j2k(&[&p], 16, 16, &bad4).is_err());
         // Override precincts of the wrong length for the effective NL.
-        let bad5 = EncodeParams {
+        let bad5 = EncodeOptions {
             component_overrides: vec![ComponentOverride {
                 precincts: Some(vec![0x33, 0x33]),
                 ..ov(0)
@@ -6436,22 +6602,22 @@ mod tests {
         let p = vec![0u16; 16];
         // Depth outside 1..=16.
         assert!(matches!(
-            encode_j2k_u16(&[&p], 4, 4, 0, &EncodeParams::default()),
+            encode_j2k_u16(&[&p], 4, 4, 0, &EncodeOptions::default()),
             Err(Error::InvalidSamplePrecision)
         ));
         assert!(matches!(
-            encode_j2k_u16(&[&p], 4, 4, 17, &EncodeParams::default()),
+            encode_j2k_u16(&[&p], 4, 4, 17, &EncodeOptions::default()),
             Err(Error::InvalidSamplePrecision)
         ));
         // A sample that does not fit the declared depth.
         let too_big = vec![1u16 << 12; 16];
         assert!(matches!(
-            encode_j2k_u16(&[&too_big], 4, 4, 12, &EncodeParams::default()),
+            encode_j2k_u16(&[&too_big], 4, 4, 12, &EncodeOptions::default()),
             Err(Error::InvalidSamplePrecision)
         ));
         // Exactly at the depth limit is fine.
         let at_limit = vec![(1u16 << 12) - 1; 16];
-        assert!(encode_j2k_u16(&[&at_limit], 4, 4, 12, &EncodeParams::default()).is_ok());
+        assert!(encode_j2k_u16(&[&at_limit], 4, 4, 12, &EncodeOptions::default()).is_ok());
     }
 
     #[test]
@@ -6459,14 +6625,14 @@ mod tests {
         // PCRD accounts the 6 + 2 framing bytes per packet: the budget
         // still binds on the framed stream.
         let p = noise(64, 64, 0x7777_1234);
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 2,
             code_block_exp: (4, 4),
             kernel: EncodeKernel::Lossy9x7 { fine_bits: 6 },
             target_bytes: Some(1500),
             sop: true,
             eph: true,
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         let stream = encode_j2k(&[&p], 64, 64, &params).expect("encode");
         assert!(stream.len() <= 1500, "budget binds: {} B", stream.len());
@@ -6510,16 +6676,16 @@ mod tests {
     #[test]
     fn ppt_and_ppm_relocations_round_trip() {
         let p = noise(64, 48, 0xA7A7_0001);
-        let base = EncodeParams {
+        let base = EncodeOptions {
             decomposition_levels: 2,
             code_block_exp: (3, 3),
             precincts: vec![0x22, 0x33, 0x33],
             layers: 3,
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         let in_stream = roundtrip_params(&[&p], 64, 48, &base);
         for mode in [PackedHeaders::Ppt, PackedHeaders::Ppm] {
-            let params = EncodeParams {
+            let params = EncodeOptions {
                 packed_headers: mode,
                 ..base.clone()
             };
@@ -6551,16 +6717,16 @@ mod tests {
         let r = noise(48, 40, 0xBEEF_0011);
         let g = noise(48, 40, 0xBEEF_0022);
         let b = noise(48, 40, 0xBEEF_0033);
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 2,
             code_block_exp: (3, 3),
-            mct: true,
+            mct: Some(true),
             tile_size: Some((32, 32)),
             tile_parts: TilePartSplit::ByResolution,
             sop: true,
             eph: true,
             packed_headers: PackedHeaders::Ppt,
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         let stream = roundtrip_params(&[&r, &g, &b], 48, 40, &params);
         let cs = crate::parse_codestream(&stream).expect("parse");
@@ -6585,7 +6751,7 @@ mod tests {
     #[test]
     fn ppm_composes_with_tiles_parts_framing_and_pcrd() {
         let p = noise(64, 64, 0xC0DE_5150);
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 2,
             code_block_exp: (3, 3),
             kernel: EncodeKernel::Lossy9x7 { fine_bits: 6 },
@@ -6595,7 +6761,7 @@ mod tests {
             eph: true,
             target_bytes: Some(2200),
             packed_headers: PackedHeaders::Ppm,
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         let stream = encode_j2k(&[&p], 64, 64, &params).expect("encode");
         assert!(stream.len() <= 2200, "budget binds: {} B", stream.len());
@@ -6623,7 +6789,7 @@ mod tests {
     #[test]
     fn roi_lossless_round_trips_bit_exact() {
         let p = noise(64, 48, 0x0510_ACE5);
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 2,
             code_block_exp: (3, 3),
             roi: Some(RoiRegion {
@@ -6632,7 +6798,7 @@ mod tests {
                 x1: 40,
                 y1: 30,
             }),
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         let stream = roundtrip_params(&[&p], 64, 48, &params);
         let rgn = rgn_markers(&stream);
@@ -6657,12 +6823,12 @@ mod tests {
             x1: 24,
             y1: 24,
         };
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 2,
             code_block_exp: (4, 4),
             kernel: EncodeKernel::Lossy9x7 { fine_bits: 4 },
             roi: Some(roi),
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         let stream = encode_j2k(&[&p], 48, 40, &params).expect("encode");
         let img = decode_j2k(&stream).expect("decode");
@@ -6681,10 +6847,10 @@ mod tests {
                 &[&p],
                 48,
                 40,
-                &EncodeParams {
+                &EncodeOptions {
                     kernel: EncodeKernel::Lossy9x7 { fine_bits: 6 },
                     roi: Some(roi),
-                    ..EncodeParams::default()
+                    ..EncodeOptions::default()
                 },
             ),
             Err(Error::NotImplemented)
@@ -6704,17 +6870,17 @@ mod tests {
             x1: 48,
             y1: 48,
         };
-        let base = EncodeParams {
+        let base = EncodeOptions {
             decomposition_levels: 2,
             code_block_exp: (4, 4),
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         let full_len = encode_j2k(&[&p], w, h, &base).unwrap().len();
         let stream = encode_j2k(
             &[&p],
             w,
             h,
-            &EncodeParams {
+            &EncodeOptions {
                 roi: Some(roi),
                 target_bytes: Some(full_len * 45 / 100),
                 ..base
@@ -6753,10 +6919,10 @@ mod tests {
         let r = noise(48, 40, 0x0510_0001);
         let g = noise(48, 40, 0x0510_0002);
         let b = noise(48, 40, 0x0510_0003);
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 2,
             code_block_exp: (3, 3),
-            mct: true,
+            mct: Some(true),
             tile_size: Some((32, 32)),
             roi: Some(RoiRegion {
                 x0: 10,
@@ -6764,7 +6930,7 @@ mod tests {
                 x1: 30,
                 y1: 26,
             }),
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         let stream = roundtrip_params(&[&r, &g, &b], 48, 40, &params);
         let rgn = rgn_markers(&stream);
@@ -6776,7 +6942,7 @@ mod tests {
         // Sub-sampled (no MCT) shape, odd dimensions.
         let half = noise(24, 20, 0x0510_0004);
         let full = noise(47, 39, 0x0510_0005);
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 1,
             code_block_exp: (3, 3),
             sub_sampling: vec![(1, 1), (2, 2)],
@@ -6786,7 +6952,7 @@ mod tests {
                 x1: 20,
                 y1: 20,
             }),
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         roundtrip_params(&[&full, &half], 47, 39, &params);
     }
@@ -6796,7 +6962,7 @@ mod tests {
     #[test]
     fn roi_rejects_overdeep_budget() {
         let p = vec![0u16; 16 * 16];
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 1,
             roi: Some(RoiRegion {
                 x0: 0,
@@ -6804,7 +6970,7 @@ mod tests {
                 x1: 8,
                 y1: 8,
             }),
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         // 16-bit: s = 2 + (16 + 2) − 1 = 19, M'b = 38 > 30.
         assert!(matches!(
@@ -6852,11 +7018,11 @@ mod tests {
             (64, 48, 2, (4, 4)),
         ] {
             let p = noise(w, h, 0x4854_0001 ^ u32::from(nl));
-            let params = EncodeParams {
+            let params = EncodeOptions {
                 decomposition_levels: nl,
                 code_block_exp: cb,
                 high_throughput: true,
-                ..EncodeParams::default()
+                ..EncodeOptions::default()
             };
             let stream = roundtrip_params(&[&p], w, h, &params);
             let header = crate::parse_j2k_header(&stream).expect("header");
@@ -6878,18 +7044,18 @@ mod tests {
     #[test]
     fn ht_refinement_mode_round_trips() {
         let p = noise(64, 64, 0x4854_0002);
-        let base = EncodeParams {
+        let base = EncodeOptions {
             decomposition_levels: 2,
             code_block_exp: (4, 4),
             high_throughput: true,
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         let plain = roundtrip_params(&[&p], 64, 64, &base);
         let refined = roundtrip_params(
             &[&p],
             64,
             64,
-            &EncodeParams {
+            &EncodeOptions {
                 ht_refinement: true,
                 ..base
             },
@@ -6907,15 +7073,15 @@ mod tests {
         let g = noise(48, 40, 0x4854_0012);
         let b = noise(48, 40, 0x4854_0013);
         // Lossless RCT, RLCP, multi-precinct.
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 2,
             code_block_exp: (3, 3),
-            mct: true,
+            mct: Some(true),
             progression: ProgressionOrder::Rlcp,
             precincts: vec![0x22, 0x33, 0x33],
             high_throughput: true,
             ht_refinement: true,
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         let stream = roundtrip_params(&[&r, &g, &b], 48, 40, &params);
         let (_, ccap15) = cap_marker(&stream).expect("CAP");
@@ -6923,17 +7089,17 @@ mod tests {
 
         // Lossy 9-7 ICT with tiles + SOP/EPH + RPCL: bounded error and
         // the HTIRV bit set.
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 2,
             code_block_exp: (4, 4),
             kernel: EncodeKernel::Lossy9x7 { fine_bits: 6 },
-            mct: true,
+            mct: Some(true),
             tile_size: Some((32, 32)),
             progression: ProgressionOrder::Rpcl,
             sop: true,
             eph: true,
             high_throughput: true,
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         let stream = encode_j2k(&[&r, &g, &b], 48, 40, &params).expect("encode");
         let img = decode_j2k(&stream).expect("decode");
@@ -6956,13 +7122,13 @@ mod tests {
     fn ht_composes_with_packed_headers() {
         let p = noise(64, 48, 0x4854_0021);
         for mode in [PackedHeaders::Ppt, PackedHeaders::Ppm] {
-            let params = EncodeParams {
+            let params = EncodeOptions {
                 decomposition_levels: 2,
                 code_block_exp: (4, 4),
                 high_throughput: true,
                 ht_refinement: true,
                 packed_headers: mode,
-                ..EncodeParams::default()
+                ..EncodeOptions::default()
             };
             roundtrip_params(&[&p], 64, 48, &params);
         }
@@ -6974,30 +7140,30 @@ mod tests {
     #[test]
     fn ht_rejects_annex_d_only_combinations() {
         let p = noise(16, 16, 0x4854_0031);
-        let ht = EncodeParams {
+        let ht = EncodeOptions {
             high_throughput: true,
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         for params in [
-            EncodeParams {
+            EncodeOptions {
                 bypass: true,
                 ..ht.clone()
             },
-            EncodeParams {
+            EncodeOptions {
                 terminate_all: true,
                 ..ht.clone()
             },
-            EncodeParams {
+            EncodeOptions {
                 layers: 2,
                 ht_refinement: true,
                 ..ht.clone()
             },
-            EncodeParams {
+            EncodeOptions {
                 target_bytes: Some(500),
                 ..ht.clone()
             },
             // ht_refinement without high_throughput is meaningless.
-            EncodeParams {
+            EncodeOptions {
                 high_throughput: false,
                 ht_refinement: true,
                 ..ht.clone()
@@ -7017,7 +7183,7 @@ mod tests {
     fn ht_composes_with_roi() {
         let p = noise(64, 48, 0x4854_0041);
         for refine in [false, true] {
-            let params = EncodeParams {
+            let params = EncodeOptions {
                 decomposition_levels: 2,
                 code_block_exp: (4, 4),
                 high_throughput: true,
@@ -7028,7 +7194,7 @@ mod tests {
                     x1: 40,
                     y1: 30,
                 }),
-                ..EncodeParams::default()
+                ..EncodeOptions::default()
             };
             let stream = roundtrip_params(&[&p], 64, 48, &params);
             let rgn = rgn_markers(&stream);
@@ -7050,12 +7216,12 @@ mod tests {
     fn ht_multiht_layers_round_trip_with_signalling() {
         let p = noise(64, 48, 0x4854_0051);
         for layers in [2u16, 4, 7] {
-            let params = EncodeParams {
+            let params = EncodeOptions {
                 decomposition_levels: 2,
                 code_block_exp: (4, 4),
                 layers,
                 high_throughput: true,
-                ..EncodeParams::default()
+                ..EncodeOptions::default()
             };
             let stream = roundtrip_params(&[&p], 64, 48, &params);
             let header = crate::parse_j2k_header(&stream).expect("header");
@@ -7076,12 +7242,12 @@ mod tests {
         // Every block shallow: 2-bit magnitudes under 5 layers force a
         // placeholder run in front of every code-block's first set.
         let shallow: Vec<u8> = noise(48, 32, 0x4854_0061).iter().map(|&v| v & 3).collect();
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 1,
             code_block_exp: (4, 4),
             layers: 5,
             high_throughput: true,
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         roundtrip_params(&[&shallow], 48, 32, &params);
 
@@ -7095,12 +7261,12 @@ mod tests {
                 mixed[y * 64 + x] = full[y * 64 + x] & 3;
             }
         }
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 1,
             code_block_exp: (4, 4),
             layers: 6,
             high_throughput: true,
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         roundtrip_params(&[&mixed], 64, 32, &params);
     }
@@ -7209,29 +7375,29 @@ mod tests {
         let r = noise(48, 40, 0x4854_0071);
         let g = noise(48, 40, 0x4854_0072);
         let b = noise(48, 40, 0x4854_0073);
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 2,
             code_block_exp: (3, 3),
-            mct: true,
+            mct: Some(true),
             layers: 3,
             progression: ProgressionOrder::Rlcp,
             precincts: vec![0x22, 0x33, 0x33],
             high_throughput: true,
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         roundtrip_params(&[&r, &g, &b], 48, 40, &params);
 
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 1,
             code_block_exp: (4, 4),
-            mct: true,
+            mct: Some(true),
             layers: 4,
             tile_size: Some((32, 32)),
             progression: ProgressionOrder::Pcrl,
             sop: true,
             eph: true,
             high_throughput: true,
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         roundtrip_params(&[&r, &g, &b], 48, 40, &params);
     }
@@ -7244,12 +7410,12 @@ mod tests {
         for (w, h) in [(47u32, 39u32), (33, 17), (13, 9)] {
             let p = noise(w, h, 0x4854_0061 ^ w ^ (h << 8));
             for refine in [false, true] {
-                let params = EncodeParams {
+                let params = EncodeOptions {
                     decomposition_levels: 2,
                     code_block_exp: (4, 4),
                     high_throughput: true,
                     ht_refinement: refine,
-                    ..EncodeParams::default()
+                    ..EncodeOptions::default()
                 };
                 roundtrip_params(&[&p], w, h, &params);
             }
@@ -7262,7 +7428,7 @@ mod tests {
     fn ht_composes_with_subsampling_and_overrides() {
         let full = noise(48, 40, 0x4854_0051);
         let half = noise(24, 20, 0x4854_0052);
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 2,
             code_block_exp: (4, 4),
             sub_sampling: vec![(1, 1), (2, 2)],
@@ -7275,7 +7441,7 @@ mod tests {
             }],
             high_throughput: true,
             ht_refinement: true,
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         roundtrip_params(&[&full, &half], 48, 40, &params);
     }
@@ -7346,11 +7512,11 @@ mod tests {
     #[test]
     fn mixed_emission_lossless_round_trips_and_signals() {
         let p = mixed_content(64, 64, 0xA5A5_0001);
-        let params = EncodeParams {
+        let params = EncodeOptions {
             decomposition_levels: 2,
             code_block_exp: (3, 3),
             ht_mixed: true,
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         let stream = roundtrip_params(&[&p], 64, 64, &params);
         let header = crate::parse_j2k_header(&stream).expect("header");
@@ -7371,16 +7537,16 @@ mod tests {
     #[test]
     fn mixed_emission_uses_both_lanes() {
         let p = mixed_content(64, 64, 0xBEEF_0007);
-        let base = EncodeParams {
+        let base = EncodeOptions {
             decomposition_levels: 2,
             code_block_exp: (3, 3),
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         let htonly = encode_j2k(
             &[&p],
             64,
             64,
-            &EncodeParams {
+            &EncodeOptions {
                 high_throughput: true,
                 ..base.clone()
             },
@@ -7390,7 +7556,7 @@ mod tests {
             &[&p],
             64,
             64,
-            &EncodeParams {
+            &EncodeOptions {
                 ht_mixed: true,
                 ..base
             },
@@ -7460,14 +7626,14 @@ mod tests {
             &[&r, &g, &b],
             48,
             40,
-            &EncodeParams {
+            &EncodeOptions {
                 decomposition_levels: 2,
                 code_block_exp: (3, 3),
-                mct: true,
+                mct: Some(true),
                 progression: ProgressionOrder::Rpcl,
                 precincts: vec![0x33, 0x44, 0x44],
                 ht_mixed: true,
-                ..EncodeParams::default()
+                ..EncodeOptions::default()
             },
         );
         // Multi-tile + SOP/EPH + PCRL.
@@ -7475,7 +7641,7 @@ mod tests {
             &[&r],
             48,
             40,
-            &EncodeParams {
+            &EncodeOptions {
                 decomposition_levels: 1,
                 code_block_exp: (3, 3),
                 tile_size: Some((17, 19)),
@@ -7483,7 +7649,7 @@ mod tests {
                 eph: true,
                 progression: ProgressionOrder::Pcrl,
                 ht_mixed: true,
-                ..EncodeParams::default()
+                ..EncodeOptions::default()
             },
         );
         // Sub-sampled chroma, CPRL.
@@ -7492,13 +7658,13 @@ mod tests {
             &[&r, &half, &half],
             48,
             40,
-            &EncodeParams {
+            &EncodeOptions {
                 decomposition_levels: 1,
                 code_block_exp: (3, 3),
                 sub_sampling: vec![(1, 1), (2, 2), (2, 2)],
                 progression: ProgressionOrder::Cprl,
                 ht_mixed: true,
-                ..EncodeParams::default()
+                ..EncodeOptions::default()
             },
         );
     }
@@ -7510,18 +7676,18 @@ mod tests {
     #[test]
     fn mixed_emission_9x7_matches_annex_d_reconstruction() {
         let p = mixed_content(64, 48, 0x9797_0001);
-        let base = EncodeParams {
+        let base = EncodeOptions {
             decomposition_levels: 2,
             code_block_exp: (3, 3),
             kernel: EncodeKernel::Lossy9x7 { fine_bits: 3 },
-            ..EncodeParams::default()
+            ..EncodeOptions::default()
         };
         let plain = encode_j2k(&[&p], 64, 48, &base).expect("annex d");
         let mixed = encode_j2k(
             &[&p],
             64,
             48,
-            &EncodeParams {
+            &EncodeOptions {
                 ht_mixed: true,
                 ..base
             },
@@ -7541,36 +7707,36 @@ mod tests {
     fn mixed_emission_rejects_barred_combinations() {
         let p = noise(16, 16, 5);
         for params in [
-            EncodeParams {
+            EncodeOptions {
                 ht_mixed: true,
                 layers: 2,
-                ..EncodeParams::default()
+                ..EncodeOptions::default()
             },
-            EncodeParams {
+            EncodeOptions {
                 ht_mixed: true,
                 bypass: true,
-                ..EncodeParams::default()
+                ..EncodeOptions::default()
             },
-            EncodeParams {
+            EncodeOptions {
                 ht_mixed: true,
                 terminate_all: true,
-                ..EncodeParams::default()
+                ..EncodeOptions::default()
             },
-            EncodeParams {
+            EncodeOptions {
                 ht_mixed: true,
                 target_bytes: Some(200),
-                ..EncodeParams::default()
+                ..EncodeOptions::default()
             },
-            EncodeParams {
+            EncodeOptions {
                 ht_mixed: true,
                 high_throughput: true,
-                ..EncodeParams::default()
+                ..EncodeOptions::default()
             },
-            EncodeParams {
+            EncodeOptions {
                 ht_mixed: true,
                 ht_refinement: true,
                 high_throughput: true,
-                ..EncodeParams::default()
+                ..EncodeOptions::default()
             },
         ] {
             assert!(

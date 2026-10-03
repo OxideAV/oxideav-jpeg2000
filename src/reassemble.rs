@@ -1217,7 +1217,7 @@ mod tests {
             nb: 8,
         }];
         let res = reassemble_subband_5x3(&band, &blocks, 8, 0.5);
-        assert_eq!(res, Err(Error::InvalidMarkerLength));
+        assert!(matches!(res, Err(Error::InvalidMarkerLength)));
     }
 
     #[test]
@@ -1249,7 +1249,7 @@ mod tests {
             nb: 8,
         }];
         let res = reassemble_subband_5x3(&band, &blocks, 8, 0.5);
-        assert_eq!(res, Err(Error::InvalidMarkerLength));
+        assert!(matches!(res, Err(Error::InvalidMarkerLength)));
     }
 
     #[test]
@@ -1277,7 +1277,7 @@ mod tests {
             nb: 8,
         }];
         let res = reassemble_subband_5x3(&band, &blocks, 8, 0.5);
-        assert_eq!(res, Err(Error::InvalidMarkerLength));
+        assert!(matches!(res, Err(Error::InvalidMarkerLength)));
     }
 
     #[test]
@@ -1319,7 +1319,7 @@ mod tests {
             },
         ];
         let res = reassemble_subband_5x3(&band, &blocks, 8, 0.5);
-        assert_eq!(res, Err(Error::InvalidMarkerLength));
+        assert!(matches!(res, Err(Error::InvalidMarkerLength)));
     }
 
     #[test]
@@ -1705,7 +1705,7 @@ mod tests {
         let groups: Vec<&[CodedCodeBlock<'_>]> = Vec::new();
         let source = groups.as_slice();
         let res = reassemble_resolution_5x3(&level, &source, &[8, 8], 0.5);
-        assert_eq!(res, Err(Error::InvalidMarkerLength));
+        assert!(matches!(res, Err(Error::InvalidMarkerLength)));
     }
 
     // ---------------------------------------------------------------
@@ -2137,7 +2137,7 @@ mod tests {
         // mb_per_level has length 0; levels has length 1 → reject.
         let mb_per_level: Vec<Vec<u32>> = Vec::new();
         let res = idwt_5x3(&[level], &source, &mb_per_level, 0.5);
-        assert_eq!(res, Err(Error::InvalidMarkerLength));
+        assert!(matches!(res, Err(Error::InvalidMarkerLength)));
     }
 
     #[test]
@@ -2146,7 +2146,7 @@ mod tests {
         let source = groups.as_slice();
         let mb_per_level: Vec<Vec<u32>> = Vec::new();
         let res = idwt_5x3(&[], &source, &mb_per_level, 0.5);
-        assert_eq!(res, Err(Error::InvalidMarkerLength));
+        assert!(matches!(res, Err(Error::InvalidMarkerLength)));
     }
 
     #[test]
@@ -2699,7 +2699,7 @@ mod tests {
             entries: &entries,
         }];
         let res = WalkerBlockSource::from_precincts(&precincts);
-        assert_eq!(res.err(), Some(Error::InvalidPacketHeader));
+        assert!(matches!(res.err(), Some(Error::InvalidPacketHeader)));
     }
 
     #[test]
@@ -2743,7 +2743,7 @@ mod tests {
             entries: &entries,
         }];
         let res = WalkerBlockSource::from_precincts(&precincts);
-        assert_eq!(res.err(), Some(Error::InvalidPacketHeader));
+        assert!(matches!(res.err(), Some(Error::InvalidPacketHeader)));
     }
 
     #[test]
@@ -2796,7 +2796,7 @@ mod tests {
             entries: &entries,
         }];
         let res = WalkerBlockSource::from_precincts(&precincts);
-        assert_eq!(res.err(), Some(Error::InvalidMarkerLength));
+        assert!(matches!(res.err(), Some(Error::InvalidMarkerLength)));
     }
 
     #[test]
@@ -2841,7 +2841,7 @@ mod tests {
             entries: &entries,
         }];
         let res = WalkerBlockSource::from_precincts(&precincts);
-        assert_eq!(res.err(), Some(Error::InvalidPacketHeader));
+        assert!(matches!(res.err(), Some(Error::InvalidPacketHeader)));
     }
 
     #[test]
@@ -2895,7 +2895,7 @@ mod tests {
             entries: &entries,
         }];
         let res = WalkerBlockSource::from_precincts(&precincts);
-        assert_eq!(res.err(), Some(Error::InvalidPacketHeader));
+        assert!(matches!(res.err(), Some(Error::InvalidPacketHeader)));
     }
 
     #[test]

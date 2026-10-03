@@ -1,104 +1,58 @@
 //! # oxideav-jpeg2000
 //!
-//! Pure-Rust JPEG 2000 (J2K) codestream parser and (eventually) codec.
+//! Pure-Rust JPEG 2000: the ITU-T T.800 | ISO/IEC 15444-1 Part-1
+//! codestream (decoder and encoder), the T.814 | 15444-15 HTJ2K block
+//! coder, and the Annex I JP2 / T.814 Annex D JPH file formats.
 //!
-//! ## Status — 2026-05-22 (round 7)
+//! ## The image API (`IMAGE_CRATE_API`)
 //!
-//! Main-header parser ([`parse_j2k_header`], round 1) plus tile-part
-//! walker ([`walk_tile_parts`] / [`parse_codestream`], round 2) plus
-//! typed per-tile-part marker parsers (round 3) plus a JP2 ISO BMFF
-//! box-wrapper parser ([`jp2::parse_jp2`], round 4) plus a
-//! structural tier-2 packet-header reader
-//! ([`packet::decode_packet_header`] / [`packet::walk_packet_headers`],
-//! round 5) plus SIZ-derived per-tile / per-component geometry
-//! ([`geometry::derive_tile_geometry`] / [`geometry::image_area`] /
-//! [`geometry::tile_grid_extent`], round 6) plus resolution-level +
-//! sub-band geometry from COD's `NL`
-//! ([`geometry::derive_resolution_levels`], round 7). The walker
-//! returns an ordered [`Vec<TilePart>`] giving each tile-part's parsed
-//! [`Sot`] (tile index, `Psot`, `TPsot`, `TNsot`), byte offsets of its
-//! `SOT` marker, `SOD` marker, and bit-stream body, plus a
-//! [`Vec<TilePartMarker>`] of the typed marker segments parsed out of
-//! the tile-part header between `SOT` and `SOD`. Recognised
-//! tile-part-header markers: [`Cod`], [`Coc`], [`Qcd`], [`Qcc`],
-//! [`Rgn`], [`Poc`], [`Plt`], [`Ppt`], and `COM`. Both fixed-`Psot`
-//! and `Psot == 0` ("body until EOC") framings are supported per
-//! T.800 §A.4.2. Round 4 adds [`jp2::parse_jp2`] which decodes the
-//! JP2 box wrapper — `jP  ` signature, `ftyp` (brand / minor /
-//! compat list), `jp2h` (`ihdr` / optional `bpcc` / `colr`), and the
-//! `jp2c` Contiguous Codestream box's payload span — and returns a
-//! [`jp2::Jp2Container`] with `codestream_offset` / `codestream_len`
-//! pointing at the slice that callers may then hand to
-//! [`parse_codestream`]. Round 5 adds the [`packet`] submodule: a
-//! bit-stuffed [`packet::PacketBitReader`] (T.800 §B.10.1), a
-//! stateful [`packet::TagTree`] (§B.10.2), the coding-passes Huffman
-//! ([`packet::decode_coding_passes`], §B.10.6 / Table B.4), the
-//! `Lblock`-based segment-length reader
-//! ([`packet::decode_segment_length`], §B.10.7.1), and a
-//! [`packet::decode_packet_header`] that composes them all per §B.10.8
-//! against a caller-supplied [`packet::PacketGeometry`]. Round 6
-//! adds the [`geometry`] submodule: image-area + tile-grid + per-tile
-//! per-component coordinate derivation directly from a parsed [`Siz`]
-//! per T.800 §B.2 / §B.3 / §B.5 (Equations B-1, B-2, B-3, B-4, B-5,
-//! B-6, B-7, B-8, B-9, B-10, B-11, B-12, B-13). Round 7 lifts the
-//! typed [`geometry::TileComponentGeometry`] to per-resolution-level
-//! [`geometry::ResolutionLevel`] (T.800 §B.5 / Equation B-14) plus
-//! per-sub-band [`geometry::SubBand`] corners (T.800 §B.5 / Equation
-//! B-15 with the orientation displacements `(xob, yob)` from Table
-//! B.1).
+//! The crate root follows the OxideAV image-crate contract, usable with
+//! `default-features = false` and no `oxideav-core`:
 //!
-//! Round 10 adds the [`mq`] submodule: the tier-1 **MQ arithmetic
-//! decoder** of T.800 Annex C §C.3 ([`mq::MqDecoder`] — INITDEC /
-//! DECODE / RENORMD / BYTEIN, with the Table C.2 [`mq::QE`]
-//! probability-estimation rows and the Table D.7 [`mq::MqContext`]
-//! initial states). It is the byte-consuming engine the Annex D
-//! coding passes drive.
+//! * [`probe`] — `true` for a JP2 / JPH file or a bare codestream;
+//! * [`info`] → [`ImageInfo`] — geometry, layout, depth, colour,
+//!   codestream shape, from the headers alone;
+//! * [`decode()`] / [`decode_with`] → [`Jpeg2000Image`] — the native
+//!   layout ([`image`] docs give the component-set → [`PixelFormat`]
+//!   derivation), colour and ICC from the JP2 header, palette as
+//!   `Pal8`; [`DecodeOptions`] for limits, strictness, reduced
+//!   resolution and layer selection;
+//! * [`decode_rgb8`] / [`decode_rgba8`] / [`decode_from`];
+//! * [`encode()`] / [`encode_rgb8`] / [`encode_rgba8`] / [`encode_to`]
+//!   with [`EncodeOptions`] — kernel, MCT, layers, rate / PSNR control,
+//!   tiles, progression, precincts, HT, JP2 vs bare codestream
+//!   ([`Container`]);
+//! * [`Jpeg2000Error`] (= [`Error`]): `InvalidData`, `Unsupported`,
+//!   `LimitExceeded`, `Io` plus the T.800 diagnostics.
 //!
-//! The [`t1`] submodule carries the Annex D Tier-1 coding passes.
-//! [`t1::CodeBlock`] holds the coefficient / σ-significance / sign /
-//! refinement state. The **significance propagation pass** of T.800
-//! §D.3.1 ([`t1::CodeBlock::significance_propagation_pass`]) walks the
-//! §D.1 stripe-major scan order, selects the Table D.1 significance
-//! context (`0..=8`) per sub-band orientation from the Figure D.2
-//! neighbour σ-states, draws the MQ decision, and on a newly-significant
-//! coefficient runs the Table D.2 / D.3 sign-context + XORbit
-//! subroutine (§D.3.2). The **magnitude refinement pass** of §D.3.3
-//! ([`t1::CodeBlock::magnitude_refinement_pass`]) walks the same scan
-//! order, refines the magnitude bit of already-significant coefficients
-//! (skipping those that just became significant in the preceding SP
-//! pass) using the Table D.4 context (`14..=16`). The **cleanup pass**
-//! of §D.3.4 ([`t1::CodeBlock::cleanup_pass`]) codes every coefficient
-//! the SP and MR passes left insignificant, applying the Table D.5
-//! run-length context (`17`) + UNIFORM context (`18`) four-zero-column
-//! shortcut where eligible and the Table D.1 significance contexts
-//! otherwise. All three Annex D coding passes are now in place.
+//! ## The depth API
 //!
-//! [`t1::BitPlaneSequencer`] chains those three passes across a code-block
-//! per the §D.3 three-pass order (cleanup-only on the first non-empty
-//! bit-plane, then SP → MR → cleanup on each subsequent bit-plane from
-//! MSB toward LSB). Its `decode_packet(block, bytes, passes, ctx)`
-//! consumes one packet's worth of pass-count + codeword-segment bytes
-//! straight from a [`packet::CodeBlockContribution`]; its
-//! `decode_passes(block, decoder, ctx, n)` is the lower-level entry
-//! point for the "termination on each pass" case where each pass owns
-//! its own codeword segment.
+//! Everything the contract cannot express stays under its own names:
+//! [`parse_j2k_header`] / [`parse_codestream`] (typed `SIZ` / `COD` /
+//! `QCD` / tile-part markers), [`jp2::parse_jp2`] (every Annex I box),
+//! [`decode_j2k`] / [`jp2::decode_jp2`] / [`decode_j2k_reduced`] /
+//! [`decode_j2k_layers`] (per-component `i32` planes for any component
+//! set — signed, 38-bit, 16 384 components), [`encode::encode_j2k`] /
+//! [`encode::encode_j2k_u16`] / [`encode::encode_jp2`] (raw planes with
+//! any `SIZ` sub-sampling, `COC` / `QCC` overrides, ROI, POC, tile-part
+//! splits, packed headers) and [`jp2::write_jp2`].
 //!
-//! The [`progression`] submodule enumerates one tile's packets in the
-//! **§B.12.1.1 LRCP** order — `for each l for each r for each i for
-//! each k` — given the per-component `(NL_i, numprecincts(r, i))`
-//! input. [`progression::lrcp_packet_order`] returns the typed
-//! [`progression::PacketDescriptor`] sequence the §B.10 packet reader
-//! consumes; all five §B.12.1 orders (and the §B.12.2 POC volume walk)
-//! have dedicated drivers alongside it.
+//! With the default `registry` feature, [`register`] installs the
+//! framework `Decoder` / `Encoder` adapters (thin wrappers over
+//! [`decode_with`] / [`encode()`]) and [`registry`] bridges
+//! [`Jpeg2000Image`] ⇄ `oxideav_core::VideoFrame`.
 //!
-//! Full codestream-body decoding (tier-1 / tier-2 entropy decoding,
-//! dequantisation, the inverse DWT and MCT) is wired end-to-end in the
-//! [`decode`] module ([`decode_jpeg2000`] / [`decode_j2k`]), and the
-//! [`encode`] module carries the full forward path — lossless 5-3,
-//! lossy 9-7, the T.814 HT block coder, every Table A.19 coding style,
-//! quality layers with PCRD byte / PSNR control, the pointer and
-//! framing markers, and the Annex I JP2 / T.814 Annex D JPH container
-//! writer ([`jp2::write_jp2`]) — see the README's Encoder section.
+//! ## Decode coverage
+//!
+//! Full Part-1 decoding — any tile grid and tile-part layout (`TPsot`
+//! chains, interleaving), `NL ∈ 0..=32`, every precinct / code-block
+//! partition, all five §B.12.1 progression orders plus `POC`, both
+//! kernels (5-3 reversible, 9-7 irreversible with scalar-derived /
+//! expounded quantisation), RCT / ICT, per-component sub-sampling,
+//! `COC` / `QCC` / `RGN` (Maxshift) / `PPM` / `PPT` / `PLT` / `TLM`
+//! (pointer markers cross-validated), all Table A.19 code-block styles,
+//! SOP / EPH, and the T.814 HT block coder in the HTONLY, HTDECLARED and
+//! MIXED sets. See the [`mod@decode`] module docs for the clean rejections.
 //!
 //! ## Clean-room provenance
 //!
@@ -116,6 +70,7 @@
 
 #![warn(missing_debug_implementations)]
 
+pub mod api;
 pub mod decode;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
@@ -124,6 +79,7 @@ pub mod dequant;
 #[doc(hidden)]
 pub mod dwt;
 pub mod encode;
+pub mod error;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod geometry;
@@ -134,6 +90,7 @@ pub(crate) mod ht_tables;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod htenc;
+pub mod image;
 pub mod jp2;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
@@ -144,6 +101,7 @@ pub mod mq;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod mqenc;
+pub mod options;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod packet;
@@ -159,13 +117,27 @@ pub mod registry;
 #[doc(hidden)]
 pub mod t1;
 
+pub use api::{
+    decode, decode_from, decode_rgb8, decode_rgba8, decode_with, encode, encode_rgb8, encode_rgba8,
+    encode_to, info, probe,
+};
 pub use decode::{
     decode_codestream, decode_j2k, decode_j2k_layers, decode_j2k_reduced, DecodedComponent,
     DecodedImage,
 };
+pub use encode::{Container, EncodeKernel, EncodeOptions};
+pub use error::{Error, Jpeg2000Error};
+pub use image::{
+    ColorInfo, ColorRange, ImageInfo, J2kImage, J2kPixelFormat, Jpeg2000Image, Jpeg2000PixelFormat,
+    Metadata, Palette, PixelFormat, Plane, RgbImage, RgbaImage,
+};
+pub use options::DecodeOptions;
 
 #[cfg(feature = "registry")]
-pub use registry::{make_decoder, Jpeg2000Decoder};
+pub use registry::{
+    make_decoder, make_encoder, register_codecs, register_containers, Jpeg2000Decoder,
+    Jpeg2000Encoder, CODEC_ID_STR,
+};
 
 #[cfg(feature = "registry")]
 use oxideav_core::RuntimeContext;
@@ -243,183 +215,6 @@ pub const MARKER_CPF: u16 = 0xFF59;
 /// so the header parser length-skips it.
 #[doc(hidden)]
 pub const MARKER_CRG: u16 = 0xFF63;
-
-// ---------------------------------------------------------------------------
-// Error type.
-// ---------------------------------------------------------------------------
-
-/// Crate-local error type.
-///
-/// The variants describe both round-1 header-parser failures and the
-/// "decoder/encoder not yet implemented" sentinel returned by the
-/// non-header entry points.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Error {
-    /// The codestream needs a coding tool the decode wiring does not
-    /// handle yet (e.g. a non-Maxshift / Part-2 `RGN` style, or a `COC`
-    /// whose Table A.19 code-block-**style** byte diverges from the
-    /// `COD`) — or the encoder was asked for a layout outside its
-    /// lossless-5-3 surface (see [`encode::encode_j2k_lossless`]). The
-    /// `COC` / `QCC` / `RGN` / `POC` overrides, `PPM` / `PPT` relocated
-    /// headers, all five §B.12.1 progression orders, and the §A.6.6
-    /// progression order change *are* honoured on the decode side. See
-    /// [`decode`] for the supported surface.
-    NotImplemented,
-    /// The codestream did not start with the SOC marker (T.800 §A.4.1).
-    MissingSoc,
-    /// SIZ marker was expected immediately after SOC (T.800 §A.5).
-    MissingSiz,
-    /// COD marker required in main header was not found (T.800 §A.6.1).
-    MissingCod,
-    /// QCD marker required in main header was not found (T.800 §A.6.4).
-    MissingQcd,
-    /// Input bytes ended before the parser finished a marker segment.
-    UnexpectedEof,
-    /// A marker segment's declared length did not match the spec's
-    /// fixed-or-derived size constraints.
-    InvalidMarkerLength,
-    /// SIZ.Csiz (number of components) was outside the spec range
-    /// `1..=16_384` (T.800 Table A.9).
-    InvalidComponentCount,
-    /// SIZ.Ssiz precision was outside the spec range `1..=38` bits
-    /// (T.800 Table A.11).
-    InvalidSamplePrecision,
-    /// COD.SPcod number of decomposition levels was outside the spec
-    /// range `0..=32` (T.800 Table A.15).
-    InvalidDecompositionLevels,
-    /// An expected main-header marker code was not recognised.
-    UnknownMarker(u16),
-    /// Round-2 tile-part walker hit a marker that's forbidden in a
-    /// tile-part header (e.g. `SOC`, `SIZ`, `CAP`, `PRF`, `TLM`, …)
-    /// per T.800 Table A.2 column "Tile-part header".
-    UnexpectedMainHeaderMarker(u16),
-    /// Tile-part walker reached EOF without seeing the `EOC` marker.
-    MissingEoc,
-    /// `Psot` field referenced a tile-part length that overran the
-    /// codestream buffer (T.800 §A.4.2).
-    PsotOverflow,
-    /// A tile-part walker found `TPsot` > 254 (T.800 Table A.5).
-    InvalidTilePartIndex,
-    /// Round-5 packet-header reader hit an invalid bit-sequence or a
-    /// geometry mismatch (T.800 §B.10).
-    InvalidPacketHeader,
-    /// A `COD` / `COC` user-defined precinct exponent violated the
-    /// T.800 §B.6 / Table A.21 constraint that `PPx` / `PPy` "may only
-    /// equal zero at the resolution level corresponding to the `NLLL`
-    /// band" — i.e. a `PPx = 0` or `PPy = 0` was signalled at `r > 0`.
-    /// No conforming encoder can have produced the stream, so it is
-    /// rejected rather than decoded against a precinct lattice the
-    /// packet sequence cannot match.
-    InvalidPrecinctSize,
-    /// Round-5 packet-header walker advanced past the end of the
-    /// tile-part body before all geometry-required packets were
-    /// decoded.
-    PacketHeaderOverrun,
-    /// The T.800 §D.5 error-resilience segmentation symbol decoded at
-    /// the end of a cleanup pass was not the required value `0xA`
-    /// (binary `1010`). Indicates that bit errors corrupted this
-    /// bit-plane's compressed image data.
-    SegmentationSymbolMismatch,
-    /// A main-header `TLM` marker segment (T.800 §A.7.1) disagrees
-    /// with the actual tile-part chain: entry count != tile-part
-    /// count, a `Ttlm` tile index != the corresponding `Isot`, a
-    /// `Ptlm` length != the tile-part's real `SOT`-to-body-end span
-    /// (== `Psot`), an `ST = 0` layout without one-tile-part-per-tile
-    /// in index order, or duplicate / malformed `Ztlm` sequencing.
-    /// Signals a lost, reordered or corrupted tile-part.
-    TlmMismatch,
-    /// A tile-part's `PLT` packet-length list (T.800 §A.7.3) disagrees
-    /// with the actual packets: entry count != the number of packets
-    /// starting in that tile-part, an `Iplt` != the packet's real byte
-    /// span, an incomplete trailing `Iplt`, or duplicate `Zplt`
-    /// sequencing. Signals a lost, resized or reordered packet.
-    PltMismatch,
-    /// An HTJ2K (ITU-T T.814 | ISO/IEC 15444-15) HT segment did not
-    /// conform to the §7.1 bit-stream-recovery constraints — e.g. a
-    /// stuffing bit was non-zero, a state machine ran past its bound,
-    /// or a CxtVLC codeword failed to match any Annex C table entry.
-    /// The §7.1.1 `error()` state.
-    HtCorruptSegment,
-}
-
-impl core::fmt::Display for Error {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Error::NotImplemented => write!(
-                f,
-                "oxideav-jpeg2000: codestream uses a coding tool not yet wired (or encoder entry point)"
-            ),
-            Error::MissingSoc => write!(f, "JPEG 2000: missing SOC (0xFF4F) marker"),
-            Error::MissingSiz => write!(f, "JPEG 2000: missing SIZ marker after SOC"),
-            Error::MissingCod => write!(f, "JPEG 2000: missing COD marker in main header"),
-            Error::MissingQcd => write!(f, "JPEG 2000: missing QCD marker in main header"),
-            Error::UnexpectedEof => write!(f, "JPEG 2000: unexpected end of input"),
-            Error::InvalidMarkerLength => write!(f, "JPEG 2000: invalid marker segment length"),
-            Error::InvalidComponentCount => {
-                write!(f, "JPEG 2000: invalid Csiz (must be 1..=16384)")
-            }
-            Error::InvalidSamplePrecision => {
-                write!(f, "JPEG 2000: invalid Ssiz precision (must be 1..=38)")
-            }
-            Error::InvalidDecompositionLevels => {
-                write!(
-                    f,
-                    "JPEG 2000: invalid decomposition levels (must be 0..=32)"
-                )
-            }
-            Error::UnknownMarker(m) => write!(f, "JPEG 2000: unknown marker 0x{:04X}", m),
-            Error::UnexpectedMainHeaderMarker(m) => write!(
-                f,
-                "JPEG 2000: marker 0x{:04X} is not allowed inside a tile-part header",
-                m
-            ),
-            Error::MissingEoc => write!(f, "JPEG 2000: codestream ended without EOC marker"),
-            Error::PsotOverflow => write!(
-                f,
-                "JPEG 2000: Psot tile-part length overruns codestream buffer"
-            ),
-            Error::InvalidTilePartIndex => {
-                write!(
-                    f,
-                    "JPEG 2000: invalid TPsot tile-part index (must be 0..=254)"
-                )
-            }
-            Error::InvalidPacketHeader => {
-                write!(f, "JPEG 2000: malformed packet header (T.800 §B.10)")
-            }
-            Error::InvalidPrecinctSize => {
-                write!(
-                    f,
-                    "JPEG 2000: precinct exponent PPx/PPy = 0 at resolution level r > 0 (T.800 §B.6)"
-                )
-            }
-            Error::PacketHeaderOverrun => {
-                write!(
-                    f,
-                    "JPEG 2000: packet-header walker overran the tile-part body"
-                )
-            }
-            Error::SegmentationSymbolMismatch => write!(
-                f,
-                "JPEG 2000: §D.5 segmentation symbol decoded != 0xA (bit-plane corruption)"
-            ),
-            Error::TlmMismatch => write!(
-                f,
-                "oxideav-jpeg2000: TLM tile-part lengths disagree with the actual tile-part chain (T.800 A.7.1)"
-            ),
-            Error::PltMismatch => write!(
-                f,
-                "oxideav-jpeg2000: PLT packet lengths disagree with the actual packets (T.800 A.7.3)"
-            ),
-            Error::HtCorruptSegment => write!(
-                f,
-                "JPEG 2000: malformed HTJ2K HT segment (T.814 §7.1 error())"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
 
 // ---------------------------------------------------------------------------
 // Parsed header structs (T.800 §A.5 / §A.6).
@@ -2089,52 +1884,33 @@ fn scan_until_sot_or_eoc(bytes: &[u8], start: usize) -> Result<usize, Error> {
 /// `true` iff `bytes` starts with the fixed 12-byte JP2 Signature
 /// box (T.800 §I.5.1) — i.e. the input is a JP2 / JPH **file**, not a
 /// bare Annex A codestream.
+///
+/// Pre-contract sniff; [`probe`] accepts both the JP2 file and the raw
+/// codestream, and [`info`] reports which one it saw (`ImageInfo::jp2`).
+#[deprecated(
+    note = "use oxideav_jpeg2000::probe (IMAGE_CRATE_API); info().jp2 tells the file shape"
+)]
 pub fn looks_like_jp2(bytes: &[u8]) -> bool {
-    bytes.len() >= 12
-        && bytes[0..4] == [0x00, 0x00, 0x00, 0x0C]
-        && bytes[4..8] == jp2::BOX_TYPE_JP2_SIGNATURE.to_be_bytes()
-        && bytes[8..12] == jp2::JP2_SIGNATURE_MAGIC
+    api::is_jp2_file(bytes)
 }
 
 /// Decode a JPEG 2000 codestream (J2K) **or JP2 / JPH file** into
 /// interleaved raw 8-bit channel samples (row-major, one entry per
 /// channel per pixel).
 ///
-/// Convenience wrapper around [`decode_j2k`] preserving the
-/// historical byte-vector signature. An input beginning with the
-/// 12-byte JP2 Signature box (T.800 §I.5.1) routes through
-/// [`jp2::decode_jp2`], so the Annex I channel semantics — Palette /
-/// Component Mapping expansion (§I.5.3.4 / §I.5.3.5) and Channel
-/// Definition ordering (§I.5.3.6) — apply. Requires every resulting
-/// channel to be 8-bit-or-less unsigned at `1:1` sub-sampling (so
-/// all planes share one geometry); other layouts return
-/// [`Error::NotImplemented`] — use [`decode_j2k`] /
-/// [`jp2::decode_jp2`] to access the per-component planes directly.
+/// Pre-contract entry point: it drops the dimensions and the layout.
+/// Use [`decode_rgb8`] / [`decode_rgba8`] for the 8-bit raw paths or
+/// [`decode()`] for the native layout. Requires every resulting channel to
+/// be 8-bit-or-less unsigned at `1:1` sub-sampling; other layouts return
+/// [`Error::NotImplemented`].
+#[deprecated(note = "use oxideav_jpeg2000::decode / decode_rgb8 (IMAGE_CRATE_API)")]
 pub fn decode_jpeg2000(bytes: &[u8]) -> Result<Vec<u8>, Error> {
-    let image = if looks_like_jp2(bytes) {
+    let image = if api::is_jp2_file(bytes) {
         jp2::decode_jp2(bytes)?
     } else {
         decode_j2k(bytes)?
     };
-    let ncomp = image.components.len();
-    let first = image.components.first().ok_or(Error::NotImplemented)?;
-    let (w, h) = (first.width, first.height);
-    for c in &image.components {
-        if c.precision_bits > 8 || c.is_signed || c.width != w || c.height != h {
-            return Err(Error::NotImplemented);
-        }
-    }
-    let len = (w as usize)
-        .checked_mul(h as usize)
-        .and_then(|v| v.checked_mul(ncomp))
-        .ok_or(Error::InvalidMarkerLength)?;
-    let mut out = vec![0u8; len];
-    for (ci, comp) in image.components.iter().enumerate() {
-        for (i, &s) in comp.samples.iter().enumerate() {
-            out[i * ncomp + ci] = s.clamp(0, 255) as u8;
-        }
-    }
-    Ok(out)
+    api::interleave_8bit(&image)
 }
 
 /// Encode raw 8-bit samples into a **lossless** JPEG 2000 codestream
@@ -2142,16 +1918,16 @@ pub fn decode_jpeg2000(bytes: &[u8]) -> Result<Vec<u8>, Error> {
 ///
 /// `pixels` is row-major interleaved with `pixels.len() / (width ·
 /// height)` components per pixel (1 = grayscale, 3 = RGB — encoded
-/// through the §G.2 reversible component transform, MCT = 1). The
-/// stream is reversible-5-3 lossless: decoding with
-/// [`decode_jpeg2000`] reproduces `pixels` bit-exactly.
-/// Uses 2 decomposition levels (clamped down for tiny images) and
-/// 64×64 code-blocks; use [`encode::encode_j2k_lossless`] directly for
-/// control over `NL` / code-block size.
-///
-/// A `pixels` length that is not a 1× or 3× multiple of
+/// through the §G.2 reversible component transform, MCT = 1). Uses 2
+/// decomposition levels (clamped down for tiny images) and 64×64
+/// code-blocks. A `pixels` length that is not a 1× or 3× multiple of
 /// `width * height` (or a zero dimension) returns
 /// [`Error::NotImplemented`].
+///
+/// Pre-contract entry point: [`encode_rgb8`] / [`encode()`] with
+/// [`EncodeOptions`] replace it (note their default container is the
+/// JP2 file; pass [`Container::J2k`] for a bare codestream).
+#[deprecated(note = "use oxideav_jpeg2000::encode_rgb8 / encode (IMAGE_CRATE_API)")]
 pub fn encode_jpeg2000(pixels: &[u8], width: u32, height: u32) -> Result<Vec<u8>, Error> {
     let n = (width as usize)
         .checked_mul(height as usize)
@@ -2181,9 +1957,10 @@ pub fn encode_jpeg2000(pixels: &[u8], width: u32, height: u32) -> Result<Vec<u8>
     }
 }
 
-/// Codec registration — installs the J2K codestream decoder factory
-/// and the `.j2k` / `.j2c` extension hints into the runtime context.
-/// See [`registry`] for the `Decoder` trait surface.
+/// Codec registration — installs the JPEG 2000 decoder + encoder
+/// factories and the `.j2k` / `.j2c` / `.jp2` / `.jph` extension hints
+/// into the runtime context. See [`registry`] for the `Decoder` /
+/// `Encoder` adapters and the `VideoFrame` bridge.
 #[cfg(feature = "registry")]
 pub fn register(ctx: &mut RuntimeContext) {
     registry::register(ctx);
@@ -2276,7 +2053,7 @@ mod tests {
         let mut bytes = synth_minimal_header();
         bytes[0] = 0xFF;
         bytes[1] = 0x51;
-        assert_eq!(parse_j2k_header(&bytes), Err(Error::MissingSoc));
+        assert!(matches!(parse_j2k_header(&bytes), Err(Error::MissingSoc)));
     }
 
     #[test]
@@ -2454,23 +2231,30 @@ mod tests {
 
         v.extend_from_slice(&MARKER_SOT.to_be_bytes());
 
-        assert_eq!(parse_j2k_header(&v), Err(Error::MissingCod));
+        assert!(matches!(parse_j2k_header(&v), Err(Error::MissingCod)));
     }
 
     #[test]
+    #[allow(deprecated)]
     fn decode_rejects_truncated_input_and_encode_round_trips() {
         // A bare SOC with no SIZ behind it is a malformed codestream —
         // the end-to-end decode path must surface a parse error (the
         // happy path is exercised in tests/decode_e2e.rs against the
         // committed fixtures).
-        assert_eq!(decode_jpeg2000(&[0xFF, 0x4F]), Err(Error::MissingSiz));
+        assert!(matches!(
+            decode_jpeg2000(&[0xFF, 0x4F]),
+            Err(Error::MissingSiz)
+        ));
         // The historical byte-vector encode entry point produces a real
         // lossless codestream that decodes back bit-exactly.
         let pixels = [10u8, 200, 30, 128];
         let stream = encode_jpeg2000(&pixels, 2, 2).expect("encode");
         assert_eq!(decode_jpeg2000(&stream).expect("decode"), pixels.to_vec());
         // A pixel buffer that is neither 1 nor 3 planes is rejected.
-        assert_eq!(encode_jpeg2000(&[0u8; 8], 2, 2), Err(Error::NotImplemented));
+        assert!(matches!(
+            encode_jpeg2000(&[0u8; 8], 2, 2),
+            Err(Error::NotImplemented)
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -2621,7 +2405,7 @@ mod tests {
         };
         let bytes = synth_codestream(&[(sot, body)]);
         let err = parse_codestream(&bytes).unwrap_err();
-        assert_eq!(err, Error::PsotOverflow);
+        assert!(matches!(err, Error::PsotOverflow));
     }
 
     #[test]
@@ -2638,7 +2422,7 @@ mod tests {
         // Trim the last 2 bytes (the EOC marker).
         bytes.truncate(bytes.len() - 2);
         let err = parse_codestream(&bytes).unwrap_err();
-        assert_eq!(err, Error::MissingEoc);
+        assert!(matches!(err, Error::MissingEoc));
     }
 
     #[test]
@@ -2658,7 +2442,7 @@ mod tests {
         hdr.extend_from_slice(&tp);
         hdr.extend_from_slice(&MARKER_EOC.to_be_bytes());
         let err = parse_codestream(&hdr).unwrap_err();
-        assert_eq!(err, Error::UnexpectedMainHeaderMarker(MARKER_SIZ));
+        assert!(matches!(err, Error::UnexpectedMainHeaderMarker(MARKER_SIZ)));
     }
 
     #[test]
@@ -2700,7 +2484,7 @@ mod tests {
         hdr.extend_from_slice(&[0u8; 4]);
         hdr.extend_from_slice(&MARKER_EOC.to_be_bytes());
         let err = parse_codestream(&hdr).unwrap_err();
-        assert_eq!(err, Error::InvalidMarkerLength);
+        assert!(matches!(err, Error::InvalidMarkerLength));
     }
 
     #[test]
@@ -2913,7 +2697,7 @@ mod tests {
         plt.push(0x82); // continuation bit set, still no terminator
         let bytes = synth_tile_part_with_markers(&plt, &[0u8; 4]);
         let err = parse_codestream(&bytes).unwrap_err();
-        assert_eq!(err, Error::InvalidMarkerLength);
+        assert!(matches!(err, Error::InvalidMarkerLength));
     }
 
     #[test]
@@ -3065,7 +2849,7 @@ mod tests {
         coc.push(1);
         let bytes = synth_tile_part_with_markers(&coc, &[0u8; 4]);
         let err = parse_codestream(&bytes).unwrap_err();
-        assert_eq!(err, Error::InvalidDecompositionLevels);
+        assert!(matches!(err, Error::InvalidDecompositionLevels));
     }
 
     // -- Table A.19 CodeBlockStyle ------------------------------------
@@ -3256,7 +3040,7 @@ mod tests {
         p.push(0xFF);
         // Zppm 0 and 2 with no 1.
         let err = collect_ppm(&[ppm_segment(0, &p), ppm_segment(2, &p)]).unwrap_err();
-        assert_eq!(err, Error::InvalidMarkerLength);
+        assert!(matches!(err, Error::InvalidMarkerLength));
     }
 
     #[test]
@@ -3266,6 +3050,6 @@ mod tests {
         payload.extend_from_slice(&9u32.to_be_bytes());
         payload.extend_from_slice(&[0x1, 0x2]);
         let err = collect_ppm(&[ppm_segment(0, &payload)]).unwrap_err();
-        assert_eq!(err, Error::InvalidMarkerLength);
+        assert!(matches!(err, Error::InvalidMarkerLength));
     }
 }

@@ -457,14 +457,14 @@ mod tests {
 
     #[test]
     fn irreversible_bytes_too_short_errors() {
-        assert_eq!(
+        assert!(matches!(
             StepSize::from_irreversible_bytes(&[0x2A]),
             Err(Error::InvalidMarkerLength)
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             StepSize::from_irreversible_bytes(&[]),
             Err(Error::InvalidMarkerLength)
-        );
+        ));
     }
 
     #[test]
@@ -505,10 +505,10 @@ mod tests {
     #[test]
     fn parse_irreversible_payload_odd_length_errors() {
         let payload = [0x28, 0x00, 0x2A];
-        assert_eq!(
+        assert!(matches!(
             StepSize::parse_irreversible_payload(&payload),
             Err(Error::InvalidMarkerLength)
-        );
+        ));
     }
 
     #[test]
@@ -598,10 +598,10 @@ mod tests {
             epsilon: 5,
             mantissa: 0,
         };
-        assert_eq!(
+        assert!(matches!(
             derive_from_nlll(nlll, 3, 4),
             Err(Error::InvalidDecompositionLevels)
-        );
+        ));
     }
 
     #[test]
@@ -611,10 +611,10 @@ mod tests {
             epsilon: 1,
             mantissa: 0,
         };
-        assert_eq!(
+        assert!(matches!(
             derive_from_nlll(nlll, 5, 0),
             Err(Error::InvalidMarkerLength)
-        );
+        ));
     }
 
     // -----------------------------------------------------------------
@@ -633,7 +633,7 @@ mod tests {
     #[test]
     fn mb_rejects_zero_sum() {
         // G = 0, εb = 0: sum = 0, Mb would be -1.
-        assert_eq!(mb(0, 0), Err(Error::InvalidMarkerLength));
+        assert!(matches!(mb(0, 0), Err(Error::InvalidMarkerLength)));
     }
 
     // -----------------------------------------------------------------

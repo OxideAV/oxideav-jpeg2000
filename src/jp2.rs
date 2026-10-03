@@ -1233,7 +1233,7 @@ pub fn parse_jp2(bytes: &[u8]) -> Result<Jp2Container, Error> {
 ///   colour order, followed by the remaining channels (opacity /
 ///   unspecified) in channel order. Without a `cdef`, channel order
 ///   is already colour order (§I.5.3.6 default rule).
-fn apply_channel_mapping(
+pub(crate) fn apply_channel_mapping(
     header: &Jp2Header,
     image: crate::DecodedImage,
 ) -> Result<crate::DecodedImage, Error> {
@@ -1288,20 +1288,7 @@ fn apply_channel_mapping(
     // channel order.
     if let Some(defs) = &header.cdef {
         let n = channels.len();
-        let mut order: Vec<usize> = (0..n).collect();
-        let key = |idx: usize| -> (u8, u32) {
-            let d = defs.iter().find(|d| usize::from(d.channel) == idx);
-            match d {
-                Some(d)
-                    if d.channel_type == ChannelDef::TYPE_COLOUR
-                        && (1..=0xFFFE).contains(&d.association) =>
-                {
-                    (0, u32::from(d.association))
-                }
-                _ => (1, idx as u32),
-            }
-        };
-        order.sort_by_key(|&i| key(i));
+        let order = cdef_presentation_order(defs, n);
         let mut reordered = Vec::with_capacity(n);
         let mut taken: Vec<Option<crate::DecodedComponent>> =
             channels.drain(..).map(Some).collect();
@@ -1315,6 +1302,29 @@ fn apply_channel_mapping(
         height,
         components: channels,
     })
+}
+
+/// The §I.5.3.6 presentation permutation of `n` channels under a
+/// Channel Definition box: colour channels (`Typ = 0`) first by their
+/// 1-based `Asoc` colour index, then every other channel in original
+/// order. Element `k` of the result is the source channel shown at
+/// position `k`.
+pub(crate) fn cdef_presentation_order(defs: &[ChannelDef], n: usize) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..n).collect();
+    let key = |idx: usize| -> (u8, u32) {
+        let d = defs.iter().find(|d| usize::from(d.channel) == idx);
+        match d {
+            Some(d)
+                if d.channel_type == ChannelDef::TYPE_COLOUR
+                    && (1..=0xFFFE).contains(&d.association) =>
+            {
+                (0, u32::from(d.association))
+            }
+            _ => (1, idx as u32),
+        }
+    };
+    order.sort_by_key(|&i| key(i));
+    order
 }
 
 // ---------------------------------------------------------------------------
@@ -1691,10 +1701,10 @@ mod tests {
     }
 
     fn codestream(planes: &[&[u8]], w: u32, h: u32, ht: bool) -> Vec<u8> {
-        let params = crate::encode::EncodeParams {
+        let params = crate::encode::EncodeOptions {
             decomposition_levels: 2,
             high_throughput: ht,
-            ..crate::encode::EncodeParams::default()
+            ..crate::encode::EncodeOptions::default()
         };
         crate::encode::encode_j2k(planes, w, h, &params).expect("encode")
     }
@@ -1715,7 +1725,7 @@ mod tests {
             let refs: Vec<&[u8]> = planes[..n].iter().map(Vec::as_slice).collect();
             let cs = codestream(&refs, w, h, false);
             let file = write_jp2(&cs, &Jp2WriteOptions::for_components(n)).expect("write");
-            assert!(crate::looks_like_jp2(&file));
+            assert!(crate::probe(&file) && crate::info(&file).expect("info").jp2);
             let c = parse_jp2(&file).expect("parse");
             assert_eq!(c.ftyp.brand, BRAND_JP2);
             assert_eq!(c.ftyp.minor_version, 0);
@@ -1757,7 +1767,7 @@ mod tests {
         let cs = codestream(&five, w, h, false);
         let opts = Jp2WriteOptions::for_components(5);
         assert!(opts.colour.is_empty() && opts.colourspace_unknown);
-        assert_eq!(write_jp2(&cs, &opts), Err(Error::NotImplemented));
+        assert!(matches!(write_jp2(&cs, &opts), Err(Error::NotImplemented)));
         let explicit = Jp2WriteOptions {
             colourspace_unknown: true,
             ..Jp2WriteOptions::enumerated(EnumCs::Srgb)
@@ -1846,7 +1856,7 @@ mod tests {
             palette: Some(pclr),
             ..Jp2WriteOptions::enumerated(EnumCs::Srgb)
         };
-        assert_eq!(write_jp2(&cs, &half), Err(Error::NotImplemented));
+        assert!(matches!(write_jp2(&cs, &half), Err(Error::NotImplemented)));
     }
 
     #[test]
@@ -1900,7 +1910,7 @@ mod tests {
             }]),
             ..Jp2WriteOptions::enumerated(EnumCs::Greyscale)
         };
-        assert_eq!(write_jp2(&cs, &bad), Err(Error::NotImplemented));
+        assert!(matches!(write_jp2(&cs, &bad), Err(Error::NotImplemented)));
     }
 
     #[test]
@@ -1998,7 +2008,7 @@ mod tests {
                 ..Jp2WriteOptions::for_components(2)
             },
         ] {
-            assert_eq!(write_jp2(&cs, &bad), Err(Error::NotImplemented));
+            assert!(matches!(write_jp2(&cs, &bad), Err(Error::NotImplemented)));
         }
     }
 
@@ -2023,7 +2033,10 @@ mod tests {
         };
         let file = write_jp2(&ht, &unknown).expect("jph without colr");
         assert!(parse_jp2(&file).expect("parse").header.colr.is_empty());
-        assert_eq!(write_jp2(&plain, &unknown), Err(Error::NotImplemented));
+        assert!(matches!(
+            write_jp2(&plain, &unknown),
+            Err(Error::NotImplemented)
+        ));
         let any_icc = Jp2WriteOptions {
             colour: vec![Colr {
                 method: ColrMethod::AnyIcc,
@@ -2057,7 +2070,10 @@ mod tests {
             assert_eq!(c.header.colr[0].method, opts.colour[0].method);
             assert_eq!(c.header.colr[0].parameterized, opts.colour[0].parameterized);
             assert_eq!(c.header.colr[0].icc_profile, opts.colour[0].icc_profile);
-            assert_eq!(write_jp2(&plain, opts), Err(Error::NotImplemented));
+            assert!(matches!(
+                write_jp2(&plain, opts),
+                Err(Error::NotImplemented)
+            ));
         }
     }
 
@@ -2502,12 +2518,12 @@ mod tests {
             &[&plane],
             w,
             h,
-            &crate::encode::EncodeParams {
+            &crate::encode::EncodeOptions {
                 decomposition_levels: 2,
                 code_block_exp: (4, 4),
                 high_throughput: true,
                 ht_refinement: true,
-                ..crate::encode::EncodeParams::default()
+                ..crate::encode::EncodeOptions::default()
             },
         )
         .expect("HT encode");
@@ -2855,7 +2871,9 @@ mod tests {
         }
         // The historical interleaved entry point sniffs the JP2
         // signature and applies the same expansion.
-        let interleaved = crate::decode_jpeg2000(&bytes).expect("interleaved");
+        let interleaved =
+            crate::api::interleave_8bit(&crate::jp2::decode_jp2(&bytes).expect("jp2"))
+                .expect("interleaved");
         assert_eq!(interleaved.len(), (w * h * 3) as usize);
         assert_eq!(interleaved[0], 255);
         assert_eq!(interleaved[1], 0);

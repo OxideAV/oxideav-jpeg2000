@@ -233,7 +233,7 @@ fn mixed_reduced_resolution_decodes() {
 /// the historical byte-vector entry point too: `jp2::decode_jp2` on a
 /// minimal JP2 wrapping of the 4-bit signed conformance stream
 /// reconstructs the same samples as the raw-codestream decode, and
-/// the registry-facing `decode_jpeg2000` sniffs both framings.
+/// the contract `decode` / `info` / `probe` sniff both framings.
 #[test]
 fn mixed_decodes_through_jp2_container() {
     let codestream = read_fixture("ds0_hm_15_b8");
@@ -278,17 +278,22 @@ fn mixed_decodes_through_jp2_container() {
         "container route must match the raw-codestream decode"
     );
 
-    // The historical interleaved-bytes entry point sniffs both
-    // framings and routes through the same decode — and per its
-    // documented contract rejects this stream's **signed** channel
-    // cleanly (callers use `decode_j2k` / `decode_jp2` for the
-    // planar surface) rather than mis-converting it.
+    // The contract entry points sniff both framings and route through
+    // the same decode — and per the layout table reject this stream's
+    // **signed** channel cleanly as `Unsupported` (callers use
+    // `decode_j2k` / `decode_jp2` for the planar surface) rather than
+    // mis-converting it; `info` says the same without decoding.
     assert!(matches!(
-        oxideav_jpeg2000::decode_jpeg2000(&file),
-        Err(oxideav_jpeg2000::Error::NotImplemented)
+        oxideav_jpeg2000::decode(&file),
+        Err(oxideav_jpeg2000::Error::Unsupported(_))
     ));
     assert!(matches!(
-        oxideav_jpeg2000::decode_jpeg2000(&codestream),
-        Err(oxideav_jpeg2000::Error::NotImplemented)
+        oxideav_jpeg2000::decode(&codestream),
+        Err(oxideav_jpeg2000::Error::Unsupported(_))
     ));
+    assert!(matches!(
+        oxideav_jpeg2000::info(&codestream),
+        Err(oxideav_jpeg2000::Error::Unsupported(_))
+    ));
+    assert!(oxideav_jpeg2000::probe(&file) && oxideav_jpeg2000::probe(&codestream));
 }

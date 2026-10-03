@@ -9,6 +9,9 @@ authors = ["Mark Karpeles"]
 description = "Pure-Rust JPEG 2000 codec — Part 1 (T.800) + HTJ2K (T.814) decoder and encoder, J2K / JP2 / JPH containers."
 
 readme = "README.md"
+# crates.io 10 MiB cap: the conformance fixtures and fuzz corpus stay
+# in the repository only.
+exclude = ["/tests", "/fuzz"]
 homepage = "https://github.com/OxideAV/oxideav-jpeg2000"
 keywords = ["multimedia", "image", "jpeg2000", "jp2", "codec"]
 categories = ["multimedia::encoding", "multimedia::images"]
@@ -19,7 +22,8 @@ oxideav-core = { version = "0.1", optional = true }
 [features]
 default = ["registry"]
 # Pulls in `oxideav-core` and exposes the `Decoder` / `Encoder` trait
-# surface plus the `register()` entry point. Disable for an
-# `oxideav-core`-free build; the scaffold still compiles and returns
-# `Error::NotImplemented` for every public entry point.
+# adapters, the `register()` entry point and the `VideoFrame` bridge.
+# Disable for an `oxideav-core`-free build: the whole standalone image
+# API (`probe` / `info` / `decode` / `encode` …) and the T.800 depth
+# surface stay available.
 registry = ["dep:oxideav-core"]

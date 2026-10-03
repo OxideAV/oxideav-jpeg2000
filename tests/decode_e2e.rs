@@ -10,7 +10,7 @@
 //! small tolerance for the floating-point inverse-DWT differences
 //! T.800 Annex F permits between conforming decoders.
 
-use oxideav_jpeg2000::{decode_j2k, decode_jpeg2000, parse_codestream, ProgressionOrder};
+use oxideav_jpeg2000::{decode_j2k, decode_rgb8, parse_codestream, ProgressionOrder};
 
 const GRAY_53: &[u8] = include_bytes!("data/gray-17x13-53.j2k");
 const GRAY_53_TILED: &[u8] = include_bytes!("data/gray-17x13-tiled-8x8-53.j2k");
@@ -457,7 +457,7 @@ fn gray_53_main_header_rgn_non_maxshift_style_is_rejected() {
     injected.extend_from_slice(&rgn);
     injected.extend_from_slice(&GRAY_53[insert_at..]);
 
-    assert_eq!(decode_j2k(&injected), Err(Error::NotImplemented));
+    assert!(matches!(decode_j2k(&injected), Err(Error::NotImplemented)));
 }
 
 /// Splice `seg` (a complete marker segment, marker code + length +
@@ -883,7 +883,7 @@ fn rgb_rct_53_redundant_main_header_coc_component1_is_pixel_exact() {
 
 #[test]
 fn rgb_rct_53_interleaved_wrapper_matches_planes() {
-    let bytes = decode_jpeg2000(RGB_RCT_53).expect("decode");
+    let bytes = decode_rgb8(RGB_RCT_53).expect("decode").into_raw();
     let expected = rgb_16x16_pattern();
     assert_eq!(bytes.len(), 16 * 16 * 3);
     for (i, px) in bytes.chunks_exact(3).enumerate() {
@@ -1354,9 +1354,8 @@ fn gray_53_zero_precinct_exponent_above_r0_is_rejected() {
 
     // Zero the r = 1 byte (the first above-NLLL resolution level).
     out[precinct0_at + 1] = 0x00;
-    assert_eq!(
-        decode_j2k(&out),
-        Err(Error::InvalidPrecinctSize),
+    assert!(
+        matches!(decode_j2k(&out), Err(Error::InvalidPrecinctSize)),
         "PPx = PPy = 0 at r = 1 must be rejected"
     );
 
@@ -1976,7 +1975,7 @@ fn assemble_mixed_style(base: &[u8], other: &[u8]) -> Vec<u8> {
 /// (both lossless).
 #[test]
 fn htdeclared_mixed_ht_and_annex_d_components_reconstruct() {
-    use oxideav_jpeg2000::encode::{encode_j2k, EncodeParams};
+    use oxideav_jpeg2000::encode::{encode_j2k, EncodeOptions};
     let mut seed = 0x4854_00A1u32;
     let mut noise = |n: usize| -> Vec<u8> {
         (0..n)
@@ -1988,20 +1987,15 @@ fn htdeclared_mixed_ht_and_annex_d_components_reconstruct() {
     };
     let pa = noise(32 * 32);
     let pb = noise(32 * 32);
-    let base_params = EncodeParams {
-        decomposition_levels: 2,
-        code_block_exp: (4, 4),
-        ..EncodeParams::default()
-    };
+    let base_params = EncodeOptions::default()
+        .with_decomposition_levels(2)
+        .with_code_block_exp((4, 4));
     let plain = encode_j2k(&[&pa], 32, 32, &base_params).expect("plain encode");
     let ht = encode_j2k(
         &[&pb],
         32,
         32,
-        &EncodeParams {
-            high_throughput: true,
-            ..base_params
-        },
+        &base_params.clone().with_high_throughput(true),
     )
     .expect("HT encode");
 
@@ -2112,7 +2106,7 @@ fn assemble_mixed_tile_lanes(
 /// altogether, so it cannot arbitrate this shape).
 #[test]
 fn htdeclared_mixed_lanes_across_tiles_reconstruct() {
-    use oxideav_jpeg2000::encode::{encode_j2k, EncodeParams};
+    use oxideav_jpeg2000::encode::{encode_j2k, EncodeOptions};
     let (w, h) = (64u32, 64u32);
     let mut seed = 0x7411_C0DEu32;
     let src: Vec<u8> = (0..w * h)
@@ -2121,23 +2115,13 @@ fn htdeclared_mixed_lanes_across_tiles_reconstruct() {
             (seed >> 24) as u8
         })
         .collect();
-    let base = EncodeParams {
-        decomposition_levels: 2,
-        code_block_exp: (4, 4),
-        tile_size: Some((32, 32)),
-        ..EncodeParams::default()
-    };
+    let base = EncodeOptions::default()
+        .with_decomposition_levels(2)
+        .with_code_block_exp((4, 4))
+        .with_tile_size((32, 32));
     let plain = encode_j2k(&[&src], w, h, &base).expect("Annex D encode");
-    let ht = encode_j2k(
-        &[&src],
-        w,
-        h,
-        &EncodeParams {
-            high_throughput: true,
-            ..base
-        },
-    )
-    .expect("HT encode");
+    let ht =
+        encode_j2k(&[&src], w, h, &base.clone().with_high_throughput(true)).expect("HT encode");
     let want: Vec<i32> = src.iter().map(|&v| i32::from(v)).collect();
 
     // HT main header; tiles 1 and 2 carry Annex D tile-part CODs.
@@ -2160,7 +2144,7 @@ fn htdeclared_mixed_lanes_across_tiles_reconstruct() {
 /// decoding with its own §B.10.7 segment layout.
 #[test]
 fn mixed_annex_d_styles_per_component_reconstruct() {
-    use oxideav_jpeg2000::encode::{encode_j2k, EncodeParams};
+    use oxideav_jpeg2000::encode::{encode_j2k, EncodeOptions};
     let mut seed = 0x4854_00B1u32;
     let mut noise = |n: usize| -> Vec<u8> {
         (0..n)
@@ -2172,23 +2156,14 @@ fn mixed_annex_d_styles_per_component_reconstruct() {
     };
     let pa = noise(32 * 32);
     let pb = noise(32 * 32);
-    let base_params = EncodeParams {
-        decomposition_levels: 2,
-        code_block_exp: (4, 4),
-        ..EncodeParams::default()
-    };
+    let base_params = EncodeOptions::default()
+        .with_decomposition_levels(2)
+        .with_code_block_exp((4, 4));
     let plain = encode_j2k(&[&pa], 32, 32, &base_params).expect("plain encode");
-    let styled = encode_j2k(
-        &[&pb],
-        32,
-        32,
-        &EncodeParams {
-            bypass: true,
-            terminate_all: true,
-            ..base_params
-        },
-    )
-    .expect("styled encode");
+    let mut styled_params = base_params.clone();
+    styled_params.bypass = true;
+    styled_params.terminate_all = true;
+    let styled = encode_j2k(&[&pb], 32, 32, &styled_params).expect("styled encode");
 
     let mixed = assemble_mixed_style(&plain, &styled);
     let img = decode_j2k(&mixed).expect("decode mixed Annex D styles");
@@ -2417,7 +2392,7 @@ fn corrupted_tlm_and_plt_pointers_are_rejected() {
     let ltlm = u16::from_be_bytes([bad[tlm_off + 2], bad[tlm_off + 3]]) as usize;
     let seg_end = tlm_off + 2 + ltlm;
     bad[seg_end - 1] ^= 0x01;
-    assert_eq!(decode_j2k(&bad), Err(Error::TlmMismatch));
+    assert!(matches!(decode_j2k(&bad), Err(Error::TlmMismatch)));
     // A TLM entry count that misses tile-parts is likewise rejected:
     // shrink the segment by one 16-bit Ptlm entry (opaque-encoder
     // layout: ST = 0 / SP = 0 or larger — rather than model the exact
@@ -2436,7 +2411,7 @@ fn corrupted_tlm_and_plt_pointers_are_rejected() {
     short.splice(seg_end - entry..seg_end, std::iter::empty());
     let new_len = (ltlm - entry) as u16;
     short[tlm_off + 2..tlm_off + 4].copy_from_slice(&new_len.to_be_bytes());
-    assert_eq!(decode_j2k(&short), Err(Error::TlmMismatch));
+    assert!(matches!(decode_j2k(&short), Err(Error::TlmMismatch)));
 
     // PLT: flip the last Iplt byte (a terminal VLQ byte, bit 7 = 0) of
     // the tile-part's PLT segment — the announced packet length then
@@ -2450,7 +2425,7 @@ fn corrupted_tlm_and_plt_pointers_are_rejected() {
     let seg_end = plt_off + 2 + lplt;
     assert_eq!(bad[seg_end - 1] & 0x80, 0, "last Iplt byte terminates");
     bad[seg_end - 1] ^= 0x01;
-    assert_eq!(decode_j2k(&bad), Err(Error::PltMismatch));
+    assert!(matches!(decode_j2k(&bad), Err(Error::PltMismatch)));
 }
 
 /// §A.7.1 TLM (tile-part length, main header) pointer marker over a
@@ -2638,9 +2613,14 @@ fn jp2_palette_expansion_matches_reference() {
         let want: Vec<i32> = rgb[ci..].iter().step_by(3).map(|&v| i32::from(v)).collect();
         assert_eq!(c.samples, want, "palette channel {ci}");
     }
-    // The interleaved entry point sniffs the JP2 signature and must
-    // reproduce the reference PPM payload directly.
-    let interleaved = oxideav_jpeg2000::decode_jpeg2000(PAL_JP2).expect("interleaved");
+    // The contract entry point sniffs the JP2 signature, keeps the
+    // palette as `Pal8` + table, and its RGB expansion reproduces the
+    // reference PPM payload directly.
+    let pal = oxideav_jpeg2000::decode(PAL_JP2).expect("contract decode");
+    assert_eq!(pal.format, oxideav_jpeg2000::PixelFormat::Pal8);
+    assert!(pal.palette.is_some());
+    assert_eq!(pal.to_rgb8().as_slice(), &rgb[..w * h * 3]);
+    let interleaved = decode_rgb8(PAL_JP2).expect("interleaved").into_raw();
     assert_eq!(interleaved.as_slice(), &rgb[..w * h * 3]);
 }
 
@@ -2856,19 +2836,25 @@ fn tile_part_order_faults_are_rejected() {
     let mut order = identity.clone();
     order.swap(4, 8);
     let swapped = reorder_tile_parts(GRAY_TP_INTERLEAVED_53, &order);
-    assert_eq!(decode_j2k(&swapped), Err(Error::InvalidTilePartIndex));
+    assert!(matches!(
+        decode_j2k(&swapped),
+        Err(Error::InvalidTilePartIndex)
+    ));
     // Duplicate TPsot: overwrite tile 0 part 2's TPsot byte (at
     // SOT + 10) with 1.
     let tp = &cs.tile_parts[8];
     assert_eq!((tp.sot.tile_index, tp.sot.tile_part_index), (0, 2));
     let mut dup = GRAY_TP_INTERLEAVED_53.to_vec();
     dup[tp.sot_offset + 10] = 1;
-    assert_eq!(decode_j2k(&dup), Err(Error::InvalidTilePartIndex));
+    assert!(matches!(decode_j2k(&dup), Err(Error::InvalidTilePartIndex)));
     // TNsot misstatement: claim tile 0 has 2 tile-parts (byte at
     // SOT + 11) while three are present.
     let mut wrong = GRAY_TP_INTERLEAVED_53.to_vec();
     wrong[cs.tile_parts[0].sot_offset + 11] = 2;
-    assert_eq!(decode_j2k(&wrong), Err(Error::InvalidTilePartIndex));
+    assert!(matches!(
+        decode_j2k(&wrong),
+        Err(Error::InvalidTilePartIndex)
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -2993,10 +2979,10 @@ fn reduced_below_component_levels_is_rejected() {
     // rather than clamp silently.
     let cs = parse_codestream(GRAY_MULTILAYER_53).expect("parse");
     let nl = cs.header.cod.decomposition_levels;
-    assert_eq!(
+    assert!(matches!(
         decode_j2k_reduced(GRAY_MULTILAYER_53, nl + 1),
         Err(Error::InvalidDecompositionLevels)
-    );
+    ));
     // Discarding exactly NL levels (down to the NLLL band) is valid.
     let img = decode_j2k_reduced(GRAY_MULTILAYER_53, nl).expect("LL-only decode");
     assert_eq!((img.width, img.height), (16, 16));
@@ -3075,10 +3061,10 @@ fn layer_limited_tile_parts_by_layer_is_consistent() {
 #[test]
 fn layer_limited_zero_is_rejected() {
     use oxideav_jpeg2000::Error;
-    assert_eq!(
+    assert!(matches!(
         decode_j2k_layers(GRAY_MULTILAYER_53, 0),
         Err(Error::InvalidMarkerLength)
-    );
+    ));
 }
 
 #[test]
@@ -3100,8 +3086,8 @@ fn magnitude_lane_overflow_budget_is_rejected() {
     for spqcd in &mut bytes[qcd + 5..qcd + 2 + len] {
         *spqcd = 31 << 3; // εb = 31 for every sub-band
     }
-    assert_eq!(
+    assert!(matches!(
         oxideav_jpeg2000::decode_j2k(&bytes),
         Err(oxideav_jpeg2000::Error::NotImplemented)
-    );
+    ));
 }

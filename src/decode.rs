@@ -2687,6 +2687,21 @@ pub fn decode_codestream(bytes: &[u8], cs: &J2kCodestream) -> Result<DecodedImag
     decode_codestream_impl(bytes, cs, 0, u16::MAX)
 }
 
+/// [`decode_codestream`] with the [`decode_j2k_reduced`] /
+/// [`decode_j2k_layers`] knobs — the contract path's
+/// (`crate::decode_with`) single entry into the tile driver.
+pub(crate) fn decode_codestream_with(
+    bytes: &[u8],
+    cs: &J2kCodestream,
+    discard_levels: u8,
+    max_layers: u16,
+) -> Result<DecodedImage, Error> {
+    if max_layers == 0 {
+        return Err(Error::InvalidMarkerLength);
+    }
+    decode_codestream_impl(bytes, cs, discard_levels, max_layers)
+}
+
 /// Ceiling division of `v` by `2^d` (Equation B-14's reduced-grid
 /// mapping; `d` is bounded by the Table A.15 `NL ≤ 32` range).
 #[inline]

@@ -4401,9 +4401,11 @@ mod tests {
             let bytes = find_bytes_decoding_to(target);
             let mut dec = MqDecoder::new(&bytes);
             let mut ctx = reset_contexts();
-            assert_eq!(
-                decode_segmentation_symbol(&mut dec, &mut ctx),
-                Err(Error::SegmentationSymbolMismatch),
+            assert!(
+                matches!(
+                    decode_segmentation_symbol(&mut dec, &mut ctx),
+                    Err(Error::SegmentationSymbolMismatch)
+                ),
                 "target 0x{target:X} should mismatch"
             );
         }
@@ -4507,10 +4509,10 @@ mod tests {
         let mut block = CodeBlock::new(SubBandOrientation::LL, 2, 2);
         let mut ctx = reset_contexts();
         let mut seq = BitPlaneSequencer::new(0).with_segmentation_symbols(true);
-        assert_eq!(
+        assert!(matches!(
             seq.decode_packet(&mut block, &bytes, 1, &mut ctx),
-            Err(Error::SegmentationSymbolMismatch),
-        );
+            Err(Error::SegmentationSymbolMismatch)
+        ));
     }
 
     // -- §D.7 vertically-causal context formation ---------------------
@@ -4839,13 +4841,13 @@ mod tests {
         for _ in 0..8 {
             r.read_bit().unwrap();
         }
-        assert_eq!(r.read_bit(), Err(Error::UnexpectedEof));
+        assert!(matches!(r.read_bit(), Err(Error::UnexpectedEof)));
     }
 
     #[test]
     fn raw_bit_reader_empty_input_eofs_on_first_read() {
         let mut r = RawBitReader::new(&[]);
-        assert_eq!(r.read_bit(), Err(Error::UnexpectedEof));
+        assert!(matches!(r.read_bit(), Err(Error::UnexpectedEof)));
     }
 
     #[test]
@@ -4879,7 +4881,7 @@ mod tests {
         for _ in 0..8 {
             assert_eq!(r.read_bit().unwrap(), 1);
         }
-        assert_eq!(r.read_bit(), Err(Error::UnexpectedEof));
+        assert!(matches!(r.read_bit(), Err(Error::UnexpectedEof)));
     }
 
     #[test]
@@ -4957,10 +4959,10 @@ mod tests {
         let mut block = CodeBlock::new(SubBandOrientation::LL, 2, 2);
         block.mark_significant_for_test(0, 0, false, 1);
         let mut raw = RawBitReader::new(&[]);
-        assert_eq!(
+        assert!(matches!(
             block.significance_propagation_pass_raw(0, &mut raw),
-            Err(Error::UnexpectedEof),
-        );
+            Err(Error::UnexpectedEof)
+        ));
     }
 
     #[test]

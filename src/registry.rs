@@ -1,134 +1,630 @@
-//! `oxideav-core` integration — `Decoder` trait impl and the
-//! [`register`] entry point.
+//! `oxideav-core` integration — the `Decoder` / `Encoder` adapters,
+//! the [`register`] entry point and the [`Jpeg2000Image`] ⇄
+//! [`VideoFrame`] bridge.
 //!
 //! Gated behind the default-on `registry` Cargo feature so consumers
 //! that only want the standalone T.800 surface can depend on
 //! `oxideav-jpeg2000` with `default-features = false` and skip the
 //! `oxideav-core` dependency.
 //!
-//! The registered decoder accepts one complete raw J2K codestream per
-//! packet (`.j2k` / `.j2c` — the bare T.800 Annex A codestream, not
-//! the JP2 box wrapper) and emits a [`Frame::Video`]:
-//!
-//! * 1 component → [`PixelFormat::Gray8`],
-//! * 3 components → [`PixelFormat::Rgb24`],
-//! * 4 components → [`PixelFormat::Rgba`].
-//!
-//! Components must be unsigned, at most 8-bit, and `1:1` sub-sampled
-//! for the packed conversion; anything else surfaces as a clean
-//! `unsupported` error (the planar [`crate::decode_j2k`] entry point
-//! has no such restriction).
+//! The adapters are thin: [`Jpeg2000Decoder`] calls
+//! [`crate::decode_with`] on each packet (a complete raw codestream
+//! **or** a whole JP2 / JPH file — the framing is sniffed) and emits
+//! the image's native layout as a [`VideoFrame`] with the palette /
+//! colour-signal / significant-bits side-channels;
+//! [`Jpeg2000Encoder`] rebuilds a [`Jpeg2000Image`] from each frame
+//! ([`Jpeg2000Image::from_video_frame`]) and calls [`crate::encode()`].
+//! One implementation, two entry doors.
 
 use oxideav_core::{
-    CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecRegistry, ContainerRegistry,
-    Decoder, Encoder, Error as CoreError, Frame, MediaType, Packet, PixelFormat, RuntimeContext,
-    TimeBase, VideoFrame, VideoPlane,
+    frame::VideoPlane, CodecCapabilities, CodecId, CodecInfo, CodecOptionsStruct, CodecParameters,
+    CodecRegistry, ColorPrimaries, ColorSignal, ContainerRegistry, Decoder, Encoder,
+    Error as CoreError, Frame, MatrixCoefficients, MediaType, OptionField, OptionKind, OptionValue,
+    Packet, PixelFormat, RuntimeContext, TimeBase, TransferCharacteristics, VideoFrame,
 };
 
-use crate::{decode_j2k, DecodedImage, Error};
+use crate::encode::{Container, EncodeKernel, EncodeOptions};
+use crate::image::{ColorInfo, ColorRange, Jpeg2000Image, Jpeg2000PixelFormat, Palette, Plane};
+use crate::options::DecodeOptions;
+use crate::{Jpeg2000Error, ProgressionOrder};
 
 /// Stable identifier this crate registers under in the codec registry.
 pub const CODEC_ID_STR: &str = "jpeg2000";
 
-impl From<Error> for CoreError {
-    fn from(e: Error) -> Self {
+impl From<Jpeg2000Error> for CoreError {
+    fn from(e: Jpeg2000Error) -> Self {
         match e {
-            Error::NotImplemented => CoreError::unsupported(format!("oxideav-jpeg2000: {e}")),
+            Jpeg2000Error::InvalidData(s) => CoreError::invalid(format!("oxideav-jpeg2000: {s}")),
+            Jpeg2000Error::Unsupported(s) => {
+                CoreError::unsupported(format!("oxideav-jpeg2000: {s}"))
+            }
+            Jpeg2000Error::LimitExceeded(s) => CoreError::invalid(format!("oxideav-jpeg2000: {s}")),
+            Jpeg2000Error::Io(e) => CoreError::Io(e),
+            Jpeg2000Error::NotImplemented => {
+                CoreError::unsupported(format!("oxideav-jpeg2000: {e}"))
+            }
             other => CoreError::invalid(format!("oxideav-jpeg2000: {other}")),
         }
     }
 }
 
-/// Pack a [`DecodedImage`] into one interleaved [`VideoFrame`]: 8-bit
-/// components as `Gray8` / `Rgb24` / `Rgba`, deeper (9–16-bit) ones as
-/// little-endian `Gray16Le` / `Rgb48Le` / `Rgba64Le` (`Gray10Le` /
-/// `Gray12Le` at exactly those depths).
-///
-/// Returns the frame plus the `(width, height, pixel_format)` triple
-/// for the decoder to surface on its [`CodecParameters`].
-fn image_to_frame(
-    image: &DecodedImage,
-    pts: Option<i64>,
-) -> oxideav_core::Result<(VideoFrame, u32, u32, PixelFormat)> {
-    let ncomp = image.components.len();
-    let first = image
-        .components
-        .first()
-        .ok_or_else(|| CoreError::invalid("oxideav-jpeg2000: image has no components"))?;
-    let depth = first.precision_bits;
-    let format = match (ncomp, depth) {
-        (1, 0..=8) => PixelFormat::Gray8,
-        (3, 0..=8) => PixelFormat::Rgb24,
-        (4, 0..=8) => PixelFormat::Rgba,
-        (1, 10) => PixelFormat::Gray10Le,
-        (1, 12) => PixelFormat::Gray12Le,
-        (1, 9..=16) => PixelFormat::Gray16Le,
-        (3, 9..=16) => PixelFormat::Rgb48Le,
-        (4, 9..=16) => PixelFormat::Rgba64Le,
-        _ => {
-            return Err(CoreError::unsupported(format!(
-                "oxideav-jpeg2000: {ncomp} components at {depth} bits have no packed PixelFormat"
-            )))
-        }
-    };
-    let bytes = if depth > 8 { 2usize } else { 1 };
-    let (w, h) = (image.width, image.height);
-    for c in &image.components {
-        if c.precision_bits != depth || c.is_signed || c.width != w || c.height != h {
-            return Err(CoreError::unsupported(
-                "oxideav-jpeg2000: only uniform-depth unsigned full-resolution components pack into a frame",
-            ));
-        }
-    }
-    let stride = (w as usize).saturating_mul(ncomp).saturating_mul(bytes);
-    let mut data = vec![0u8; stride.saturating_mul(h as usize)];
-    for (ci, c) in image.components.iter().enumerate() {
-        for (i, &v) in c.samples.iter().enumerate() {
-            let at = (i * ncomp + ci) * bytes;
-            if bytes == 1 {
-                data[at] = v.clamp(0, 255) as u8;
-            } else {
-                data[at..at + 2].copy_from_slice(&(v.clamp(0, 65_535) as u16).to_le_bytes());
+// ---- Pixel-format and colour bridges ----------------------------------------
+
+macro_rules! pixel_format_bridge {
+    ($($v:ident),* $(,)?) => {
+        impl From<Jpeg2000PixelFormat> for PixelFormat {
+            fn from(p: Jpeg2000PixelFormat) -> Self {
+                match p {
+                    $(Jpeg2000PixelFormat::$v => PixelFormat::$v,)*
+                }
             }
         }
-    }
-    Ok((
-        VideoFrame {
-            pts,
-            planes: vec![VideoPlane { stride, data }],
-        },
-        w,
-        h,
-        format,
-    ))
+
+        impl TryFrom<PixelFormat> for Jpeg2000PixelFormat {
+            type Error = Jpeg2000Error;
+            fn try_from(p: PixelFormat) -> Result<Self, Jpeg2000Error> {
+                Ok(match p {
+                    $(PixelFormat::$v => Jpeg2000PixelFormat::$v,)*
+                    other => {
+                        return Err(Jpeg2000Error::unsupported(format!(
+                            "pixel format {other:?} has no JPEG 2000 layout"
+                        )))
+                    }
+                })
+            }
+        }
+    };
 }
 
+pixel_format_bridge!(
+    Gray8,
+    Gray10Le,
+    Gray12Le,
+    Gray16Le,
+    Ya8,
+    Ya16Le,
+    Rgb24,
+    Rgb48Le,
+    Rgba,
+    Rgba64Le,
+    Pal8,
+    Yuv444P,
+    Yuv444P10Le,
+    Yuv444P12Le,
+    Yuv444P16Le,
+    Yuv422P,
+    Yuv422P10Le,
+    Yuv422P12Le,
+    Yuv422P16Le,
+    Yuv420P,
+    Yuv420P10Le,
+    Yuv420P12Le,
+    Yuv420P16Le,
+    Yuv440P,
+    Yuv440P10Le,
+    Yuv440P12Le,
+    Yuv440P16Le,
+    Yuv411P,
+    Yuva444P,
+    Yuva444P10Le,
+    Yuva444P12Le,
+    Yuva444P16Le,
+    Yuva422P,
+    Yuva422P10Le,
+    Yuva422P12Le,
+    Yuva422P16Le,
+    Yuva420P,
+    Yuva420P10Le,
+    Yuva420P12Le,
+    Yuva420P16Le,
+);
+
+/// [`ColorInfo`] as the framework's [`ColorSignal`] (code points map
+/// 1:1; `Unspecified` range stays unspecified).
+pub fn to_color_signal(c: &ColorInfo) -> ColorSignal {
+    let range = match c.range {
+        ColorRange::Unspecified => oxideav_core::ColorRange::Unspecified,
+        ColorRange::Limited => oxideav_core::ColorRange::Limited,
+        ColorRange::Full => oxideav_core::ColorRange::Full,
+    };
+    ColorSignal::new(
+        range,
+        ColorPrimaries(c.primaries),
+        TransferCharacteristics(c.transfer),
+        MatrixCoefficients(c.matrix),
+    )
+}
+
+/// The inverse of [`to_color_signal`].
+pub fn from_color_signal(s: &ColorSignal) -> ColorInfo {
+    let range = match s.range {
+        oxideav_core::ColorRange::Limited => ColorRange::Limited,
+        oxideav_core::ColorRange::Full => ColorRange::Full,
+        _ => ColorRange::Unspecified,
+    };
+    ColorInfo::new(range, s.primaries.0, s.transfer.0, s.matrix.0)
+}
+
+// ---- Jpeg2000Image ⇄ VideoFrame -------------------------------------------------
+
+/// [`From<Jpeg2000Image>`] with an explicit `pts`, moving the planes.
+/// Side-channels: the palette for `Pal8`; the colour signal when the
+/// file carried one (JP2 `colr`); the per-plane significant-bits count
+/// when `bit_depth` differs from the layout's own depth (8 / 10 / 12 /
+/// 16).
+pub(crate) fn image_into_video_frame(image: Jpeg2000Image, pts: Option<i64>) -> VideoFrame {
+    let storage = image
+        .format
+        .fixed_bit_depth()
+        .unwrap_or(image.format.storage_bits());
+    let bits = image.bit_depth;
+    let nplanes = image.planes.len();
+    let mut frame = VideoFrame {
+        pts,
+        planes: image
+            .planes
+            .into_iter()
+            .map(|p| VideoPlane {
+                stride: p.stride,
+                data: p.data,
+            })
+            .collect(),
+    };
+    if let (Jpeg2000PixelFormat::Pal8, Some(p)) = (image.format, &image.palette) {
+        frame.set_palette(p.entries.iter().flat_map(|e| [e[0], e[1], e[2]]).collect());
+    }
+    if image.color.is_signalled() {
+        frame.set_color_signal(to_color_signal(&image.color));
+    }
+    if bits != storage {
+        frame.set_significant_bits(vec![bits; nplanes]);
+    }
+    frame
+}
+
+impl From<Jpeg2000Image> for VideoFrame {
+    /// The planes (`pts` `None`) plus the side-channels: palette for
+    /// `Pal8`, colour signal when the file carried one, significant bits
+    /// when `bit_depth` differs from the label's depth.
+    fn from(image: Jpeg2000Image) -> Self {
+        image_into_video_frame(image, None)
+    }
+}
+
+impl From<&Jpeg2000Image> for VideoFrame {
+    fn from(image: &Jpeg2000Image) -> Self {
+        image_into_video_frame(image.clone(), None)
+    }
+}
+
+impl From<Jpeg2000Image> for Frame {
+    fn from(img: Jpeg2000Image) -> Self {
+        Frame::Video(img.into())
+    }
+}
+
+impl Jpeg2000Image {
+    /// Rebuild an image from a framework frame and the stream parameters
+    /// that describe it (`width`, `height` and `pixel_format` are
+    /// required). `Bgr24` / `Bgra` frames are re-ordered into `Rgb24` /
+    /// `Rgba`; the palette side-channel (or `extradata` RGB triples)
+    /// becomes [`Jpeg2000Image::palette`] for `Pal8`; the colour-signal
+    /// side-channel becomes [`Jpeg2000Image::color`]; the significant-bits
+    /// side-channel (plane 0) becomes [`Jpeg2000Image::bit_depth`].
+    pub fn from_video_frame(
+        frame: &VideoFrame,
+        params: &CodecParameters,
+    ) -> Result<Self, Jpeg2000Error> {
+        let width = params
+            .width
+            .ok_or_else(|| Jpeg2000Error::invalid("missing width"))?;
+        let height = params
+            .height
+            .ok_or_else(|| Jpeg2000Error::invalid("missing height"))?;
+        let core_pix = params
+            .pixel_format
+            .ok_or_else(|| Jpeg2000Error::invalid("missing pixel_format"))?;
+        let (pix, swizzle) = match core_pix {
+            PixelFormat::Bgr24 => (Jpeg2000PixelFormat::Rgb24, true),
+            PixelFormat::Bgra => (Jpeg2000PixelFormat::Rgba, true),
+            other => (Jpeg2000PixelFormat::try_from(other)?, false),
+        };
+        let src = frame.image_planes();
+        if src.len() != pix.plane_count() {
+            return Err(Jpeg2000Error::invalid(format!(
+                "{pix:?} needs {} plane(s), frame has {}",
+                pix.plane_count(),
+                src.len()
+            )));
+        }
+        let planes: Vec<Plane> = src
+            .iter()
+            .map(|p| {
+                let mut data = p.data.clone();
+                if swizzle {
+                    let n = pix.components();
+                    for px in data.chunks_exact_mut(n) {
+                        px.swap(0, 2);
+                    }
+                }
+                Plane::new(p.stride, data)
+            })
+            .collect();
+        let mut img = Jpeg2000Image::new(width, height, pix, planes)?;
+        if pix == Jpeg2000PixelFormat::Pal8 {
+            let rgb: Option<&[u8]> = frame
+                .palette()
+                .or((!params.extradata.is_empty()).then_some(params.extradata.as_slice()));
+            img.palette = rgb.map(|rgb| {
+                Palette::new(
+                    rgb.chunks_exact(3)
+                        .map(|c| [c[0], c[1], c[2], 255])
+                        .collect(),
+                )
+            });
+            if img.palette.is_none() {
+                return Err(Jpeg2000Error::invalid(
+                    "Pal8 frame without a palette side-channel or extradata",
+                ));
+            }
+        }
+        if let Some(sig) = frame.color_signal() {
+            img.color = from_color_signal(&sig);
+        }
+        if let Some(bits) = frame.plane_significant_bits(0) {
+            img = img.with_bit_depth(bits)?;
+        }
+        Ok(img)
+    }
+}
+
+impl TryFrom<(&VideoFrame, &CodecParameters)> for Jpeg2000Image {
+    type Error = Jpeg2000Error;
+    fn try_from((frame, params): (&VideoFrame, &CodecParameters)) -> Result<Self, Jpeg2000Error> {
+        Jpeg2000Image::from_video_frame(frame, params)
+    }
+}
+
+// ---- CodecOptionsStruct (registry-only schema for EncodeOptions) ------------
+
+/// The registry's view of [`EncodeOptions`]: the same knobs under the
+/// `CodecOptions` string keys, with the registry default container
+/// `j2k` (a bare codestream — the framework carries colour on the
+/// frame, not in the file).
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct RegistryEncodeOptions {
+    /// The options the keys build (kernel resolved by
+    /// [`Self::into_options`]).
+    pub inner: EncodeOptions,
+    lossless: bool,
+    fine_bits: u8,
+}
+
+impl Default for RegistryEncodeOptions {
+    fn default() -> Self {
+        Self {
+            inner: EncodeOptions::default().with_container(Container::J2k),
+            lossless: true,
+            fine_bits: 6,
+        }
+    }
+}
+
+impl RegistryEncodeOptions {
+    /// The resolved [`EncodeOptions`]: `lossless` picks the kernel,
+    /// `fine_bits` its 9-7 step.
+    pub fn into_options(self) -> EncodeOptions {
+        let mut o = self.inner;
+        o.kernel = if self.lossless {
+            EncodeKernel::Lossless5x3
+        } else {
+            EncodeKernel::Lossy9x7 {
+                fine_bits: self.fine_bits,
+            }
+        };
+        o
+    }
+}
+
+impl CodecOptionsStruct for RegistryEncodeOptions {
+    const SCHEMA: &'static [OptionField] = &[
+        OptionField {
+            name: "lossless",
+            kind: OptionKind::Bool,
+            default: OptionValue::Bool(true),
+            help: "Reversible 5-3 kernel (true, default) or irreversible 9-7 (false).",
+        },
+        OptionField {
+            name: "fine_bits",
+            kind: OptionKind::U32,
+            default: OptionValue::U32(6),
+            help: "9-7 quantisation step 2^-fine_bits (0..=8; only with lossless = false).",
+        },
+        OptionField {
+            name: "psnr",
+            kind: OptionKind::F32,
+            default: OptionValue::F32(0.0),
+            help: "PCRD PSNR floor in dB (0 = none).",
+        },
+        OptionField {
+            name: "target_bytes",
+            kind: OptionKind::U32,
+            default: OptionValue::U32(0),
+            help: "PCRD byte budget per codestream (0 = none; bit_rate / frame_rate otherwise).",
+        },
+        OptionField {
+            name: "levels",
+            kind: OptionKind::U32,
+            default: OptionValue::U32(3),
+            help: "Wavelet decomposition levels NL (0..=32).",
+        },
+        OptionField {
+            name: "layers",
+            kind: OptionKind::U32,
+            default: OptionValue::U32(1),
+            help: "Quality layers (1..=65535).",
+        },
+        OptionField {
+            name: "progression",
+            kind: OptionKind::Enum(&["lrcp", "rlcp", "rpcl", "pcrl", "cprl"]),
+            default: OptionValue::String(String::new()),
+            help: "Packet progression order (default lrcp).",
+        },
+        OptionField {
+            name: "tile",
+            kind: OptionKind::String,
+            default: OptionValue::String(String::new()),
+            help: "Tile size as WxH on the reference grid (empty = one tile).",
+        },
+        OptionField {
+            name: "ht",
+            kind: OptionKind::Bool,
+            default: OptionValue::Bool(false),
+            help: "Use the T.814 HT block coder (JPH brand under container = jp2).",
+        },
+        OptionField {
+            name: "plt",
+            kind: OptionKind::Bool,
+            default: OptionValue::Bool(false),
+            help: "Emit PLT packet-length markers.",
+        },
+        OptionField {
+            name: "tlm",
+            kind: OptionKind::Bool,
+            default: OptionValue::Bool(false),
+            help: "Emit a TLM tile-part-length marker.",
+        },
+        OptionField {
+            name: "sop",
+            kind: OptionKind::Bool,
+            default: OptionValue::Bool(false),
+            help: "Emit SOP marker segments.",
+        },
+        OptionField {
+            name: "eph",
+            kind: OptionKind::Bool,
+            default: OptionValue::Bool(false),
+            help: "Emit EPH markers.",
+        },
+        OptionField {
+            name: "comment",
+            kind: OptionKind::String,
+            default: OptionValue::String(String::new()),
+            help: "COM marker text.",
+        },
+        OptionField {
+            name: "container",
+            kind: OptionKind::Enum(&["j2k", "j2c", "jp2", "jph"]),
+            default: OptionValue::String(String::new()),
+            help: "Bare codestream (j2k / j2c, default) or JP2 / JPH file (jp2 / jph).",
+        },
+    ];
+
+    fn apply(&mut self, key: &str, value: &OptionValue) -> oxideav_core::Result<()> {
+        let o = &mut self.inner;
+        match key {
+            "lossless" => self.lossless = value.as_bool()?,
+            "fine_bits" => {
+                let f = value.as_u32()?;
+                if f > 8 {
+                    return Err(CoreError::invalid(format!(
+                        "oxideav-jpeg2000 encoder: fine_bits {f} out of 0..=8"
+                    )));
+                }
+                self.fine_bits = f as u8;
+            }
+            "psnr" => {
+                let p = value.as_f32()?;
+                o.target_psnr = (p > 0.0).then_some(f64::from(p));
+            }
+            "target_bytes" => {
+                let b = value.as_u32()?;
+                o.target_bytes = (b > 0).then_some(b as usize);
+            }
+            "levels" => {
+                let l = value.as_u32()?;
+                o.decomposition_levels =
+                    u8::try_from(l).ok().filter(|l| *l <= 32).ok_or_else(|| {
+                        CoreError::invalid(format!(
+                            "oxideav-jpeg2000 encoder: levels {l} out of 0..=32"
+                        ))
+                    })?;
+            }
+            "layers" => {
+                let l = value.as_u32()?;
+                o.layers = u16::try_from(l).ok().filter(|l| *l >= 1).ok_or_else(|| {
+                    CoreError::invalid(format!(
+                        "oxideav-jpeg2000 encoder: layers {l} out of 1..=65535"
+                    ))
+                })?;
+            }
+            "progression" => {
+                o.progression = match value.as_str()? {
+                    "lrcp" => ProgressionOrder::Lrcp,
+                    "rlcp" => ProgressionOrder::Rlcp,
+                    "rpcl" => ProgressionOrder::Rpcl,
+                    "pcrl" => ProgressionOrder::Pcrl,
+                    "cprl" => ProgressionOrder::Cprl,
+                    _ => unreachable!("guarded by SCHEMA"),
+                };
+            }
+            "tile" => {
+                let v = value.as_str()?;
+                if v.is_empty() {
+                    o.tile_size = None;
+                } else {
+                    let bad = || {
+                        CoreError::invalid(format!(
+                            "oxideav-jpeg2000 encoder: option tile={v:?} is invalid"
+                        ))
+                    };
+                    let (w, h) = v.split_once('x').ok_or_else(bad)?;
+                    o.tile_size =
+                        Some((w.parse().map_err(|_| bad())?, h.parse().map_err(|_| bad())?));
+                }
+            }
+            "ht" => o.high_throughput = value.as_bool()?,
+            "plt" => o.plt = value.as_bool()?,
+            "tlm" => o.tlm = value.as_bool()?,
+            "sop" => o.sop = value.as_bool()?,
+            "eph" => o.eph = value.as_bool()?,
+            "comment" => {
+                let c = value.as_str()?;
+                o.comment = (!c.is_empty()).then(|| c.to_owned());
+            }
+            "container" => {
+                o.container = match value.as_str()? {
+                    "j2k" | "j2c" => Container::J2k,
+                    "jp2" | "jph" => Container::Jp2,
+                    _ => unreachable!("guarded by SCHEMA"),
+                };
+            }
+            _ => unreachable!("guarded by SCHEMA"),
+        }
+        Ok(())
+    }
+}
+
+// ---- Registration -------------------------------------------------------------
+
+/// Register the JPEG 2000 decoder + encoder factories into a
+/// [`CodecRegistry`].
+pub fn register_codecs(reg: &mut CodecRegistry) {
+    let caps = CodecCapabilities::video("jpeg2000_sw")
+        .with_intra_only(true)
+        .with_lossless(true)
+        .with_pixel_formats(
+            Jpeg2000PixelFormat::ALL
+                .iter()
+                .map(|&f| PixelFormat::from(f))
+                .collect(),
+        );
+    reg.register(
+        CodecInfo::new(CodecId::new(CODEC_ID_STR))
+            .capabilities(caps)
+            .decoder(make_decoder)
+            .encoder(make_encoder)
+            .encoder_options::<RegistryEncodeOptions>(),
+    );
+}
+
+/// Register the file extensions (`.j2k` / `.j2c` raw codestreams,
+/// `.jp2` / `.jph` files) so a [`RuntimeContext`] can map a filename
+/// hint back to the codec id.
+pub fn register_containers(reg: &mut ContainerRegistry) {
+    reg.register_extension("j2k", CODEC_ID_STR);
+    reg.register_extension("j2c", CODEC_ID_STR);
+    reg.register_extension("jp2", CODEC_ID_STR);
+    reg.register_extension("jph", CODEC_ID_STR);
+}
+
+/// Unified registration entry point: install the codec factories and
+/// the extension hints into the supplied [`RuntimeContext`].
+pub fn register(ctx: &mut RuntimeContext) {
+    register_codecs(&mut ctx.codecs);
+    register_containers(&mut ctx.containers);
+}
+
+// ---- Decoder --------------------------------------------------------------------
+
+/// Factory registered with the codec registry. The framework's
+/// [`oxideav_core::DecoderLimits`] tighten the standalone
+/// [`DecodeOptions`] (never loosen them); the `CodecOptions` keys
+/// `reduce` (resolution levels to discard), `layers` (quality layers to
+/// decode) and `strict` are honoured.
 pub fn make_decoder(params: &CodecParameters) -> oxideav_core::Result<Box<dyn Decoder>> {
-    Ok(Box::new(Jpeg2000Decoder::new(params.clone())))
+    let limits = params.limits();
+    let mut opts = DecodeOptions::default();
+    opts.max_pixels = Some(opts.max_pixels.map_or(limits.max_pixels_per_frame, |m| {
+        m.min(limits.max_pixels_per_frame)
+    }));
+    opts.max_bytes = Some(
+        opts.max_bytes
+            .map_or(limits.max_alloc_bytes_per_frame, |m| {
+                m.min(limits.max_alloc_bytes_per_frame)
+            }),
+    );
+    let bad = |k: &str, v: &str| {
+        CoreError::invalid(format!(
+            "oxideav-jpeg2000 decoder: option {k}={v:?} is invalid"
+        ))
+    };
+    if let Some(v) = params.options.get("reduce") {
+        opts.reduce = v.parse().map_err(|_| bad("reduce", v))?;
+    }
+    if let Some(v) = params.options.get("layers") {
+        let l: u16 = v.parse().map_err(|_| bad("layers", v))?;
+        if l == 0 {
+            return Err(bad("layers", v));
+        }
+        opts.layers = Some(l);
+    }
+    if let Some(v) = params.options.get("strict") {
+        opts.strict = match v {
+            "true" | "1" | "yes" | "on" => true,
+            "false" | "0" | "no" | "off" => false,
+            _ => return Err(bad("strict", v)),
+        };
+    }
+    Ok(Box::new(Jpeg2000Decoder::with_options(
+        params.clone(),
+        opts,
+    )))
 }
 
 /// JPEG 2000 [`Decoder`] trait impl.
 ///
 /// One-packet-in / one-frame-out: each `send_packet` carries one
-/// complete raw J2K codestream; the matching `receive_frame` returns
-/// the decoded picture as packed 8-bit Gray8 / Rgb24 / Rgba.
+/// complete raw codestream or JP2 / JPH file; the matching
+/// `receive_frame` returns the picture in its native layout
+/// ([`crate::image`] docs) with the palette / colour-signal /
+/// significant-bits side-channels, and the decoder's
+/// [`CodecParameters`] take the decoded geometry and pixel format.
 #[derive(Debug)]
 pub struct Jpeg2000Decoder {
     params: CodecParameters,
+    opts: DecodeOptions,
     pending: Option<Packet>,
     eof: bool,
 }
 
 impl Jpeg2000Decoder {
     /// Build a decoder whose output [`CodecParameters`] start from
-    /// `params`; geometry and pixel format are re-derived from each
-    /// successfully decoded frame.
+    /// `params` (default [`DecodeOptions`]); geometry and pixel format
+    /// are re-derived from each successfully decoded frame.
     pub fn new(params: CodecParameters) -> Self {
+        Self::with_options(params, DecodeOptions::default())
+    }
+
+    /// [`Self::new`] with explicit decode options.
+    pub fn with_options(params: CodecParameters, opts: DecodeOptions) -> Self {
         let mut p = params;
         p.media_type = MediaType::Video;
         p.codec_id = CodecId::new(CODEC_ID_STR);
         Self {
             params: p,
+            opts,
             pending: None,
             eof: false,
         }
@@ -164,19 +660,14 @@ impl Decoder for Jpeg2000Decoder {
                 Err(CoreError::NeedMore)
             };
         };
-        // A packet may carry either a bare Annex A codestream or a
-        // whole JP2 / JPH file — the latter routes through the Annex I
-        // channel semantics (palette expansion, channel ordering).
-        let image = if crate::looks_like_jp2(&pkt.data) {
-            crate::jp2::decode_jp2(&pkt.data)?
-        } else {
-            decode_j2k(&pkt.data)?
-        };
-        let (frame, w, h, format) = image_to_frame(&image, pkt.pts)?;
-        self.params.width = Some(w);
-        self.params.height = Some(h);
-        self.params.pixel_format = Some(format);
-        Ok(Frame::Video(frame))
+        let image = crate::decode_with(&pkt.data, &self.opts)?;
+        self.params.width = Some(image.width);
+        self.params.height = Some(image.height);
+        self.params.pixel_format = Some(image.format.into());
+        if image.color.is_signalled() {
+            self.params.color_signal = to_color_signal(&image.color);
+        }
+        Ok(Frame::Video(image_into_video_frame(image, pkt.pts)))
     }
 
     fn flush(&mut self) -> oxideav_core::Result<()> {
@@ -185,31 +676,27 @@ impl Decoder for Jpeg2000Decoder {
     }
 }
 
+// ---- Encoder --------------------------------------------------------------------
+
 /// Factory for the [`Encoder`] trait impl — installed in the codec
-/// registry by [`register`].
+/// registry by [`register`]. Options are validated when the first
+/// frame is encoded (the factory only captures the parameter set).
 pub fn make_encoder(params: &CodecParameters) -> oxideav_core::Result<Box<dyn Encoder>> {
     Ok(Box::new(Jpeg2000Encoder::new(params.clone())))
 }
 
 /// JPEG 2000 [`Encoder`] trait impl.
 ///
-/// Takes one packed interleaved plane per frame in any of `Gray8`,
-/// `Rgb24`, `Rgba`, `Bgr24`, `Bgra`, `Gray16Le`, `Gray10Le`,
-/// `Gray12Le`, `Rgb48Le` or `Rgba64Le` (from
-/// [`CodecParameters::pixel_format`], else inferred from the stride as
-/// 8-bit Gray / RGB / RGBA) and emits one intra packet per frame. The
-/// coding shape comes from the parameters:
-///
-/// * `bit_rate` (bits per second) with `frame_rate` — or without one,
-///   read as bits per frame — becomes a PCRD byte budget per frame;
-/// * [`CodecParameters::options`] keys: `lossless` (`true` default:
-///   5-3 + RCT; `false`: 9-7 + ICT with `fine_bits`, default 6),
-///   `psnr` (dB floor), `target_bytes`, `levels` (`NL`), `layers`,
-///   `progression` (`lrcp` / `rlcp` / `rpcl` / `pcrl` / `cprl`),
-///   `tile` (`WxH`), `ht` (`true` selects the T.814 HT block coder),
-///   `plt` / `tlm` / `sop` / `eph` (`true`), `comment`, and
-///   `container` (`j2k` default, or `jp2` for an Annex I / T.814
-///   Annex D file with the conventional colour header).
+/// Takes one frame in any [`Jpeg2000PixelFormat`] (plus `Bgr24` /
+/// `Bgra`, re-ordered) — from [`CodecParameters::pixel_format`], else
+/// inferred from the stride as 8-bit Gray / RGB / RGBA — and emits one
+/// intra packet per frame through [`crate::encode()`]. The coding shape
+/// comes from the parameters: `bit_rate` (bits per second with
+/// `frame_rate`, else bits per frame) becomes a PCRD byte budget, and
+/// the `CodecOptions` keys are those of [`RegistryEncodeOptions`]
+/// (`lossless`, `fine_bits`, `psnr`, `target_bytes`, `levels`,
+/// `layers`, `progression`, `tile`, `ht`, `plt`, `tlm`, `sop`, `eph`,
+/// `comment`, `container` — default `j2k`).
 #[derive(Debug)]
 pub struct Jpeg2000Encoder {
     params: CodecParameters,
@@ -231,78 +718,23 @@ impl Jpeg2000Encoder {
         }
     }
 
-    /// The [`crate::encode::EncodeParams`] the parameters select.
-    fn encode_params(&self, ncomp: usize) -> oxideav_core::Result<crate::encode::EncodeParams> {
-        use crate::encode::{EncodeKernel, EncodeParams};
-        let opts = &self.params.options;
-        let bad = |k: &str, v: &str| {
-            CoreError::invalid(format!(
-                "oxideav-jpeg2000 encoder: option {k}={v:?} is invalid"
-            ))
-        };
-        let flag = |k: &str| -> oxideav_core::Result<Option<bool>> {
-            match opts.get(k) {
-                None => Ok(None),
-                Some("true" | "1" | "yes") => Ok(Some(true)),
-                Some("false" | "0" | "no") => Ok(Some(false)),
-                Some(v) => Err(bad(k, v)),
+    /// The [`EncodeOptions`] the parameters select.
+    fn encode_options(&self) -> oxideav_core::Result<EncodeOptions> {
+        let mut o = oxideav_core::parse_options::<RegistryEncodeOptions>(&self.params.options)?
+            .into_options();
+        if o.target_bytes.is_none() {
+            if let Some(bit_rate) = self.params.bit_rate {
+                // Bits per second over the frame rate, or bits per frame.
+                let bits_per_frame = match self.params.frame_rate {
+                    Some(r) if r.num > 0 && r.den > 0 => {
+                        (bit_rate as u128 * r.den as u128 / r.num as u128) as u64
+                    }
+                    _ => bit_rate,
+                };
+                o.target_bytes = Some(usize::try_from(bits_per_frame / 8).unwrap_or(usize::MAX));
             }
-        };
-        let mut p = EncodeParams::default();
-        let lossless = flag("lossless")?.unwrap_or(true);
-        if !lossless {
-            let fine_bits = match opts.get("fine_bits") {
-                None => 6,
-                Some(v) => v.parse::<u8>().map_err(|_| bad("fine_bits", v))?,
-            };
-            p.kernel = EncodeKernel::Lossy9x7 { fine_bits };
         }
-        p.mct = ncomp >= 3;
-        if let Some(v) = opts.get("levels") {
-            p.decomposition_levels = v.parse().map_err(|_| bad("levels", v))?;
-        }
-        if let Some(v) = opts.get("layers") {
-            p.layers = v.parse().map_err(|_| bad("layers", v))?;
-        }
-        if let Some(v) = opts.get("progression") {
-            p.progression = match v.to_ascii_lowercase().as_str() {
-                "lrcp" => crate::ProgressionOrder::Lrcp,
-                "rlcp" => crate::ProgressionOrder::Rlcp,
-                "rpcl" => crate::ProgressionOrder::Rpcl,
-                "pcrl" => crate::ProgressionOrder::Pcrl,
-                "cprl" => crate::ProgressionOrder::Cprl,
-                _ => return Err(bad("progression", v)),
-            };
-        }
-        if let Some(v) = opts.get("tile") {
-            let (w, h) = v.split_once('x').ok_or_else(|| bad("tile", v))?;
-            p.tile_size = Some((
-                w.parse().map_err(|_| bad("tile", v))?,
-                h.parse().map_err(|_| bad("tile", v))?,
-            ));
-        }
-        if let Some(v) = opts.get("psnr") {
-            p.target_psnr = Some(v.parse().map_err(|_| bad("psnr", v))?);
-        }
-        if let Some(v) = opts.get("target_bytes") {
-            p.target_bytes = Some(v.parse().map_err(|_| bad("target_bytes", v))?);
-        } else if let Some(bit_rate) = self.params.bit_rate {
-            // Bits per second over the frame rate, or bits per frame.
-            let bits_per_frame = match self.params.frame_rate {
-                Some(r) if r.num > 0 && r.den > 0 => {
-                    (bit_rate as u128 * r.den as u128 / r.num as u128) as u64
-                }
-                _ => bit_rate,
-            };
-            p.target_bytes = Some(usize::try_from(bits_per_frame / 8).unwrap_or(usize::MAX));
-        }
-        p.high_throughput = flag("ht")?.unwrap_or(false);
-        p.plt = flag("plt")?.unwrap_or(false);
-        p.tlm = flag("tlm")?.unwrap_or(false);
-        p.sop = flag("sop")?.unwrap_or(false);
-        p.eph = flag("eph")?.unwrap_or(false);
-        p.comment = opts.get("comment").map(str::to_owned);
-        Ok(p)
+        Ok(o)
     }
 }
 
@@ -334,110 +766,26 @@ impl Encoder for Jpeg2000Encoder {
                 ))
             }
         };
-        let plane = v.planes.first().ok_or_else(|| {
-            CoreError::invalid("oxideav-jpeg2000 encoder: video frame has no planes")
-        })?;
-        if v.planes.len() != 1 {
-            return Err(CoreError::unsupported(
-                "oxideav-jpeg2000 encoder: expected one packed interleaved plane",
-            ));
-        }
-        // Component count, bytes per sample, depth, and the plane order
-        // that maps the packed layout onto components 0..n.
-        let format = match self.params.pixel_format {
-            Some(f) => f,
-            None => match plane.stride / width as usize {
-                1 => PixelFormat::Gray8,
-                3 => PixelFormat::Rgb24,
-                4 => PixelFormat::Rgba,
+        let mut params = self.params.clone();
+        if params.pixel_format.is_none() {
+            let plane = v.planes.first().ok_or_else(|| {
+                CoreError::invalid("oxideav-jpeg2000 encoder: video frame has no planes")
+            })?;
+            params.pixel_format = Some(match (v.planes.len(), plane.stride / width as usize) {
+                (1, 1) => PixelFormat::Gray8,
+                (1, 3) => PixelFormat::Rgb24,
+                (1, 4) => PixelFormat::Rgba,
                 _ => return Err(CoreError::unsupported(
                     "oxideav-jpeg2000 encoder: cannot infer a packed pixel format from the stride",
                 )),
-            },
-        };
-        let (ncomp, bytes, depth, order): (usize, usize, u8, [usize; 4]) = match format {
-            PixelFormat::Gray8 => (1, 1, 8, [0, 0, 0, 0]),
-            PixelFormat::Rgb24 => (3, 1, 8, [0, 1, 2, 0]),
-            PixelFormat::Bgr24 => (3, 1, 8, [2, 1, 0, 0]),
-            PixelFormat::Rgba => (4, 1, 8, [0, 1, 2, 3]),
-            PixelFormat::Bgra => (4, 1, 8, [2, 1, 0, 3]),
-            PixelFormat::Gray16Le => (1, 2, 16, [0, 0, 0, 0]),
-            PixelFormat::Gray10Le => (1, 2, 10, [0, 0, 0, 0]),
-            PixelFormat::Gray12Le => (1, 2, 12, [0, 0, 0, 0]),
-            PixelFormat::Rgb48Le => (3, 2, 16, [0, 1, 2, 0]),
-            PixelFormat::Rgba64Le => (4, 2, 16, [0, 1, 2, 3]),
-            other => {
-                return Err(CoreError::unsupported(format!(
-                    "oxideav-jpeg2000 encoder: pixel format {other:?} is not a packed Gray / RGB / RGBA layout"
-                )))
-            }
-        };
-        let row = ncomp * bytes * width as usize;
-        if plane.stride < row || plane.data.len() < plane.stride * (height as usize - 1) + row {
-            return Err(CoreError::invalid(
-                "oxideav-jpeg2000 encoder: plane is smaller than the declared size",
-            ));
+            });
         }
-        let params = self.encode_params(ncomp)?;
-        let jp2 = match self.params.options.get("container") {
-            None | Some("j2k") | Some("j2c") => false,
-            Some("jp2") | Some("jph") => true,
-            Some(v) => {
-                return Err(CoreError::invalid(format!(
-                    "oxideav-jpeg2000 encoder: option container={v:?} is invalid"
-                )))
-            }
-        };
-        let n = (width * height) as usize;
-        let bytes_out = if bytes == 1 {
-            let mut planes: Vec<Vec<u8>> = vec![Vec::with_capacity(n); ncomp];
-            for y in 0..height as usize {
-                let r = &plane.data[y * plane.stride..y * plane.stride + row];
-                for px in r.chunks_exact(ncomp) {
-                    for (c, plane) in planes.iter_mut().enumerate() {
-                        plane.push(px[order[c]]);
-                    }
-                }
-            }
-            let refs: Vec<&[u8]> = planes.iter().map(Vec::as_slice).collect();
-            if jp2 {
-                crate::encode::encode_jp2(&refs, width, height, &params)?
-            } else {
-                crate::encode::encode_j2k(&refs, width, height, &params)?
-            }
-        } else {
-            let max = (1u32 << depth) - 1;
-            let mut planes: Vec<Vec<u16>> = vec![Vec::with_capacity(n); ncomp];
-            for y in 0..height as usize {
-                let r = &plane.data[y * plane.stride..y * plane.stride + row];
-                for px in r.chunks_exact(ncomp * 2) {
-                    for (c, plane) in planes.iter_mut().enumerate() {
-                        let k = order[c] * 2;
-                        let v = u16::from_le_bytes([px[k], px[k + 1]]);
-                        if u32::from(v) > max {
-                            return Err(CoreError::invalid(format!(
-                                "oxideav-jpeg2000 encoder: sample {v} exceeds {depth} bits"
-                            )));
-                        }
-                        plane.push(v);
-                    }
-                }
-            }
-            let refs: Vec<&[u16]> = planes.iter().map(Vec::as_slice).collect();
-            if jp2 {
-                crate::encode::encode_jp2_u16(
-                    &refs,
-                    width,
-                    height,
-                    depth,
-                    &params,
-                    &crate::jp2::Jp2WriteOptions::for_components(ncomp),
-                )?
-            } else {
-                crate::encode::encode_j2k_u16(&refs, width, height, depth, &params)?
-            }
-        };
-        self.params.pixel_format = Some(format);
+        let opts = self.encode_options()?;
+        let image = Jpeg2000Image::from_video_frame(v, &params)?;
+        let bytes_out = crate::encode(&image, &opts)?;
+        self.params.width = Some(width);
+        self.params.height = Some(height);
+        self.params.pixel_format = Some(image.format.into());
         let mut pkt = Packet::new(0, TimeBase::new(1, 1), bytes_out);
         pkt.pts = v.pts;
         pkt.dts = v.pts;
@@ -460,39 +808,6 @@ impl Encoder for Jpeg2000Encoder {
     }
 }
 
-/// Register the JPEG 2000 decoder + encoder factories into a
-/// [`CodecRegistry`].
-pub fn register_codecs(reg: &mut CodecRegistry) {
-    let caps = CodecCapabilities::video("jpeg2000_sw")
-        .with_intra_only(true)
-        .with_lossless(true)
-        .with_pixel_formats(vec![
-            PixelFormat::Gray8,
-            PixelFormat::Rgb24,
-            PixelFormat::Rgba,
-        ]);
-    reg.register(
-        CodecInfo::new(CodecId::new(CODEC_ID_STR))
-            .capabilities(caps)
-            .decoder(make_decoder)
-            .encoder(make_encoder),
-    );
-}
-
-/// Register the raw-codestream file extensions (`.j2k` / `.j2c`) so a
-/// [`RuntimeContext`] can map a filename hint back to the codec id.
-pub fn register_containers(reg: &mut ContainerRegistry) {
-    reg.register_extension("j2k", CODEC_ID_STR);
-    reg.register_extension("j2c", CODEC_ID_STR);
-}
-
-/// Unified registration entry point: install both the decoder factory
-/// and the extension hints into the supplied [`RuntimeContext`].
-pub fn register(ctx: &mut RuntimeContext) {
-    register_codecs(&mut ctx.codecs);
-    register_containers(&mut ctx.containers);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -510,14 +825,13 @@ mod tests {
             ctx.codecs.has_encoder(&id),
             "jpeg2000 encoder factory not installed via RuntimeContext"
         );
-        assert_eq!(
-            ctx.containers.container_for_extension("j2k"),
-            Some(CODEC_ID_STR)
-        );
-        assert_eq!(
-            ctx.containers.container_for_extension("j2c"),
-            Some(CODEC_ID_STR)
-        );
+        for ext in ["j2k", "j2c", "jp2", "jph"] {
+            assert_eq!(
+                ctx.containers.container_for_extension(ext),
+                Some(CODEC_ID_STR),
+                "{ext}"
+            );
+        }
     }
 
     #[test]
@@ -545,6 +859,11 @@ mod tests {
         let pkt = enc.receive_packet().expect("receive_packet");
         assert!(pkt.flags.keyframe);
         assert_eq!(pkt.pts, Some(42));
+        assert_eq!(
+            &pkt.data[..2],
+            &[0xFF, 0x4F],
+            "registry default is a bare codestream"
+        );
 
         let mut dec =
             make_decoder(&CodecParameters::video(CodecId::new(CODEC_ID_STR))).expect("factory");
@@ -554,6 +873,11 @@ mod tests {
         };
         assert_eq!(out.planes.len(), 1);
         assert_eq!(out.planes[0].data, data, "registry round-trip pixels");
+        assert_eq!(
+            out.color_signal(),
+            None,
+            "a bare codestream signals no colour"
+        );
     }
 
     fn drive(params: &CodecParameters, stride: usize, data: Vec<u8>) -> (Packet, VideoFrame) {
@@ -584,6 +908,7 @@ mod tests {
             (PixelFormat::Bgr24, 3, true),
             (PixelFormat::Rgba, 4, false),
             (PixelFormat::Bgra, 4, true),
+            (PixelFormat::Ya8, 2, false),
         ] {
             let data: Vec<u8> = (0..n * ncomp).map(|i| (i * 53 % 256) as u8).collect();
             let mut params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
@@ -607,6 +932,7 @@ mod tests {
             (PixelFormat::Gray10Le, 1, 10),
             (PixelFormat::Rgb48Le, 3, 16),
             (PixelFormat::Rgba64Le, 4, 16),
+            (PixelFormat::Ya16Le, 2, 16),
         ] {
             let max = (1u32 << depth) - 1;
             let data: Vec<u8> = (0..n * ncomp)
@@ -621,7 +947,106 @@ mod tests {
             assert_eq!(out.planes[0].data, data, "{format:?}");
             let hdr = crate::parse_j2k_header(&pkt.data).expect("header");
             assert_eq!(u32::from(hdr.siz.components[0].precision_bits), depth);
+            assert_eq!(
+                out.significant_bits(),
+                None,
+                "{format:?}: label-exact depth"
+            );
         }
+    }
+
+    #[test]
+    fn planar_yuv_and_deep_gray_ride_side_channels() {
+        // A 4:2:0 frame encodes with SIZ sub-sampling and decodes back
+        // planar, byte-exact, with no MCT.
+        let (w, h) = (6u32, 4u32);
+        let y: Vec<u8> = (0..(w * h) as usize)
+            .map(|i| (i * 11 % 256) as u8)
+            .collect();
+        let c: Vec<u8> = (0..6).map(|i| (100 + i * 7) as u8).collect();
+        let mut params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        params.width = Some(w);
+        params.height = Some(h);
+        params.pixel_format = Some(PixelFormat::Yuv420P);
+        params.options = oxideav_core::CodecOptions::new().set("container", "jp2");
+        let mut enc = make_encoder(&params).expect("factory");
+        enc.send_frame(&Frame::Video(VideoFrame {
+            pts: None,
+            planes: vec![
+                VideoPlane {
+                    stride: 6,
+                    data: y.clone(),
+                },
+                VideoPlane {
+                    stride: 3,
+                    data: c.clone(),
+                },
+                VideoPlane {
+                    stride: 3,
+                    data: c.clone(),
+                },
+            ],
+        }))
+        .expect("send_frame");
+        let pkt = enc.receive_packet().expect("packet");
+        let hdr = crate::parse_j2k_header(
+            &crate::jp2::parse_jp2(&pkt.data)
+                .map(|c| {
+                    pkt.data[c.codestream_offset..c.codestream_offset + c.codestream_len].to_vec()
+                })
+                .expect("jp2"),
+        )
+        .expect("header");
+        assert_eq!(hdr.cod.multi_component_transform, 0);
+        assert_eq!(hdr.siz.components[1].h_separation, 2);
+        let mut dec = make_decoder(&CodecParameters::video(CodecId::new(CODEC_ID_STR))).unwrap();
+        dec.send_packet(&pkt).unwrap();
+        let Frame::Video(out) = dec.receive_frame().unwrap() else {
+            panic!()
+        };
+        assert_eq!(out.image_planes().len(), 3);
+        assert_eq!(out.planes[0].data, y);
+        assert_eq!(out.planes[1].data, c);
+        assert_eq!(
+            out.color_signal().map(|s| s.matrix.0),
+            Some(5),
+            "JP2 sYCC colr → BT.601 matrix on the frame"
+        );
+
+        // A 14-bit gray frame (Gray16Le + significant bits 14) keeps its
+        // depth through SIZ and comes back with the side-channel set.
+        let g: Vec<u8> = (0..(w * h) as usize)
+            .map(|i| (i as u32 * 911 % 16384) as u16)
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let mut params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        params.width = Some(w);
+        params.height = Some(h);
+        params.pixel_format = Some(PixelFormat::Gray16Le);
+        let mut enc = make_encoder(&params).expect("factory");
+        enc.send_frame(&Frame::Video(
+            VideoFrame {
+                pts: None,
+                planes: vec![VideoPlane {
+                    stride: 12,
+                    data: g.clone(),
+                }],
+            }
+            .with_significant_bits(vec![14]),
+        ))
+        .expect("send_frame");
+        let pkt = enc.receive_packet().expect("packet");
+        assert_eq!(
+            crate::parse_j2k_header(&pkt.data).unwrap().siz.components[0].precision_bits,
+            14
+        );
+        let mut dec = make_decoder(&CodecParameters::video(CodecId::new(CODEC_ID_STR))).unwrap();
+        dec.send_packet(&pkt).unwrap();
+        let Frame::Video(out) = dec.receive_frame().unwrap() else {
+            panic!()
+        };
+        assert_eq!(out.planes[0].data, g);
+        assert_eq!(out.significant_bits(), Some(&[14u8][..]));
     }
 
     #[test]
@@ -682,21 +1107,89 @@ mod tests {
             .set("container", "jp2")
             .set("ht", "true");
         let (pkt, out) = drive(&base(opts), w as usize * 3, data.clone());
-        assert!(crate::looks_like_jp2(&pkt.data));
+        assert!(crate::info(&pkt.data).expect("info").jp2);
         assert_eq!(out.planes[0].data, data);
         let c = crate::jp2::parse_jp2(&pkt.data).expect("parse");
         assert!(c.ftyp.is_jph_compatible());
-        // Malformed options surface a clean error.
-        let opts = oxideav_core::CodecOptions::new().set("levels", "many");
-        let mut enc = make_encoder(&base(opts)).expect("factory");
-        assert!(enc
-            .send_frame(&Frame::Video(VideoFrame {
-                pts: None,
-                planes: vec![VideoPlane {
-                    stride: w as usize * 3,
-                    data: data.clone(),
-                }],
-            }))
-            .is_err());
+        assert_eq!(
+            out.color_signal().map(|s| s.primaries.0),
+            Some(1),
+            "sRGB colr"
+        );
+        // Malformed options surface a clean error at encode time.
+        for (k, v) in [
+            ("levels", "many"),
+            ("container", "tiff"),
+            ("fine_bits", "9"),
+        ] {
+            let opts = oxideav_core::CodecOptions::new().set(k, v);
+            let mut enc = make_encoder(&base(opts)).expect("factory defers validation");
+            assert!(
+                enc.send_frame(&Frame::Video(VideoFrame {
+                    pts: None,
+                    planes: vec![VideoPlane {
+                        stride: w as usize * 3,
+                        data: data.clone(),
+                    }],
+                }))
+                .is_err(),
+                "{k}={v}"
+            );
+        }
+    }
+
+    #[test]
+    fn frame_bridge_round_trips_palette_and_colour() {
+        let img = Jpeg2000Image::packed(2, 2, Jpeg2000PixelFormat::Pal8, vec![0, 1, 1, 0])
+            .unwrap()
+            .with_palette(Palette::new(vec![[1, 2, 3, 255], [4, 5, 6, 255]]))
+            .with_color(ColorInfo::srgb());
+        let frame: VideoFrame = img.clone().into();
+        assert_eq!(frame.palette(), Some(&[1u8, 2, 3, 4, 5, 6][..]));
+        assert!(frame.color_signal().is_some());
+        let mut params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        params.width = Some(2);
+        params.height = Some(2);
+        params.pixel_format = Some(PixelFormat::Pal8);
+        let back = Jpeg2000Image::try_from((&frame, &params)).expect("bridge");
+        assert_eq!(back, img);
+        // Missing parameters are an error, not a panic.
+        assert!(Jpeg2000Image::from_video_frame(
+            &frame,
+            &CodecParameters::video(CodecId::new(CODEC_ID_STR))
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn decoder_options_reduce_and_strict() {
+        let (w, h) = (16u32, 12u32);
+        let data: Vec<u8> = (0..(w * h) as usize).map(|i| (i % 251) as u8).collect();
+        let mut params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        params.width = Some(w);
+        params.height = Some(h);
+        params.pixel_format = Some(PixelFormat::Gray8);
+        let mut enc = make_encoder(&params).unwrap();
+        enc.send_frame(&Frame::Video(VideoFrame {
+            pts: None,
+            planes: vec![VideoPlane {
+                stride: w as usize,
+                data,
+            }],
+        }))
+        .unwrap();
+        let pkt = enc.receive_packet().unwrap();
+        let mut dp = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        dp.options = oxideav_core::CodecOptions::new().set("reduce", "1");
+        let mut dec = make_decoder(&dp).unwrap();
+        dec.send_packet(&pkt).unwrap();
+        let Frame::Video(out) = dec.receive_frame().unwrap() else {
+            panic!()
+        };
+        assert_eq!(out.planes[0].stride, 8);
+        assert_eq!(out.planes[0].data.len(), 8 * 6);
+        let mut bad = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        bad.options = oxideav_core::CodecOptions::new().set("layers", "0");
+        assert!(make_decoder(&bad).is_err());
     }
 }

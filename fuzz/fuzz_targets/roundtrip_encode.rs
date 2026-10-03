@@ -1,13 +1,13 @@
 #![no_main]
 
 //! Structure-aware fuzz target for the **encoder**: build an
-//! [`EncodeParams`] from the fuzz bytes, encode deterministic sample
+//! [`EncodeOptions`] from the fuzz bytes, encode deterministic sample
 //! planes, and require the crate's own decoder to accept the product —
 //! `decode(encode(x))` must never fail on a stream this encoder
 //! emitted, and on the reversible full-rate path it must reproduce
 //! `x` **bit-exactly**.
 //!
-//! The parameter generator walks the whole `EncodeParams` surface:
+//! The parameter generator walks the whole `EncodeOptions` surface:
 //!
 //! * both Table A.20 kernels (5-3 reversible / 9-7 with every
 //!   `fine_bits` step) and the Table A.17 MCT pairings;
@@ -41,7 +41,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_jpeg2000::encode::{
-    encode_j2k, ComponentOverride, EncodeKernel, EncodeParams, PackedHeaders, TilePartSplit,
+    encode_j2k, ComponentOverride, EncodeKernel, EncodeOptions, PackedHeaders, TilePartSplit,
 };
 use oxideav_jpeg2000::{
     decode_j2k, decode_j2k_layers, decode_j2k_reduced, PocProgression, ProgressionOrder,
@@ -229,38 +229,39 @@ fuzz_target!(|data: &[u8]| {
         None
     };
 
-    let params = EncodeParams {
-        decomposition_levels: nl,
-        code_block_exp: (xcb, ycb),
-        kernel,
-        mct,
-        progression,
-        precincts,
-        layers,
-        target_bytes,
-        target_psnr,
-        tile_size,
-        bypass,
-        terminate_all,
-        reset_probabilities,
-        vertically_causal,
-        predictable_termination,
-        segmentation_symbols,
-        sop,
-        eph,
-        sub_sampling: sub_sampling.clone(),
-        tile_parts,
-        poc,
-        component_overrides: component_overrides.clone(),
-        packed_headers,
-        plt: c.bool(),
-        tlm: c.bool(),
-        comment: c.bool().then(|| "fuzz".into()),
-        high_throughput: ht && !mixed,
-        ht_refinement: mode == 5,
-        ht_mixed: mixed,
-        roi,
-    };
+    // `EncodeOptions` is `#[non_exhaustive]`: start from the defaults
+    // and assign every field the script drives.
+    let mut params = EncodeOptions::default();
+    params.decomposition_levels = nl;
+    params.code_block_exp = (xcb, ycb);
+    params.kernel = kernel;
+    params.mct = Some(mct);
+    params.progression = progression;
+    params.precincts = precincts;
+    params.layers = layers;
+    params.target_bytes = target_bytes;
+    params.target_psnr = target_psnr;
+    params.tile_size = tile_size;
+    params.bypass = bypass;
+    params.terminate_all = terminate_all;
+    params.reset_probabilities = reset_probabilities;
+    params.vertically_causal = vertically_causal;
+    params.predictable_termination = predictable_termination;
+    params.segmentation_symbols = segmentation_symbols;
+    params.sop = sop;
+    params.eph = eph;
+    params.sub_sampling = sub_sampling.clone();
+    params.tile_parts = tile_parts;
+    params.poc = poc;
+    params.component_overrides = component_overrides.clone();
+    params.packed_headers = packed_headers;
+    params.plt = c.bool();
+    params.tlm = c.bool();
+    params.comment = c.bool().then(|| "fuzz".into());
+    params.high_throughput = ht && !mixed;
+    params.ht_refinement = mode == 5;
+    params.ht_mixed = mixed;
+    params.roi = roi;
 
     // --- Sample planes (deterministic from the remaining bytes) ----
     let planes_data: Vec<Vec<u8>> = (0..ncomp)

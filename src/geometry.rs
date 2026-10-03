@@ -1395,7 +1395,7 @@ mod tests {
         // numXtiles * numYtiles = 16 → tile index 16 is out of range.
         let siz = siz_b4_worked_example();
         let err = derive_tile_geometry(&siz, 16).unwrap_err();
-        assert_eq!(err, Error::InvalidTilePartIndex);
+        assert!(matches!(err, Error::InvalidTilePartIndex));
     }
 
     #[test]
@@ -1436,7 +1436,7 @@ mod tests {
         let mut siz = siz_b4_worked_example();
         siz.tile_x_offset = siz.x_offset + 1;
         let err = validate_siz(&siz).unwrap_err();
-        assert_eq!(err, Error::InvalidMarkerLength);
+        assert!(matches!(err, Error::InvalidMarkerLength));
     }
 
     #[test]
@@ -1448,7 +1448,7 @@ mod tests {
         siz.tile_width = 1;
         siz.tile_x_offset = 0;
         let err = validate_siz(&siz).unwrap_err();
-        assert_eq!(err, Error::InvalidMarkerLength);
+        assert!(matches!(err, Error::InvalidMarkerLength));
     }
 
     #[test]
@@ -1457,7 +1457,7 @@ mod tests {
         let mut siz = siz_b4_worked_example();
         siz.x_offset = siz.x_size;
         let err = validate_siz(&siz).unwrap_err();
-        assert_eq!(err, Error::InvalidMarkerLength);
+        assert!(matches!(err, Error::InvalidMarkerLength));
     }
 
     #[test]

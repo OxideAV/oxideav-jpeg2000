@@ -3588,7 +3588,7 @@ mod tests {
             SopEphMode::SopAndEph,
         )
         .unwrap_err();
-        assert_eq!(err, Error::InvalidPacketHeader);
+        assert!(matches!(err, Error::InvalidPacketHeader));
     }
 
     #[test]
@@ -3612,7 +3612,7 @@ mod tests {
             SopEphMode::None,
         )
         .unwrap_err();
-        assert_eq!(err, Error::PacketHeaderOverrun);
+        assert!(matches!(err, Error::PacketHeaderOverrun));
     }
 
     #[test]
@@ -3852,7 +3852,7 @@ mod tests {
             SegmentSplit::Single,
         )
         .unwrap_err();
-        assert_eq!(err, Error::InvalidPacketHeader);
+        assert!(matches!(err, Error::InvalidPacketHeader));
     }
 
     // -- §B.10 packet-header encoder round-trip ------------------------

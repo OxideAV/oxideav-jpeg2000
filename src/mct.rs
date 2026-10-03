@@ -91,7 +91,7 @@
 //!   module's API is therefore strictly 3-component.
 //! * **Per-tile-component MCT toggle.** The COD marker's `SGcod` MCT
 //!   byte (`0` = none, `1` = MCT-on-0/1/2; see T.800 Table A.16) is
-//!   parsed by the main-header walker into [`crate::Cod::mct`]; the
+//!   parsed by the main-header walker into [`crate::Cod::multi_component_transform`]; the
 //!   pick between [`inverse_rct`] / [`inverse_ict`] / no-op based on
 //!   that byte is wired by the tile-reconstruction round (deferred —
 //!   see the Roadmap in `README.md`). This module just exposes the
@@ -442,7 +442,7 @@ pub fn forward_ict_f64(c0: &mut [f64], c1: &mut [f64], c2: &mut [f64]) -> Result
 /// ```
 ///
 /// `precision` is the per-component bit depth `Ssiz` as recorded in
-/// the SIZ marker (T.800 §A.5.1; see [`crate::SizComponent::precision`]).
+/// the SIZ marker (T.800 §A.5.1; see [`crate::SizComponent::precision_bits`]).
 ///
 /// # Errors
 ///
@@ -474,7 +474,7 @@ pub fn forward_dc_level_shift_unsigned(samples: &mut [i32], precision: u8) -> Re
 /// ```
 ///
 /// `precision` is the per-component bit depth `Ssiz` as recorded in
-/// the SIZ marker (T.800 §A.5.1; see [`crate::SizComponent::precision`]).
+/// the SIZ marker (T.800 §A.5.1; see [`crate::SizComponent::precision_bits`]).
 /// Caller is responsible for skipping this step on signed components
 /// (the SIZ marker's `Ssiz` high bit, see Table A.11; §G.1.2 only
 /// shifts unsigned components) — [`inverse_dc_level_shift`] is the
@@ -1593,26 +1593,26 @@ mod tests {
         let mut a = [0_i32; 4];
         let mut b = [0_i32; 3];
         let mut c = [0_i32; 4];
-        assert_eq!(
+        assert!(matches!(
             inverse_rct(&mut a, &mut b, &mut c),
             Err(Error::InvalidMarkerLength)
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             forward_rct(&mut a, &mut b, &mut c),
             Err(Error::InvalidMarkerLength)
-        );
+        ));
 
         let mut a = [0.0_f32; 4];
         let mut b = [0.0_f32; 4];
         let mut c = [0.0_f32; 5];
-        assert_eq!(
+        assert!(matches!(
             inverse_ict(&mut a, &mut b, &mut c),
             Err(Error::InvalidMarkerLength)
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             forward_ict(&mut a, &mut b, &mut c),
             Err(Error::InvalidMarkerLength)
-        );
+        ));
     }
 
     /// §G.1.2 DC level shift — Ssiz = 8 ⇒ shift = `+128`.
@@ -1635,14 +1635,14 @@ mod tests {
     #[test]
     fn inverse_dc_level_shift_rejects_invalid_precision() {
         let mut s = [0_i32; 4];
-        assert_eq!(
+        assert!(matches!(
             inverse_dc_level_shift_unsigned(&mut s, 0),
             Err(Error::InvalidSamplePrecision)
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             inverse_dc_level_shift_unsigned(&mut s, 32),
             Err(Error::InvalidSamplePrecision)
-        );
+        ));
         // 31 is the upper bound representable in an `i32` shift.
         assert!(inverse_dc_level_shift_unsigned(&mut s, 31).is_ok());
         assert!(inverse_dc_level_shift_unsigned(&mut s, 1).is_ok());
@@ -1689,14 +1689,14 @@ mod tests {
     #[test]
     fn forward_dc_level_shift_rejects_invalid_precision() {
         let mut s = [0_i32; 4];
-        assert_eq!(
+        assert!(matches!(
             forward_dc_level_shift_unsigned(&mut s, 0),
             Err(Error::InvalidSamplePrecision)
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             forward_dc_level_shift_unsigned(&mut s, 32),
             Err(Error::InvalidSamplePrecision)
-        );
+        ));
         assert!(forward_dc_level_shift_unsigned(&mut s, 1).is_ok());
         assert!(forward_dc_level_shift_unsigned(&mut s, 31).is_ok());
     }
@@ -1773,22 +1773,22 @@ mod tests {
     #[test]
     fn dc_level_shift_i64_rejects_invalid_precision() {
         let mut s = [0_i64; 4];
-        assert_eq!(
+        assert!(matches!(
             forward_dc_level_shift_unsigned_i64(&mut s, 0),
             Err(Error::InvalidSamplePrecision)
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             forward_dc_level_shift_unsigned_i64(&mut s, 39),
             Err(Error::InvalidSamplePrecision)
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             inverse_dc_level_shift_unsigned_i64(&mut s, 0),
             Err(Error::InvalidSamplePrecision)
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             inverse_dc_level_shift_unsigned_i64(&mut s, 39),
             Err(Error::InvalidSamplePrecision)
-        );
+        ));
         assert!(forward_dc_level_shift_unsigned_i64(&mut s, 1).is_ok());
         assert!(forward_dc_level_shift_unsigned_i64(&mut s, 38).is_ok());
         assert!(inverse_dc_level_shift_unsigned_i64(&mut s, 1).is_ok());
@@ -1838,22 +1838,22 @@ mod tests {
     #[test]
     fn dc_level_shift_signed_dispatcher_validates_precision() {
         let mut s = [0_i32; 4];
-        assert_eq!(
+        assert!(matches!(
             forward_dc_level_shift(&mut s, 0, true),
             Err(Error::InvalidSamplePrecision)
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             forward_dc_level_shift(&mut s, 39, true),
             Err(Error::InvalidSamplePrecision)
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             inverse_dc_level_shift(&mut s, 0, true),
             Err(Error::InvalidSamplePrecision)
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             inverse_dc_level_shift(&mut s, 39, true),
             Err(Error::InvalidSamplePrecision)
-        );
+        ));
         assert!(forward_dc_level_shift(&mut s, 8, true).is_ok());
         assert!(forward_dc_level_shift(&mut s, 38, true).is_ok());
     }
@@ -1911,14 +1911,14 @@ mod tests {
     #[test]
     fn clamp_dynamic_range_rejects_invalid_precision() {
         let mut s = [0_i32; 4];
-        assert_eq!(
+        assert!(matches!(
             clamp_to_dynamic_range(&mut s, 0, false),
             Err(Error::InvalidSamplePrecision)
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             clamp_to_dynamic_range(&mut s, 32, false),
             Err(Error::InvalidSamplePrecision)
-        );
+        ));
         assert!(clamp_to_dynamic_range(&mut s, 1, false).is_ok());
         assert!(clamp_to_dynamic_range(&mut s, 31, true).is_ok());
     }
@@ -2034,18 +2034,18 @@ mod tests {
     #[test]
     fn clamp_dynamic_range_i64_rejects_invalid_precision() {
         let mut s = [0_i64; 4];
-        assert_eq!(
+        assert!(matches!(
             clamp_to_dynamic_range_i64(&mut s, 0, false),
             Err(Error::InvalidSamplePrecision)
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             clamp_to_dynamic_range_i64(&mut s, 39, false),
             Err(Error::InvalidSamplePrecision)
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             clamp_to_dynamic_range_i64(&mut s, 255, true),
             Err(Error::InvalidSamplePrecision)
-        );
+        ));
         assert!(clamp_to_dynamic_range_i64(&mut s, 1, false).is_ok());
         assert!(clamp_to_dynamic_range_i64(&mut s, 38, true).is_ok());
     }
@@ -2215,10 +2215,10 @@ mod tests {
         let mut c1 = [0_i32];
         let mut c2 = [0_i32];
         let descs = [d_unsigned(8), d_unsigned(10), d_unsigned(8)];
-        assert_eq!(
+        assert!(matches!(
             reconstruct_tile_components_5x3(&mut c0, &mut c1, &mut c2, &descs, InverseMctMode::Rct,),
             Err(Error::InvalidComponentCount)
-        );
+        ));
     }
 
     /// 5-3 + RCT rejects mixed signedness across the three
@@ -2230,10 +2230,10 @@ mod tests {
         let mut c1 = [0_i32];
         let mut c2 = [0_i32];
         let descs = [d_unsigned(8), d_unsigned(8), d_signed(8)];
-        assert_eq!(
+        assert!(matches!(
             reconstruct_tile_components_5x3(&mut c0, &mut c1, &mut c2, &descs, InverseMctMode::Rct,),
             Err(Error::InvalidComponentCount)
-        );
+        ));
     }
 
     /// 5-3 entry point refuses ICT (wrong kernel pairing per the
@@ -2244,10 +2244,10 @@ mod tests {
         let mut c1 = [0_i32];
         let mut c2 = [0_i32];
         let descs = [d_unsigned(8), d_unsigned(8), d_unsigned(8)];
-        assert_eq!(
+        assert!(matches!(
             reconstruct_tile_components_5x3(&mut c0, &mut c1, &mut c2, &descs, InverseMctMode::Ict,),
             Err(Error::NotImplemented)
-        );
+        ));
     }
 
     /// 5-3 entry point rejects mismatched slice lengths up front.
@@ -2257,7 +2257,7 @@ mod tests {
         let mut c1 = [0_i32; 3];
         let mut c2 = [0_i32; 4];
         let descs = [d_unsigned(8); 3];
-        assert_eq!(
+        assert!(matches!(
             reconstruct_tile_components_5x3(
                 &mut c0,
                 &mut c1,
@@ -2266,7 +2266,7 @@ mod tests {
                 InverseMctMode::None,
             ),
             Err(Error::InvalidMarkerLength)
-        );
+        ));
     }
 
     /// 5-3 entry point rejects a non-3 descriptor count.
@@ -2276,7 +2276,7 @@ mod tests {
         let mut c1 = [0_i32];
         let mut c2 = [0_i32];
         let descs = [d_unsigned(8); 2];
-        assert_eq!(
+        assert!(matches!(
             reconstruct_tile_components_5x3(
                 &mut c0,
                 &mut c1,
@@ -2285,7 +2285,7 @@ mod tests {
                 InverseMctMode::None,
             ),
             Err(Error::InvalidMarkerLength)
-        );
+        ));
     }
 
     /// 5-3 entry point rejects out-of-range precision (any descriptor).
@@ -2295,7 +2295,7 @@ mod tests {
         let mut c1 = [0_i32];
         let mut c2 = [0_i32];
         let descs = [d_unsigned(8), d_unsigned(32), d_unsigned(8)];
-        assert_eq!(
+        assert!(matches!(
             reconstruct_tile_components_5x3(
                 &mut c0,
                 &mut c1,
@@ -2304,7 +2304,7 @@ mod tests {
                 InverseMctMode::None,
             ),
             Err(Error::InvalidSamplePrecision)
-        );
+        ));
     }
 
     // -------------------------------------------------------------------
@@ -2386,10 +2386,10 @@ mod tests {
         let mut c1 = [0_i32];
         let descs = [d_unsigned(8), d_unsigned(8)];
         let mut comps: [&mut [i32]; 2] = [&mut c0, &mut c1];
-        assert_eq!(
+        assert!(matches!(
             reconstruct_tile_components_5x3_multi(&mut comps, &descs, InverseMctMode::Rct),
             Err(Error::InvalidComponentCount)
-        );
+        ));
     }
 
     /// The §G.2 "same bit-depth" prologue binds the three transform
@@ -2403,10 +2403,10 @@ mod tests {
         let mut c3 = [0_i32];
         let descs = [d_unsigned(8), d_unsigned(10), d_unsigned(8), d_unsigned(8)];
         let mut comps: [&mut [i32]; 4] = [&mut c0, &mut c1, &mut c2, &mut c3];
-        assert_eq!(
+        assert!(matches!(
             reconstruct_tile_components_5x3_multi(&mut comps, &descs, InverseMctMode::Rct),
             Err(Error::InvalidComponentCount)
-        );
+        ));
     }
 
     /// ICT mode is rejected on the reversible multi entry point (wrong
@@ -2418,10 +2418,10 @@ mod tests {
         let mut c2 = [0_i32];
         let descs = [d_unsigned(8); 3];
         let mut comps: [&mut [i32]; 3] = [&mut c0, &mut c1, &mut c2];
-        assert_eq!(
+        assert!(matches!(
             reconstruct_tile_components_5x3_multi(&mut comps, &descs, InverseMctMode::Ict),
             Err(Error::NotImplemented)
-        );
+        ));
     }
 
     /// Empty component collection is rejected.
@@ -2429,10 +2429,10 @@ mod tests {
     fn thread_5x3_multi_rejects_empty() {
         let descs: [ComponentDescriptor; 0] = [];
         let mut comps: [&mut [i32]; 0] = [];
-        assert_eq!(
+        assert!(matches!(
             reconstruct_tile_components_5x3_multi(&mut comps, &descs, InverseMctMode::None),
             Err(Error::InvalidMarkerLength)
-        );
+        ));
     }
 
     /// Mismatched component / descriptor counts are rejected.
@@ -2442,10 +2442,10 @@ mod tests {
         let mut c1 = [0_i32];
         let descs = [d_unsigned(8); 3];
         let mut comps: [&mut [i32]; 2] = [&mut c0, &mut c1];
-        assert_eq!(
+        assert!(matches!(
             reconstruct_tile_components_5x3_multi(&mut comps, &descs, InverseMctMode::None),
             Err(Error::InvalidMarkerLength)
-        );
+        ));
     }
 
     /// Component slices that do not share a common length are rejected
@@ -2457,10 +2457,10 @@ mod tests {
         let mut c2 = [0_i32, 0];
         let descs = [d_unsigned(8); 3];
         let mut comps: [&mut [i32]; 3] = [&mut c0, &mut c1, &mut c2];
-        assert_eq!(
+        assert!(matches!(
             reconstruct_tile_components_5x3_multi(&mut comps, &descs, InverseMctMode::Rct),
             Err(Error::InvalidMarkerLength)
-        );
+        ));
     }
 
     /// Out-of-range precision on any descriptor (including an index-≥3
@@ -2473,10 +2473,10 @@ mod tests {
         let mut c3 = [0_i32];
         let descs = [d_unsigned(8), d_unsigned(8), d_unsigned(8), d_unsigned(32)];
         let mut comps: [&mut [i32]; 4] = [&mut c0, &mut c1, &mut c2, &mut c3];
-        assert_eq!(
+        assert!(matches!(
             reconstruct_tile_components_5x3_multi(&mut comps, &descs, InverseMctMode::Rct),
             Err(Error::InvalidSamplePrecision)
-        );
+        ));
     }
 
     /// Five-component multispectral tile, no MCT: every plane is
@@ -2579,14 +2579,14 @@ mod tests {
         let mut c0 = [0_i64; 2];
         let mut c1 = [0_i64; 3];
         let mut c2 = [0_i64; 2];
-        assert_eq!(
+        assert!(matches!(
             forward_rct_i64(&mut c0, &mut c1, &mut c2),
             Err(Error::InvalidMarkerLength)
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             inverse_rct_i64(&mut c0, &mut c1, &mut c2),
             Err(Error::InvalidMarkerLength)
-        );
+        ));
     }
 
     /// i64 threading mirror + RCT + unsigned 8-bit: the same §G.2.1
@@ -2690,7 +2690,7 @@ mod tests {
         let mut c1 = [0_i64];
         let mut c2 = [0_i64];
         let descs = [d_unsigned(36), d_unsigned(38), d_unsigned(36)];
-        assert_eq!(
+        assert!(matches!(
             reconstruct_tile_components_5x3_i64(
                 &mut c0,
                 &mut c1,
@@ -2699,9 +2699,9 @@ mod tests {
                 InverseMctMode::Rct,
             ),
             Err(Error::InvalidComponentCount)
-        );
+        ));
         let descs = [d_unsigned(36), d_unsigned(36), d_signed(36)];
-        assert_eq!(
+        assert!(matches!(
             reconstruct_tile_components_5x3_i64(
                 &mut c0,
                 &mut c1,
@@ -2710,7 +2710,7 @@ mod tests {
                 InverseMctMode::Rct,
             ),
             Err(Error::InvalidComponentCount)
-        );
+        ));
     }
 
     /// i64 threading refuses ICT (wrong kernel pairing — the 9-7 /
@@ -2721,7 +2721,7 @@ mod tests {
         let mut c1 = [0_i64];
         let mut c2 = [0_i64];
         let descs = [d_unsigned(36), d_unsigned(36), d_unsigned(36)];
-        assert_eq!(
+        assert!(matches!(
             reconstruct_tile_components_5x3_i64(
                 &mut c0,
                 &mut c1,
@@ -2730,7 +2730,7 @@ mod tests {
                 InverseMctMode::Ict,
             ),
             Err(Error::NotImplemented)
-        );
+        ));
     }
 
     /// i64 threading rejects mismatched slice lengths and a non-3
@@ -2741,7 +2741,7 @@ mod tests {
         let mut c1 = [0_i64; 3];
         let mut c2 = [0_i64; 4];
         let descs = [d_unsigned(36); 3];
-        assert_eq!(
+        assert!(matches!(
             reconstruct_tile_components_5x3_i64(
                 &mut c0,
                 &mut c1,
@@ -2750,10 +2750,10 @@ mod tests {
                 InverseMctMode::None,
             ),
             Err(Error::InvalidMarkerLength)
-        );
+        ));
         let mut c1 = [0_i64; 4];
         let two = [d_unsigned(36); 2];
-        assert_eq!(
+        assert!(matches!(
             reconstruct_tile_components_5x3_i64(
                 &mut c0,
                 &mut c1,
@@ -2762,7 +2762,7 @@ mod tests {
                 InverseMctMode::None,
             ),
             Err(Error::InvalidMarkerLength)
-        );
+        ));
     }
 
     /// i64 threading accepts the full Table A.11 `1..=38` precision
@@ -2792,15 +2792,17 @@ mod tests {
             let mut c1 = [0_i64];
             let mut c2 = [0_i64];
             let descs = [d_unsigned(8), d_unsigned(bad), d_unsigned(8)];
-            assert_eq!(
-                reconstruct_tile_components_5x3_i64(
-                    &mut c0,
-                    &mut c1,
-                    &mut c2,
-                    &descs,
-                    InverseMctMode::None,
+            assert!(
+                matches!(
+                    reconstruct_tile_components_5x3_i64(
+                        &mut c0,
+                        &mut c1,
+                        &mut c2,
+                        &descs,
+                        InverseMctMode::None,
+                    ),
+                    Err(Error::InvalidSamplePrecision)
                 ),
-                Err(Error::InvalidSamplePrecision),
                 "precision {} must reject",
                 bad
             );
@@ -2886,7 +2888,7 @@ mod tests {
         let mut o1 = [0_i32];
         let mut o2 = [0_i32];
         let descs = [d_unsigned(8), d_unsigned(8), d_unsigned(10)];
-        assert_eq!(
+        assert!(matches!(
             reconstruct_tile_components_9x7(
                 &mut c0,
                 &mut c1,
@@ -2898,7 +2900,7 @@ mod tests {
                 InverseMctMode::Ict,
             ),
             Err(Error::InvalidComponentCount)
-        );
+        ));
     }
 
     /// 9-7 entry point refuses RCT (wrong kernel pairing).
@@ -2911,7 +2913,7 @@ mod tests {
         let mut o1 = [0_i32];
         let mut o2 = [0_i32];
         let descs = [d_unsigned(8); 3];
-        assert_eq!(
+        assert!(matches!(
             reconstruct_tile_components_9x7(
                 &mut c0,
                 &mut c1,
@@ -2923,7 +2925,7 @@ mod tests {
                 InverseMctMode::Rct,
             ),
             Err(Error::NotImplemented)
-        );
+        ));
     }
 
     /// 9-7 entry point rejects out-of-range output slot length.
@@ -2936,7 +2938,7 @@ mod tests {
         let mut o1 = [0_i32; 3]; // wrong
         let mut o2 = [0_i32; 4];
         let descs = [d_unsigned(8); 3];
-        assert_eq!(
+        assert!(matches!(
             reconstruct_tile_components_9x7(
                 &mut c0,
                 &mut c1,
@@ -2948,7 +2950,7 @@ mod tests {
                 InverseMctMode::None,
             ),
             Err(Error::InvalidMarkerLength)
-        );
+        ));
     }
 
     /// 9-7 entry point saturates an ICT-amplified `f32` sample to
@@ -3175,7 +3177,7 @@ mod tests {
         let descs = [d_unsigned(8), d_unsigned(8)];
         let mut comps: [&mut [f32]; 2] = [&mut c0, &mut c1];
         let mut outs: [&mut [i32]; 2] = [&mut o0, &mut o1];
-        assert_eq!(
+        assert!(matches!(
             reconstruct_tile_components_9x7_multi(
                 &mut comps,
                 &mut outs,
@@ -3183,7 +3185,7 @@ mod tests {
                 InverseMctMode::Ict
             ),
             Err(Error::InvalidComponentCount)
-        );
+        ));
     }
 
     /// The §G.3 "same bit-depth" prologue binds the three transform
@@ -3202,7 +3204,7 @@ mod tests {
         let descs = [d_unsigned(8), d_unsigned(10), d_unsigned(8), d_unsigned(8)];
         let mut comps: [&mut [f32]; 4] = [&mut c0, &mut c1, &mut c2, &mut c3];
         let mut outs: [&mut [i32]; 4] = [&mut o0, &mut o1, &mut o2, &mut o3];
-        assert_eq!(
+        assert!(matches!(
             reconstruct_tile_components_9x7_multi(
                 &mut comps,
                 &mut outs,
@@ -3210,7 +3212,7 @@ mod tests {
                 InverseMctMode::Ict
             ),
             Err(Error::InvalidComponentCount)
-        );
+        ));
     }
 
     /// The §G.3 prologue also binds signedness — mixed signedness on
@@ -3226,7 +3228,7 @@ mod tests {
         let descs = [d_unsigned(8), d_signed(8), d_unsigned(8)];
         let mut comps: [&mut [f32]; 3] = [&mut c0, &mut c1, &mut c2];
         let mut outs: [&mut [i32]; 3] = [&mut o0, &mut o1, &mut o2];
-        assert_eq!(
+        assert!(matches!(
             reconstruct_tile_components_9x7_multi(
                 &mut comps,
                 &mut outs,
@@ -3234,7 +3236,7 @@ mod tests {
                 InverseMctMode::Ict
             ),
             Err(Error::InvalidComponentCount)
-        );
+        ));
     }
 
     /// RCT mode is rejected on the irreversible multi entry point
@@ -3250,7 +3252,7 @@ mod tests {
         let descs = [d_unsigned(8); 3];
         let mut comps: [&mut [f32]; 3] = [&mut c0, &mut c1, &mut c2];
         let mut outs: [&mut [i32]; 3] = [&mut o0, &mut o1, &mut o2];
-        assert_eq!(
+        assert!(matches!(
             reconstruct_tile_components_9x7_multi(
                 &mut comps,
                 &mut outs,
@@ -3258,7 +3260,7 @@ mod tests {
                 InverseMctMode::Rct
             ),
             Err(Error::NotImplemented)
-        );
+        ));
     }
 
     /// Empty component collection is rejected.
@@ -3267,7 +3269,7 @@ mod tests {
         let descs: [ComponentDescriptor; 0] = [];
         let mut comps: [&mut [f32]; 0] = [];
         let mut outs: [&mut [i32]; 0] = [];
-        assert_eq!(
+        assert!(matches!(
             reconstruct_tile_components_9x7_multi(
                 &mut comps,
                 &mut outs,
@@ -3275,7 +3277,7 @@ mod tests {
                 InverseMctMode::None
             ),
             Err(Error::InvalidMarkerLength)
-        );
+        ));
     }
 
     /// Mismatched component / output / descriptor counts are rejected.
@@ -3290,7 +3292,7 @@ mod tests {
         let descs3 = [d_unsigned(8); 3];
         let mut comps: [&mut [f32]; 2] = [&mut c0, &mut c1];
         let mut outs: [&mut [i32]; 2] = [&mut o0, &mut o1];
-        assert_eq!(
+        assert!(matches!(
             reconstruct_tile_components_9x7_multi(
                 &mut comps,
                 &mut outs,
@@ -3298,13 +3300,13 @@ mod tests {
                 InverseMctMode::None
             ),
             Err(Error::InvalidMarkerLength)
-        );
+        ));
 
         // components vs outputs mismatch.
         let descs2 = [d_unsigned(8); 2];
         let mut comps: [&mut [f32]; 2] = [&mut c0, &mut c1];
         let mut outs1: [&mut [i32]; 1] = [&mut o0];
-        assert_eq!(
+        assert!(matches!(
             reconstruct_tile_components_9x7_multi(
                 &mut comps,
                 &mut outs1,
@@ -3312,7 +3314,7 @@ mod tests {
                 InverseMctMode::None
             ),
             Err(Error::InvalidMarkerLength)
-        );
+        ));
     }
 
     /// Component slices that do not share a common length are rejected
@@ -3330,7 +3332,7 @@ mod tests {
         let descs = [d_unsigned(8); 3];
         let mut comps: [&mut [f32]; 3] = [&mut c0, &mut c1, &mut c2];
         let mut outs: [&mut [i32]; 3] = [&mut o0, &mut o1, &mut o2];
-        assert_eq!(
+        assert!(matches!(
             reconstruct_tile_components_9x7_multi(
                 &mut comps,
                 &mut outs,
@@ -3338,7 +3340,7 @@ mod tests {
                 InverseMctMode::Ict
             ),
             Err(Error::InvalidMarkerLength)
-        );
+        ));
 
         // Uniform components but one short output slot.
         let mut c0 = [0.0_f32, 0.0];
@@ -3349,7 +3351,7 @@ mod tests {
         let mut o2 = [0_i32; 2];
         let mut comps: [&mut [f32]; 3] = [&mut c0, &mut c1, &mut c2];
         let mut outs: [&mut [i32]; 3] = [&mut o0, &mut o1, &mut o2];
-        assert_eq!(
+        assert!(matches!(
             reconstruct_tile_components_9x7_multi(
                 &mut comps,
                 &mut outs,
@@ -3357,7 +3359,7 @@ mod tests {
                 InverseMctMode::Ict
             ),
             Err(Error::InvalidMarkerLength)
-        );
+        ));
     }
 
     /// Out-of-range precision on any descriptor (including an
@@ -3375,7 +3377,7 @@ mod tests {
         let descs = [d_unsigned(8), d_unsigned(8), d_unsigned(8), d_unsigned(32)];
         let mut comps: [&mut [f32]; 4] = [&mut c0, &mut c1, &mut c2, &mut c3];
         let mut outs: [&mut [i32]; 4] = [&mut o0, &mut o1, &mut o2, &mut o3];
-        assert_eq!(
+        assert!(matches!(
             reconstruct_tile_components_9x7_multi(
                 &mut comps,
                 &mut outs,
@@ -3383,7 +3385,7 @@ mod tests {
                 InverseMctMode::Ict
             ),
             Err(Error::InvalidSamplePrecision)
-        );
+        ));
     }
 
     /// Pathological f32 inputs saturate at the cast point on the
