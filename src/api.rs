@@ -466,6 +466,74 @@ pub fn info(bytes: &[u8]) -> Result<ImageInfo, Error> {
 }
 
 // ---------------------------------------------------------------------------
+// describe (the framework demuxer's header walk)
+// ---------------------------------------------------------------------------
+
+/// What the framework demuxer publishes on its stream before any
+/// sample is decoded — [`info`] with the layout made optional.
+#[cfg(feature = "registry")]
+pub(crate) struct Described {
+    pub width: u32,
+    pub height: u32,
+    /// The contract layout, `None` when the component set has none
+    /// (signed / mixed-depth / ≥ 5 components): the stream still opens,
+    /// the decoder reports `Unsupported`.
+    pub format: Option<PixelFormat>,
+    /// JP2 palette for `Pal8`.
+    pub palette: Option<Palette>,
+    /// Colour as the JP2 header signals it; unspecified for a bare
+    /// codestream.
+    pub color: ColorInfo,
+    /// A `colr` box carried an ICC profile.
+    pub has_icc: bool,
+    /// Wrapped in a JP2 / JPH file (vs a bare codestream).
+    pub jp2: bool,
+}
+
+/// Header-only walk for the framework demuxer: the geometry and colour
+/// of every readable file, plus the contract layout when the component
+/// set has one. Only an `Unsupported` layout verdict is absorbed —
+/// malformed headers are errors here as in [`info`].
+#[cfg(feature = "registry")]
+pub(crate) fn describe(bytes: &[u8]) -> Result<Described, Error> {
+    let parsed = parse(bytes, false)?;
+    let jp2h = parsed.container.as_ref().map(|c| &c.header);
+    match plan(&parsed, 0) {
+        Ok(p) => Ok(Described {
+            width: p.width,
+            height: p.height,
+            format: Some(p.layout.format),
+            palette: p.palette,
+            color: p.color,
+            has_icc: p.icc.is_some(),
+            jp2: parsed.container.is_some(),
+        }),
+        Err(Jpeg2000Error::Unsupported(_)) => {
+            let siz = &parsed.header.siz;
+            let first = siz
+                .components
+                .first()
+                .ok_or_else(|| Jpeg2000Error::invalid("codestream has no components"))?;
+            let (width, height) = component_dims(siz, first.h_separation, first.v_separation, 0);
+            if width == 0 || height == 0 {
+                return Err(Jpeg2000Error::invalid("image area is empty"));
+            }
+            let (color, icc, _) = jp2h.map(colour_from_jp2).unwrap_or_default();
+            Ok(Described {
+                width,
+                height,
+                format: None,
+                palette: None,
+                color,
+                has_icc: icc.is_some(),
+                jp2: parsed.container.is_some(),
+            })
+        }
+        Err(e) => Err(e),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // decode
 // ---------------------------------------------------------------------------
 
@@ -771,12 +839,30 @@ fn component_planes<T: Copy>(image: &Jpeg2000Image, read: impl Fn(&[u8]) -> T) -
 /// [`Jpeg2000Image::color`] / ICC, palette boxes for `Pal8`, opacity
 /// channel definitions for the alpha layouts.
 fn jp2_options(image: &Jpeg2000Image, jph: bool) -> Jp2WriteOptions {
-    let format = image.format;
+    jp2_options_parts(
+        image.format,
+        image.palette.as_ref(),
+        image.color,
+        image.metadata.icc.as_deref(),
+        jph,
+    )
+}
+
+/// [`jp2_options`] from its parts — what the framework muxer has when
+/// it wraps an encoder's bare codestream (layout + stream colour, no
+/// image): `palette` is required for `Pal8`, `icc` lands in a
+/// restricted-ICC `colr`.
+pub(crate) fn jp2_options_parts(
+    format: PixelFormat,
+    palette: Option<&Palette>,
+    color: ColorInfo,
+    icc: Option<&[u8]>,
+    jph: bool,
+) -> Jp2WriteOptions {
     let n = format.components();
-    let color = image.color;
     // Channel count the colour description sees (palette columns for
     // Pal8).
-    let channels = match (format, &image.palette) {
+    let channels = match (format, palette) {
         (PixelFormat::Pal8, Some(p)) => {
             if p.has_alpha() {
                 4
@@ -809,13 +895,13 @@ fn jp2_options(image: &Jpeg2000Image, jph: bool) -> Jp2WriteOptions {
         || (srgb_points
             && ((format.is_yuv() && color.matrix == ColorInfo::MATRIX_BT601)
                 || (!format.is_yuv() && color.matrix == ColorInfo::MATRIX_IDENTITY)));
-    opts.colour = if let Some(icc) = &image.metadata.icc {
+    opts.colour = if let Some(icc) = icc {
         vec![Colr {
             method: ColrMethod::RestrictedIccProfile,
             precedence: 0,
             approximation: 0,
             enumerated: None,
-            icc_profile: Some(icc.clone()),
+            icc_profile: Some(icc.to_vec()),
             parameterized: None,
         }]
     } else if expressible {
@@ -840,7 +926,7 @@ fn jp2_options(image: &Jpeg2000Image, jph: bool) -> Jp2WriteOptions {
         opts.colourspace_unknown = true;
         vec![enumerated(conventional)]
     };
-    if let (PixelFormat::Pal8, Some(p)) = (format, &image.palette) {
+    if let (PixelFormat::Pal8, Some(p)) = (format, palette) {
         let column = |k: usize| PclrColumn {
             bit_depth: 8,
             signed: false,

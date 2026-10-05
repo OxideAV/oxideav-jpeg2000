@@ -49,11 +49,14 @@ libfuzzer-sys = "0.4"
 
 [dependencies.oxideav-jpeg2000]
 path = ".."
-# The parser surface lives at the crate root and is always compiled (no
-# feature gate); the `registry` default feature only pulls in
-# `oxideav-core`'s `Decoder` / `Encoder` traits which we don't need
-# here. Drop it to keep the build minimal.
+# The parser surface lives at the crate root and is always compiled; the
+# `registry` feature (oxideav-core) is needed only by the `demux` target
+# that drives the framework containers.
 default-features = false
+features = ["registry"]
+
+[dependencies.oxideav-core]
+version = "0.1"
 
 [profile.release]
 debug = 1
@@ -124,6 +127,13 @@ bench = false
 [[bin]]
 name = "contract"
 path = "fuzz_targets/contract.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "demux"
+path = "fuzz_targets/demux.rs"
 test = false
 doc = false
 bench = false

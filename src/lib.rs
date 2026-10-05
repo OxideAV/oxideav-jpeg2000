@@ -71,6 +71,8 @@
 #![warn(missing_debug_implementations)]
 
 pub mod api;
+#[cfg(feature = "registry")]
+pub mod container;
 pub mod decode;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
@@ -1958,9 +1960,10 @@ pub fn encode_jpeg2000(pixels: &[u8], width: u32, height: u32) -> Result<Vec<u8>
 }
 
 /// Codec registration — installs the JPEG 2000 decoder + encoder
-/// factories and the `.j2k` / `.j2c` / `.jp2` / `.jph` extension hints
-/// into the runtime context. See [`registry`] for the `Decoder` /
-/// `Encoder` adapters and the `VideoFrame` bridge.
+/// factories and the `jpeg2000` (`.j2k` / `.j2c`) and `jp2` (`.jp2` /
+/// `.jph`) containers into the runtime context. See [`registry`] for
+/// the `Decoder` / `Encoder` adapters and the `VideoFrame` bridge,
+/// [`container`] for the demuxer / muxers.
 #[cfg(feature = "registry")]
 pub fn register(ctx: &mut RuntimeContext) {
     registry::register(ctx);

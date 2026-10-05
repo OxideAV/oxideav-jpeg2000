@@ -115,11 +115,31 @@ oxideav-jpeg2000 = "0.0"    # default `registry` feature: pulls oxideav-core
 ```
 
 `oxideav_jpeg2000::register(&mut RuntimeContext)` installs the
-`jpeg2000` codec (decoder + encoder, `jpeg2000_sw`) and the `.j2k` /
-`.j2c` / `.jp2` / `.jph` extension hints; `register_codecs` /
-`register_containers` take the individual registries, `make_decoder` /
-`make_encoder` are the factories. `oxideav_meta::register_all` calls
-`register` for you.
+`jpeg2000` codec (decoder + encoder, `jpeg2000_sw`) and two containers:
+`jpeg2000` (the bare codestream, `.j2k` / `.j2c`) and `jp2` (the JP2 /
+JPH file, `.jp2` / `.jph`), each with a probe, a demuxer and a muxer;
+`register_codecs` / `register_containers` take the individual
+registries, `make_decoder` / `make_encoder` are the factories.
+`oxideav_meta::register_all` calls `register` for you, so
+`oxideav_image::open(&ctx, "photo.jp2")` resolves through the registry.
+
+The containers (`oxideav_jpeg2000::container`) are single-image: the
+demuxer declares one video stream — `width` / `height`, the native
+layout of the table below as `pixel_format`, the JP2 palette as RGB
+triples in `extradata` for `Pal8`, and `color_signal` only when the
+JP2 header carries a `colr` box (a bare codestream signals no colour) —
+and emits the whole file as one keyframe packet (time base 1/1, `pts`
+0). A component set with no contract layout (signed, mixed depths, five
+or more components) still opens with `pixel_format = None`; the decoder
+then reports `Unsupported`. `metadata()` carries `("icc", "present")`
+when a `colr` box holds an ICC profile (the blob itself has no
+framework carriage yet). A multi-codestream (`jpx`) file yields its
+first `jp2c`. The muxers take the registry encoder's packets and write
+what their name says: `jpeg2000` strips a JP2 wrapper to the codestream
+(refusing `Pal8`, whose palette would be lost), `jp2` wraps a bare
+codestream in a JP2 / JPH header built from the stream's layout,
+palette and colour signal (the layout's conventional colourspace when
+the stream signals none). One picture per file.
 
 The framework `Decoder` and `Encoder` are thin adapters over
 `decode_with` / `encode` (one implementation). Each packet is one

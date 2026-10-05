@@ -529,18 +529,15 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
     );
 }
 
-/// Register the file extensions (`.j2k` / `.j2c` raw codestreams,
-/// `.jp2` / `.jph` files) so a [`RuntimeContext`] can map a filename
-/// hint back to the codec id.
+/// Register the two containers of [`crate::container`]: `jpeg2000`
+/// (bare codestream, `.j2k` / `.j2c`) and `jp2` (JP2 / JPH file,
+/// `.jp2` / `.jph`) — demuxer, muxer, probe and extension table each.
 pub fn register_containers(reg: &mut ContainerRegistry) {
-    reg.register_extension("j2k", CODEC_ID_STR);
-    reg.register_extension("j2c", CODEC_ID_STR);
-    reg.register_extension("jp2", CODEC_ID_STR);
-    reg.register_extension("jph", CODEC_ID_STR);
+    crate::container::register(reg);
 }
 
 /// Unified registration entry point: install the codec factories and
-/// the extension hints into the supplied [`RuntimeContext`].
+/// the containers into the supplied [`RuntimeContext`].
 pub fn register(ctx: &mut RuntimeContext) {
     register_codecs(&mut ctx.codecs);
     register_containers(&mut ctx.containers);
@@ -813,7 +810,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn register_installs_decoder_factory_and_extensions() {
+    fn register_installs_decoder_factory_and_containers() {
         let mut ctx = RuntimeContext::new();
         register(&mut ctx);
         let id = CodecId::new(CODEC_ID_STR);
@@ -825,12 +822,21 @@ mod tests {
             ctx.codecs.has_encoder(&id),
             "jpeg2000 encoder factory not installed via RuntimeContext"
         );
-        for ext in ["j2k", "j2c", "jp2", "jph"] {
+        for (ext, name) in [
+            ("j2k", "jpeg2000"),
+            ("j2c", "jpeg2000"),
+            ("jp2", "jp2"),
+            ("jph", "jp2"),
+        ] {
             assert_eq!(
                 ctx.containers.container_for_extension(ext),
-                Some(CODEC_ID_STR),
+                Some(name),
                 "{ext}"
             );
+        }
+        for name in ["jpeg2000", "jp2"] {
+            assert!(ctx.containers.demuxer_names().any(|n| n == name), "{name}");
+            assert!(ctx.containers.muxer_names().any(|n| n == name), "{name}");
         }
     }
 

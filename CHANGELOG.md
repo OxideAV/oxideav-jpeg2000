@@ -6,6 +6,24 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+- Framework containers (`oxideav_jpeg2000::container`, `registry`
+  feature): `jpeg2000` (bare codestream, `.j2k` / `.j2c`) and `jp2`
+  (JP2 / JPH file, `.jp2` / `.jph`), each with a probe, a demuxer and a
+  muxer, so `ctx.containers.probe_input` → `open_demuxer` →
+  `first_decoder` opens JPEG 2000 files through the registry
+  (`oxideav-image`). The demuxer declares the Layer 1 stream (native
+  `pixel_format`, `Pal8` palette in `extradata`, `color_signal` only
+  from a JP2 `colr`, `("icc", "present")` metadata), opens layouts
+  with no contract format as `pixel_format = None`; the muxers write
+  the encoder's packet bare or JP2-wrapped by container name. New
+  `demux` fuzz target.
+
+### Changed
+
+- `register_containers` now installs the containers above; the `jp2` /
+  `jph` extensions resolve to the `jp2` container (previously every
+  extension named the codec id, which no demuxer answered).
+
 - The image-crate API contract (`IMAGE_CRATE_API`) at the crate root:
   `probe`, `info -> ImageInfo`, `decode` / `decode_with(&DecodeOptions)`
   -> `Jpeg2000Image`, `decode_rgb8` / `decode_rgba8`, `decode_from`,
