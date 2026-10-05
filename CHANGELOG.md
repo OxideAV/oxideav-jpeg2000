@@ -4,6 +4,16 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ## [Unreleased]
 
+## [0.0.17](https://github.com/OxideAV/oxideav-jpeg2000/compare/v0.0.16...v0.0.17) - 2026-10-05
+
+### Other
+
+- framework containers — `jpeg2000` (bare codestream) and `jp2` (JP2 / JPH) demuxer + muxer behind register_containers
+- README in the contract's section order (standalone use, framework use, layouts, options, metadata and colour, limits, then the T.800 / T.814 specifics); CHANGELOG Added / Changed / Deprecated
+- contract gate — tests/contract_api.rs pins the layout derivation and lossless round trips, `contract` fuzz target, standalone clippy on CI
+- image-crate API contract — probe / info / decode / encode root vocabulary, Jpeg2000Image with component-set → layout derivation, Jpeg2000Error, DecodeOptions, EncodeOptions (was EncodeParams), registry frame bridge
+- hide internal pub surface from rustdoc/semver (fleet rule 2026-09-01)
+
 ### Added
 
 - Framework containers (`oxideav_jpeg2000::container`, `registry`
