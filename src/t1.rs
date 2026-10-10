@@ -1655,6 +1655,28 @@ impl CodeBlock {
     /// [`Self::neighbours_in_stripe`] instead — that path layers the
     /// §D.7 vertically-causal clip on top of this read.
     fn neighbours(&self, u: usize, v: usize) -> Neighbours {
+        // Interior samples have all eight neighbours inside the code-block.
+        // Keep the clipped path below for samples on a code-block edge.
+        if u > 0 && u + 1 < self.width && v > 0 && v + 1 < self.height {
+            let top = (v - 1) * self.width + u;
+            let middle = v * self.width + u;
+            let bottom = (v + 1) * self.width + u;
+            let c = &self.coefficients;
+            return Neighbours {
+                d0_sigma: c[top - 1].sigma,
+                v0_sigma: c[top].sigma,
+                v0_sign: c[top].sign,
+                d1_sigma: c[top + 1].sigma,
+                h0_sigma: c[middle - 1].sigma,
+                h0_sign: c[middle - 1].sign,
+                h1_sigma: c[middle + 1].sigma,
+                h1_sign: c[middle + 1].sign,
+                d2_sigma: c[bottom - 1].sigma,
+                v1_sigma: c[bottom].sigma,
+                v1_sign: c[bottom].sign,
+                d3_sigma: c[bottom + 1].sigma,
+            };
+        }
         let mut nb = Neighbours::default();
         // Iterate the eight (du, dv) offsets in the Figure D.2 grid.
         let positions: [(i32, i32, NeighbourSlot); 8] = [
@@ -2819,6 +2841,139 @@ impl BitPlaneSequencer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Test-only oracle: retain the original offset iteration and clipping,
+    // independently of the direct row-address reads in the interior path.
+    fn neighbour_snapshot_reference(
+        block: &CodeBlock,
+        u: usize,
+        v: usize,
+        clip_below: bool,
+    ) -> Neighbours {
+        let mut nb = Neighbours::default();
+        let positions = [
+            (-1, -1, NeighbourSlot::D0),
+            (0, -1, NeighbourSlot::V0),
+            (1, -1, NeighbourSlot::D1),
+            (-1, 0, NeighbourSlot::H0),
+            (1, 0, NeighbourSlot::H1),
+            (-1, 1, NeighbourSlot::D2),
+            (0, 1, NeighbourSlot::V1),
+            (1, 1, NeighbourSlot::D3),
+        ];
+        for (du, dv, slot) in positions {
+            // Model causal clipping by omitting below-row reads rather
+            // than copying the implementation's post-read field resets.
+            if clip_below && dv == 1 {
+                continue;
+            }
+            let nu = u as i32 + du;
+            let nv = v as i32 + dv;
+            if nu < 0 || nu >= block.width as i32 || nv < 0 || nv >= block.height as i32 {
+                continue;
+            }
+            let c = block.coefficients[nu as usize + nv as usize * block.width];
+            nb.set(slot, c.sigma, c.sign);
+        }
+        nb
+    }
+
+    fn set_neighbour_snapshot_masks(
+        block: &mut CodeBlock,
+        u: usize,
+        v: usize,
+        sigma_mask: u8,
+        sign_mask: u8,
+    ) {
+        let offsets = [
+            (-1, -1),
+            (0, -1),
+            (1, -1),
+            (-1, 0),
+            (1, 0),
+            (-1, 1),
+            (0, 1),
+            (1, 1),
+        ];
+        for (slot, (du, dv)) in offsets.into_iter().enumerate() {
+            let nu = u as i32 + du;
+            let nv = v as i32 + dv;
+            if nu >= 0 && nu < block.width as i32 && nv >= 0 && nv < block.height as i32 {
+                let c = &mut block.coefficients[nu as usize + nv as usize * block.width];
+                c.sigma = sigma_mask & (1 << slot) != 0;
+                // Include true signs on insignificant neighbours: snapshots
+                // preserve the stored sign even when context coding ignores it.
+                c.sign = sign_mask & (1 << slot) != 0;
+            }
+        }
+    }
+
+    #[test]
+    fn neighbours_interior_matches_offset_reference_for_all_masks() {
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 3, 3);
+        for sigma_mask in 0..=u8::MAX {
+            for sign_mask in 0..=u8::MAX {
+                set_neighbour_snapshot_masks(&mut block, 1, 1, sigma_mask, sign_mask);
+                // Whole-structure equality checks all eight significance
+                // fields and all four cardinal sign fields.
+                assert_eq!(
+                    block.neighbours(1, 1),
+                    neighbour_snapshot_reference(&block, 1, 1, false),
+                    "interior sigma={sigma_mask:#04x} sign={sign_mask:#04x}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn neighbours_edges_and_causal_stripes_match_offset_reference() {
+        // Thin blocks, every edge/corner, and trailing stripe heights 1–3.
+        // In the 3x5/6/7 fixtures, row 3 is an interior stripe bottom
+        // with a real next row, so causal clipping is observable.
+        for (width, height) in [
+            (1, 1),
+            (1, 7),
+            (7, 1),
+            (2, 5),
+            (5, 2),
+            (3, 5),
+            (3, 6),
+            (3, 7),
+        ] {
+            let mut block = CodeBlock::new(SubBandOrientation::LL, width, height);
+            for v in 0..height {
+                for u in 0..width {
+                    let stripe_v0 = v / 4 * 4;
+                    let stripe_h = (height - stripe_v0).min(4);
+                    for sigma_mask in 0..=u8::MAX {
+                        // Diagonal signs have no snapshot field. All 16
+                        // combinations of the four stored signs suffice here.
+                        for cardinal_sign_mask in 0..16u8 {
+                            let sign_mask = ((cardinal_sign_mask & 1) << 1)
+                                | ((cardinal_sign_mask & 2) << 2)
+                                | ((cardinal_sign_mask & 4) << 2)
+                                | ((cardinal_sign_mask & 8) << 3);
+                            set_neighbour_snapshot_masks(&mut block, u, v, sigma_mask, sign_mask);
+                            assert_eq!(
+                                block.neighbours(u, v),
+                                neighbour_snapshot_reference(&block, u, v, false),
+                                "plain {width}x{height} ({u},{v}) sigma={sigma_mask:#04x} sign={sign_mask:#04x}",
+                            );
+                            for causal in [false, true] {
+                                block.vertically_causal = causal;
+                                let clip_below = causal && v + 1 == stripe_v0 + stripe_h;
+                                assert_eq!(
+                                    block.neighbours_in_stripe(u, v, stripe_v0, stripe_h),
+                                    neighbour_snapshot_reference(&block, u, v, clip_below),
+                                    "stripe {width}x{height} ({u},{v}) sigma={sigma_mask:#04x} sign={sign_mask:#04x} causal={causal}",
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // -- Context-array reset (Table D.7) ------------------------------
 
