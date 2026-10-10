@@ -198,6 +198,7 @@ pub fn reassemble_subband_5x3(
 
     for cb in blocks {
         check_placement(band, &cb.placement, cb.coefficients)?;
+        let effective_nb = cb.coefficients.effective_nb_resolver(cb.nb);
         let dx = (cb.placement.x0 - band.tbx0) as usize;
         let dy = (cb.placement.y0 - band.tby0) as usize;
         let block_w = cb.coefficients.width();
@@ -212,7 +213,7 @@ pub fn reassemble_subband_5x3(
                 // more decoded magnitude bit than those it did not. The
                 // block tracks these counts; a test-constructed block
                 // (no passes run) falls back to the uniform `cb.nb`.
-                let nb = cb.coefficients.effective_nb(u, v, cb.nb);
+                let nb = effective_nb(u, v);
                 let r_qb = reconstruct_reversible(qb, mb, nb, r);
                 let target = (dy + v) * width + (dx + u);
                 if written[target] {
@@ -267,6 +268,7 @@ pub fn reassemble_subband_9x7(
 
     for cb in blocks {
         check_placement(band, &cb.placement, cb.coefficients)?;
+        let effective_nb = cb.coefficients.effective_nb_resolver(cb.nb);
         let dx = (cb.placement.x0 - band.tbx0) as usize;
         let dy = (cb.placement.y0 - band.tby0) as usize;
         let block_w = cb.coefficients.width();
@@ -278,7 +280,7 @@ pub fn reassemble_subband_9x7(
                 // §E.1.1.2 Equation E-6 takes the **per-coefficient**
                 // Nb(u, v) (§D.2.1) so mid-bit-plane truncation lifts each
                 // coefficient by its own `r · 2^(Mb − Nb(u, v))` midpoint.
-                let nb = cb.coefficients.effective_nb(u, v, cb.nb);
+                let nb = effective_nb(u, v);
                 let r_qb = reconstruct_irreversible(qb, quant.mb, nb, step_size, r);
                 let target = (dy + v) * width + (dx + u);
                 if written[target] {
