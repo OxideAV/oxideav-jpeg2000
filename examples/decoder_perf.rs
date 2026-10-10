@@ -1,90 +1,82 @@
-//! Standalone backend benchmark: `cargo run --release --no-default-features
-//! --example decoder_perf -- [width height] [--save]`.
+//! Standalone raw-codestream decoder benchmark:
+//! `cargo run --release --no-default-features --example decoder_perf -- image.j2k [rounds]`.
+//! Input I/O, warmup, sample hashing and output destruction are not timed.
 
 #![forbid(unsafe_code)]
 
-use oxideav_jpeg2000::{Container, EncodeOptions, Jpeg2000Image, PixelFormat, decode, encode};
+use oxideav_jpeg2000::{decode_j2k, DecodedImage};
 use std::{error::Error, io, time::Instant};
 
-fn generated_image(width: u32, height: u32, bits: u8) -> Result<Jpeg2000Image, Box<dyn Error>> {
-    let max = if bits == 8 { 255 } else { 65535 };
-    let length = (width as usize)
-        .checked_mul(height as usize)
-        .and_then(|n| n.checked_mul(3))
-        .and_then(|n| n.checked_mul(usize::from(bits / 8)))
-        .ok_or_else(|| io::Error::other("image length overflow"))?;
-    let mut data = Vec::new();
-    data.try_reserve_exact(length)?;
-    let amplitude = (max / 80).max(1);
-    let mut random = 0x1047_a53c_u32;
-    for y in 0..height {
-        let gy = (u64::from(y) * u64::from(max) / u64::from((height - 1).max(1))) as u32;
-        for x in 0..width {
-            let gx = (u64::from(x) * u64::from(max) / u64::from((width - 1).max(1))) as u32;
-            for base in [gx, gy, (gx + gy) / 2] {
-                random = random.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                let noise = ((random >> 8) % (2 * amplitude + 1)) as i32 - amplitude as i32;
-                let value = (base as i32 + noise).clamp(0, max as i32) as u16;
-                if bits == 16 {
-                    data.extend_from_slice(&value.to_le_bytes());
-                } else {
-                    data.push(value as u8);
-                }
+fn sample_hash(image: &DecodedImage) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for component in &image.components {
+        for value in &component.samples {
+            for byte in value.to_le_bytes() {
+                hash = (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3);
             }
         }
     }
-    let format = if bits == 8 {
-        PixelFormat::Rgb24
-    } else {
-        PixelFormat::Rgb48Le
-    };
-    Ok(Jpeg2000Image::packed(width, height, format, data)?)
+    hash
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let mut dimensions = Vec::new();
-    let mut save = false;
-    for argument in std::env::args().skip(1) {
-        if argument == "--save" {
-            save = true;
-        } else {
-            dimensions.push(argument.parse::<u32>()?);
-        }
-    }
-    let (width, height) = match dimensions.as_slice() {
-        [] => (512, 512),
-        [width, height] if *width > 0 && *height > 0 => (*width, *height),
-        _ => return Err(io::Error::other("use [positive width height] [--save]").into()),
-    };
     if cfg!(debug_assertions) {
         return Err(io::Error::other("benchmark requires --release").into());
     }
-    println!("RGB {width}x{height}; generation and validation outside codec timings");
-    for bits in [8, 16] {
-        let image = generated_image(width, height, bits)?;
+    let mut arguments = std::env::args().skip(1);
+    let path = arguments
+        .next()
+        .ok_or_else(|| io::Error::other("use image.j2k [positive rounds]"))?;
+    let rounds = arguments
+        .next()
+        .map(|argument| argument.parse::<usize>())
+        .transpose()?
+        .unwrap_or(5);
+    if rounds == 0 || arguments.next().is_some() {
+        return Err(io::Error::other("use image.j2k [positive rounds]").into());
+    }
+    let bytes = std::fs::read(&path)?;
+    let reference = {
+        let image = decode_j2k(&bytes)?;
+        (
+            image.width,
+            image.height,
+            image.components.len(),
+            sample_hash(&image),
+        )
+    };
+    println!(
+        "Raw J2K {}x{}, {} components; {} timed rounds after one warmup",
+        reference.0, reference.1, reference.2, rounds
+    );
+    let mut times = Vec::with_capacity(rounds);
+    for round in 1..=rounds {
         let start = Instant::now();
-        let bytes = encode(&image, &EncodeOptions::new().with_container(Container::Jp2))?;
-        let encode_time = start.elapsed();
-        let start = Instant::now();
-        let output = decode(&bytes)?;
-        let decode_time = start.elapsed();
-        if output.width != width
-            || output.height != height
-            || output.format != image.format
-            || output.bit_depth != bits
-            || output.planes.first().map(|p| &p.data) != image.planes.first().map(|p| &p.data)
-        {
-            return Err(io::Error::other("lossless decode changed native sample bytes").into());
+        let image = decode_j2k(&bytes)?;
+        let elapsed = start.elapsed();
+        let result = (
+            image.width,
+            image.height,
+            image.components.len(),
+            sample_hash(&image),
+        );
+        if result != reference {
+            return Err(io::Error::other("repeated decode changed native samples").into());
         }
         println!(
-            "RGB{bits}: {} bytes; encode {:.6}s; decode {:.6}s; native samples exact",
-            bytes.len(),
-            encode_time.as_secs_f64(),
-            decode_time.as_secs_f64()
+            "round {round}: {:.6}s; planar i32LE FNV1a64 {:016x}",
+            elapsed.as_secs_f64(),
+            result.3
         );
-        if save {
-            std::fs::write(format!("perf-{width}x{height}-rgb{bits}.jp2"), &bytes)?;
-        }
+        times.push(elapsed);
     }
+    times.sort_unstable();
+    let middle = rounds / 2;
+    let median = if rounds % 2 == 0 {
+        (times[middle - 1].as_secs_f64() + times[middle].as_secs_f64()) / 2.0
+    } else {
+        times[middle].as_secs_f64()
+    };
+    println!("median: {median:.6}s");
     Ok(())
 }
