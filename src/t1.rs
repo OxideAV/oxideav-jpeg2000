@@ -775,6 +775,28 @@ impl CodeBlock {
         }
     }
 
+    /// Resolve the block-wide fallback once before scanning its coefficients.
+    /// Reassembly borrows an immutable block, so the decision stays valid for
+    /// the complete scan. ROI overrides and partial-plane counts retain the
+    /// same semantics as `effective_nb`, without its per-coefficient max scan.
+    pub(crate) fn effective_nb_resolver(
+        &self,
+        uniform_fallback: u32,
+    ) -> impl Fn(usize, usize) -> u32 + '_ {
+        let uniform = self.roi_nb.is_none() && self.max_decoded_bits() == 0;
+        move |u, v| {
+            debug_assert!(u < self.width && v < self.height);
+            let index = u + v * self.width;
+            if let Some(roi) = &self.roi_nb {
+                roi[index]
+            } else if uniform {
+                uniform_fallback
+            } else {
+                self.zero_bit_planes + self.decoded_bits[index]
+            }
+        }
+    }
+
     /// Apply the T.800 §H.1 region-of-interest (Maxshift) decode remap
     /// to this code-block, given the background Equation E-2 `mb` and the
     /// `SPrgn` scaling value `s` (§A.6.3 / Table A.26).
@@ -3382,6 +3404,70 @@ mod tests {
         // Fallback returned verbatim when no per-coefficient data.
         assert_eq!(block.effective_nb(1, 2, 7), 7);
         assert_eq!(block.effective_nb(0, 0, 12), 12);
+    }
+
+    #[test]
+    fn effective_nb_resolver_preserves_uniform_fallback_without_passes() {
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 3, 2);
+        block.mark_significant_for_test(1, 1, true, 5);
+        block.set_zero_bit_planes(4);
+        for fallback in [0, 7, 99] {
+            let resolve = block.effective_nb_resolver(fallback);
+            for v in 0..2 {
+                for u in 0..3 {
+                    assert_eq!(resolve(u, v), fallback);
+                    assert_eq!(resolve(u, v), block.effective_nb(u, v, fallback));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn effective_nb_resolver_preserves_partial_plane_counts() {
+        let bytes = [0x84u8, 0xC7, 0x3B, 0xFC];
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 4, 1);
+        block.mark_significant_for_test(0, 0, false, 1);
+        let mut dec = MqDecoder::new(&bytes);
+        let mut ctx = reset_contexts();
+        block
+            .significance_propagation_pass(0, &mut dec, &mut ctx)
+            .unwrap();
+        block.set_zero_bit_planes(2);
+        let resolve = block.effective_nb_resolver(99);
+        for (u, expected) in [2, 3, 2, 2].into_iter().enumerate() {
+            assert_eq!(resolve(u, 0), expected);
+            assert_eq!(resolve(u, 0), block.effective_nb(u, 0, 99));
+        }
+    }
+
+    #[test]
+    fn effective_nb_resolver_preserves_roi_background_and_partial_counts() {
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 3, 1);
+        for (u, magnitude, bits) in [(0, 5, 6), (1, 0b1010011, 7), (2, 0b1000000, 2)] {
+            block.mark_significant_for_test(u, 0, u == 1, magnitude);
+            block.set_decoded_bits_for_test(u, 0, bits);
+        }
+        block.apply_roi_maxshift(3, 4);
+        let resolve = block.effective_nb_resolver(99);
+        // Background loses four coded ROI planes, ROI caps at Mb, and a
+        // coefficient truncated above Mb retains its own partial count.
+        for (u, expected) in [2, 3, 2].into_iter().enumerate() {
+            assert_eq!(resolve(u, 0), expected);
+            assert_eq!(resolve(u, 0), block.effective_nb(u, 0, 99));
+        }
+    }
+
+    #[test]
+    fn effective_nb_resolver_preserves_ht_supplied_counts_and_zero_entries() {
+        let mut block = CodeBlock::new(SubBandOrientation::HH, 2, 2);
+        block.set_decoded_bits_raw(vec![0, 0, 5, 2]);
+        block.set_zero_bit_planes(3);
+        let resolve = block.effective_nb_resolver(99);
+        for (index, expected) in [3, 3, 8, 5].into_iter().enumerate() {
+            let (u, v) = (index % 2, index / 2);
+            assert_eq!(resolve(u, v), expected);
+            assert_eq!(resolve(u, v), block.effective_nb(u, v, 99));
+        }
     }
 
     #[test]
