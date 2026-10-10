@@ -310,6 +310,16 @@ fn length_one_9x7(y_i0: f64, i0: i32) -> f64 {
 /// Returns [`Error::InvalidMarkerLength`] if `y.len() != il - i0`
 /// or `x.len() != il - i0` or `i0 >= il`.
 pub fn idwt_1d_9x7(y: &[f64], x: &mut [f64], i0: i32, il: i32) -> Result<(), Error> {
+    idwt_1d_9x7_with_scratch(y, x, i0, il, &mut Vec::new())
+}
+
+fn idwt_1d_9x7_with_scratch(
+    y: &[f64],
+    x: &mut [f64],
+    i0: i32,
+    il: i32,
+    buf: &mut Vec<f64>,
+) -> Result<(), Error> {
     let len = (il - i0) as usize;
     if y.len() != len || x.len() != len || i0 >= il {
         return Err(Error::InvalidMarkerLength);
@@ -333,7 +343,9 @@ pub fn idwt_1d_9x7(y: &[f64], x: &mut [f64], i0: i32, il: i32) -> Result<(), Err
     let ileft = (i0 - access_lo).max(3);
     let iright = (access_hi - (il - 1)).max(3);
     let ext_len = (len as i32 + ileft + iright) as usize;
-    let mut buf = vec![0.0_f64; ext_len];
+    // Reuse capacity across rows/columns; the fill below overwrites every
+    // active slot before any lifting step reads it.
+    buf.resize(ext_len, 0.0);
     // Fill buf so that coefficient index `i` lives at buf[i - i0 + ileft].
     for j in 0..ext_len {
         let i = j as i32 + i0 - ileft;
@@ -630,10 +642,10 @@ pub fn hor_sr_9x7(a: &mut Interleaved2D<f64>, i0: i32) -> Result<(), Error> {
     }
     let il = i0 + a.width as i32;
     let mut tmp = vec![0.0_f64; a.width];
+    let mut scratch = Vec::new();
     for v in 0..a.height {
         let row = &a.data[v * a.width..(v + 1) * a.width];
-        let row_vec = row.to_vec();
-        idwt_1d_9x7(&row_vec, &mut tmp, i0, il)?;
+        idwt_1d_9x7_with_scratch(row, &mut tmp, i0, il, &mut scratch)?;
         a.data[v * a.width..(v + 1) * a.width].copy_from_slice(&tmp);
     }
     Ok(())
@@ -649,11 +661,12 @@ pub fn ver_sr_9x7(a: &mut Interleaved2D<f64>, j0: i32) -> Result<(), Error> {
     let jl = j0 + a.height as i32;
     let mut col = vec![0.0_f64; a.height];
     let mut out = vec![0.0_f64; a.height];
+    let mut scratch = Vec::new();
     for u in 0..a.width {
         for v in 0..a.height {
             col[v] = a.data[v * a.width + u];
         }
-        idwt_1d_9x7(&col, &mut out, j0, jl)?;
+        idwt_1d_9x7_with_scratch(&col, &mut out, j0, jl, &mut scratch)?;
         for v in 0..a.height {
             a.data[v * a.width + u] = out[v];
         }
