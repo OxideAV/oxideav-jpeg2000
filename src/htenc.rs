@@ -39,7 +39,8 @@
 //!   `ε̄ᵏ_q` bits (their §7.3.8 known bit — the `U_q − 1` magnitude
 //!   bit — is 1 whenever `E_n = U_q ≥ 2`, which `u_off = 1` implies
 //!   since `κ_q ≥ 1`),
-//! * partial trailing bytes pad with `1` bits, and a pending MEL run
+//! * MagSgn/VLC trailing bytes pad with `1` bits, MEL pads with `0`
+//!   bits to keep its byte-stream interface free of false markers, and a pending MEL run
 //!   flushes as a single `1` (a claimed-complete run the decoder never
 //!   reads past).
 //!
@@ -149,11 +150,18 @@ impl MelWriter {
 
     fn finish(mut self) -> Vec<u8> {
         if self.used > 0 {
-            // Left-align the partial byte and pad the tail with 1s (the
-            // reader consumes MSB-first and never requests the pad).
+            // T.814 7.1.1 forbids false markers (FF followed by >8F). The
+            // Annex F.4 reference termination zero-pads MEL. We keep the
+            // streams separate: left-align MEL with zero padding, making its
+            // final byte non-FF regardless of the first VLC byte.
             let pad = self.cap - self.used;
-            self.tmp = (self.tmp << pad) | ((1 << pad) - 1);
+            self.tmp <<= pad;
             self.out.push(self.tmp as u8);
+        } else if self.cap == 7 {
+            // A complete FF was just emitted. Its successor must carry the
+            // zero stuffing bit even when MEL has no further data bits; a
+            // zero termination byte protects the independently packed VLC.
+            self.out.push(0);
         }
         self.out
     }
@@ -1207,6 +1215,43 @@ mod tests {
         mu[1] = 2;
         let sign = vec![false; w * h];
         roundtrip(&mu, &sign, w, h);
+    }
+
+    #[test]
+    fn mel_termination_does_not_create_a_false_marker_at_the_vlc_interface() {
+        // The 7.1.1 segment constraint applies at byte-stream interfaces too.
+        // A partial all-one MEL byte used to become
+        // FF, colliding with this valid first VLC byte and OpenJPEG's MEL
+        // prefetch check. The bit sequences, not decoder roundtrips, establish
+        // the stream-interface regression.
+        for (bits, expected) in [
+            (vec![1], vec![0x80]),
+            (vec![1; 7], vec![0xFE]),
+            (vec![1; 8], vec![0xFF, 0]),
+            (vec![1; 9], vec![0xFF, 0x40]),
+            (vec![1; 15], vec![0xFF, 0x7F]),
+        ] {
+            let mut writer = MelWriter::new();
+            for bit in bits {
+                writer.bit(bit);
+            }
+            let mut mel_vlc = writer.finish();
+            assert_eq!(mel_vlc, expected);
+            mel_vlc.push(0xC2);
+            assert!(mel_vlc
+                .windows(2)
+                .all(|pair| pair[0] != 0xFF || pair[1] <= 0x8F));
+        }
+    }
+
+    #[test]
+    fn mel_termination_keeps_non_ff_aligned_bytes_and_empty_stream_unchanged() {
+        assert!(MelWriter::new().finish().is_empty());
+        let mut writer = MelWriter::new();
+        for bit in [1, 0, 1, 0, 0, 1, 0, 1] {
+            writer.bit(bit);
+        }
+        assert_eq!(writer.finish(), [0xA5]);
     }
 
     #[test]
