@@ -990,12 +990,14 @@ impl CodeBlock {
                         continue;
                     }
 
-                    // Table D.4 context: the neighbour summation uses the
-                    // significance states currently known to the decoder.
-                    let label = refinement_context_label(
-                        self.neighbours_in_stripe(u, v, v0, stripe_h),
-                        coef.already_refined,
-                    );
+                    let neighbours = if coef.already_refined {
+                        // Subsequent refinements always use context 16;
+                        // no neighbour state contributes to that label.
+                        Neighbours::default()
+                    } else {
+                        self.neighbours_in_stripe(u, v, v0, stripe_h)
+                    };
+                    let label = refinement_context_label(neighbours, coef.already_refined);
                     let cx = &mut ctx[REFINEMENT_CTX_OFFSET + label as usize];
                     let bit = decoder.decode(cx);
 
@@ -1229,10 +1231,14 @@ impl CodeBlock {
                     if !coef.sigma || self.newly_significant[idx] {
                         continue;
                     }
-                    let label = refinement_context_label(
-                        self.neighbours_in_stripe(u, v, v0, stripe_h),
-                        coef.already_refined,
-                    );
+                    let neighbours = if coef.already_refined {
+                        // Subsequent refinements always use context 16;
+                        // no neighbour state contributes to that label.
+                        Neighbours::default()
+                    } else {
+                        self.neighbours_in_stripe(u, v, v0, stripe_h)
+                    };
+                    let label = refinement_context_label(neighbours, coef.already_refined);
                     let bit = ((targets[idx].magnitude >> bitplane) & 1) as u8;
                     encoder.encode(&mut ctx[REFINEMENT_CTX_OFFSET + label as usize], bit);
                     let mut updated = coef;
@@ -3281,6 +3287,117 @@ mod tests {
             ctx16_before,
             "context 16 should be used by the second refinement"
         );
+    }
+
+    #[test]
+    fn refinement_preserves_first_and_later_contexts_codeword_and_decoded_state() {
+        let (width, height) = (8, 9);
+        let mut targets = vec![Coefficient::default(); width * height];
+        let mut known = targets.clone();
+        for v in 0..height {
+            for u in 0..width {
+                let i = u + v * width;
+                targets[i].magnitude = 0x8000 | ((i as u32 * 1741 + 9271) & 0x7fff);
+                targets[i].sign = i % 3 == 0;
+                // Isolated and adjacent coefficients exercise first-refinement
+                // contexts 14 and 15. The pair across a stripe boundary also
+                // exercises the vertically-causal context change.
+                if (u == 0 && v == 0) || (u == 1 && (v == 3 || v == 4)) || (u >= 4 && v >= 2) {
+                    known[i] = Coefficient {
+                        magnitude: 0x8000,
+                        sigma: true,
+                        sign: targets[i].sign,
+                        already_refined: false,
+                    };
+                }
+            }
+        }
+        for causal in [false, true] {
+            let mut block =
+                CodeBlock::from_coefficients(SubBandOrientation::LL, width, height, known.clone())
+                    .with_vertically_causal_context(causal);
+            let mut encoder = MqEncoder::new();
+            let mut ctx = reset_contexts();
+            block.magnitude_refinement_encode(14, &targets, &mut encoder, &mut ctx);
+            let first14 = if causal { 6 } else { 1 };
+            assert_eq!(ctx[REFINEMENT_CTX_OFFSET].index(), first14);
+            assert!(!ctx[REFINEMENT_CTX_OFFSET].mps());
+            assert_eq!(ctx[REFINEMENT_CTX_OFFSET + 1].index(), 14);
+            assert!(!ctx[REFINEMENT_CTX_OFFSET + 1].mps());
+            assert_eq!(
+                ctx[REFINEMENT_CTX_OFFSET + 2],
+                reset_contexts()[REFINEMENT_CTX_OFFSET + 2]
+            );
+            let first_ctx = ctx;
+            for p in (0..14).rev() {
+                block.magnitude_refinement_encode(p, &targets, &mut encoder, &mut ctx);
+            }
+            // Only context 16 adapts after the first refinement.
+            assert_eq!(ctx[REFINEMENT_CTX_OFFSET].index(), first14);
+            assert_eq!(ctx[REFINEMENT_CTX_OFFSET + 1].index(), 14);
+            assert_eq!(ctx[REFINEMENT_CTX_OFFSET + 2].index(), 16);
+            assert!(!ctx[REFINEMENT_CTX_OFFSET + 2].mps());
+            for (i, original) in known.iter().enumerate() {
+                let coefficient = block.coefficient(i % width, i / width);
+                assert_eq!(coefficient.sigma, original.sigma);
+                if original.sigma {
+                    assert!(coefficient.already_refined);
+                    assert_eq!(coefficient.magnitude, targets[i].magnitude);
+                    assert_eq!(coefficient.sign, targets[i].sign);
+                    assert_eq!(block.decoded_bits(i % width, i / width), 15);
+                } else {
+                    assert_eq!(coefficient, *original);
+                    assert_eq!(block.decoded_bits(i % width, i / width), 0);
+                }
+            }
+            // Captured from commit 2c41bb83 before the shortcut: mixed signs,
+            // fifteen refinement planes, edges and a partial bottom stripe.
+            let golden: &[u8] = if causal {
+                &[
+                    24, 101, 4, 166, 254, 49, 114, 26, 91, 29, 25, 167, 54, 86, 196, 21, 182, 7,
+                    164, 180, 94, 252, 87, 16, 149, 69, 210, 43, 215, 227, 150, 106, 167, 143, 232,
+                    132, 32, 111, 103, 215, 75, 189, 108, 26, 66, 29, 117, 76, 230, 128, 79, 58,
+                    235, 144, 83, 144, 92, 253, 132, 150, 180,
+                ]
+            } else {
+                &[
+                    11, 74, 185, 184, 236, 115, 200, 105, 108, 116, 102, 156, 217, 91, 16, 86, 216,
+                    30, 146, 209, 123, 241, 92, 66, 85, 23, 72, 175, 95, 142, 89, 170, 158, 63,
+                    162, 16, 129, 189, 159, 93, 46, 245, 176, 105, 8, 117, 213, 51, 154, 1, 60,
+                    235, 174, 65, 78, 65, 115, 246, 18, 90, 211,
+                ]
+            };
+            assert_eq!(encoder.flush(), golden);
+
+            // Decode the independent pre-shortcut codeword, not the current
+            // encoder's output, and check both first and later contexts.
+            let mut decoded =
+                CodeBlock::from_coefficients(SubBandOrientation::LL, width, height, known.clone())
+                    .with_vertically_causal_context(causal);
+            let mut decoder = MqDecoder::new(golden);
+            let mut decoded_ctx = reset_contexts();
+            let eligible = known.iter().filter(|c| c.sigma).count();
+            assert_eq!(
+                decoded
+                    .magnitude_refinement_pass(14, &mut decoder, &mut decoded_ctx)
+                    .unwrap(),
+                eligible
+            );
+            assert_eq!(decoded_ctx, first_ctx);
+            for p in (0..14).rev() {
+                assert_eq!(
+                    decoded
+                        .magnitude_refinement_pass(p, &mut decoder, &mut decoded_ctx)
+                        .unwrap(),
+                    eligible
+                );
+            }
+            assert_eq!(decoded_ctx, ctx);
+            assert_eq!(decoded.coefficients, block.coefficients);
+            assert_eq!(decoded.decoded_bits, block.decoded_bits);
+            assert_eq!(decoded.newly_significant, block.newly_significant);
+            assert_eq!(decoded.sp_visited, block.sp_visited);
+        }
     }
 
     #[test]
