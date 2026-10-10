@@ -990,12 +990,14 @@ impl CodeBlock {
                         continue;
                     }
 
-                    // Table D.4 context: the neighbour summation uses the
-                    // significance states currently known to the decoder.
-                    let label = refinement_context_label(
-                        self.neighbours_in_stripe(u, v, v0, stripe_h),
-                        coef.already_refined,
-                    );
+                    let neighbours = if coef.already_refined {
+                        // Subsequent refinements always use context 16;
+                        // no neighbour state contributes to that label.
+                        Neighbours::default()
+                    } else {
+                        self.neighbours_in_stripe(u, v, v0, stripe_h)
+                    };
+                    let label = refinement_context_label(neighbours, coef.already_refined);
                     let cx = &mut ctx[REFINEMENT_CTX_OFFSET + label as usize];
                     let bit = decoder.decode(cx);
 
@@ -3288,7 +3290,7 @@ mod tests {
     }
 
     #[test]
-    fn refinement_encode_preserves_first_and_later_contexts_and_codeword() {
+    fn refinement_preserves_first_and_later_contexts_codeword_and_decoded_state() {
         let (width, height) = (8, 9);
         let mut targets = vec![Coefficient::default(); width * height];
         let mut known = targets.clone();
@@ -3326,6 +3328,7 @@ mod tests {
                 ctx[REFINEMENT_CTX_OFFSET + 2],
                 reset_contexts()[REFINEMENT_CTX_OFFSET + 2]
             );
+            let first_ctx = ctx;
             for p in (0..14).rev() {
                 block.magnitude_refinement_encode(p, &targets, &mut encoder, &mut ctx);
             }
@@ -3365,6 +3368,35 @@ mod tests {
                 ]
             };
             assert_eq!(encoder.flush(), golden);
+
+            // Decode the independent pre-shortcut codeword, not the current
+            // encoder's output, and check both first and later contexts.
+            let mut decoded =
+                CodeBlock::from_coefficients(SubBandOrientation::LL, width, height, known.clone())
+                    .with_vertically_causal_context(causal);
+            let mut decoder = MqDecoder::new(golden);
+            let mut decoded_ctx = reset_contexts();
+            let eligible = known.iter().filter(|c| c.sigma).count();
+            assert_eq!(
+                decoded
+                    .magnitude_refinement_pass(14, &mut decoder, &mut decoded_ctx)
+                    .unwrap(),
+                eligible
+            );
+            assert_eq!(decoded_ctx, first_ctx);
+            for p in (0..14).rev() {
+                assert_eq!(
+                    decoded
+                        .magnitude_refinement_pass(p, &mut decoder, &mut decoded_ctx)
+                        .unwrap(),
+                    eligible
+                );
+            }
+            assert_eq!(decoded_ctx, ctx);
+            assert_eq!(decoded.coefficients, block.coefficients);
+            assert_eq!(decoded.decoded_bits, block.decoded_bits);
+            assert_eq!(decoded.newly_significant, block.newly_significant);
+            assert_eq!(decoded.sp_visited, block.sp_visited);
         }
     }
 
