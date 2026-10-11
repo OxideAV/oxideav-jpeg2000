@@ -13,20 +13,19 @@ use crate::dwt::{sr_2d_5x3, sr_2d_9x7, Interleaved2D};
 use crate::geometry::{ResolutionLevel, SubBand, SubBandOrientation};
 use crate::Error;
 
-#[derive(Clone, Copy)]
-struct BandRegion {
+struct BandRegion<T> {
     band: SubBand,
     offset: usize,
-    len: usize,
+    data: Vec<T>,
 }
 
-/// One allocation contains all coded bands of the kept resolution levels.
-/// Uncoded positions stay zero. The overlap guard costs one bit per sample
-/// and is released before synthesis; no decoded block is retained here.
+/// Each coded band owns a contiguous coefficient buffer. Uncoded positions
+/// stay zero. The shared overlap guard costs one bit per sample and is
+/// released before synthesis; no decoded block is retained here. Synthesis
+/// moves LL into the carry and releases each level's high bands immediately.
 pub(crate) struct CoefficientSurface<'a, T> {
     levels: &'a [ResolutionLevel],
-    bands: Vec<Vec<BandRegion>>,
-    data: Vec<T>,
+    bands: Vec<Vec<BandRegion<T>>>,
     written: Vec<u64>,
 }
 
@@ -71,19 +70,19 @@ impl<'a, T: Default + Clone> CoefficientSurface<'a, T> {
                 let len = (band.width() as usize)
                     .checked_mul(band.height() as usize)
                     .ok_or(Error::InvalidMarkerLength)?;
+                let offset = count;
+                count = count.checked_add(len).ok_or(Error::InvalidMarkerLength)?;
                 regions.push(BandRegion {
                     band,
-                    offset: count,
-                    len,
+                    offset,
+                    data: vec![T::default(); len],
                 });
-                count = count.checked_add(len).ok_or(Error::InvalidMarkerLength)?;
             }
             bands.push(regions);
         }
         Ok(Self {
             levels,
             bands,
-            data: vec![T::default(); count],
             written: vec![0; count.div_ceil(64)],
         })
     }
@@ -95,10 +94,10 @@ impl<'a, T: Default + Clone> CoefficientSurface<'a, T> {
         cb: CodedCodeBlock<'_>,
         reconstruct: F,
     ) -> Result<(), Error> {
-        let region = *self
+        let region = self
             .bands
-            .get(resolution)
-            .and_then(|bands| bands.get(sub_band))
+            .get_mut(resolution)
+            .and_then(|bands| bands.get_mut(sub_band))
             .ok_or(Error::InvalidPacketHeader)?;
         check_placement(&region.band, &cb.placement, cb.coefficients)?;
         let width = region.band.width() as usize;
@@ -107,16 +106,17 @@ impl<'a, T: Default + Clone> CoefficientSurface<'a, T> {
         let effective_nb = cb.coefficients.effective_nb_resolver(cb.nb);
         for v in 0..cb.coefficients.height() {
             for u in 0..cb.coefficients.width() {
-                let target = region.offset + (dy + v) * width + dx + u;
-                let mask = 1u64 << (target % 64);
-                let word = &mut self.written[target / 64];
+                let target = (dy + v) * width + dx + u;
+                let coverage_index = region.offset + target;
+                let mask = 1u64 << (coverage_index % 64);
+                let word = &mut self.written[coverage_index / 64];
                 if *word & mask != 0 {
                     return Err(Error::InvalidMarkerLength);
                 }
                 *word |= mask;
                 let qb = qb_signed(cb.coefficients.coefficient(u, v));
                 let nb = effective_nb(u, v);
-                self.data[target] = reconstruct(nb, qb);
+                region.data[target] = reconstruct(nb, qb);
             }
         }
         Ok(())
@@ -126,40 +126,41 @@ impl<'a, T: Default + Clone> CoefficientSurface<'a, T> {
         let Self {
             levels,
             bands,
-            data,
             written,
         } = self;
-        // No more scatters are possible once synthesis owns the surface.
+        // No more scatters are possible once synthesis owns the buffers.
         drop(written);
-        let ll = bands[0][0];
+        let mut bands = bands.into_iter();
+        let ll = bands.next().unwrap().pop().unwrap();
         let mut carry_dims = (ll.band.width() as usize, ll.band.height() as usize);
-        if levels.len() == 1 {
-            return Ok(Interleaved2D {
-                data,
-                width: carry_dims.0,
-                height: carry_dims.1,
-            });
-        }
-        let mut carry = data[ll.offset..ll.offset + ll.len].to_vec();
-        for (level, regions) in levels.iter().zip(&bands).skip(1) {
-            let hl = regions[0];
-            let lh = regions[1];
-            let hh = regions[2];
+        // The lowest band is already a contiguous owned buffer. Move it
+        // directly instead of allocating a second copy for the first carry.
+        let mut carry = ll.data;
+        for (level, regions) in levels.iter().skip(1).zip(bands) {
+            let mut regions = regions.into_iter();
+            let hl = regions.next().unwrap();
+            let lh = regions.next().unwrap();
+            let hh = regions.next().unwrap();
             // These are exactly the band slices and origin casts passed by
             // the existing public IDWT cascade. No precision or rounding
-            // change is introduced by the backing surface.
+            // change is introduced by the lifetime of these buffers.
             let grid = inverse(
                 &carry,
                 carry_dims,
-                &data[hl.offset..hl.offset + hl.len],
+                &hl.data,
                 (hl.band.width() as usize, hl.band.height() as usize),
-                &data[lh.offset..lh.offset + lh.len],
+                &lh.data,
                 (lh.band.width() as usize, lh.band.height() as usize),
-                &data[hh.offset..hh.offset + hh.len],
+                &hh.data,
                 (hh.band.width() as usize, hh.band.height() as usize),
                 level.trx0 as i32,
                 level.try0 as i32,
             )?;
+            // Later resolutions need only the new LL carry, never these
+            // coded bands. Release them before the next synthesis step.
+            drop(hl);
+            drop(lh);
+            drop(hh);
             carry_dims = (grid.width, grid.height);
             carry = grid.data;
         }
@@ -504,7 +505,7 @@ mod tests {
         };
         let expected = crate::reassemble::reassemble_subband_5x3(&band, &[cb], 31, 0.5).unwrap();
         let mut surface = CoefficientSurface::<i32>::new(&levels).unwrap();
-        let allocation = surface.data.as_ptr();
+        let allocation = surface.bands[0][0].data.as_ptr();
         surface.scatter_5x3(0, 0, cb, 31, 0.5).unwrap();
         // The sink does not retain the borrow; reset before synthesis.
         block.reset_for_decode(SubBandOrientation::HH, 1, 1);
@@ -513,6 +514,83 @@ mod tests {
         assert_eq!(grid.data.as_ptr(), allocation);
         assert_eq!(grid.data[0], i32::MAX);
         assert_eq!(grid.data[1], i32::MIN);
+    }
+
+    #[test]
+    fn synthesis_moves_ll_and_releases_consumed_bands_before_next_level() {
+        use std::cell::Cell;
+
+        // Logical live values provide a deterministic lifetime check without
+        // instrumenting a system allocator or depending on RSS behaviour.
+        thread_local! {
+            static LIVE: Cell<usize> = const { Cell::new(0) };
+            static CALLS: Cell<usize> = const { Cell::new(0) };
+        }
+        struct Tracked {
+            _value: u8,
+        }
+        impl Default for Tracked {
+            fn default() -> Self {
+                LIVE.with(|live| live.set(live.get() + 1));
+                Self { _value: 0 }
+            }
+        }
+        impl Clone for Tracked {
+            fn clone(&self) -> Self {
+                Self::default()
+            }
+        }
+        impl Drop for Tracked {
+            fn drop(&mut self) {
+                LIVE.with(|live| live.set(live.get() - 1));
+            }
+        }
+        // Mirrors the existing ten-argument inverse-DWT interface; this
+        // callback verifies ownership lifetimes rather than wavelet math.
+        #[allow(clippy::too_many_arguments)]
+        fn inverse(
+            _ll: &[Tracked],
+            ll_dims: (usize, usize),
+            _hl: &[Tracked],
+            hl_dims: (usize, usize),
+            _lh: &[Tracked],
+            lh_dims: (usize, usize),
+            _hh: &[Tracked],
+            _hh_dims: (usize, usize),
+            _i0: i32,
+            _j0: i32,
+        ) -> Result<Interleaved2D<Tracked>, Error> {
+            CALLS.with(|calls| calls.set(calls.get() + 1));
+            // At the first step: four LL + twelve high-band + forty-eight
+            // future-band values. At the second: sixteen carry + forty-eight
+            // high-band values. A cloned LL or retained consumed bands would
+            // increase this count and fail before the next output allocates.
+            LIVE.with(|live| assert_eq!(live.get(), 64));
+            let width = ll_dims.0 + hl_dims.0;
+            let height = ll_dims.1 + lh_dims.1;
+            Ok(Interleaved2D {
+                data: vec![Tracked::default(); width * height],
+                width,
+                height,
+            })
+        }
+        let levels = derive_resolution_levels(
+            TileComponentGeometry {
+                tcx0: 0,
+                tcy0: 0,
+                tcx1: 8,
+                tcy1: 8,
+            },
+            2,
+        );
+        let surface = CoefficientSurface::<Tracked>::new(&levels).unwrap();
+        LIVE.with(|live| assert_eq!(live.get(), 64));
+        let grid = surface.synthesize(inverse).unwrap();
+        assert_eq!((grid.width, grid.height), (8, 8));
+        CALLS.with(|calls| assert_eq!(calls.get(), 2));
+        LIVE.with(|live| assert_eq!(live.get(), 64));
+        drop(grid);
+        LIVE.with(|live| assert_eq!(live.get(), 0));
     }
 
     #[test]
