@@ -2489,6 +2489,12 @@ fn decode_tile_from_plan(
         }
     }
 
+    // Every accumulated key must belong to a planned component. Reject an
+    // inconsistent plan rather than silently discarding any remaining blocks.
+    if accum.next().is_some() {
+        return Err(Error::InvalidPacketHeader);
+    }
+
     // -- Annex G: inverse MCT + DC level shift + clamp, per tile --
     //
     // The reassembly above split each component into the `planes_5x3`
