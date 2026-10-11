@@ -70,7 +70,7 @@ use crate::dequant::{self, StepSize};
 use crate::geometry::{
     derive_precinct_code_blocks, derive_precinct_partition, derive_resolution_levels,
     derive_tile_geometry, image_area, precinct_exponents_at, tile_grid_extent, PrecinctCodeBlocks,
-    ResolutionLevel, SubBand, SubBandOrientation,
+    ResolutionLevel, SubBandOrientation,
 };
 use crate::mct::{
     reconstruct_tile_components_5x3_multi, reconstruct_tile_components_9x7_multi,
@@ -82,10 +82,7 @@ use crate::progression::{
     rlcp_packet_order, rpcl_packet_order, ComponentPositionInfo, ComponentProgressionInfo,
     PacketDescriptor, PocVolume, ResolutionPrecinctLayout,
 };
-use crate::reassemble::{
-    idwt_5x3, idwt_9x7, BlockSource, CodedCodeBlock, PrecinctBlocks, SubBandQuantization,
-    WalkerBlockEntry, WalkerBlockSource,
-};
+use crate::reassemble::{CodedCodeBlock, CoefficientSurface, SubBandQuantization};
 use crate::t1::{reset_contexts, BitPlaneSequencer, CodeBlock};
 use crate::{
     Error, J2kCodestream, ProgressionOrder, QuantizationStyle, Siz, WaveletTransform, MARKER_CAP,
@@ -295,6 +292,31 @@ fn spqcd_index(r: u8, orientation: SubBandOrientation) -> usize {
 struct BandQuant {
     mb: u32,
     quant: SubBandQuantization,
+}
+
+/// Component-local reconstructed coefficients; never owns decoded blocks.
+enum ComponentSurface<'a> {
+    Reversible(CoefficientSurface<'a, i32>),
+    Irreversible(CoefficientSurface<'a, f64>),
+}
+
+impl ComponentSurface<'_> {
+    fn scatter(
+        &mut self,
+        resolution: u8,
+        sub_band: u32,
+        cb: CodedCodeBlock<'_>,
+        quant: &BandQuant,
+    ) -> Result<(), Error> {
+        match self {
+            Self::Reversible(surface) => {
+                surface.scatter_5x3(resolution as usize, sub_band as usize, cb, quant.mb, 0.5)
+            }
+            Self::Irreversible(surface) => {
+                surface.scatter_9x7(resolution as usize, sub_band as usize, cb, quant.quant, 0.5)
+            }
+        }
+    }
 }
 
 /// The quantisation parameters that apply to one component, after the
@@ -592,43 +614,6 @@ struct AccumSegment {
 /// Key addressing one code-block inside one tile:
 /// `(component, resolution, precinct, sub_band, cbx, cby)`.
 type BlockKey = (u16, u8, u32, u32, u32, u32);
-
-/// One tier-1-decoded code-block, owned, ready to be bridged into a
-/// [`WalkerBlockSource`].
-struct DecodedBlock {
-    component: u16,
-    r: u8,
-    precinct: u32,
-    sub_band: u32,
-    cbx: u32,
-    cby: u32,
-    nb: u32,
-    block: CodeBlock,
-}
-
-/// Per-resolution-level [`BlockSource`] dispatch for one
-/// tile-component: [`WalkerBlockSource`] keys blocks by orientation
-/// only, so one source per resolution level keeps the `HL` blocks of
-/// different levels apart. The owning level is recovered from the
-/// band's decomposition level `nb` (`r = NL − nb + 1` for high-pass
-/// bands, `r = 0` for `LL`, per §B.5).
-struct LevelKeyedSource<'a> {
-    n_l: u8,
-    per_level: Vec<WalkerBlockSource<'a>>,
-}
-
-impl<'a> BlockSource<'a> for LevelKeyedSource<'a> {
-    fn blocks_for(&self, band: &SubBand) -> &[CodedCodeBlock<'a>] {
-        let r = match band.orientation {
-            SubBandOrientation::LL => 0usize,
-            _ => (self.n_l as usize) + 1 - (band.nb as usize),
-        };
-        match self.per_level.get(r) {
-            Some(src) => src.blocks_for(band),
-            None => &[],
-        }
-    }
-}
 
 /// Number of fully-decoded bit-planes implied by `passes` coding
 /// passes per the §D.3 schedule (cleanup on the first plane, then
@@ -2101,286 +2086,331 @@ fn decode_tile_from_plan(
         )?);
     }
 
-    // -- Tier-1: decode every included code-block --
-    let mut decoded: Vec<DecodedBlock> = Vec::with_capacity(accum.len());
-    for ((c, r, k, sb, cbx, cby), acc) in accum.iter() {
-        if acc.passes == 0 {
-            continue;
-        }
-        // Reduced-resolution decode: blocks above the kept resolution
-        // level contribute nothing to the truncated synthesis — skip
-        // their (already length-accounted) tier-1 work entirely.
-        {
-            let keep = comp_coding
-                .get(*c as usize)
-                .ok_or(Error::InvalidMarkerLength)?
-                .n_l
-                - discard_levels;
-            if *r > keep {
-                continue;
-            }
-        }
-        let geom = precinct_geom
-            .get(&(*c, *r, *k))
-            .ok_or(Error::InvalidPacketHeader)?;
-        let psb = geom
-            .sub_bands
-            .get(*sb as usize)
-            .ok_or(Error::InvalidPacketHeader)?;
-        if *cbx >= psb.grid_wide || *cby >= psb.grid_high {
-            return Err(Error::InvalidPacketHeader);
-        }
-        let placement = psb.code_blocks[(*cby as usize) * (psb.grid_wide as usize) + *cbx as usize];
-        // Per-level band order matches the §B.9 packet sub-band order
-        // ([LL] at r = 0, [HL, LH, HH] at r ≥ 1), so the packet's
-        // sub-band index addresses the quant table directly.
-        let mb = quant_per_comp[*c as usize][*r as usize]
-            .get(*sb as usize)
-            .ok_or(Error::InvalidPacketHeader)?
-            .mb;
-        // §H.1 / §H.2: under an `RGN` Maxshift the encoder shifts ROI
-        // coefficients up into the top `s` bit-planes, so the coded
-        // bit budget is `M'b = Mb + s`. The tier-1 schedule, the
-        // zero-bit-plane bound and the pass-count cap all run against
-        // `M'b`; the §H.1 de-scaling below re-anchors the magnitudes to
-        // the background `Mb` before reassembly. With no `RGN` `s = 0`
-        // and `mb_coded == mb`.
-        let s = roi_shift.get(*c as usize).copied().unwrap_or(0);
-        let mb_coded = mb.saturating_add(s);
-        // Implementation limit: tier-1 assembles magnitudes into a
-        // 31-bit `u32` lane (sign carried separately), so the §D.3 /
-        // §7.6 bit-plane weights `2^(M'b − 1 − P) … 2^0` must fit it.
-        // Equation E-2 admits `Mb` up to 37 (`εb = 31`, 7 guard bits)
-        // and an `RGN` shift stacks on top — a coded budget past the
-        // lane cannot be represented, so it is rejected cleanly here
-        // rather than overflowing the pass weights downstream.
-        if mb_coded > 31 {
-            return Err(Error::NotImplemented);
-        }
-        let p = acc.p.ok_or(Error::InvalidPacketHeader)?;
-        if p >= mb_coded {
-            return Err(Error::InvalidPacketHeader);
-        }
-        // The Table A.19 style byte resolved for this block's
-        // component (§A.6.2) — tier-1 dispatch is per component.
-        let style = comp_coding
-            .get(*c as usize)
-            .ok_or(Error::InvalidMarkerLength)?
-            .style;
-        // §D.3: at most 3 (M'b − P) − 2 passes fit above bit-plane 0.
-        // The HT path has its own §B.3 cap (Z_blk ≤ 3) and a different
-        // pass↔bit-plane relationship, so the Annex D cap does not
-        // apply; a MIXED block's lane is not known yet, so its cap is
-        // applied on the Annex D side of the dispatch below.
-        if !style.high_throughput && !style.mixed && acc.passes > 3 * (mb_coded - p) - 2 {
-            return Err(Error::InvalidPacketHeader);
-        }
-        // -- HTJ2K (T.814) HT code-block path --
-        // When the tile-component signals HT block coding (SPcod
-        // bit 6, or an HTONLY CAP), every code-block is an HT
-        // code-block (§A.4 HTONLY / HTDECLARED) and an HT tier-1
-        // failure is a stream error. In a §A.4 MIXED tile-component
-        // the lane resolves per block: a tier-2-pinned HT block still
-        // fails hard (driving the caller's depth-first re-walk), a
-        // pinned T.800 block skips straight to Annex D, and an
-        // unresolved block is arbitrated exactly as the §A.4 NOTE
-        // prescribes — "processing the code-block assuming it
-        // conforms to Annex B; failure of such processing indicates
-        // that the code-block might conform to" T.800 — with the
-        // Annex D lane as the fallback.
-        let mixed_ty = style
-            .mixed
-            .then(|| acc.mixed.unwrap_or(crate::packet::MixedBlockType::Unknown));
-        let try_ht = style.high_throughput
-            || matches!(
-                mixed_ty,
-                Some(crate::packet::MixedBlockType::Ht | crate::packet::MixedBlockType::Unknown)
-            );
-        let mut ht_failed = false;
-        if try_ht {
-            match ht_tier1_block(
-                acc,
-                p,
-                mb,
-                mb_coded,
-                s,
-                psb.orientation,
-                placement.width() as usize,
-                placement.height() as usize,
-            ) {
-                Ok(Some((block, nb_ht))) => {
-                    decoded.push(DecodedBlock {
-                        component: *c,
-                        r: *r,
-                        precinct: *k,
-                        sub_band: *sb,
-                        cbx: *cbx,
-                        cby: *cby,
-                        nb: nb_ht,
-                        block,
-                    });
-                    continue;
-                }
-                Ok(None) => {
-                    // Nothing decodable under the HT reading (only
-                    // placeholder passes / absent cleanup segments).
-                    // For a genuine HT block that is a valid
-                    // all-zero outcome; for an unresolved MIXED
-                    // block the T.800 reading of the same record is
-                    // a zero-byte contribution decoding to the same
-                    // all-zero block — skip either way.
-                    continue;
-                }
-                Err(e) => {
-                    if !matches!(mixed_ty, Some(crate::packet::MixedBlockType::Unknown)) {
-                        return Err(e);
-                    }
-                    // §A.4 NOTE: HT processing failed — the block
-                    // might conform to T.800. Fall through.
-                    ht_failed = true;
-                }
-            }
-        }
-        let _ = ht_failed;
-        // -- T.800 Annex D path --
-        // For a MIXED block the Annex D reading treats every
-        // accumulated contribution as one continuous §C.3 codeword
-        // segment (the §A.4-derived K(T.800) = 1 — no bypass, no
-        // per-pass termination), so the per-span records concatenate;
-        // and the §D.3 pass cap deferred above applies now.
-        let mixed_concat: Vec<AccumSegment>;
-        let segments: &[AccumSegment] = if mixed_ty.is_some() {
-            if acc.passes > 3 * (mb_coded - p) - 2 {
-                return Err(Error::InvalidPacketHeader);
-            }
-            let mut bytes = Vec::new();
-            for seg in &acc.segments {
-                bytes.extend_from_slice(&seg.bytes);
-            }
-            mixed_concat = vec![AccumSegment {
-                bytes,
-                passes: acc.passes,
-                is_raw: false,
-                start_pass: 0,
-            }];
-            &mixed_concat
-        } else {
-            &acc.segments
-        };
-        let mut block = CodeBlock::new(
-            psb.orientation,
-            placement.width() as usize,
-            placement.height() as usize,
-        );
-        let mut ctx = reset_contexts();
-        let mut seq = BitPlaneSequencer::new(mb_coded - 1 - p)
-            .with_segmentation_symbols(style.segmentation_symbols)
-            .with_vertically_causal_context(style.vertically_causal)
-            .with_reset_context_probabilities(style.reset_context_probabilities)
-            .with_termination_on_each_coding_pass(style.termination_on_each_coding_pass)
-            .with_selective_arithmetic_coding_bypass(style.selective_arithmetic_coding_bypass)
-            .with_predictable_termination(style.predictable_termination);
-        // Drive the §D.3 pass schedule across this code-block's §C.3
-        // codeword segments. Each AC segment opens a fresh MqDecoder (the
-        // MQ engine restarts per §C.3 at every termination boundary —
-        // §D.4.1 0xFF-fill is synthesised by `MqDecoder::new`), while
-        // the Annex D context array (`ctx`) persists across segments per
-        // §D.4 (unless the §C.3.6 reset bit is set, which the sequencer
-        // applies internally). The single-segment case is one iteration
-        // carrying every pass; the §D.4.2 per-pass case is one iteration
-        // per terminated pass; the §D.6 bypass case alternates AC and
-        // raw spans (each raw span opens a fresh RawBitReader instead).
-        let last_coded = segments.iter().rposition(|seg| seg.passes > 0);
-        for (si, seg) in segments.iter().enumerate() {
-            if seg.passes == 0 {
-                continue;
-            }
-            if seg.is_raw {
-                // §D.6 raw (lazy) span — the SP / MR passes read from a
-                // bit-stuffed stream. The MQ context array is untouched.
-                let mut raw = crate::t1::RawBitReader::new_with_d4_1_fill(&seg.bytes);
-                seq.decode_passes_raw(&mut block, &mut raw, seg.passes)?;
-            } else {
-                let mut decoder = crate::mq::MqDecoder::new(&seg.bytes);
-                match seq.decode_passes(&mut block, &mut decoder, &mut ctx, seg.passes) {
-                    Ok(_) => {}
-                    // §D.5 positions the segmentation symbol as error
-                    // *detection*. On a layer-limited decode the final
-                    // accumulated pass is a deliberate prefix cut whose
-                    // tail decisions may diverge under the §D.4.1 fill,
-                    // so a mismatch on the last coded segment is the
-                    // expected truncation artefact (§J.7 resilience:
-                    // keep the decoded passes), not stream corruption.
-                    // A full decode still surfaces it.
-                    Err(Error::SegmentationSymbolMismatch)
-                        if acc.layer_truncated && Some(si) == last_coded =>
-                    {
-                        break;
-                    }
-                    Err(e) => return Err(e),
-                }
-                // §D.4.2 predictable termination (Table A.19 bit 4)
-                // constrains the *encoder's* flush procedure only — the
-                // decode path is unchanged and the §D.4.1 synthesised
-                // 0xFF extension still applies ("Often at that point
-                // there are more symbols to be decoded. Therefore, the
-                // decoder shall extend the input bit stream … with 0xFF
-                // bytes"). Real predictable-termination codestreams
-                // routinely finish their final renormalisations inside
-                // that synthesised fill, so no landing-position check can
-                // be made without rejecting conforming streams; §J.7
-                // names the segmentation symbol (§D.5) as the in-stream
-                // error-detection mechanism instead.
-            }
-        }
-        // Record the §B.10.5 zero-MSB count so the reassembly bridge can
-        // recover the full per-coefficient §D.2.1 Nb(u, v) =
-        // P + decoded_bits(u, v). The tier-1 passes have already tracked
-        // each coefficient's decoded-bit count; under mid-bit-plane
-        // truncation those counts diverge (the §E.1.1.2 / E.1.2.1
-        // per-coefficient Nb), tightening the Equation E-6 / E-8 lift
-        // versus the per-block `nb` fallback below.
-        block.set_zero_bit_planes(p);
-        let nb = p + completed_bitplanes(acc.passes);
-        // §H.1 region-of-interest (Maxshift) decode: re-anchor every
-        // coefficient from the `M'b = Mb + s` coded budget back to the
-        // background `Mb` and rewrite the per-coefficient Nb(u, v). A
-        // no-op when `s == 0` (no `RGN` for this component).
-        block.apply_roi_maxshift(mb, s);
-        decoded.push(DecodedBlock {
-            component: *c,
-            r: *r,
-            precinct: *k,
-            sub_band: *sb,
-            cbx: *cbx,
-            cby: *cby,
-            nb,
-            block,
-        });
-    }
-
-    // -- Per-component: bridge → reassemble → §F.3.1 IDWT cascade --
+    // -- Per-component: tier-1 → immediate reconstruction → IDWT cascade --
     //
-    // Each component's reconstructed samples land in one of two lanes,
-    // keyed by its §A.6.2 wavelet kernel: the 5-3 lane (`i32`) or the
-    // 9-7 lane (`f64`, integerised later). `comp_lane[c]` records which
-    // lane the component's plane went into and its index within that
-    // lane, so a tile whose COC gave different components different
-    // kernels can be re-interleaved back into component order after the
-    // §G reconstruct (see below). When every component shares one kernel
-    // one lane is empty and `comp_lane` is the identity within the other.
+    // Packet replay above has collected every selected contribution before
+    // any block is decoded. BlockKey starts with the component, so consuming
+    // the sorted map one component at a time preserves the tier-1 block order
+    // without decoding blocks whose samples cannot yet be reconstructed.
+    // Completed blocks are scattered immediately into this component's
+    // coefficient surface. Only one Annex D work block survives between
+    // decodes; HT outputs remain temporary and are dropped after scatter.
+    // Compressed contributions for later components remain in the iterator.
+    //
+    // Each reconstructed plane lands in the lane for its resolved kernel.
+    // comp_lane restores component order after the Annex G transform even
+    // when COC overrides select different kernels for different components.
     let mut planes_5x3: Vec<Vec<i32>> = Vec::new();
-    let mut planes_9x7: Vec<Vec<f64>> = Vec::new();
+    let mut planes_9x7: Vec<Vec<f32>> = Vec::new();
     let mut comp_lane: Vec<(WaveletTransform, usize)> = Vec::with_capacity(levels_per_comp.len());
+    let mut accum = accum.into_iter().peekable();
     for (c, levels) in levels_per_comp.iter().enumerate() {
         let cc = comp_coding.get(c).ok_or(Error::InvalidMarkerLength)?;
-        // Reduced-resolution decode: truncate the synthesis cascade to
-        // the kept levels — the output is the resolution-level-`keep`
-        // reconstruction (§F.3.1 stopped early; ISO/IEC 15444-4
-        // §B.2.3). At `discard_levels == 0` this is the full slice and
-        // the level-`NL` (tile-component) extent.
+        // Keep exactly the levels selected for synthesis. Contributions
+        // above this range remain length-accounted but are not decoded.
         let keep = (cc.n_l - discard_levels) as usize;
         let levels = &levels[..=keep];
+        let mut surface = match cc.transform {
+            WaveletTransform::Reversible5x3 => {
+                ComponentSurface::Reversible(CoefficientSurface::new(levels)?)
+            }
+            WaveletTransform::Irreversible9x7 => {
+                ComponentSurface::Irreversible(CoefficientSurface::new(levels)?)
+            }
+            WaveletTransform::Reserved(_) => return Err(Error::NotImplemented),
+        };
+        let mut work_block: Option<CodeBlock> = None;
+        while let Some((key, acc)) = accum.next_if(|(key, _)| usize::from(key.0) == c) {
+            let (c, r, k, sb, cbx, cby) = &key;
+            if acc.passes == 0 {
+                continue;
+            }
+            // Reduced-resolution decode: blocks above the kept resolution
+            // level contribute nothing to the truncated synthesis — skip
+            // their (already length-accounted) tier-1 work entirely.
+            {
+                let keep = comp_coding
+                    .get(*c as usize)
+                    .ok_or(Error::InvalidMarkerLength)?
+                    .n_l
+                    - discard_levels;
+                if *r > keep {
+                    continue;
+                }
+            }
+            let geom = precinct_geom
+                .get(&(*c, *r, *k))
+                .ok_or(Error::InvalidPacketHeader)?;
+            let psb = geom
+                .sub_bands
+                .get(*sb as usize)
+                .ok_or(Error::InvalidPacketHeader)?;
+            if *cbx >= psb.grid_wide || *cby >= psb.grid_high {
+                return Err(Error::InvalidPacketHeader);
+            }
+            let placement =
+                psb.code_blocks[(*cby as usize) * (psb.grid_wide as usize) + *cbx as usize];
+            // Per-level band order matches the §B.9 packet sub-band order
+            // ([LL] at r = 0, [HL, LH, HH] at r ≥ 1), so the packet's
+            // sub-band index addresses the quant table directly.
+            let quant = quant_per_comp[*c as usize][*r as usize]
+                .get(*sb as usize)
+                .ok_or(Error::InvalidPacketHeader)?;
+            let mb = quant.mb;
+            // §H.1 / §H.2: under an `RGN` Maxshift the encoder shifts ROI
+            // coefficients up into the top `s` bit-planes, so the coded
+            // bit budget is `M'b = Mb + s`. The tier-1 schedule, the
+            // zero-bit-plane bound and the pass-count cap all run against
+            // `M'b`; the §H.1 de-scaling below re-anchors the magnitudes to
+            // the background `Mb` before reassembly. With no `RGN` `s = 0`
+            // and `mb_coded == mb`.
+            let s = roi_shift.get(*c as usize).copied().unwrap_or(0);
+            let mb_coded = mb.saturating_add(s);
+            // Implementation limit: tier-1 assembles magnitudes into a
+            // 31-bit `u32` lane (sign carried separately), so the §D.3 /
+            // §7.6 bit-plane weights `2^(M'b − 1 − P) … 2^0` must fit it.
+            // Equation E-2 admits `Mb` up to 37 (`εb = 31`, 7 guard bits)
+            // and an `RGN` shift stacks on top — a coded budget past the
+            // lane cannot be represented, so it is rejected cleanly here
+            // rather than overflowing the pass weights downstream.
+            if mb_coded > 31 {
+                return Err(Error::NotImplemented);
+            }
+            let p = acc.p.ok_or(Error::InvalidPacketHeader)?;
+            if p >= mb_coded {
+                return Err(Error::InvalidPacketHeader);
+            }
+            // The Table A.19 style byte resolved for this block's
+            // component (§A.6.2) — tier-1 dispatch is per component.
+            let style = comp_coding
+                .get(*c as usize)
+                .ok_or(Error::InvalidMarkerLength)?
+                .style;
+            // §D.3: at most 3 (M'b − P) − 2 passes fit above bit-plane 0.
+            // The HT path has its own §B.3 cap (Z_blk ≤ 3) and a different
+            // pass↔bit-plane relationship, so the Annex D cap does not
+            // apply; a MIXED block's lane is not known yet, so its cap is
+            // applied on the Annex D side of the dispatch below.
+            if !style.high_throughput && !style.mixed && acc.passes > 3 * (mb_coded - p) - 2 {
+                return Err(Error::InvalidPacketHeader);
+            }
+            // -- HTJ2K (T.814) HT code-block path --
+            // When the tile-component signals HT block coding (SPcod
+            // bit 6, or an HTONLY CAP), every code-block is an HT
+            // code-block (§A.4 HTONLY / HTDECLARED) and an HT tier-1
+            // failure is a stream error. In a §A.4 MIXED tile-component
+            // the lane resolves per block: a tier-2-pinned HT block still
+            // fails hard (driving the caller's depth-first re-walk), a
+            // pinned T.800 block skips straight to Annex D, and an
+            // unresolved block is arbitrated exactly as the §A.4 NOTE
+            // prescribes — "processing the code-block assuming it
+            // conforms to Annex B; failure of such processing indicates
+            // that the code-block might conform to" T.800 — with the
+            // Annex D lane as the fallback.
+            let mixed_ty = style
+                .mixed
+                .then(|| acc.mixed.unwrap_or(crate::packet::MixedBlockType::Unknown));
+            let try_ht = style.high_throughput
+                || matches!(
+                    mixed_ty,
+                    Some(
+                        crate::packet::MixedBlockType::Ht | crate::packet::MixedBlockType::Unknown
+                    )
+                );
+            let mut ht_failed = false;
+            if try_ht {
+                match ht_tier1_block(
+                    &acc,
+                    p,
+                    mb,
+                    mb_coded,
+                    s,
+                    psb.orientation,
+                    placement.width() as usize,
+                    placement.height() as usize,
+                ) {
+                    Ok(Some((block, nb_ht))) => {
+                        surface.scatter(
+                            *r,
+                            *sb,
+                            CodedCodeBlock {
+                                placement,
+                                coefficients: &block,
+                                nb: nb_ht,
+                            },
+                            quant,
+                        )?;
+                        continue;
+                    }
+                    Ok(None) => {
+                        // Nothing decodable under the HT reading (only
+                        // placeholder passes / absent cleanup segments).
+                        // For a genuine HT block that is a valid
+                        // all-zero outcome; for an unresolved MIXED
+                        // block the T.800 reading of the same record is
+                        // a zero-byte contribution decoding to the same
+                        // all-zero block — skip either way.
+                        continue;
+                    }
+                    Err(e) => {
+                        if !matches!(mixed_ty, Some(crate::packet::MixedBlockType::Unknown)) {
+                            return Err(e);
+                        }
+                        // §A.4 NOTE: HT processing failed — the block
+                        // might conform to T.800. Fall through.
+                        ht_failed = true;
+                    }
+                }
+            }
+            let _ = ht_failed;
+            // -- T.800 Annex D path --
+            // For a MIXED block the Annex D reading treats every
+            // accumulated contribution as one continuous §C.3 codeword
+            // segment (the §A.4-derived K(T.800) = 1 — no bypass, no
+            // per-pass termination), so the per-span records concatenate;
+            // and the §D.3 pass cap deferred above applies now.
+            let mixed_concat: Vec<AccumSegment>;
+            let segments: &[AccumSegment] = if mixed_ty.is_some() {
+                if acc.passes > 3 * (mb_coded - p) - 2 {
+                    return Err(Error::InvalidPacketHeader);
+                }
+                let mut bytes = Vec::new();
+                for seg in &acc.segments {
+                    bytes.extend_from_slice(&seg.bytes);
+                }
+                mixed_concat = vec![AccumSegment {
+                    bytes,
+                    passes: acc.passes,
+                    is_raw: false,
+                    start_pass: 0,
+                }];
+                &mixed_concat
+            } else {
+                &acc.segments
+            };
+            let block = match &mut work_block {
+                Some(block) => {
+                    block.reset_for_decode(
+                        psb.orientation,
+                        placement.width() as usize,
+                        placement.height() as usize,
+                    );
+                    block
+                }
+                empty @ None => empty.insert(CodeBlock::new(
+                    psb.orientation,
+                    placement.width() as usize,
+                    placement.height() as usize,
+                )),
+            };
+            let mut ctx = reset_contexts();
+            let mut seq = BitPlaneSequencer::new(mb_coded - 1 - p)
+                .with_segmentation_symbols(style.segmentation_symbols)
+                .with_vertically_causal_context(style.vertically_causal)
+                .with_reset_context_probabilities(style.reset_context_probabilities)
+                .with_termination_on_each_coding_pass(style.termination_on_each_coding_pass)
+                .with_selective_arithmetic_coding_bypass(style.selective_arithmetic_coding_bypass)
+                .with_predictable_termination(style.predictable_termination);
+            // Drive the §D.3 pass schedule across this code-block's §C.3
+            // codeword segments. Each AC segment opens a fresh MqDecoder (the
+            // MQ engine restarts per §C.3 at every termination boundary —
+            // §D.4.1 0xFF-fill is synthesised by `MqDecoder::new`), while
+            // the Annex D context array (`ctx`) persists across segments per
+            // §D.4 (unless the §C.3.6 reset bit is set, which the sequencer
+            // applies internally). The single-segment case is one iteration
+            // carrying every pass; the §D.4.2 per-pass case is one iteration
+            // per terminated pass; the §D.6 bypass case alternates AC and
+            // raw spans (each raw span opens a fresh RawBitReader instead).
+            let last_coded = segments.iter().rposition(|seg| seg.passes > 0);
+            for (si, seg) in segments.iter().enumerate() {
+                if seg.passes == 0 {
+                    continue;
+                }
+                if seg.is_raw {
+                    // §D.6 raw (lazy) span — the SP / MR passes read from a
+                    // bit-stuffed stream. The MQ context array is untouched.
+                    let mut raw = crate::t1::RawBitReader::new_with_d4_1_fill(&seg.bytes);
+                    if !style.high_throughput && !style.mixed {
+                        seq.decode_passes_raw_validated(block, &mut raw, seg.passes, mb_coded - p)?;
+                    } else {
+                        seq.decode_passes_raw(block, &mut raw, seg.passes)?;
+                    }
+                } else {
+                    let mut decoder = crate::mq::MqDecoder::new(&seg.bytes);
+                    // The guards above bound this fresh/reset block's entire
+                    // Annex D schedule to at most 31 magnitude bits. Keep the
+                    // original budget across every MQ/RAW segment; HT/MIXED
+                    // dispatch retains the general public count semantics.
+                    let decoded = if !style.high_throughput && !style.mixed {
+                        seq.decode_passes_validated(
+                            block,
+                            &mut decoder,
+                            &mut ctx,
+                            seg.passes,
+                            mb_coded - p,
+                        )
+                    } else {
+                        seq.decode_passes(block, &mut decoder, &mut ctx, seg.passes)
+                    };
+                    match decoded {
+                        Ok(_) => {}
+                        // §D.5 positions the segmentation symbol as error
+                        // *detection*. On a layer-limited decode the final
+                        // accumulated pass is a deliberate prefix cut whose
+                        // tail decisions may diverge under the §D.4.1 fill,
+                        // so a mismatch on the last coded segment is the
+                        // expected truncation artefact (§J.7 resilience:
+                        // keep the decoded passes), not stream corruption.
+                        // A full decode still surfaces it.
+                        Err(Error::SegmentationSymbolMismatch)
+                            if acc.layer_truncated && Some(si) == last_coded =>
+                        {
+                            break;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                    // §D.4.2 predictable termination (Table A.19 bit 4)
+                    // constrains the *encoder's* flush procedure only — the
+                    // decode path is unchanged and the §D.4.1 synthesised
+                    // 0xFF extension still applies ("Often at that point
+                    // there are more symbols to be decoded. Therefore, the
+                    // decoder shall extend the input bit stream … with 0xFF
+                    // bytes"). Real predictable-termination codestreams
+                    // routinely finish their final renormalisations inside
+                    // that synthesised fill, so no landing-position check can
+                    // be made without rejecting conforming streams; §J.7
+                    // names the segmentation symbol (§D.5) as the in-stream
+                    // error-detection mechanism instead.
+                }
+            }
+            // Record the §B.10.5 zero-MSB count so the reassembly bridge can
+            // recover the full per-coefficient §D.2.1 Nb(u, v) =
+            // P + decoded_bits(u, v). The tier-1 passes have already tracked
+            // each coefficient's decoded-bit count; under mid-bit-plane
+            // truncation those counts diverge (the §E.1.1.2 / E.1.2.1
+            // per-coefficient Nb), tightening the Equation E-6 / E-8 lift
+            // versus the per-block `nb` fallback below.
+            block.set_zero_bit_planes(p);
+            let nb = p + completed_bitplanes(acc.passes);
+            // §H.1 region-of-interest (Maxshift) decode: re-anchor every
+            // coefficient from the `M'b = Mb + s` coded budget back to the
+            // background `Mb` and rewrite the per-coefficient Nb(u, v). A
+            // no-op when `s == 0` (no `RGN` for this component).
+            block.apply_roi_maxshift(mb, s);
+            surface.scatter(
+                *r,
+                *sb,
+                CodedCodeBlock {
+                    placement,
+                    coefficients: block,
+                    nb,
+                },
+                quant,
+            )?;
+        }
+
+        // No entropy state is needed during IDWT or by later components.
+        drop(work_block);
         let out_level = &levels[keep];
         let tc = &tile.components[c];
         let (tw, th) = if discard_levels == 0 {
@@ -2403,97 +2433,47 @@ fn decode_tile_from_plan(
             continue;
         }
 
-        // Group this component's decoded blocks by (level, precinct).
-        // The entry maps are kept alive alongside the per-level
-        // sources because the bridge's lifetime parameter unifies the
-        // entry-slice borrow with the CodeBlock borrow.
-        let entries_store: Vec<BTreeMap<u32, Vec<WalkerBlockEntry<'_>>>> = levels
-            .iter()
-            .map(|level| {
-                let mut by_precinct: BTreeMap<u32, Vec<WalkerBlockEntry<'_>>> = BTreeMap::new();
-                for b in decoded
-                    .iter()
-                    .filter(|b| b.component == c as u16 && b.r == level.r)
-                {
-                    by_precinct
-                        .entry(b.precinct)
-                        .or_default()
-                        .push(WalkerBlockEntry {
-                            sub_band: b.sub_band,
-                            cbx: b.cbx,
-                            cby: b.cby,
-                            coefficients: &b.block,
-                            nb: b.nb,
-                        });
-                }
-                by_precinct
-            })
-            .collect();
-        let mut per_level_sources = Vec::with_capacity(levels.len());
-        for (level, entries_by_precinct) in levels.iter().zip(entries_store.iter()) {
-            let precinct_blocks: Vec<PrecinctBlocks<'_>> = entries_by_precinct
-                .iter()
-                .map(|(k, entries)| {
-                    precinct_geom
-                        .get(&(c as u16, level.r, *k))
-                        .map(|geometry| PrecinctBlocks {
-                            geometry,
-                            entries: entries.as_slice(),
-                        })
-                        .ok_or(Error::InvalidPacketHeader)
-                })
-                .collect::<Result<_, _>>()?;
-            per_level_sources.push(WalkerBlockSource::from_precincts(&precinct_blocks)?);
-        }
-        let source = LevelKeyedSource {
-            n_l: cc.n_l,
-            per_level: per_level_sources,
-        };
-
         // §A.6.2 / §A.6.5: a COC may override the wavelet kernel and a
         // QCC the quantisation style per component; Table A.28 still
         // requires each component's quantisation style to match the
         // kernel it is reconstructed with.
         let comp_style = comp_quant[c].style;
-        match cc.transform {
-            WaveletTransform::Reversible5x3 => {
+        match surface {
+            ComponentSurface::Reversible(surface) => {
                 if comp_style != QuantizationStyle::None {
                     // Table A.28: the reversible kernel pairs with the
                     // "no quantisation" style only.
                     return Err(Error::NotImplemented);
                 }
-                let mb_per_level: Vec<Vec<u32>> = quant_per_comp[c]
-                    .iter()
-                    .take(levels.len())
-                    .map(|bands| bands.iter().map(|b| b.mb).collect())
-                    .collect();
-                let grid = idwt_5x3(levels, &source, &mb_per_level, 0.5)?;
+                let grid = surface.into_idwt_5x3()?;
                 if grid.width != tw || grid.height != th {
                     return Err(Error::InvalidMarkerLength);
                 }
                 comp_lane.push((WaveletTransform::Reversible5x3, planes_5x3.len()));
                 planes_5x3.push(grid.data);
             }
-            WaveletTransform::Irreversible9x7 => {
+            ComponentSurface::Irreversible(surface) => {
                 if comp_style == QuantizationStyle::None {
                     // Table A.28 pairs the 9-7 kernel with scalar
                     // quantisation (derived or expounded).
                     return Err(Error::NotImplemented);
                 }
-                let quant_per_level: Vec<Vec<SubBandQuantization>> = quant_per_comp[c]
-                    .iter()
-                    .take(levels.len())
-                    .map(|bands| bands.iter().map(|b| b.quant).collect())
-                    .collect();
-                let grid = idwt_9x7(levels, &source, &quant_per_level, 0.5)?;
+                let grid = surface.into_idwt_9x7()?;
                 if grid.width != tw || grid.height != th {
                     return Err(Error::InvalidMarkerLength);
                 }
                 comp_lane.push((WaveletTransform::Irreversible9x7, planes_9x7.len()));
-                planes_9x7.push(grid.data);
+                // Annex G consumes f32. Convert each completed plane before
+                // decoding the next component so no finished f64 plane is retained.
+                planes_9x7.push(grid.data.into_iter().map(|v| v as f32).collect());
             }
-            WaveletTransform::Reserved(_) => return Err(Error::NotImplemented),
         }
+    }
+
+    // Every accumulated key must belong to a planned component. Reject an
+    // inconsistent plan rather than silently discarding any remaining blocks.
+    if accum.next().is_some() {
+        return Err(Error::InvalidPacketHeader);
     }
 
     // -- Annex G: inverse MCT + DC level shift + clamp, per tile --
@@ -2568,8 +2548,8 @@ fn decode_tile_from_plan(
         reconstruct_tile_components_5x3_multi(&mut refs, &desc_5x3, mode)?;
     }
 
-    // Reconstruct the 9-7 lane (`f64` → `f32` → `i32`) when populated.
-    let outputs_9x7: Vec<Vec<i32>> = if planes_9x7.is_empty() {
+    // Reconstruct the 9-7 lane (`f32` → `i32`) when populated.
+    let mut outputs_9x7: Vec<Vec<i32>> = if planes_9x7.is_empty() {
         Vec::new()
     } else {
         let mode = if mixed_kernel {
@@ -2581,11 +2561,8 @@ fn decode_tile_from_plan(
                 _ => return Err(Error::NotImplemented),
             }
         };
-        let mut comps_f32: Vec<Vec<f32>> = planes_9x7
-            .iter()
-            .map(|p| p.iter().map(|&v| v as f32).collect())
-            .collect();
-        let mut outputs: Vec<Vec<i32>> = planes_9x7.iter().map(|p| vec![0i32; p.len()]).collect();
+        let mut comps_f32: Vec<Vec<f32>> = planes_9x7;
+        let mut outputs: Vec<Vec<i32>> = comps_f32.iter().map(|p| vec![0i32; p.len()]).collect();
         let mut comp_refs: Vec<&mut [f32]> =
             comps_f32.iter_mut().map(|v| v.as_mut_slice()).collect();
         let mut out_refs: Vec<&mut [i32]> = outputs.iter_mut().map(|v| v.as_mut_slice()).collect();
@@ -2605,8 +2582,8 @@ fn decode_tile_from_plan(
                 result.push(std::mem::take(&mut planes_5x3[idx]));
             }
             WaveletTransform::Irreversible9x7 => {
-                let out = outputs_9x7.get(idx).ok_or(Error::InvalidMarkerLength)?;
-                result.push(out.clone());
+                let out = outputs_9x7.get_mut(idx).ok_or(Error::InvalidMarkerLength)?;
+                result.push(std::mem::take(out));
             }
             WaveletTransform::Reserved(_) => return Err(Error::NotImplemented),
         }
@@ -3708,6 +3685,68 @@ mod tests {
     #[test]
     fn empty_input_is_rejected() {
         assert!(decode_j2k(&[]).is_err());
+    }
+
+    #[test]
+    fn exact_32_bit_coded_budget_is_rejected_before_validated_tier1() {
+        let pixels = [255u8];
+        let mut bytes = crate::encode::encode_j2k_lossless(&[&pixels], 1, 1, 0, (2, 2)).unwrap();
+        let qcd = bytes.windows(2).position(|w| w == [0xff, 0x5c]).unwrap();
+        // Equation E-2: Mb = guard + epsilon - 1 = 2 + 31 - 1 = 32.
+        bytes[qcd + 4] = 2 << 5;
+        bytes[qcd + 5] = 31 << 3;
+        assert!(matches!(decode_j2k(&bytes), Err(Error::NotImplemented)));
+    }
+
+    #[test]
+    fn replayed_annex_d_pass_cap_plus_one_is_rejected_before_tier1() {
+        let pixels = [255u8];
+        let bytes = crate::encode::encode_j2k_lossless(&[&pixels], 1, 1, 0, (2, 2)).unwrap();
+        let cs = crate::parse_codestream(&bytes).unwrap();
+        let (params, coding, quant) = main_defaults(1, &cs.header.cod, &cs.header.qcd);
+        let plan = build_tile_packet_plan(&cs.header.siz, &params, &coding, &[], 0).unwrap();
+        let tp = &cs.tile_parts[0];
+        let body = &bytes[tp.body_offset..tp.body_offset + tp.body_len];
+        let mut headers =
+            walk_tile_packet_headers(body, &plan.packets, params.sop_eph, None).unwrap();
+        let run = |headers: &[(crate::packet::PacketHeader, usize)]| {
+            decode_tile_from_plan(
+                &cs.header.siz,
+                &params,
+                &coding,
+                &quant,
+                &[0],
+                0,
+                body,
+                &plan.levels_per_comp,
+                &plan.precinct_geom,
+                &plan.descriptors,
+                headers,
+                0,
+                u16::MAX,
+            )
+        };
+        assert_eq!(run(&headers).unwrap(), vec![vec![255]]);
+        let mb = resolve_band_quant(
+            &plan.levels_per_comp[0],
+            quant[0].style,
+            quant[0].spqcd,
+            quant[0].guard_bits,
+            8,
+            0,
+        )
+        .unwrap()[0][0]
+            .mb;
+        let contribution = headers
+            .iter_mut()
+            .flat_map(|(header, _)| header.contributions.iter_mut())
+            .find(|contribution| contribution.included && contribution.coding_passes != 0)
+            .unwrap();
+        let p = contribution.zero_bit_planes.unwrap();
+        // Exercise the actual accumulator/driver, retaining the valid packet
+        // geometry and body bounds but replaying exactly one excess pass.
+        contribution.coding_passes = 3 * (mb - p) - 1;
+        assert!(matches!(run(&headers), Err(Error::InvalidPacketHeader)));
     }
 
     // `style_code` is the low-5-bit Table A.28 style; `None` = 0, so the
