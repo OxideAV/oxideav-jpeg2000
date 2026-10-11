@@ -893,6 +893,19 @@ impl CodeBlock {
 
     #[inline]
     fn increment_decoded_bits(&mut self, idx: usize) {
+        self.increment_decoded_bits_inner::<false>(idx);
+    }
+
+    #[inline]
+    fn increment_decoded_bits_inner<const VALIDATED: bool>(&mut self, idx: usize) {
+        if VALIDATED {
+            // Only a fresh block driven by the validated Annex D schedule
+            // reaches this path: at most 31 magnitude bits per sample.
+            debug_assert!(self.wide_decoded_bits.is_none());
+            debug_assert!(self.coding_state[idx] >> COUNT_SHIFT < 31);
+            self.coding_state[idx] += 1 << COUNT_SHIFT;
+            return;
+        }
         if let Some(bits) = &mut self.wide_decoded_bits {
             bits[idx] += 1;
         } else if self.coding_state[idx] & COUNT_MASK != COUNT_MASK {
@@ -1057,6 +1070,15 @@ impl CodeBlock {
         decoder: &mut MqDecoder<'_>,
         ctx: &mut [MqContext; NUM_CONTEXTS],
     ) -> Result<usize, Error> {
+        self.significance_propagation_pass_inner::<false>(bitplane, decoder, ctx)
+    }
+
+    fn significance_propagation_pass_inner<const VALIDATED: bool>(
+        &mut self,
+        bitplane: u32,
+        decoder: &mut MqDecoder<'_>,
+        ctx: &mut [MqContext; NUM_CONTEXTS],
+    ) -> Result<usize, Error> {
         self.ensure_coding_state();
         let contexts = significance_contexts(self.orientation);
         // §D.3.3: clear the "just became significant in the last SP
@@ -1100,7 +1122,7 @@ impl CodeBlock {
                     // §D.2.1: a magnitude MSB was decoded for this
                     // coefficient on this bit-plane (whether it read 0
                     // or 1) — count it toward Nb(u, v).
-                    self.increment_decoded_bits(u + v * self.width);
+                    self.increment_decoded_bits_inner::<VALIDATED>(u + v * self.width);
                     if bit == 1 {
                         // Newly significant — set σ, accumulate the
                         // bit-plane's positional value into magnitude,
@@ -1166,6 +1188,15 @@ impl CodeBlock {
         decoder: &mut MqDecoder<'_>,
         ctx: &mut [MqContext; NUM_CONTEXTS],
     ) -> Result<usize, Error> {
+        self.magnitude_refinement_pass_inner::<false>(bitplane, decoder, ctx)
+    }
+
+    fn magnitude_refinement_pass_inner<const VALIDATED: bool>(
+        &mut self,
+        bitplane: u32,
+        decoder: &mut MqDecoder<'_>,
+        ctx: &mut [MqContext; NUM_CONTEXTS],
+    ) -> Result<usize, Error> {
         self.ensure_coding_state();
         let weight: u32 = 1u32 << bitplane;
         let mut refined = 0usize;
@@ -1204,7 +1235,7 @@ impl CodeBlock {
                     self.set_coefficient_at(idx, updated);
                     // §D.2.1: one refinement (magnitude) bit decoded for
                     // this already-significant coefficient on this plane.
-                    self.increment_decoded_bits(idx);
+                    self.increment_decoded_bits_inner::<VALIDATED>(idx);
                     refined += 1;
                 }
             }
@@ -1263,6 +1294,15 @@ impl CodeBlock {
         decoder: &mut MqDecoder<'_>,
         ctx: &mut [MqContext; NUM_CONTEXTS],
     ) -> Result<usize, Error> {
+        self.cleanup_pass_inner::<false>(bitplane, decoder, ctx)
+    }
+
+    fn cleanup_pass_inner<const VALIDATED: bool>(
+        &mut self,
+        bitplane: u32,
+        decoder: &mut MqDecoder<'_>,
+        ctx: &mut [MqContext; NUM_CONTEXTS],
+    ) -> Result<usize, Error> {
         self.ensure_coding_state();
         let contexts = significance_contexts(self.orientation);
         let weight: u32 = 1u32 << bitplane;
@@ -1285,7 +1325,9 @@ impl CodeBlock {
                         // of the column's four coefficients on this
                         // bit-plane (§D.2.1: count each toward Nb).
                         for dv in 0..4 {
-                            self.increment_decoded_bits(u + (v0 + dv) * self.width);
+                            self.increment_decoded_bits_inner::<VALIDATED>(
+                                u + (v0 + dv) * self.width,
+                            );
                         }
                         continue;
                     }
@@ -1307,7 +1349,7 @@ impl CodeBlock {
                     // bit-plane. (Coefficients below `first` are coded by
                     // the normal loop below, which counts them there.)
                     for dv in 0..=first {
-                        self.increment_decoded_bits(u + (v0 + dv) * self.width);
+                        self.increment_decoded_bits_inner::<VALIDATED>(u + (v0 + dv) * self.width);
                     }
                     start_dv = first + 1;
                 }
@@ -1333,7 +1375,7 @@ impl CodeBlock {
                     let cx = &mut ctx[SP_CTX_OFFSET + label as usize];
                     // §D.2.1: this leftover coefficient is coded (a 0 or
                     // 1 magnitude bit) by the cleanup pass on this plane.
-                    self.increment_decoded_bits(u + v * self.width);
+                    self.increment_decoded_bits_inner::<VALIDATED>(u + v * self.width);
                     if decoder.decode(cx) == 1 {
                         self.make_significant_with_sign(u, v, weight, v0, stripe_h, decoder, ctx);
                         newly += 1;
@@ -1663,6 +1705,14 @@ impl CodeBlock {
         bitplane: u32,
         raw: &mut RawBitReader<'_>,
     ) -> Result<usize, Error> {
+        self.significance_propagation_pass_raw_inner::<false>(bitplane, raw)
+    }
+
+    fn significance_propagation_pass_raw_inner<const VALIDATED: bool>(
+        &mut self,
+        bitplane: u32,
+        raw: &mut RawBitReader<'_>,
+    ) -> Result<usize, Error> {
         self.ensure_coding_state();
         // §D.3.3: clear the "just became significant in the last SP
         // pass" carry at the start of every new SP pass; the §D.6 raw
@@ -1695,7 +1745,7 @@ impl CodeBlock {
                     // §D.2.1: one magnitude MSB decoded for this
                     // coefficient on this bit-plane — count toward
                     // Nb(u, v).
-                    self.increment_decoded_bits(u + v * self.width);
+                    self.increment_decoded_bits_inner::<VALIDATED>(u + v * self.width);
                     if bit == 1 {
                         // §D.6 Equation D-2: signbit = raw_value (no
                         // XOR-with-XORbit redirection).
@@ -1739,6 +1789,14 @@ impl CodeBlock {
         bitplane: u32,
         raw: &mut RawBitReader<'_>,
     ) -> Result<usize, Error> {
+        self.magnitude_refinement_pass_raw_inner::<false>(bitplane, raw)
+    }
+
+    fn magnitude_refinement_pass_raw_inner<const VALIDATED: bool>(
+        &mut self,
+        bitplane: u32,
+        raw: &mut RawBitReader<'_>,
+    ) -> Result<usize, Error> {
         let weight: u32 = 1u32 << bitplane;
         let mut refined = 0usize;
 
@@ -1762,7 +1820,7 @@ impl CodeBlock {
                     self.set_coefficient_at(idx, updated);
                     // §D.2.1: one refinement (magnitude) bit decoded for
                     // this already-significant coefficient on this plane.
-                    self.increment_decoded_bits(idx);
+                    self.increment_decoded_bits_inner::<VALIDATED>(idx);
                     refined += 1;
                 }
             }
@@ -3014,6 +3072,64 @@ impl BitPlaneSequencer {
         ctx: &mut [MqContext; NUM_CONTEXTS],
         passes: u32,
     ) -> Result<usize, Error> {
+        self.decode_passes_inner::<false>(block, decoder, ctx, passes)
+    }
+
+    /// Decode one MQ span of a fresh/reset Annex D block whose complete
+    /// schedule was validated by the codestream driver. `coded_bitplanes`
+    /// is the original Mb + ROI shift - P budget, unchanged across spans.
+    /// The caller must stop after any error and must not invoke public passes
+    /// or change block/sequence state between these spans. P and ROI are
+    /// applied only after the final span. HT/MIXED blocks use the public path.
+    pub(crate) fn decode_passes_validated(
+        &mut self,
+        block: &mut CodeBlock,
+        decoder: &mut MqDecoder<'_>,
+        ctx: &mut [MqContext; NUM_CONTEXTS],
+        passes: u32,
+        coded_bitplanes: u32,
+    ) -> Result<usize, Error> {
+        self.debug_assert_validated_span(block, passes, coded_bitplanes);
+        self.decode_passes_inner::<true>(block, decoder, ctx, passes)
+    }
+
+    #[inline]
+    fn debug_assert_validated_span(&self, block: &CodeBlock, passes: u32, coded_bitplanes: u32) {
+        debug_assert!((1..=31).contains(&coded_bitplanes));
+        debug_assert!(self.passes_decoded <= 91 && passes <= 91);
+        debug_assert!(self.passes_decoded + passes <= 3 * coded_bitplanes - 2);
+        debug_assert_eq!(
+            self.current_bitplane,
+            (coded_bitplanes - 1).saturating_sub((self.passes_decoded + 2) / 3)
+        );
+        debug_assert_eq!(
+            self.next_pass,
+            match self.passes_decoded % 3 {
+                0 => Pass::Cleanup,
+                1 => Pass::Sp,
+                _ => Pass::Mr,
+            }
+        );
+        debug_assert!(block.coding_state_ready);
+        debug_assert!(block.wide_decoded_bits.is_none() && block.roi_nb.is_none());
+        debug_assert_eq!(block.zero_bit_planes, 0);
+        debug_assert!(block
+            .coding_state
+            .iter()
+            .all(|s| s >> COUNT_SHIFT <= coded_bitplanes));
+        if cfg!(debug_assertions) && self.passes_decoded == 0 {
+            debug_assert!(block.magnitudes.iter().all(|&m| m == 0));
+            debug_assert!(block.coding_state.iter().all(|&s| s == 0));
+        }
+    }
+
+    fn decode_passes_inner<const VALIDATED: bool>(
+        &mut self,
+        block: &mut CodeBlock,
+        decoder: &mut MqDecoder<'_>,
+        ctx: &mut [MqContext; NUM_CONTEXTS],
+        passes: u32,
+    ) -> Result<usize, Error> {
         // Push the sequencer's §D.7 vertically-causal toggle onto the
         // block before any pass runs. The block is the owner of the
         // neighbour-read clip and the sequencer is the owner of the
@@ -3024,7 +3140,7 @@ impl BitPlaneSequencer {
             let bitplane = self.current_bitplane;
             let n = match self.next_pass {
                 Pass::Cleanup => {
-                    let n = block.cleanup_pass(bitplane, decoder, ctx)?;
+                    let n = block.cleanup_pass_inner::<VALIDATED>(bitplane, decoder, ctx)?;
                     // §D.5: when the COD / COC Table A.19 flag is set
                     // the encoder appended the 4-bit symbol `1010` at
                     // the end of every cleanup pass (UNIFORM context).
@@ -3045,12 +3161,14 @@ impl BitPlaneSequencer {
                     n
                 }
                 Pass::Sp => {
-                    let n = block.significance_propagation_pass(bitplane, decoder, ctx)?;
+                    let n = block
+                        .significance_propagation_pass_inner::<VALIDATED>(bitplane, decoder, ctx)?;
                     self.next_pass = Pass::Mr;
                     n
                 }
                 Pass::Mr => {
-                    let n = block.magnitude_refinement_pass(bitplane, decoder, ctx)?;
+                    let n = block
+                        .magnitude_refinement_pass_inner::<VALIDATED>(bitplane, decoder, ctx)?;
                     self.next_pass = Pass::Cleanup;
                     n
                 }
@@ -3100,18 +3218,42 @@ impl BitPlaneSequencer {
         raw: &mut RawBitReader<'_>,
         passes: u32,
     ) -> Result<usize, Error> {
+        self.decode_passes_raw_inner::<false>(block, raw, passes)
+    }
+
+    /// RAW counterpart of `decode_passes_validated`, with the same fresh
+    /// block, total pass-budget and no-resume-after-error contract.
+    pub(crate) fn decode_passes_raw_validated(
+        &mut self,
+        block: &mut CodeBlock,
+        raw: &mut RawBitReader<'_>,
+        passes: u32,
+        coded_bitplanes: u32,
+    ) -> Result<usize, Error> {
+        self.debug_assert_validated_span(block, passes, coded_bitplanes);
+        self.decode_passes_raw_inner::<true>(block, raw, passes)
+    }
+
+    fn decode_passes_raw_inner<const VALIDATED: bool>(
+        &mut self,
+        block: &mut CodeBlock,
+        raw: &mut RawBitReader<'_>,
+        passes: u32,
+    ) -> Result<usize, Error> {
         block.vertically_causal = self.vertically_causal_context;
         let mut total = 0usize;
         for _ in 0..passes {
             let bitplane = self.current_bitplane;
             let n = match self.next_pass {
                 Pass::Sp => {
-                    let n = block.significance_propagation_pass_raw(bitplane, raw)?;
+                    let n = block
+                        .significance_propagation_pass_raw_inner::<VALIDATED>(bitplane, raw)?;
                     self.next_pass = Pass::Mr;
                     n
                 }
                 Pass::Mr => {
-                    let n = block.magnitude_refinement_pass_raw(bitplane, raw)?;
+                    let n =
+                        block.magnitude_refinement_pass_raw_inner::<VALIDATED>(bitplane, raw)?;
                     self.next_pass = Pass::Cleanup;
                     n
                 }
@@ -3130,6 +3272,291 @@ impl BitPlaneSequencer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_validated_state_matches(
+        validated: &CodeBlock,
+        public: &CodeBlock,
+        validated_seq: &BitPlaneSequencer,
+        public_seq: &BitPlaneSequencer,
+    ) {
+        assert_eq!(validated.orientation, public.orientation);
+        assert_eq!(validated.width, public.width);
+        assert_eq!(validated.height, public.height);
+        assert_eq!(validated.magnitudes, public.magnitudes);
+        assert_eq!(validated.coding_state, public.coding_state);
+        assert_eq!(validated.coding_state_ready, public.coding_state_ready);
+        assert_eq!(validated.wide_decoded_bits, public.wide_decoded_bits);
+        assert_eq!(validated.zero_bit_planes, public.zero_bit_planes);
+        assert_eq!(validated.vertically_causal, public.vertically_causal);
+        assert_eq!(validated.roi_nb, public.roi_nb);
+        assert_eq!(format!("{validated_seq:?}"), format!("{public_seq:?}"));
+        let validated_nb = validated.effective_nb_resolver(11);
+        let public_nb = public.effective_nb_resolver(11);
+        for v in 0..validated.height {
+            for u in 0..validated.width {
+                assert_eq!(validated_nb(u, v), public_nb(u, v));
+            }
+        }
+    }
+
+    #[test]
+    fn validated_counts_match_public_ac_raw_segments_and_pass_prefixes() {
+        let bytes = [0x84, 0xc7, 0x3b, 0xfc, 0xff, 0x8f, 0x53, 0xa6];
+        for (mb_coded, p) in [(1u32, 0u32), (31, 0), (31, 15), (31, 30)] {
+            let bitplanes = mb_coded - p;
+            let cap = 3 * bitplanes - 2;
+            let mut prefixes = vec![0, 1, 2, 3, cap.saturating_sub(2), cap - 1, cap];
+            prefixes.retain(|&n| n <= cap);
+            prefixes.sort_unstable();
+            prefixes.dedup();
+            for orientation in [
+                SubBandOrientation::LL,
+                SubBandOrientation::LH,
+                SubBandOrientation::HL,
+                SubBandOrientation::HH,
+            ] {
+                for (width, height) in [(1, 4), (3, 5)] {
+                    for causal in [false, true] {
+                        // Continuous MQ, termall MQ, BYPASS and BYPASS+termall.
+                        for mode in 0..4 {
+                            for &prefix in &prefixes {
+                                let mut validated = CodeBlock::new(orientation, width, height);
+                                if mode == 3 {
+                                    // Reuse must erase imported wide counts,
+                                    // ROI, stale cache, flags and magnitudes.
+                                    validated = CodeBlock::new(
+                                        SubBandOrientation::HH,
+                                        width + 1,
+                                        height + 1,
+                                    );
+                                    validated.magnitudes.fill(u32::MAX);
+                                    validated.coding_state.fill(u32::MAX);
+                                    validated.coding_state_ready = false;
+                                    validated.wide_decoded_bits =
+                                        Some(vec![u32::MAX; validated.magnitudes.len()]);
+                                    validated.roi_nb = Some(vec![19; validated.magnitudes.len()]);
+                                    validated.zero_bit_planes = 23;
+                                    validated.vertically_causal = true;
+                                    validated.reset_for_decode(orientation, width, height);
+                                }
+                                let mut public = CodeBlock::new(orientation, width, height);
+                                let mut validated_seq = BitPlaneSequencer::new(bitplanes - 1)
+                                    .with_vertically_causal_context(causal)
+                                    .with_reset_context_probabilities(mode % 2 == 1)
+                                    .with_termination_on_each_coding_pass(mode % 2 == 1)
+                                    .with_selective_arithmetic_coding_bypass(mode >= 2);
+                                let mut public_seq = validated_seq.clone();
+                                let mut validated_ctx = reset_contexts();
+                                let mut public_ctx = reset_contexts();
+                                let mut continuous_validated = MqDecoder::new(&bytes);
+                                let mut continuous_public = continuous_validated.clone();
+                                let spans = if mode < 2 {
+                                    vec![(1, false); prefix as usize]
+                                } else {
+                                    crate::packet::bypass_segment_spans(0, prefix, mode == 3)
+                                };
+                                for (passes, is_raw) in spans {
+                                    if is_raw {
+                                        let mut validated_raw =
+                                            RawBitReader::new_with_d4_1_fill(&bytes);
+                                        let mut public_raw = validated_raw.clone();
+                                        assert_eq!(
+                                            validated_seq
+                                                .decode_passes_raw_validated(
+                                                    &mut validated,
+                                                    &mut validated_raw,
+                                                    passes,
+                                                    bitplanes,
+                                                )
+                                                .unwrap(),
+                                            public_seq
+                                                .decode_passes_raw(
+                                                    &mut public,
+                                                    &mut public_raw,
+                                                    passes
+                                                )
+                                                .unwrap(),
+                                        );
+                                        // Includes cursor, stuff-bit cache and
+                                        // total payload bits, not just samples.
+                                        assert_eq!(
+                                            format!("{validated_raw:?}"),
+                                            format!("{public_raw:?}")
+                                        );
+                                    } else {
+                                        let mut fresh_validated = MqDecoder::new(&bytes);
+                                        let mut fresh_public = fresh_validated.clone();
+                                        let (validated_mq, public_mq) = if mode == 0 {
+                                            (&mut continuous_validated, &mut continuous_public)
+                                        } else {
+                                            (&mut fresh_validated, &mut fresh_public)
+                                        };
+                                        assert_eq!(
+                                            validated_seq
+                                                .decode_passes_validated(
+                                                    &mut validated,
+                                                    validated_mq,
+                                                    &mut validated_ctx,
+                                                    passes,
+                                                    bitplanes,
+                                                )
+                                                .unwrap(),
+                                            public_seq
+                                                .decode_passes(
+                                                    &mut public,
+                                                    public_mq,
+                                                    &mut public_ctx,
+                                                    passes
+                                                )
+                                                .unwrap(),
+                                        );
+                                        // MqDecoder Debug includes A/C/CT,
+                                        // byte pointer and synthetic-fill state.
+                                        assert_eq!(
+                                            format!("{validated_mq:?}"),
+                                            format!("{public_mq:?}")
+                                        );
+                                    }
+                                    assert_eq!(validated_ctx, public_ctx);
+                                    assert_validated_state_matches(
+                                        &validated,
+                                        &public,
+                                        &validated_seq,
+                                        &public_seq,
+                                    );
+                                    assert!(validated.wide_decoded_bits.is_none());
+                                    assert!(validated.max_decoded_bits() <= bitplanes);
+                                }
+                                assert_eq!(validated_seq.passes_decoded(), prefix);
+                                if prefix == cap {
+                                    for idx in 0..validated.magnitudes.len() {
+                                        assert_eq!(validated.decoded_bits_at(idx), bitplanes);
+                                    }
+                                }
+                                validated.set_zero_bit_planes(p);
+                                public.set_zero_bit_planes(p);
+                                assert_validated_state_matches(
+                                    &validated,
+                                    &public,
+                                    &validated_seq,
+                                    &public_seq,
+                                );
+                                if mb_coded >= 3 {
+                                    validated.apply_roi_maxshift(mb_coded - 2, 2);
+                                    public.apply_roi_maxshift(mb_coded - 2, 2);
+                                    assert_validated_state_matches(
+                                        &validated,
+                                        &public,
+                                        &validated_seq,
+                                        &public_seq,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn validated_raw_sign_eof_preserves_public_partial_pass_state() {
+        let targets = coeffs(&[(16, false), (0, false)]);
+        let mut encoded = CodeBlock::new(SubBandOrientation::LL, 2, 1);
+        let mut encoder = MqEncoder::new();
+        let mut encoded_ctx = reset_contexts();
+        encoded.cleanup_encode(4, &targets, &mut encoder, &mut encoded_ctx);
+        for plane in (1..4).rev() {
+            encoded.significance_propagation_encode(
+                plane,
+                &targets,
+                &mut encoder,
+                &mut encoded_ctx,
+            );
+            encoded.magnitude_refinement_encode(plane, &targets, &mut encoder, &mut encoded_ctx);
+            encoded.cleanup_encode(plane, &targets, &mut encoder, &mut encoded_ctx);
+        }
+        let bytes = encoder.flush();
+        let mut validated = CodeBlock::new(SubBandOrientation::LL, 2, 1);
+        let mut public = validated.clone();
+        let mut validated_seq =
+            BitPlaneSequencer::new(4).with_selective_arithmetic_coding_bypass(true);
+        let mut public_seq = validated_seq.clone();
+        let mut validated_mq = MqDecoder::new(&bytes);
+        let mut public_mq = validated_mq.clone();
+        let mut validated_ctx = reset_contexts();
+        let mut public_ctx = reset_contexts();
+        validated_seq
+            .decode_passes_validated(&mut validated, &mut validated_mq, &mut validated_ctx, 10, 5)
+            .unwrap();
+        public_seq
+            .decode_passes(&mut public, &mut public_mq, &mut public_ctx, 10)
+            .unwrap();
+        assert!(validated_seq.raw_mode_for_next_pass());
+        // One final significance bit is present, but its sign bit is absent.
+        let mut validated_raw = RawBitReader::new(&[]);
+        validated_raw.bits_remaining = 1;
+        validated_raw.current_byte = 0x80;
+        let mut public_raw = validated_raw.clone();
+        assert!(matches!(
+            validated_seq.decode_passes_raw_validated(&mut validated, &mut validated_raw, 1, 5),
+            Err(Error::UnexpectedEof)
+        ));
+        assert!(matches!(
+            public_seq.decode_passes_raw(&mut public, &mut public_raw, 1),
+            Err(Error::UnexpectedEof)
+        ));
+        assert_validated_state_matches(&validated, &public, &validated_seq, &public_seq);
+        assert_eq!(format!("{validated_raw:?}"), format!("{public_raw:?}"));
+        assert_eq!(validated.decoded_bits(1, 0), 5);
+        assert!(!validated.coefficient(1, 0).sigma);
+        assert_eq!(validated_seq.passes_decoded(), 10);
+        // The codestream caller stops here; the failed pass is not resumed.
+    }
+
+    #[test]
+    fn public_plane_zero_repetitions_keep_full_count_promotion() {
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 1, 1);
+        block.mark_significant_for_test(0, 0, false, 1);
+        let bytes = [0x84, 0xc7, 0x3b, 0xfc];
+        let mut decoder = MqDecoder::new(&bytes);
+        let mut ctx = reset_contexts();
+        for _ in 0..PACKED_COUNT_MAX + 2 {
+            assert_eq!(
+                block
+                    .magnitude_refinement_pass(0, &mut decoder, &mut ctx)
+                    .unwrap(),
+                1
+            );
+        }
+        assert_eq!(
+            block.wide_decoded_bits.as_deref(),
+            Some(&[PACKED_COUNT_MAX + 2][..])
+        );
+        // Public sequencers may continue after their saturating LSB cleanup;
+        // unlike the private driver, they carry no validated total pass cap.
+        let mut seq = BitPlaneSequencer::new(0);
+        seq.decode_passes(&mut block, &mut decoder, &mut ctx, 7)
+            .unwrap();
+        assert_eq!(seq.passes_decoded(), 7);
+        assert_eq!(seq.current_bitplane(), 0);
+        assert_eq!(block.decoded_bits(0, 0), PACKED_COUNT_MAX + 4);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic]
+    fn validated_sequence_rejects_passes_after_its_original_lsb_cap() {
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 1, 1);
+        let mut seq = BitPlaneSequencer::new(0);
+        let mut decoder = MqDecoder::new(&[]);
+        let mut ctx = reset_contexts();
+        seq.decode_passes_validated(&mut block, &mut decoder, &mut ctx, 1, 1)
+            .unwrap();
+        assert_eq!(seq.current_bitplane(), 0);
+        seq.decode_passes_validated(&mut block, &mut decoder, &mut ctx, 1, 1)
+            .unwrap();
+    }
 
     #[test]
     fn compact_coefficient_snapshots_preserve_full_magnitude_and_all_flags() {
@@ -5236,6 +5663,24 @@ mod tests {
             seq.decode_packet(&mut block, &bytes, 1, &mut ctx),
             Err(Error::SegmentationSymbolMismatch)
         ));
+        let mut validated = CodeBlock::new(SubBandOrientation::LL, 2, 2);
+        let mut validated_ctx = reset_contexts();
+        let mut validated_seq = BitPlaneSequencer::new(0).with_segmentation_symbols(true);
+        let mut decoder = MqDecoder::new(&bytes);
+        assert!(matches!(
+            validated_seq.decode_passes_validated(
+                &mut validated,
+                &mut decoder,
+                &mut validated_ctx,
+                1,
+                1
+            ),
+            Err(Error::SegmentationSymbolMismatch)
+        ));
+        assert_eq!(validated_ctx, ctx);
+        assert_validated_state_matches(&validated, &block, &validated_seq, &seq);
+        assert_eq!(validated_seq.passes_decoded(), 0);
+        // Cleanup already changed the block; neither caller resumes it.
     }
 
     // -- §D.7 vertically-causal context formation ---------------------

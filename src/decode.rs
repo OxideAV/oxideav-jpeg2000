@@ -2330,10 +2330,29 @@ fn decode_tile_from_plan(
                     // §D.6 raw (lazy) span — the SP / MR passes read from a
                     // bit-stuffed stream. The MQ context array is untouched.
                     let mut raw = crate::t1::RawBitReader::new_with_d4_1_fill(&seg.bytes);
-                    seq.decode_passes_raw(block, &mut raw, seg.passes)?;
+                    if !style.high_throughput && !style.mixed {
+                        seq.decode_passes_raw_validated(block, &mut raw, seg.passes, mb_coded - p)?;
+                    } else {
+                        seq.decode_passes_raw(block, &mut raw, seg.passes)?;
+                    }
                 } else {
                     let mut decoder = crate::mq::MqDecoder::new(&seg.bytes);
-                    match seq.decode_passes(block, &mut decoder, &mut ctx, seg.passes) {
+                    // The guards above bound this fresh/reset block's entire
+                    // Annex D schedule to at most 31 magnitude bits. Keep the
+                    // original budget across every MQ/RAW segment; HT/MIXED
+                    // dispatch retains the general public count semantics.
+                    let decoded = if !style.high_throughput && !style.mixed {
+                        seq.decode_passes_validated(
+                            block,
+                            &mut decoder,
+                            &mut ctx,
+                            seg.passes,
+                            mb_coded - p,
+                        )
+                    } else {
+                        seq.decode_passes(block, &mut decoder, &mut ctx, seg.passes)
+                    };
+                    match decoded {
                         Ok(_) => {}
                         // §D.5 positions the segmentation symbol as error
                         // *detection*. On a layer-limited decode the final
@@ -3666,6 +3685,68 @@ mod tests {
     #[test]
     fn empty_input_is_rejected() {
         assert!(decode_j2k(&[]).is_err());
+    }
+
+    #[test]
+    fn exact_32_bit_coded_budget_is_rejected_before_validated_tier1() {
+        let pixels = [255u8];
+        let mut bytes = crate::encode::encode_j2k_lossless(&[&pixels], 1, 1, 0, (2, 2)).unwrap();
+        let qcd = bytes.windows(2).position(|w| w == [0xff, 0x5c]).unwrap();
+        // Equation E-2: Mb = guard + epsilon - 1 = 2 + 31 - 1 = 32.
+        bytes[qcd + 4] = 2 << 5;
+        bytes[qcd + 5] = 31 << 3;
+        assert!(matches!(decode_j2k(&bytes), Err(Error::NotImplemented)));
+    }
+
+    #[test]
+    fn replayed_annex_d_pass_cap_plus_one_is_rejected_before_tier1() {
+        let pixels = [255u8];
+        let bytes = crate::encode::encode_j2k_lossless(&[&pixels], 1, 1, 0, (2, 2)).unwrap();
+        let cs = crate::parse_codestream(&bytes).unwrap();
+        let (params, coding, quant) = main_defaults(1, &cs.header.cod, &cs.header.qcd);
+        let plan = build_tile_packet_plan(&cs.header.siz, &params, &coding, &[], 0).unwrap();
+        let tp = &cs.tile_parts[0];
+        let body = &bytes[tp.body_offset..tp.body_offset + tp.body_len];
+        let mut headers =
+            walk_tile_packet_headers(body, &plan.packets, params.sop_eph, None).unwrap();
+        let run = |headers: &[(crate::packet::PacketHeader, usize)]| {
+            decode_tile_from_plan(
+                &cs.header.siz,
+                &params,
+                &coding,
+                &quant,
+                &[0],
+                0,
+                body,
+                &plan.levels_per_comp,
+                &plan.precinct_geom,
+                &plan.descriptors,
+                headers,
+                0,
+                u16::MAX,
+            )
+        };
+        assert_eq!(run(&headers).unwrap(), vec![vec![255]]);
+        let mb = resolve_band_quant(
+            &plan.levels_per_comp[0],
+            quant[0].style,
+            quant[0].spqcd,
+            quant[0].guard_bits,
+            8,
+            0,
+        )
+        .unwrap()[0][0]
+            .mb;
+        let contribution = headers
+            .iter_mut()
+            .flat_map(|(header, _)| header.contributions.iter_mut())
+            .find(|contribution| contribution.included && contribution.coding_passes != 0)
+            .unwrap();
+        let p = contribution.zero_bit_planes.unwrap();
+        // Exercise the actual accumulator/driver, retaining the valid packet
+        // geometry and body bounds but replaying exactly one excess pass.
+        contribution.coding_passes = 3 * (mb - p) - 1;
+        assert!(matches!(run(&headers), Err(Error::InvalidPacketHeader)));
     }
 
     // `style_code` is the low-5-bit Table A.28 style; `None` = 0, so the
