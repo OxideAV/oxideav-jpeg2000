@@ -769,14 +769,13 @@ fn encode_code_block(
     // done`, so the decoder reconstructs `known + 2^(t−1)` (or exactly
     // `m` once t = 0, or 0 while still insignificant).
     let dist_of = |blk: &CodeBlock| -> f64 {
-        let bits = blk.decoded_bits_raw();
         let mut d = 0.0;
         for (i, c) in targets.iter().enumerate() {
             let m = c.magnitude;
             if m == 0 {
                 continue;
             }
-            let done = bits[i].min(planes);
+            let done = blk.decoded_bits_at(i).min(planes);
             let t = planes - done;
             let known = (m >> t) << t;
             let rec = if known == 0 {

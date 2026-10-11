@@ -514,7 +514,7 @@ pub struct Coefficient {
 /// One rectangular code-block under tier-1 decoding.
 ///
 /// The coefficient grid is stored in raster-major (row-major) order:
-/// `coefficients[u + v * width]` is `(u, v)`.
+/// `coefficient(u, v)` reads the magnitude and packed flags at that position.
 #[derive(Debug, Clone)]
 pub struct CodeBlock {
     /// Sub-band orientation; selects the Table D.1 column.
@@ -523,15 +523,18 @@ pub struct CodeBlock {
     width: usize,
     /// Code-block height in samples.
     height: usize,
-    /// Raster-major coefficient grid (`width * height` entries).
-    coefficients: Vec<Coefficient>,
+    /// Full-width magnitudes, in raster order. The coefficient's three
+    /// flags live in `coding_state`; the public Coefficient is a snapshot.
+    magnitudes: Vec<u32>,
     /// Packed Figure D.2 neighbour sigma/sign and the two per-plane flags.
-    /// Replaces two byte-sized bool grids, retaining two bytes per coefficient.
+    /// Together with `magnitudes`, uses eight bytes per coefficient.
+    /// Bits 14..16: own sigma, sign and first-refinement flags.
+    /// Bits 17..31: completed-plane count, with full-u32 overflow fallback.
     /// Bits 0..7: D0, V0, D1, H0, H1, D2, V1, D3 sigma.
     /// Bits 8..11: V0, H0, H1, V1 signs (meaningful only with sigma).
     /// Bits 12..13: newly significant in the SP pass (MR skip, D.3.3),
     /// and coded by the SP pass even when insignificant (cleanup skip, D.3.4).
-    coding_state: Vec<u16>,
+    coding_state: Vec<u32>,
     /// Preassembled/HT blocks need no neighbour cache until Annex D runs.
     coding_state_ready: bool,
     /// Per-coefficient count of decoded magnitude bits drawn by the
@@ -548,7 +551,9 @@ pub struct CodeBlock {
     /// reached carry one more decoded bit than those it did not — which
     /// is exactly the per-coefficient `Nb(u, v)` of §E.1.1.2 /
     /// §E.1.2.1 Equation E-6 / E-8.
-    decoded_bits: Vec<u32>,
+    /// Counts normally live in `coding_state`. Direct public pass calls
+    /// may exceed that representation; then this stores all full-u32 counts.
+    wide_decoded_bits: Option<Vec<u32>>,
     /// The §B.10.5 zero-most-significant-bit-plane count `P` for this
     /// code-block, recorded by the decode driver via
     /// [`Self::set_zero_bit_planes`]. `Nb(u, v) = P + decoded_bits(u, v)`
@@ -577,13 +582,27 @@ pub struct CodeBlock {
     /// `Nb(u, v)` was rewritten by [`Self::apply_roi_maxshift`] (the
     /// §H.1 steps subtract / cap `Nb` per coefficient class) and is read
     /// directly from this vector. The magnitudes carried in
-    /// [`Self::coefficients`] are likewise rewritten in place to the
+    /// [`Self::magnitudes`] are likewise rewritten in place to the
     /// background-`Mb`-anchored values §E.1 expects.
     roi_nb: Option<Vec<u32>>,
 }
 
-const NEWLY_SIGNIFICANT: u16 = 1 << 12;
-const SP_VISITED: u16 = 1 << 13;
+const NEWLY_SIGNIFICANT: u32 = 1 << 12;
+const SP_VISITED: u32 = 1 << 13;
+const SELF_SIGMA: u32 = 1 << 14;
+const SELF_SIGN: u32 = 1 << 15;
+const SELF_REFINED: u32 = 1 << 16;
+const COEFFICIENT_FLAGS: u32 = SELF_SIGMA | SELF_SIGN | SELF_REFINED;
+const COUNT_SHIFT: u32 = 17;
+const COUNT_MASK: u32 = u32::MAX << COUNT_SHIFT;
+const PACKED_COUNT_MAX: u32 = u32::MAX >> COUNT_SHIFT;
+
+#[inline]
+fn coefficient_flags(coefficient: Coefficient) -> u32 {
+    (u32::from(coefficient.sigma) * SELF_SIGMA)
+        | (u32::from(coefficient.sign) * SELF_SIGN)
+        | (u32::from(coefficient.already_refined) * SELF_REFINED)
+}
 
 // Derive the packed lookups from the same Table D.1/D.2/D.3 rules as the
 // public Neighbours helpers. Plane-local flags never participate in a key.
@@ -657,10 +676,10 @@ impl CodeBlock {
             orientation,
             width,
             height,
-            coefficients: vec![Coefficient::default(); width * height],
+            magnitudes: vec![0; width * height],
             coding_state: vec![0; width * height],
             coding_state_ready: true,
-            decoded_bits: vec![0u32; width * height],
+            wide_decoded_bits: None,
             zero_bit_planes: 0,
             vertically_causal: false,
             roi_nb: None,
@@ -691,10 +710,10 @@ impl CodeBlock {
             orientation,
             width,
             height,
-            coefficients,
-            coding_state: vec![0; width * height],
+            magnitudes: coefficients.iter().map(|c| c.magnitude).collect(),
+            coding_state: coefficients.into_iter().map(coefficient_flags).collect(),
             coding_state_ready: false,
-            decoded_bits: vec![0u32; width * height],
+            wide_decoded_bits: None,
             zero_bit_planes: 0,
             vertically_causal: false,
             roi_nb: None,
@@ -750,7 +769,7 @@ impl CodeBlock {
     /// Read one coefficient `(u, v)` (`u` ∈ `0..width`, `v` ∈ `0..height`).
     pub fn coefficient(&self, u: usize, v: usize) -> Coefficient {
         debug_assert!(u < self.width && v < self.height);
-        self.coefficients[u + v * self.width]
+        self.coefficient_at(u + v * self.width)
     }
 
     /// Whether `(u, v)` became significant in the most recent SP pass.
@@ -766,7 +785,7 @@ impl CodeBlock {
     /// count `P`; use [`Self::effective_nb`] for the full `Nb(u, v)`.
     pub fn decoded_bits(&self, u: usize, v: usize) -> u32 {
         debug_assert!(u < self.width && v < self.height);
-        self.decoded_bits[u + v * self.width]
+        self.decoded_bits_at(u + v * self.width)
     }
 
     /// The largest per-coefficient decoded-bit count in the block. Zero
@@ -775,7 +794,15 @@ impl CodeBlock {
     /// this to decide whether per-coefficient `Nb(u, v)` data is
     /// available or whether to fall back to a uniform `Nb`.
     pub fn max_decoded_bits(&self) -> u32 {
-        self.decoded_bits.iter().copied().max().unwrap_or(0)
+        if let Some(bits) = &self.wide_decoded_bits {
+            bits.iter().copied().max().unwrap_or(0)
+        } else {
+            self.coding_state
+                .iter()
+                .map(|s| s >> COUNT_SHIFT)
+                .max()
+                .unwrap_or(0)
+        }
     }
 
     /// Record the §B.10.5 zero-most-significant-bit-plane count `P` so
@@ -796,8 +823,59 @@ impl CodeBlock {
     /// the §D.2.1 `Nb(u, v)`, raster order). The encoder's Annex J.13.4
     /// distortion estimate reads these between forward coding passes to
     /// derive each coefficient's midpoint-reconstruction uncertainty.
-    pub(crate) fn decoded_bits_raw(&self) -> &[u32] {
-        &self.decoded_bits
+    #[inline]
+    pub(crate) fn decoded_bits_at(&self, idx: usize) -> u32 {
+        if let Some(bits) = &self.wide_decoded_bits {
+            bits[idx]
+        } else {
+            self.coding_state[idx] >> COUNT_SHIFT
+        }
+    }
+
+    #[inline]
+    fn coefficient_at(&self, idx: usize) -> Coefficient {
+        let state = self.coding_state[idx];
+        Coefficient {
+            magnitude: self.magnitudes[idx],
+            sigma: state & SELF_SIGMA != 0,
+            sign: state & SELF_SIGN != 0,
+            already_refined: state & SELF_REFINED != 0,
+        }
+    }
+
+    #[inline]
+    fn set_coefficient_at(&mut self, idx: usize, coefficient: Coefficient) {
+        self.magnitudes[idx] = coefficient.magnitude;
+        self.coding_state[idx] =
+            (self.coding_state[idx] & !COEFFICIENT_FLAGS) | coefficient_flags(coefficient);
+    }
+
+    /// Preserve full-u32 direct-pass semantics when packed counts overflow.
+    #[cold]
+    fn promote_decoded_bits(&mut self) {
+        self.wide_decoded_bits = Some(self.coding_state.iter().map(|s| s >> COUNT_SHIFT).collect());
+        for state in &mut self.coding_state {
+            *state &= !COUNT_MASK;
+        }
+    }
+
+    #[inline]
+    fn increment_decoded_bits(&mut self, idx: usize) {
+        if let Some(bits) = &mut self.wide_decoded_bits {
+            bits[idx] += 1;
+        } else if self.coding_state[idx] & COUNT_MASK != COUNT_MASK {
+            self.coding_state[idx] += 1 << COUNT_SHIFT;
+        } else {
+            self.promote_decoded_bits();
+            self.wide_decoded_bits.as_mut().unwrap()[idx] += 1;
+        }
+    }
+
+    #[cfg(test)]
+    fn coefficients_for_test(&self) -> Vec<Coefficient> {
+        (0..self.magnitudes.len())
+            .map(|i| self.coefficient_at(i))
+            .collect()
     }
 
     /// Overwrite the per-coefficient completed-plane counts (raster
@@ -807,7 +885,17 @@ impl CodeBlock {
     /// Annex D passes.
     pub(crate) fn set_decoded_bits_raw(&mut self, bits: Vec<u32>) {
         assert_eq!(bits.len(), self.width * self.height);
-        self.decoded_bits = bits;
+        if bits.iter().any(|&b| b > PACKED_COUNT_MAX) {
+            for state in &mut self.coding_state {
+                *state &= !COUNT_MASK;
+            }
+            self.wide_decoded_bits = Some(bits);
+        } else {
+            for (state, bits) in self.coding_state.iter_mut().zip(bits) {
+                *state = (*state & !COUNT_MASK) | (bits << COUNT_SHIFT);
+            }
+            self.wide_decoded_bits = None;
+        }
     }
 
     /// The full per-coefficient §D.2.1 `Nb(u, v)` for reconstruction:
@@ -826,7 +914,7 @@ impl CodeBlock {
         if self.max_decoded_bits() == 0 {
             uniform_fallback
         } else {
-            self.zero_bit_planes + self.decoded_bits[u + v * self.width]
+            self.zero_bit_planes + self.decoded_bits_at(u + v * self.width)
         }
     }
 
@@ -886,27 +974,24 @@ impl CodeBlock {
             return;
         }
         let mut roi_nb = vec![0u32; self.width * self.height];
-        for ((slot, coeff), &decoded) in roi_nb
-            .iter_mut()
-            .zip(self.coefficients.iter_mut())
-            .zip(self.decoded_bits.iter())
-        {
+        for (idx, slot) in roi_nb.iter_mut().enumerate() {
+            let decoded = self.decoded_bits_at(idx);
             // Per-coefficient Nb(u, v) under the M'b budget: P + decoded.
             let nb = self.zero_bit_planes + decoded;
             // Top `mb` MSBs of the M'b-anchored magnitude.
-            let top = coeff.magnitude >> s;
+            let top = self.magnitudes[idx] >> s;
             if nb >= mb && top == 0 {
                 // §H.1 step 4 — background: magnitude unchanged (its top
                 // `s` bits are already zero), Nb drops by `s`.
                 *slot = nb.saturating_sub(s);
             } else if nb >= mb {
                 // §H.1 step 3 — ROI: keep the top `mb` bits, cap Nb = mb.
-                coeff.magnitude = top;
+                self.magnitudes[idx] = top;
                 *slot = mb;
             } else {
                 // §H.1 step 2 — Nb < mb: re-anchor only (magnitude >> s),
                 // Nb unchanged.
-                coeff.magnitude = top;
+                self.magnitudes[idx] = top;
                 *slot = nb;
             }
         }
@@ -960,7 +1045,7 @@ impl CodeBlock {
             for u in 0..self.width {
                 for dv in 0..stripe_h {
                     let v = v0 + dv;
-                    let coef = self.coefficients[u + v * self.width];
+                    let coef = self.coefficient_at(u + v * self.width);
 
                     // SP pass: only insignificant coefficients with a
                     // non-zero Table D.1 context are considered.
@@ -983,7 +1068,7 @@ impl CodeBlock {
                     // §D.2.1: a magnitude MSB was decoded for this
                     // coefficient on this bit-plane (whether it read 0
                     // or 1) — count it toward Nb(u, v).
-                    self.decoded_bits[u + v * self.width] += 1;
+                    self.increment_decoded_bits(u + v * self.width);
                     if bit == 1 {
                         // Newly significant — set σ, accumulate the
                         // bit-plane's positional value into magnitude,
@@ -1002,7 +1087,7 @@ impl CodeBlock {
                             sign: sign_bit,
                             already_refined: coef.already_refined,
                         };
-                        self.coefficients[u + v * self.width] = updated;
+                        self.set_coefficient_at(u + v * self.width, updated);
                         self.publish_significance(u, v, sign_bit);
                         self.coding_state[u + v * self.width] |= NEWLY_SIGNIFICANT;
                         newly += 1;
@@ -1060,7 +1145,7 @@ impl CodeBlock {
                 for dv in 0..stripe_h {
                     let v = v0 + dv;
                     let idx = u + v * self.width;
-                    let coef = self.coefficients[idx];
+                    let coef = self.coefficient_at(idx);
 
                     // §D.3.3: refine coefficients that are already
                     // significant, *except* those that became significant
@@ -1084,10 +1169,10 @@ impl CodeBlock {
                         updated.magnitude |= weight;
                     }
                     updated.already_refined = true;
-                    self.coefficients[idx] = updated;
+                    self.set_coefficient_at(idx, updated);
                     // §D.2.1: one refinement (magnitude) bit decoded for
                     // this already-significant coefficient on this plane.
-                    self.decoded_bits[idx] += 1;
+                    self.increment_decoded_bits(idx);
                     refined += 1;
                 }
             }
@@ -1168,7 +1253,7 @@ impl CodeBlock {
                         // of the column's four coefficients on this
                         // bit-plane (§D.2.1: count each toward Nb).
                         for dv in 0..4 {
-                            self.decoded_bits[u + (v0 + dv) * self.width] += 1;
+                            self.increment_decoded_bits(u + (v0 + dv) * self.width);
                         }
                         continue;
                     }
@@ -1190,7 +1275,7 @@ impl CodeBlock {
                     // bit-plane. (Coefficients below `first` are coded by
                     // the normal loop below, which counts them there.)
                     for dv in 0..=first {
-                        self.decoded_bits[u + (v0 + dv) * self.width] += 1;
+                        self.increment_decoded_bits(u + (v0 + dv) * self.width);
                     }
                     start_dv = first + 1;
                 }
@@ -1206,7 +1291,7 @@ impl CodeBlock {
                     // propagation pass (§D.3.4 "the remaining
                     // coefficients … not handled by the significance
                     // propagation pass").
-                    if self.coefficients[u + v * self.width].sigma
+                    if self.coefficient_at(u + v * self.width).sigma
                         || self.coding_state[u + v * self.width] & SP_VISITED != 0
                     {
                         continue;
@@ -1216,7 +1301,7 @@ impl CodeBlock {
                     let cx = &mut ctx[SP_CTX_OFFSET + label as usize];
                     // §D.2.1: this leftover coefficient is coded (a 0 or
                     // 1 magnitude bit) by the cleanup pass on this plane.
-                    self.decoded_bits[u + v * self.width] += 1;
+                    self.increment_decoded_bits(u + v * self.width);
                     if decoder.decode(cx) == 1 {
                         self.make_significant_with_sign(u, v, weight, v0, stripe_h, decoder, ctx);
                         newly += 1;
@@ -1237,7 +1322,7 @@ impl CodeBlock {
     // difference is that the magnitude / sign bit fed to each MQ coding
     // decision comes from the caller-supplied `targets` (the fully-known
     // quantised coefficients) rather than the decoder, and the decision is
-    // handed to [`MqEncoder::encode`]. Because `self.coefficients` evolves
+    // handed to [`MqEncoder::encode`]. Because the coefficient state evolves
     // exactly as the decoder would reconstruct it, every context label the
     // encoder computes equals the label the decoder will compute — so the
     // produced codeword segment decodes back to the same coefficients. The
@@ -1265,7 +1350,7 @@ impl CodeBlock {
                 for dv in 0..stripe_h {
                     let v = v0 + dv;
                     let idx = u + v * self.width;
-                    if self.coefficients[idx].sigma {
+                    if self.coefficient_at(idx).sigma {
                         continue;
                     }
                     let label =
@@ -1276,7 +1361,7 @@ impl CodeBlock {
                     let bit = ((targets[idx].magnitude >> bitplane) & 1) as u8;
                     encoder.encode(&mut ctx[SP_CTX_OFFSET + label as usize], bit);
                     self.coding_state[idx] |= SP_VISITED;
-                    self.decoded_bits[idx] += 1;
+                    self.increment_decoded_bits(idx);
                     if bit == 1 {
                         self.code_sign_encode(u, v, weight, targets, v0, stripe_h, encoder, ctx);
                         self.coding_state[idx] |= NEWLY_SIGNIFICANT;
@@ -1305,7 +1390,7 @@ impl CodeBlock {
                 for dv in 0..stripe_h {
                     let v = v0 + dv;
                     let idx = u + v * self.width;
-                    let coef = self.coefficients[idx];
+                    let coef = self.coefficient_at(idx);
                     if !coef.sigma || self.coding_state[idx] & NEWLY_SIGNIFICANT != 0 {
                         continue;
                     }
@@ -1321,8 +1406,8 @@ impl CodeBlock {
                         updated.magnitude |= weight;
                     }
                     updated.already_refined = true;
-                    self.coefficients[idx] = updated;
-                    self.decoded_bits[idx] += 1;
+                    self.set_coefficient_at(idx, updated);
+                    self.increment_decoded_bits(idx);
                 }
             }
             v0 += 4;
@@ -1350,7 +1435,7 @@ impl CodeBlock {
                 for dv in 0..stripe_h {
                     let v = v0 + dv;
                     let idx = u + v * self.width;
-                    if self.coefficients[idx].sigma {
+                    if self.coefficient_at(idx).sigma {
                         continue;
                     }
                     if self.coding_state_in_stripe(u, v, v0, stripe_h) & 0xff == 0 {
@@ -1359,15 +1444,15 @@ impl CodeBlock {
                     let bit = ((targets[idx].magnitude >> bitplane) & 1) as u8;
                     raw.write_bit(bit);
                     self.coding_state[idx] |= SP_VISITED;
-                    self.decoded_bits[idx] += 1;
+                    self.increment_decoded_bits(idx);
                     if bit == 1 {
                         // §D.6 Equation D-2: the sign is one raw bit.
                         raw.write_bit(targets[idx].sign as u8);
-                        let mut updated = self.coefficients[idx];
+                        let mut updated = self.coefficient_at(idx);
                         updated.magnitude |= weight;
                         updated.sigma = true;
                         updated.sign = targets[idx].sign;
-                        self.coefficients[idx] = updated;
+                        self.set_coefficient_at(idx, updated);
                         self.publish_significance(u, v, updated.sign);
                         self.coding_state[idx] |= NEWLY_SIGNIFICANT;
                     }
@@ -1395,7 +1480,7 @@ impl CodeBlock {
                 for dv in 0..stripe_h {
                     let v = v0 + dv;
                     let idx = u + v * self.width;
-                    let coef = self.coefficients[idx];
+                    let coef = self.coefficient_at(idx);
                     if !coef.sigma || self.coding_state[idx] & NEWLY_SIGNIFICANT != 0 {
                         continue;
                     }
@@ -1406,8 +1491,8 @@ impl CodeBlock {
                         updated.magnitude |= weight;
                     }
                     updated.already_refined = true;
-                    self.coefficients[idx] = updated;
-                    self.decoded_bits[idx] += 1;
+                    self.set_coefficient_at(idx, updated);
+                    self.increment_decoded_bits(idx);
                 }
             }
             v0 += 4;
@@ -1441,7 +1526,7 @@ impl CodeBlock {
                         None => {
                             encoder.encode(&mut ctx[RUN_LENGTH_CTX], 0);
                             for dv in 0..4 {
-                                self.decoded_bits[u + (v0 + dv) * self.width] += 1;
+                                self.increment_decoded_bits(u + (v0 + dv) * self.width);
                             }
                             continue;
                         }
@@ -1456,7 +1541,7 @@ impl CodeBlock {
                                 u, v, weight, targets, v0, stripe_h, encoder, ctx,
                             );
                             for dv in 0..=first {
-                                self.decoded_bits[u + (v0 + dv) * self.width] += 1;
+                                self.increment_decoded_bits(u + (v0 + dv) * self.width);
                             }
                             start_dv = first + 1;
                         }
@@ -1465,13 +1550,13 @@ impl CodeBlock {
                 for dv in start_dv..stripe_h {
                     let v = v0 + dv;
                     let idx = u + v * self.width;
-                    if self.coefficients[idx].sigma || self.coding_state[idx] & SP_VISITED != 0 {
+                    if self.coefficient_at(idx).sigma || self.coding_state[idx] & SP_VISITED != 0 {
                         continue;
                     }
                     let label =
                         contexts[(self.coding_state_in_stripe(u, v, v0, stripe_h) & 0xff) as usize];
                     let bit = ((targets[idx].magnitude >> bitplane) & 1) as u8;
-                    self.decoded_bits[idx] += 1;
+                    self.increment_decoded_bits(idx);
                     encoder.encode(&mut ctx[SP_CTX_OFFSET + label as usize], bit);
                     if bit == 1 {
                         self.code_sign_encode(u, v, weight, targets, v0, stripe_h, encoder, ctx);
@@ -1508,10 +1593,9 @@ impl CodeBlock {
         let sign_bit = targets[idx].sign;
         let d = (sign_bit as u8) ^ xorbit;
         encoder.encode(&mut ctx[SIGN_CTX_OFFSET + sign_label as usize], d);
-        let coef = &mut self.coefficients[idx];
-        coef.magnitude |= weight;
-        coef.sigma = true;
-        coef.sign = sign_bit;
+        self.magnitudes[idx] |= weight;
+        self.coding_state[idx] =
+            (self.coding_state[idx] & !SELF_SIGN) | SELF_SIGMA | (u32::from(sign_bit) * SELF_SIGN);
         self.publish_significance(u, v, sign_bit);
     }
 
@@ -1563,7 +1647,7 @@ impl CodeBlock {
             for u in 0..self.width {
                 for dv in 0..stripe_h {
                     let v = v0 + dv;
-                    let coef = self.coefficients[u + v * self.width];
+                    let coef = self.coefficient_at(u + v * self.width);
                     if coef.sigma {
                         continue;
                     }
@@ -1579,7 +1663,7 @@ impl CodeBlock {
                     // §D.2.1: one magnitude MSB decoded for this
                     // coefficient on this bit-plane — count toward
                     // Nb(u, v).
-                    self.decoded_bits[u + v * self.width] += 1;
+                    self.increment_decoded_bits(u + v * self.width);
                     if bit == 1 {
                         // §D.6 Equation D-2: signbit = raw_value (no
                         // XOR-with-XORbit redirection).
@@ -1590,7 +1674,7 @@ impl CodeBlock {
                             sign: sign_bit,
                             already_refined: coef.already_refined,
                         };
-                        self.coefficients[u + v * self.width] = updated;
+                        self.set_coefficient_at(u + v * self.width, updated);
                         self.publish_significance(u, v, sign_bit);
                         self.coding_state[u + v * self.width] |= NEWLY_SIGNIFICANT;
                         newly += 1;
@@ -1633,7 +1717,7 @@ impl CodeBlock {
                 for dv in 0..stripe_h {
                     let v = v0 + dv;
                     let idx = u + v * self.width;
-                    let coef = self.coefficients[idx];
+                    let coef = self.coefficient_at(idx);
                     if !coef.sigma || self.coding_state[idx] & NEWLY_SIGNIFICANT != 0 {
                         continue;
                     }
@@ -1643,10 +1727,10 @@ impl CodeBlock {
                         updated.magnitude |= weight;
                     }
                     updated.already_refined = true;
-                    self.coefficients[idx] = updated;
+                    self.set_coefficient_at(idx, updated);
                     // §D.2.1: one refinement (magnitude) bit decoded for
                     // this already-significant coefficient on this plane.
-                    self.decoded_bits[idx] += 1;
+                    self.increment_decoded_bits(idx);
                     refined += 1;
                 }
             }
@@ -1669,7 +1753,7 @@ impl CodeBlock {
     fn column_run_length_eligible(&self, u: usize, v0: usize) -> bool {
         for dv in 0..4 {
             let v = v0 + dv;
-            let c = self.coefficients[u + v * self.width];
+            let c = self.coefficient_at(u + v * self.width);
             // Table D.10 decision D8: the four coefficients must be
             // *undecoded* in this bit-plane — insignificant and not
             // already coded by the SP pass. (A zero context implies the
@@ -1712,10 +1796,9 @@ impl CodeBlock {
         let d = decoder.decode(sign_cx);
         let sign_bit = (d ^ xorbit) != 0;
 
-        let coef = &mut self.coefficients[idx];
-        coef.magnitude |= weight;
-        coef.sigma = true;
-        coef.sign = sign_bit;
+        self.magnitudes[idx] |= weight;
+        self.coding_state[idx] =
+            (self.coding_state[idx] & !SELF_SIGN) | SELF_SIGMA | (u32::from(sign_bit) * SELF_SIGN);
         self.publish_significance(u, v, sign_bit);
         self.coding_state[idx] |= NEWLY_SIGNIFICANT;
     }
@@ -1728,7 +1811,7 @@ impl CodeBlock {
         }
         for v in 0..self.height {
             for u in 0..self.width {
-                let coef = self.coefficients[u + v * self.width];
+                let coef = self.coefficient_at(u + v * self.width);
                 if coef.sigma {
                     self.publish_significance(u, v, coef.sign);
                 }
@@ -1756,23 +1839,23 @@ impl CodeBlock {
             if u > 0 {
                 c[above - 1] |= 1 << 7;
             }
-            c[above] = (c[above] & !(1 << 11)) | (1 << 6) | ((sign as u16) << 11);
+            c[above] = (c[above] & !(1 << 11)) | (1 << 6) | ((sign as u32) << 11);
             if u + 1 < w {
                 c[above + 1] |= 1 << 5;
             }
         }
         if u > 0 {
-            c[idx - 1] = (c[idx - 1] & !(1 << 10)) | (1 << 4) | ((sign as u16) << 10);
+            c[idx - 1] = (c[idx - 1] & !(1 << 10)) | (1 << 4) | ((sign as u32) << 10);
         }
         if u + 1 < w {
-            c[idx + 1] = (c[idx + 1] & !(1 << 9)) | (1 << 3) | ((sign as u16) << 9);
+            c[idx + 1] = (c[idx + 1] & !(1 << 9)) | (1 << 3) | ((sign as u32) << 9);
         }
         if v + 1 < self.height {
             let below = idx + w;
             if u > 0 {
                 c[below - 1] |= 1 << 2;
             }
-            c[below] = (c[below] & !(1 << 8)) | (1 << 1) | ((sign as u16) << 8);
+            c[below] = (c[below] & !(1 << 8)) | (1 << 1) | ((sign as u32) << 8);
             if u + 1 < w {
                 c[below + 1] |= 1;
             }
@@ -1781,7 +1864,7 @@ impl CodeBlock {
 
     #[inline]
     fn coding_state_in_stripe(&self, u: usize, v: usize, v0: usize, stripe_h: usize) -> u16 {
-        let state = self.coding_state[u + v * self.width];
+        let state = self.coding_state[u + v * self.width] as u16;
         if self.vertically_causal && v + 1 == v0 + stripe_h {
             // Clip D2, V1, D3 and the below-stripe cardinal sign.
             state & !((7 << 5) | (1 << 11))
@@ -1870,7 +1953,7 @@ impl CodeBlock {
             if nu < 0 || nu >= w || nv < 0 || nv >= h {
                 continue;
             }
-            let c = self.coefficients[(nu as usize) + (nv as usize) * self.width];
+            let c = self.coefficient_at((nu as usize) + (nv as usize) * self.width);
             nb.set(slot, c.sigma, c.sign);
         }
         nb
@@ -3150,6 +3233,88 @@ mod tests {
     }
 
 
+    #[test]
+    fn compact_coefficient_snapshots_preserve_full_magnitude_and_all_flags() {
+        let coefficients: Vec<_> = [0, 1, 1 << 31, u32::MAX]
+            .into_iter()
+            .flat_map(|magnitude| {
+                (0..8).map(move |flags| Coefficient {
+                    magnitude,
+                    sigma: flags & 1 != 0,
+                    sign: flags & 2 != 0,
+                    already_refined: flags & 4 != 0,
+                })
+            })
+            .collect();
+        let mut block =
+            CodeBlock::from_coefficients(SubBandOrientation::HH, 4, 8, coefficients.clone());
+        assert_eq!(block.coefficients_for_test(), coefficients);
+        assert!(block.wide_decoded_bits.is_none());
+        block.ensure_coding_state();
+        assert_coding_cache(&block);
+        assert_eq!(block.coefficients_for_test(), coefficients);
+        assert_eq!(block.clone().coefficients_for_test(), coefficients);
+    }
+
+    #[test]
+    fn compact_counts_promote_without_losing_neighbours_flags_or_other_counts() {
+        let mut block = CodeBlock::new(SubBandOrientation::HL, 3, 5);
+        block.mark_significant_for_test(1, 3, true, u32::MAX);
+        block.coding_state[10] |= SELF_REFINED | NEWLY_SIGNIFICANT | SP_VISITED;
+        let mut counts: Vec<_> = (0..15).collect();
+        counts[10] = PACKED_COUNT_MAX;
+        block.set_decoded_bits_raw(counts.clone());
+        block.set_zero_bit_planes(2);
+        assert!(block.wide_decoded_bits.is_none());
+        let coefficients = block.coefficients_for_test();
+        let flags: Vec<_> = block.coding_state.iter().map(|s| s & !COUNT_MASK).collect();
+        block.increment_decoded_bits(10);
+        counts[10] += 1;
+        assert_eq!(block.wide_decoded_bits.as_ref().unwrap(), &counts);
+        assert_eq!(block.coefficients_for_test(), coefficients);
+        assert_eq!(block.coding_state, flags);
+        assert_coding_cache(&block);
+        assert!(block.was_newly_significant(1, 3));
+        assert_eq!(block.effective_nb(1, 3, 0), PACKED_COUNT_MAX + 3);
+        block.clear_pass_flags();
+        assert_eq!(block.coefficients_for_test(), coefficients);
+        assert_eq!(block.max_decoded_bits(), PACKED_COUNT_MAX + 1);
+        block.increment_decoded_bits(0);
+        assert_eq!(block.decoded_bits(0, 0), 1);
+        assert_coding_cache(&block);
+    }
+
+    #[test]
+    fn imported_full_u32_counts_can_return_to_compact_state() {
+        let mut block = CodeBlock::from_coefficients(
+            SubBandOrientation::LL,
+            2,
+            1,
+            vec![
+                Coefficient {
+                    magnitude: u32::MAX,
+                    sign: true,
+                    ..Coefficient::default()
+                },
+                Coefficient {
+                    sigma: true,
+                    already_refined: true,
+                    ..Coefficient::default()
+                },
+            ],
+        );
+        let coefficients = block.coefficients_for_test();
+        block.set_decoded_bits_raw(vec![u32::MAX, PACKED_COUNT_MAX + 1]);
+        assert_eq!(block.decoded_bits(0, 0), u32::MAX);
+        assert_eq!(block.max_decoded_bits(), u32::MAX);
+        assert_eq!(block.coefficients_for_test(), coefficients);
+        block.set_decoded_bits_raw(vec![17, 0]);
+        assert!(block.wide_decoded_bits.is_none());
+        assert_eq!(block.decoded_bits(0, 0), 17);
+        assert_eq!(block.decoded_bits(1, 0), 0);
+        assert_eq!(block.coefficients_for_test(), coefficients);
+        assert_eq!(block.max_decoded_bits(), 17);
+    }
     fn normalized_signs(mut nb: Neighbours) -> Neighbours {
         nb.v0_sign &= nb.v0_sigma;
         nb.h0_sign &= nb.h0_sigma;
@@ -3207,7 +3372,7 @@ mod tests {
         // context; the public helpers remain an independent runtime oracle.
         let mut block = CodeBlock::new(SubBandOrientation::LL, 1, 1);
         for state in 0u16..=u16::MAX {
-            block.coding_state[0] = state;
+            block.coding_state[0] = u32::from(state);
             let nb = block.coding_neighbours_in_stripe(0, 0, 0, 1);
             for orientation in [
                 SubBandOrientation::LL,
@@ -3281,7 +3446,7 @@ mod tests {
                         .with_vertically_causal_context(causal);
                         block.ensure_coding_state();
                         assert_coding_cache(&block);
-                        assert_eq!(block.coefficients, coefficients);
+                        assert_eq!(block.coefficients_for_test(), coefficients);
                         assert!(block
                             .coding_state
                             .iter()
@@ -3317,16 +3482,23 @@ mod tests {
                     }
                     for &idx in &order {
                         state = state.wrapping_mul(1664525).wrapping_add(1013904223);
-                        block.coefficients[idx] = Coefficient {
-                            sigma: true,
-                            sign: state & 1 != 0,
-                            magnitude: state >> 1,
-                            already_refined: false,
-                        };
+                        block.set_coefficient_at(
+                            idx,
+                            Coefficient {
+                                sigma: true,
+                                sign: state & 1 != 0,
+                                magnitude: state >> 1,
+                                already_refined: false,
+                            },
+                        );
                         block.publish_significance(idx % w, idx / w, state & 1 != 0);
                         block.coding_state[idx] |= NEWLY_SIGNIFICANT | SP_VISITED;
                         assert_coding_cache(&block);
-                        let before: Vec<_> = block.coding_state.iter().map(|s| s & 0xfff).collect();
+                        let before: Vec<_> = block
+                            .coding_state
+                            .iter()
+                            .map(|s| s & !(NEWLY_SIGNIFICANT | SP_VISITED))
+                            .collect();
                         block.clear_pass_flags();
                         assert_eq!(block.coding_state, before);
                         assert_coding_cache(&block);
@@ -3335,7 +3507,7 @@ mod tests {
                         SubBandOrientation::HL,
                         w,
                         h,
-                        block.coefficients.clone(),
+                        block.coefficients_for_test(),
                     )
                     .with_vertically_causal_context(causal);
                     assert!(!reconstructed.coding_state_ready);
@@ -4387,12 +4559,15 @@ mod tests {
         ) {
             self.ensure_coding_state();
             let idx = u + v * self.width;
-            self.coefficients[idx] = Coefficient {
-                magnitude,
-                sigma: true,
-                sign,
-                already_refined: false,
-            };
+            self.set_coefficient_at(
+                idx,
+                Coefficient {
+                    magnitude,
+                    sigma: true,
+                    sign,
+                    already_refined: false,
+                },
+            );
             self.publish_significance(u, v, sign);
         }
 
@@ -4406,7 +4581,11 @@ mod tests {
         /// driven into [`CodeBlock::apply_roi_maxshift`] without replaying
         /// the §D.3 passes.
         pub(super) fn set_decoded_bits_for_test(&mut self, u: usize, v: usize, bits: u32) {
-            self.decoded_bits[u + v * self.width] = bits;
+            let mut counts: Vec<_> = (0..self.magnitudes.len())
+                .map(|idx| self.decoded_bits_at(idx))
+                .collect();
+            counts[u + v * self.width] = bits;
+            self.set_decoded_bits_raw(counts);
         }
     }
 
@@ -6286,11 +6465,11 @@ mod tests {
         let mut block = CodeBlock::new(SubBandOrientation::LL, 3, 2);
         block.mark_significant_for_test(1, 0, true, 2);
         for idx in 0..6 {
-            if !block.coefficients[idx].sigma {
+            if !block.coefficient_at(idx).sigma {
                 block.coding_state[idx] |= SP_VISITED;
             }
         }
-        let before = block.coefficients.clone();
+        let before = block.coefficients_for_test();
         // 0xFF-heavy bytes decode plenty of 1-decisions if anything is
         // coded, so an unchanged block proves nothing was coded.
         let bytes = [0x5A, 0xFF, 0x00, 0xFF, 0x00, 0xFF];
@@ -6298,7 +6477,7 @@ mod tests {
         let mut ctx = reset_contexts();
         let newly = block.cleanup_pass(1, &mut dec, &mut ctx).unwrap();
         assert_eq!(newly, 0);
-        assert_eq!(block.coefficients, before);
+        assert_eq!(block.coefficients_for_test(), before);
     }
 
     #[test]
