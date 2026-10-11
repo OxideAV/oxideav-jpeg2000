@@ -70,7 +70,7 @@ use crate::dequant::{self, StepSize};
 use crate::geometry::{
     derive_precinct_code_blocks, derive_precinct_partition, derive_resolution_levels,
     derive_tile_geometry, image_area, precinct_exponents_at, tile_grid_extent, PrecinctCodeBlocks,
-    ResolutionLevel, SubBand, SubBandOrientation,
+    ResolutionLevel, SubBandOrientation,
 };
 use crate::mct::{
     reconstruct_tile_components_5x3_multi, reconstruct_tile_components_9x7_multi,
@@ -82,10 +82,7 @@ use crate::progression::{
     rlcp_packet_order, rpcl_packet_order, ComponentPositionInfo, ComponentProgressionInfo,
     PacketDescriptor, PocVolume, ResolutionPrecinctLayout,
 };
-use crate::reassemble::{
-    idwt_5x3, idwt_9x7, BlockSource, CodedCodeBlock, PrecinctBlocks, SubBandQuantization,
-    WalkerBlockEntry, WalkerBlockSource,
-};
+use crate::reassemble::{CodedCodeBlock, CoefficientSurface, SubBandQuantization};
 use crate::t1::{reset_contexts, BitPlaneSequencer, CodeBlock};
 use crate::{
     Error, J2kCodestream, ProgressionOrder, QuantizationStyle, Siz, WaveletTransform, MARKER_CAP,
@@ -295,6 +292,31 @@ fn spqcd_index(r: u8, orientation: SubBandOrientation) -> usize {
 struct BandQuant {
     mb: u32,
     quant: SubBandQuantization,
+}
+
+/// Component-local reconstructed coefficients; never owns decoded blocks.
+enum ComponentSurface<'a> {
+    Reversible(CoefficientSurface<'a, i32>),
+    Irreversible(CoefficientSurface<'a, f64>),
+}
+
+impl ComponentSurface<'_> {
+    fn scatter(
+        &mut self,
+        resolution: u8,
+        sub_band: u32,
+        cb: CodedCodeBlock<'_>,
+        quant: &BandQuant,
+    ) -> Result<(), Error> {
+        match self {
+            Self::Reversible(surface) => {
+                surface.scatter_5x3(resolution as usize, sub_band as usize, cb, quant.mb, 0.5)
+            }
+            Self::Irreversible(surface) => {
+                surface.scatter_9x7(resolution as usize, sub_band as usize, cb, quant.quant, 0.5)
+            }
+        }
+    }
 }
 
 /// The quantisation parameters that apply to one component, after the
@@ -592,42 +614,6 @@ struct AccumSegment {
 /// Key addressing one code-block inside one tile:
 /// `(component, resolution, precinct, sub_band, cbx, cby)`.
 type BlockKey = (u16, u8, u32, u32, u32, u32);
-
-/// One tier-1-decoded code-block, owned, ready to be bridged into a
-/// [`WalkerBlockSource`].
-struct DecodedBlock {
-    r: u8,
-    precinct: u32,
-    sub_band: u32,
-    cbx: u32,
-    cby: u32,
-    nb: u32,
-    block: CodeBlock,
-}
-
-/// Per-resolution-level [`BlockSource`] dispatch for one
-/// tile-component: [`WalkerBlockSource`] keys blocks by orientation
-/// only, so one source per resolution level keeps the `HL` blocks of
-/// different levels apart. The owning level is recovered from the
-/// band's decomposition level `nb` (`r = NL − nb + 1` for high-pass
-/// bands, `r = 0` for `LL`, per §B.5).
-struct LevelKeyedSource<'a> {
-    n_l: u8,
-    per_level: Vec<WalkerBlockSource<'a>>,
-}
-
-impl<'a> BlockSource<'a> for LevelKeyedSource<'a> {
-    fn blocks_for(&self, band: &SubBand) -> &[CodedCodeBlock<'a>] {
-        let r = match band.orientation {
-            SubBandOrientation::LL => 0usize,
-            _ => (self.n_l as usize) + 1 - (band.nb as usize),
-        };
-        match self.per_level.get(r) {
-            Some(src) => src.blocks_for(band),
-            None => &[],
-        }
-    }
-}
 
 /// Number of fully-decoded bit-planes implied by `passes` coding
 /// passes per the §D.3 schedule (cleanup on the first plane, then
@@ -2100,14 +2086,15 @@ fn decode_tile_from_plan(
         )?);
     }
 
-    // -- Per-component: tier-1 → bridge → reassemble → IDWT cascade --
+    // -- Per-component: tier-1 → immediate reconstruction → IDWT cascade --
     //
     // Packet replay above has collected every selected contribution before
     // any block is decoded. BlockKey starts with the component, so consuming
     // the sorted map one component at a time preserves the tier-1 block order
     // without decoding blocks whose samples cannot yet be reconstructed.
-    // The bridge borrows only this component's blocks; its coefficient and
-    // pass-state buffers are released after IDWT, before the next component.
+    // Completed blocks are scattered immediately into this component's
+    // coefficient surface. Only one Annex D work block survives between
+    // decodes; HT outputs remain temporary and are dropped after scatter.
     // Compressed contributions for later components remain in the iterator.
     //
     // Each reconstructed plane lands in the lane for its resolved kernel.
@@ -2118,7 +2105,21 @@ fn decode_tile_from_plan(
     let mut comp_lane: Vec<(WaveletTransform, usize)> = Vec::with_capacity(levels_per_comp.len());
     let mut accum = accum.into_iter().peekable();
     for (c, levels) in levels_per_comp.iter().enumerate() {
-        let mut blocks = Vec::new();
+        let cc = comp_coding.get(c).ok_or(Error::InvalidMarkerLength)?;
+        // Keep exactly the levels selected for synthesis. Contributions
+        // above this range remain length-accounted but are not decoded.
+        let keep = (cc.n_l - discard_levels) as usize;
+        let levels = &levels[..=keep];
+        let mut surface = match cc.transform {
+            WaveletTransform::Reversible5x3 => {
+                ComponentSurface::Reversible(CoefficientSurface::new(levels)?)
+            }
+            WaveletTransform::Irreversible9x7 => {
+                ComponentSurface::Irreversible(CoefficientSurface::new(levels)?)
+            }
+            WaveletTransform::Reserved(_) => return Err(Error::NotImplemented),
+        };
+        let mut work_block: Option<CodeBlock> = None;
         while let Some((key, acc)) = accum.next_if(|(key, _)| usize::from(key.0) == c) {
             let (c, r, k, sb, cbx, cby) = &key;
             if acc.passes == 0 {
@@ -2152,10 +2153,10 @@ fn decode_tile_from_plan(
             // Per-level band order matches the §B.9 packet sub-band order
             // ([LL] at r = 0, [HL, LH, HH] at r ≥ 1), so the packet's
             // sub-band index addresses the quant table directly.
-            let mb = quant_per_comp[*c as usize][*r as usize]
+            let quant = quant_per_comp[*c as usize][*r as usize]
                 .get(*sb as usize)
-                .ok_or(Error::InvalidPacketHeader)?
-                .mb;
+                .ok_or(Error::InvalidPacketHeader)?;
+            let mb = quant.mb;
             // §H.1 / §H.2: under an `RGN` Maxshift the encoder shifts ROI
             // coefficients up into the top `s` bit-planes, so the coded
             // bit budget is `M'b = Mb + s`. The tier-1 schedule, the
@@ -2229,15 +2230,16 @@ fn decode_tile_from_plan(
                     placement.height() as usize,
                 ) {
                     Ok(Some((block, nb_ht))) => {
-                        blocks.push(DecodedBlock {
-                            r: *r,
-                            precinct: *k,
-                            sub_band: *sb,
-                            cbx: *cbx,
-                            cby: *cby,
-                            nb: nb_ht,
-                            block,
-                        });
+                        surface.scatter(
+                            *r,
+                            *sb,
+                            CodedCodeBlock {
+                                placement,
+                                coefficients: &block,
+                                nb: nb_ht,
+                            },
+                            quant,
+                        )?;
                         continue;
                     }
                     Ok(None) => {
@@ -2286,11 +2288,21 @@ fn decode_tile_from_plan(
             } else {
                 &acc.segments
             };
-            let mut block = CodeBlock::new(
-                psb.orientation,
-                placement.width() as usize,
-                placement.height() as usize,
-            );
+            let block = match &mut work_block {
+                Some(block) => {
+                    block.reset_for_decode(
+                        psb.orientation,
+                        placement.width() as usize,
+                        placement.height() as usize,
+                    );
+                    block
+                }
+                empty @ None => empty.insert(CodeBlock::new(
+                    psb.orientation,
+                    placement.width() as usize,
+                    placement.height() as usize,
+                )),
+            };
             let mut ctx = reset_contexts();
             let mut seq = BitPlaneSequencer::new(mb_coded - 1 - p)
                 .with_segmentation_symbols(style.segmentation_symbols)
@@ -2318,10 +2330,10 @@ fn decode_tile_from_plan(
                     // §D.6 raw (lazy) span — the SP / MR passes read from a
                     // bit-stuffed stream. The MQ context array is untouched.
                     let mut raw = crate::t1::RawBitReader::new_with_d4_1_fill(&seg.bytes);
-                    seq.decode_passes_raw(&mut block, &mut raw, seg.passes)?;
+                    seq.decode_passes_raw(block, &mut raw, seg.passes)?;
                 } else {
                     let mut decoder = crate::mq::MqDecoder::new(&seg.bytes);
-                    match seq.decode_passes(&mut block, &mut decoder, &mut ctx, seg.passes) {
+                    match seq.decode_passes(block, &mut decoder, &mut ctx, seg.passes) {
                         Ok(_) => {}
                         // §D.5 positions the segmentation symbol as error
                         // *detection*. On a layer-limited decode the final
@@ -2366,25 +2378,20 @@ fn decode_tile_from_plan(
             // background `Mb` and rewrite the per-coefficient Nb(u, v). A
             // no-op when `s == 0` (no `RGN` for this component).
             block.apply_roi_maxshift(mb, s);
-            blocks.push(DecodedBlock {
-                r: *r,
-                precinct: *k,
-                sub_band: *sb,
-                cbx: *cbx,
-                cby: *cby,
-                nb,
-                block,
-            });
+            surface.scatter(
+                *r,
+                *sb,
+                CodedCodeBlock {
+                    placement,
+                    coefficients: block,
+                    nb,
+                },
+                quant,
+            )?;
         }
 
-        let cc = comp_coding.get(c).ok_or(Error::InvalidMarkerLength)?;
-        // Reduced-resolution decode: truncate the synthesis cascade to
-        // the kept levels — the output is the resolution-level-`keep`
-        // reconstruction (§F.3.1 stopped early; ISO/IEC 15444-4
-        // §B.2.3). At `discard_levels == 0` this is the full slice and
-        // the level-`NL` (tile-component) extent.
-        let keep = (cc.n_l - discard_levels) as usize;
-        let levels = &levels[..=keep];
+        // No entropy state is needed during IDWT or by later components.
+        drop(work_block);
         let out_level = &levels[keep];
         let tc = &tile.components[c];
         let (tw, th) = if discard_levels == 0 {
@@ -2407,93 +2414,38 @@ fn decode_tile_from_plan(
             continue;
         }
 
-        // Group this component's decoded blocks by (level, precinct).
-        // The entry maps are kept alive alongside the per-level
-        // sources because the bridge's lifetime parameter unifies the
-        // entry-slice borrow with the CodeBlock borrow.
-        let entries_store: Vec<BTreeMap<u32, Vec<WalkerBlockEntry<'_>>>> = levels
-            .iter()
-            .map(|level| {
-                let mut by_precinct: BTreeMap<u32, Vec<WalkerBlockEntry<'_>>> = BTreeMap::new();
-                for b in blocks.iter().filter(|b| b.r == level.r) {
-                    by_precinct
-                        .entry(b.precinct)
-                        .or_default()
-                        .push(WalkerBlockEntry {
-                            sub_band: b.sub_band,
-                            cbx: b.cbx,
-                            cby: b.cby,
-                            coefficients: &b.block,
-                            nb: b.nb,
-                        });
-                }
-                by_precinct
-            })
-            .collect();
-        let mut per_level_sources = Vec::with_capacity(levels.len());
-        for (level, entries_by_precinct) in levels.iter().zip(entries_store.iter()) {
-            let precinct_blocks: Vec<PrecinctBlocks<'_>> = entries_by_precinct
-                .iter()
-                .map(|(k, entries)| {
-                    precinct_geom
-                        .get(&(c as u16, level.r, *k))
-                        .map(|geometry| PrecinctBlocks {
-                            geometry,
-                            entries: entries.as_slice(),
-                        })
-                        .ok_or(Error::InvalidPacketHeader)
-                })
-                .collect::<Result<_, _>>()?;
-            per_level_sources.push(WalkerBlockSource::from_precincts(&precinct_blocks)?);
-        }
-        let source = LevelKeyedSource {
-            n_l: cc.n_l,
-            per_level: per_level_sources,
-        };
-
         // §A.6.2 / §A.6.5: a COC may override the wavelet kernel and a
         // QCC the quantisation style per component; Table A.28 still
         // requires each component's quantisation style to match the
         // kernel it is reconstructed with.
         let comp_style = comp_quant[c].style;
-        match cc.transform {
-            WaveletTransform::Reversible5x3 => {
+        match surface {
+            ComponentSurface::Reversible(surface) => {
                 if comp_style != QuantizationStyle::None {
                     // Table A.28: the reversible kernel pairs with the
                     // "no quantisation" style only.
                     return Err(Error::NotImplemented);
                 }
-                let mb_per_level: Vec<Vec<u32>> = quant_per_comp[c]
-                    .iter()
-                    .take(levels.len())
-                    .map(|bands| bands.iter().map(|b| b.mb).collect())
-                    .collect();
-                let grid = idwt_5x3(levels, &source, &mb_per_level, 0.5)?;
+                let grid = surface.into_idwt_5x3()?;
                 if grid.width != tw || grid.height != th {
                     return Err(Error::InvalidMarkerLength);
                 }
                 comp_lane.push((WaveletTransform::Reversible5x3, planes_5x3.len()));
                 planes_5x3.push(grid.data);
             }
-            WaveletTransform::Irreversible9x7 => {
+            ComponentSurface::Irreversible(surface) => {
                 if comp_style == QuantizationStyle::None {
                     // Table A.28 pairs the 9-7 kernel with scalar
                     // quantisation (derived or expounded).
                     return Err(Error::NotImplemented);
                 }
-                let quant_per_level: Vec<Vec<SubBandQuantization>> = quant_per_comp[c]
-                    .iter()
-                    .take(levels.len())
-                    .map(|bands| bands.iter().map(|b| b.quant).collect())
-                    .collect();
-                let grid = idwt_9x7(levels, &source, &quant_per_level, 0.5)?;
+                let grid = surface.into_idwt_9x7()?;
                 if grid.width != tw || grid.height != th {
                     return Err(Error::InvalidMarkerLength);
                 }
                 comp_lane.push((WaveletTransform::Irreversible9x7, planes_9x7.len()));
                 planes_9x7.push(grid.data);
             }
-            WaveletTransform::Reserved(_) => return Err(Error::NotImplemented),
         }
     }
 

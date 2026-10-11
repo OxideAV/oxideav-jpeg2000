@@ -82,6 +82,9 @@ use crate::geometry::{
 use crate::t1::CodeBlock;
 use crate::Error;
 
+mod surface;
+pub(crate) use surface::CoefficientSurface;
+
 /// One decoded code-block ready to be scattered into a sub-band array.
 ///
 /// `placement` carries the code-block's clipped sample corners on the

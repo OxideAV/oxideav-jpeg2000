@@ -612,6 +612,34 @@ impl CodeBlock {
         }
     }
 
+    /// Reuse the block buffers for a different, independent decode.
+    /// Call only after all selected contributions of the previous block
+    /// have been consumed and its coefficients have been reconstructed.
+    /// Every pass/precision/style field is reset; capacity alone survives.
+    pub(crate) fn reset_for_decode(
+        &mut self,
+        orientation: SubBandOrientation,
+        width: usize,
+        height: usize,
+    ) {
+        assert!(width >= 1 && height >= 1);
+        let len = width * height;
+        self.orientation = orientation;
+        self.width = width;
+        self.height = height;
+        self.coefficients.resize(len, Coefficient::default());
+        self.coefficients.fill(Coefficient::default());
+        self.newly_significant.resize(len, false);
+        self.newly_significant.fill(false);
+        self.sp_visited.resize(len, false);
+        self.sp_visited.fill(false);
+        self.decoded_bits.resize(len, 0);
+        self.decoded_bits.fill(0);
+        self.zero_bit_planes = 0;
+        self.vertically_causal = false;
+        self.roi_nb = None;
+    }
+
     /// Construct a code-block directly from a flat row-major coefficient
     /// vector — useful for sibling modules (e.g. [`crate::reassemble`])
     /// that need to round-trip a fully-decoded code-block through their
@@ -772,6 +800,28 @@ impl CodeBlock {
             uniform_fallback
         } else {
             self.zero_bit_planes + self.decoded_bits[u + v * self.width]
+        }
+    }
+
+    /// Resolve the block-wide fallback once before scanning its coefficients.
+    /// Reassembly borrows an immutable block, so the decision stays valid for
+    /// the complete scan. ROI overrides and partial-plane counts retain the
+    /// same semantics as `effective_nb`, without its per-coefficient max scan.
+    pub(crate) fn effective_nb_resolver(
+        &self,
+        uniform_fallback: u32,
+    ) -> impl Fn(usize, usize) -> u32 + '_ {
+        let uniform = self.roi_nb.is_none() && self.max_decoded_bits() == 0;
+        move |u, v| {
+            debug_assert!(u < self.width && v < self.height);
+            let index = u + v * self.width;
+            if let Some(roi) = &self.roi_nb {
+                roi[index]
+            } else if uniform {
+                uniform_fallback
+            } else {
+                self.zero_bit_planes + self.decoded_bits[index]
+            }
         }
     }
 
@@ -2821,6 +2871,52 @@ mod tests {
     use super::*;
 
     // -- Context-array reset (Table D.7) ------------------------------
+
+    #[test]
+    fn reusable_decode_block_clears_every_state_across_geometry_changes() {
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 7, 5);
+        for (orientation, width, height) in [
+            (SubBandOrientation::HH, 2, 3),
+            (SubBandOrientation::HL, 7, 5),
+            (SubBandOrientation::LH, 1, 1),
+            (SubBandOrientation::LL, 8, 7),
+        ] {
+            block.coefficients.fill(Coefficient {
+                magnitude: 37,
+                sigma: true,
+                sign: true,
+                already_refined: true,
+            });
+            block.newly_significant.fill(true);
+            block.sp_visited.fill(true);
+            block.decoded_bits.fill(5);
+            block.zero_bit_planes = 2;
+            block.vertically_causal = true;
+            block.roi_nb = Some(vec![3; block.width * block.height]);
+            let old_capacity = block.coefficients.capacity();
+            let old_ptr = block.coefficients.as_ptr();
+            block.reset_for_decode(orientation, width, height);
+            let fresh = CodeBlock::new(orientation, width, height);
+            assert_eq!(block.orientation, fresh.orientation);
+            assert_eq!(block.width, fresh.width);
+            assert_eq!(block.height, fresh.height);
+            assert_eq!(block.coefficients, fresh.coefficients);
+            assert_eq!(block.newly_significant, fresh.newly_significant);
+            assert_eq!(block.sp_visited, fresh.sp_visited);
+            assert_eq!(block.decoded_bits, fresh.decoded_bits);
+            assert_eq!(block.zero_bit_planes, fresh.zero_bit_planes);
+            assert_eq!(block.vertically_causal, fresh.vertically_causal);
+            assert_eq!(block.roi_nb, fresh.roi_nb);
+            if width * height <= old_capacity {
+                assert_eq!(block.coefficients.as_ptr(), old_ptr);
+            }
+            for v in 0..height {
+                for u in 0..width {
+                    assert_eq!(block.effective_nb_resolver(11)(u, v), 11);
+                }
+            }
+        }
+    }
 
     #[test]
     fn reset_contexts_populates_table_d7_specials() {
