@@ -596,7 +596,6 @@ type BlockKey = (u16, u8, u32, u32, u32, u32);
 /// One tier-1-decoded code-block, owned, ready to be bridged into a
 /// [`WalkerBlockSource`].
 struct DecodedBlock {
-    component: u16,
     r: u8,
     precinct: u32,
     sub_band: u32,
@@ -2094,8 +2093,11 @@ fn decode_tile_from_plan(
     }
 
     // -- Tier-1: decode every included code-block --
-    let mut decoded: Vec<DecodedBlock> = Vec::with_capacity(accum.len());
-    for ((c, r, k, sb, cbx, cby), acc) in accum.iter() {
+    let mut decoded: Vec<Vec<DecodedBlock>> = (0..num_components).map(|_| Vec::new()).collect();
+    // Consume each accumulator so its compressed segments can be freed as
+    // soon as tier-1 finishes the block, before component reconstruction.
+    for (key, acc) in accum {
+        let (c, r, k, sb, cbx, cby) = &key;
         if acc.passes == 0 {
             continue;
         }
@@ -2191,7 +2193,7 @@ fn decode_tile_from_plan(
         let mut ht_failed = false;
         if try_ht {
             match ht_tier1_block(
-                acc,
+                &acc,
                 p,
                 mb,
                 mb_coded,
@@ -2201,8 +2203,7 @@ fn decode_tile_from_plan(
                 placement.height() as usize,
             ) {
                 Ok(Some((block, nb_ht))) => {
-                    decoded.push(DecodedBlock {
-                        component: *c,
+                    decoded[*c as usize].push(DecodedBlock {
                         r: *r,
                         precinct: *k,
                         sub_band: *sb,
@@ -2339,8 +2340,7 @@ fn decode_tile_from_plan(
         // background `Mb` and rewrite the per-coefficient Nb(u, v). A
         // no-op when `s == 0` (no `RGN` for this component).
         block.apply_roi_maxshift(mb, s);
-        decoded.push(DecodedBlock {
-            component: *c,
+        decoded[*c as usize].push(DecodedBlock {
             r: *r,
             precinct: *k,
             sub_band: *sb,
@@ -2365,6 +2365,9 @@ fn decode_tile_from_plan(
     let mut planes_9x7: Vec<Vec<f64>> = Vec::new();
     let mut comp_lane: Vec<(WaveletTransform, usize)> = Vec::with_capacity(levels_per_comp.len());
     for (c, levels) in levels_per_comp.iter().enumerate() {
+        // The bridge borrows only this component's blocks. Taking ownership
+        // here releases their coefficient buffers after its IDWT completes.
+        let blocks = std::mem::take(&mut decoded[c]);
         let cc = comp_coding.get(c).ok_or(Error::InvalidMarkerLength)?;
         // Reduced-resolution decode: truncate the synthesis cascade to
         // the kept levels — the output is the resolution-level-`keep`
@@ -2403,10 +2406,7 @@ fn decode_tile_from_plan(
             .iter()
             .map(|level| {
                 let mut by_precinct: BTreeMap<u32, Vec<WalkerBlockEntry<'_>>> = BTreeMap::new();
-                for b in decoded
-                    .iter()
-                    .filter(|b| b.component == c as u16 && b.r == level.r)
-                {
+                for b in blocks.iter().filter(|b| b.r == level.r) {
                     by_precinct
                         .entry(b.precinct)
                         .or_default()
@@ -2561,7 +2561,7 @@ fn decode_tile_from_plan(
     }
 
     // Reconstruct the 9-7 lane (`f64` → `f32` → `i32`) when populated.
-    let outputs_9x7: Vec<Vec<i32>> = if planes_9x7.is_empty() {
+    let mut outputs_9x7: Vec<Vec<i32>> = if planes_9x7.is_empty() {
         Vec::new()
     } else {
         let mode = if mixed_kernel {
@@ -2574,10 +2574,10 @@ fn decode_tile_from_plan(
             }
         };
         let mut comps_f32: Vec<Vec<f32>> = planes_9x7
-            .iter()
-            .map(|p| p.iter().map(|&v| v as f32).collect())
+            .into_iter()
+            .map(|p| p.into_iter().map(|v| v as f32).collect())
             .collect();
-        let mut outputs: Vec<Vec<i32>> = planes_9x7.iter().map(|p| vec![0i32; p.len()]).collect();
+        let mut outputs: Vec<Vec<i32>> = comps_f32.iter().map(|p| vec![0i32; p.len()]).collect();
         let mut comp_refs: Vec<&mut [f32]> =
             comps_f32.iter_mut().map(|v| v.as_mut_slice()).collect();
         let mut out_refs: Vec<&mut [i32]> = outputs.iter_mut().map(|v| v.as_mut_slice()).collect();
@@ -2597,8 +2597,8 @@ fn decode_tile_from_plan(
                 result.push(std::mem::take(&mut planes_5x3[idx]));
             }
             WaveletTransform::Irreversible9x7 => {
-                let out = outputs_9x7.get(idx).ok_or(Error::InvalidMarkerLength)?;
-                result.push(out.clone());
+                let out = outputs_9x7.get_mut(idx).ok_or(Error::InvalidMarkerLength)?;
+                result.push(std::mem::take(out));
             }
             WaveletTransform::Reserved(_) => return Err(Error::NotImplemented),
         }
