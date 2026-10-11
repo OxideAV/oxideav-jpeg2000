@@ -3100,7 +3100,7 @@ impl BitPlaneSequencer {
         debug_assert!(self.passes_decoded + passes <= 3 * coded_bitplanes - 2);
         debug_assert_eq!(
             self.current_bitplane,
-            (coded_bitplanes - 1).saturating_sub((self.passes_decoded + 2) / 3)
+            (coded_bitplanes - 1).saturating_sub(self.passes_decoded.div_ceil(3))
         );
         debug_assert_eq!(
             self.next_pass,
