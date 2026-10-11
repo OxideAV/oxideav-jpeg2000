@@ -217,9 +217,9 @@ fn length_one_5x3(y_i0: i32, i0: i32) -> i32 {
 /// lives in `y[k]` for `k = 0 .. il - i0`) and writes the inverse-
 /// filtered output to `x[i0..il]` (same layout).
 ///
-/// The internal extension uses the closed-form [`pseo`] of
-/// Equation F-4 so the lifting steps can fetch arbitrary out-of-
-/// range indices without materialising an extended buffer.
+/// Each lifting step reads only the immediate neighbours. Interior
+/// samples are indexed directly; at either endpoint Equation F-4
+/// reflects the missing neighbour to the adjacent sample.
 ///
 /// # Errors
 ///
@@ -236,42 +236,27 @@ pub fn idwt_1d_5x3(y: &[i32], x: &mut [i32], i0: i32, il: i32) -> Result<(), Err
         x[0] = length_one_5x3(y[0], i0);
         return Ok(());
     }
-    // Index helper: returns the value of Yext at coefficient index `i`.
-    let yext = |i: i32| -> i32 { y[(pseo(i, i0, il) - i0) as usize] };
     // §F.3.8.1 Equation F-5 — even-index outputs:
     //     X(2n) = Yext(2n) - ⌊ (Yext(2n - 1) + Yext(2n + 1) + 2) / 4 ⌋
     //                                                     for ⌈i0/2⌉ ≤ n < ⌈il/2⌉
-    let n_lo_even = div_floor(i0, 2); // ⌊i0/2⌋
-    let n_hi_even = div_floor(il + 1, 2); // ⌈il/2⌉
-    let mut n = n_lo_even;
-    while n < n_hi_even {
-        let two_n = 2 * n;
-        let v = yext(two_n) - div_floor(yext(two_n - 1) + yext(two_n + 1) + 2, 4);
-        if two_n >= i0 && two_n < il {
-            x[(two_n - i0) as usize] = v;
-        }
-        n += 1;
+    let mut k = i0.rem_euclid(2) as usize;
+    while k < len {
+        let left = if k == 0 { y[1] } else { y[k - 1] };
+        let right = if k + 1 == len { y[len - 2] } else { y[k + 1] };
+        x[k] = y[k] - div_floor(left + right + 2, 4);
+        k += 2;
     }
     // §F.3.8.1 Equation F-6 — odd-index outputs:
     //     X(2n + 1) = Yext(2n + 1) + ⌊ (X(2n) + X(2n + 2)) / 2 ⌋
     //                                                     for ⌊i0/2⌋ ≤ n < ⌊il/2⌋
-    let n_lo_odd = div_floor(i0, 2);
-    let n_hi_odd = div_floor(il, 2);
-    let xext = |x_slice: &[i32], i: i32| -> i32 {
-        // Even-indexed X values are valid in the array slot
-        // pseo(i, i0, il); odd values haven't been written yet,
-        // but the §F.3.8.1 equation only ever references X(2n)
-        // and X(2n + 2), both even, so the lookup is safe.
-        x_slice[(pseo(i, i0, il) - i0) as usize]
-    };
-    let mut n = n_lo_odd;
-    while n < n_hi_odd {
-        let two_n = 2 * n;
-        let v = yext(two_n + 1) + div_floor(xext(x, two_n) + xext(x, two_n + 2), 2);
-        if two_n + 1 >= i0 && two_n + 1 < il {
-            x[(two_n + 1 - i0) as usize] = v;
-        }
-        n += 1;
+    let mut k = 1 - i0.rem_euclid(2) as usize;
+    while k < len {
+        // Both neighbours have even absolute indices and were written
+        // by the first lifting step, including reflected endpoints.
+        let left = if k == 0 { x[1] } else { x[k - 1] };
+        let right = if k + 1 == len { x[len - 2] } else { x[k + 1] };
+        x[k] = y[k] + div_floor(left + right, 2);
+        k += 2;
     }
     Ok(())
 }
@@ -601,8 +586,7 @@ pub fn hor_sr_5x3(a: &mut Interleaved2D<i32>, i0: i32) -> Result<(), Error> {
     let mut tmp = vec![0_i32; a.width];
     for v in 0..a.height {
         let row = &a.data[v * a.width..(v + 1) * a.width];
-        let row_vec = row.to_vec();
-        idwt_1d_5x3(&row_vec, &mut tmp, i0, il)?;
+        idwt_1d_5x3(row, &mut tmp, i0, il)?;
         a.data[v * a.width..(v + 1) * a.width].copy_from_slice(&tmp);
     }
     Ok(())
@@ -1526,6 +1510,73 @@ mod tests {
     // -------------------------------------------------------------
     // Equation-mismatch / boundary failure paths.
     // -------------------------------------------------------------
+
+    #[test]
+    fn direct_5x3_neighbours_match_equation_f4_extension() {
+        // Keep the general reflected-index equations as an independent
+        // oracle for signed origins, both endpoint parities and short rows.
+        fn reflected(y: &[i32], i0: i32) -> Vec<i32> {
+            let il = i0 + y.len() as i32;
+            if y.len() == 1 {
+                return vec![length_one_5x3(y[0], i0)];
+            }
+            let mut x = vec![0; y.len()];
+            let yext = |i| y[(pseo(i, i0, il) - i0) as usize];
+            for n in div_floor(i0, 2)..div_floor(il + 1, 2) {
+                let i = 2 * n;
+                if i >= i0 && i < il {
+                    x[(i - i0) as usize] = yext(i) - div_floor(yext(i - 1) + yext(i + 1) + 2, 4);
+                }
+            }
+            for n in div_floor(i0, 2)..div_floor(il, 2) {
+                let i = 2 * n + 1;
+                if i >= i0 && i < il {
+                    let left = x[(pseo(i - 1, i0, il) - i0) as usize];
+                    let right = x[(pseo(i + 1, i0, il) - i0) as usize];
+                    x[(i - i0) as usize] = yext(i) + div_floor(left + right, 2);
+                }
+            }
+            x
+        }
+
+        let mut seed = 0x96c8_24abu32;
+        for i0 in -7..=7 {
+            for len in 1..=129 {
+                for pattern in 0..4 {
+                    let y: Vec<i32> = (0..len)
+                        .map(|k| {
+                            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                            match pattern {
+                                0 => (seed >> 16) as i32 - 32_768,
+                                1 => {
+                                    if k % 2 == 0 {
+                                        -65_535
+                                    } else {
+                                        65_535
+                                    }
+                                }
+                                2 => {
+                                    if k == 0 || k + 1 == len {
+                                        -3
+                                    } else {
+                                        0
+                                    }
+                                }
+                                _ => 3,
+                            }
+                        })
+                        .collect();
+                    let mut actual = vec![0; len];
+                    idwt_1d_5x3(&y, &mut actual, i0, i0 + len as i32).unwrap();
+                    assert_eq!(
+                        actual,
+                        reflected(&y, i0),
+                        "origin={i0} length={len} pattern={pattern}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn idwt_1d_5x3_rejects_length_mismatch() {
