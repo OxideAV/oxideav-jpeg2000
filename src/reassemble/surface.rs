@@ -48,7 +48,7 @@ impl<'a, T: Default + Clone> CoefficientSurface<'a, T> {
             return Err(Error::InvalidMarkerLength);
         }
         let mut count = 0usize;
-        let mut bands = Vec::with_capacity(levels.len());
+        let mut layout = Vec::with_capacity(levels.len());
         for (resolution, level) in levels.iter().enumerate() {
             let orientations: &[SubBandOrientation] = if resolution == 0 {
                 &[SubBandOrientation::LL]
@@ -72,14 +72,25 @@ impl<'a, T: Default + Clone> CoefficientSurface<'a, T> {
                     .ok_or(Error::InvalidMarkerLength)?;
                 let offset = count;
                 count = count.checked_add(len).ok_or(Error::InvalidMarkerLength)?;
-                regions.push(BandRegion {
-                    band,
-                    offset,
-                    data: vec![T::default(); len],
-                });
+                regions.push((band, offset, len));
             }
-            bands.push(regions);
+            layout.push(regions);
         }
+        // Validate every level before allocating any coefficient buffer. A
+        // malformed later band must not cause a large earlier allocation.
+        let bands = layout
+            .into_iter()
+            .map(|regions| {
+                regions
+                    .into_iter()
+                    .map(|(band, offset, len)| BandRegion {
+                        band,
+                        offset,
+                        data: vec![T::default(); len],
+                    })
+                    .collect()
+            })
+            .collect();
         Ok(Self {
             levels,
             bands,
@@ -610,5 +621,51 @@ mod tests {
             CoefficientSurface::<f64>::new(&levels),
             Err(Error::InvalidMarkerLength)
         ));
+    }
+
+    #[test]
+    fn later_invalid_layout_constructs_no_coefficients() {
+        use std::cell::Cell;
+
+        thread_local! {
+            static CONSTRUCTIONS: Cell<usize> = const { Cell::new(0) };
+        }
+        #[derive(Clone)]
+        struct ConstructionWitness {
+            _value: u8,
+        }
+        impl Default for ConstructionWitness {
+            fn default() -> Self {
+                CONSTRUCTIONS.with(|count| count.set(count.get() + 1));
+                Self { _value: 0 }
+            }
+        }
+
+        let levels = derive_resolution_levels(
+            TileComponentGeometry {
+                tcx0: 0,
+                tcy0: 0,
+                tcx1: 8,
+                tcy1: 8,
+            },
+            2,
+        );
+        for invalid_kind in 0..4 {
+            let mut invalid = levels.clone();
+            match invalid_kind {
+                0 => invalid[1].r = 2,
+                1 => invalid[1].sub_bands.clear(),
+                2 => invalid[1].sub_bands[0].orientation = SubBandOrientation::LL,
+                _ => invalid[2].sub_bands[2].orientation = SubBandOrientation::HL,
+            }
+            CONSTRUCTIONS.with(|count| count.set(0));
+            assert!(matches!(
+                CoefficientSurface::<ConstructionWitness>::new(&invalid),
+                Err(Error::InvalidMarkerLength)
+            ));
+            // Live-value counts alone would miss an early allocation that
+            // gets dropped while returning the later validation error.
+            CONSTRUCTIONS.with(|count| assert_eq!(count.get(), 0));
+        }
     }
 }
