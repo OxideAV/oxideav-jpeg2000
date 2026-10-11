@@ -585,6 +585,65 @@ pub struct CodeBlock {
 const NEWLY_SIGNIFICANT: u16 = 1 << 12;
 const SP_VISITED: u16 = 1 << 13;
 
+// Derive the packed lookups from the same Table D.1/D.2/D.3 rules as the
+// public Neighbours helpers. Plane-local flags never participate in a key.
+const SIGNIFICANCE_CONTEXTS: [[u8; 256]; 3] = build_significance_contexts();
+const SIGN_CONTEXTS: [(u8, u8); 256] = build_sign_contexts();
+
+const fn build_significance_contexts() -> [[u8; 256]; 3] {
+    let mut tables = [[0; 256]; 3];
+    let mut sigma = 0usize;
+    while sigma < 256 {
+        let h = (((sigma >> 3) & 1) + ((sigma >> 4) & 1)) as u8;
+        let v = (((sigma >> 1) & 1) + ((sigma >> 6) & 1)) as u8;
+        let d = ((sigma & 1) + ((sigma >> 2) & 1) + ((sigma >> 5) & 1) + ((sigma >> 7) & 1)) as u8;
+        tables[0][sigma] = sp_label_ll_lh(h, v, d);
+        tables[1][sigma] = sp_label_ll_lh(v, h, d);
+        tables[2][sigma] = sp_label_hh(h + v, d);
+        sigma += 1;
+    }
+    tables
+}
+
+#[inline]
+fn significance_contexts(orientation: SubBandOrientation) -> &'static [u8; 256] {
+    match orientation {
+        SubBandOrientation::LL | SubBandOrientation::LH => &SIGNIFICANCE_CONTEXTS[0],
+        SubBandOrientation::HL => &SIGNIFICANCE_CONTEXTS[1],
+        SubBandOrientation::HH => &SIGNIFICANCE_CONTEXTS[2],
+    }
+}
+
+const fn build_sign_contexts() -> [(u8, u8); 256] {
+    let mut table = [(0, 0); 256];
+    let mut key = 0usize;
+    while key < 256 {
+        // Low nibble: H0, H1, V0, V1 sigma. High nibble: V0, H0,
+        // H1, V1 sign, retaining the cache's cardinal-sign order.
+        let h = horizontal_or_vertical_contribution(
+            key & 1 != 0,
+            key & (1 << 5) != 0,
+            key & 2 != 0,
+            key & (1 << 6) != 0,
+        );
+        let v = horizontal_or_vertical_contribution(
+            key & 4 != 0,
+            key & (1 << 4) != 0,
+            key & 8 != 0,
+            key & (1 << 7) != 0,
+        );
+        table[key] = sign_label_from_contributions(h, v);
+        key += 1;
+    }
+    table
+}
+
+#[inline]
+fn packed_sign_context_label(state: u16) -> (u8, u8) {
+    let key = ((state >> 3) & 3) | ((state << 1) & 4) | ((state >> 3) & 8) | ((state >> 4) & 0xf0);
+    SIGN_CONTEXTS[key as usize]
+}
+
 impl CodeBlock {
     /// Construct a fresh, all-insignificant code-block of the given
     /// sub-band orientation and dimensions.
@@ -860,6 +919,7 @@ impl CodeBlock {
         ctx: &mut [MqContext; NUM_CONTEXTS],
     ) -> Result<usize, Error> {
         self.ensure_coding_state();
+        let contexts = significance_contexts(self.orientation);
         // §D.3.3: clear the "just became significant in the last SP
         // pass" carry at the start of every new SP pass; bits set during
         // *this* pass will be visible to the *next* magnitude refinement
@@ -885,10 +945,8 @@ impl CodeBlock {
                     if coef.sigma {
                         continue;
                     }
-                    let label = significance_context_label(
-                        self.orientation,
-                        self.coding_neighbours_in_stripe(u, v, v0, stripe_h),
-                    );
+                    let label =
+                        contexts[(self.coding_state_in_stripe(u, v, v0, stripe_h) & 0xff) as usize];
                     if label == 0 {
                         // Zero context — deferred to the cleanup pass.
                         continue;
@@ -909,8 +967,9 @@ impl CodeBlock {
                         // bit-plane's positional value into magnitude,
                         // then immediately run the §D.3.2 sign-bit
                         // subroutine.
-                        let nb = self.coding_neighbours_in_stripe(u, v, v0, stripe_h);
-                        let (sign_label, xorbit) = sign_context_label(nb);
+                        let (sign_label, xorbit) = packed_sign_context_label(
+                            self.coding_state_in_stripe(u, v, v0, stripe_h),
+                        );
                         let sign_cx = &mut ctx[SIGN_CTX_OFFSET + sign_label as usize];
                         let d = decoder.decode(sign_cx);
                         let sign_bit = (d ^ xorbit) != 0;
@@ -990,10 +1049,11 @@ impl CodeBlock {
 
                     // Table D.4 context: the neighbour summation uses the
                     // significance states currently known to the decoder.
-                    let label = refinement_context_label(
-                        self.coding_neighbours_in_stripe(u, v, v0, stripe_h),
-                        coef.already_refined,
-                    );
+                    let label = if coef.already_refined {
+                        2
+                    } else {
+                        u8::from(self.coding_state_in_stripe(u, v, v0, stripe_h) & 0xff != 0)
+                    };
                     let cx = &mut ctx[REFINEMENT_CTX_OFFSET + label as usize];
                     let bit = decoder.decode(cx);
 
@@ -1065,6 +1125,7 @@ impl CodeBlock {
         ctx: &mut [MqContext; NUM_CONTEXTS],
     ) -> Result<usize, Error> {
         self.ensure_coding_state();
+        let contexts = significance_contexts(self.orientation);
         let weight: u32 = 1u32 << bitplane;
         let mut newly = 0usize;
 
@@ -1128,10 +1189,8 @@ impl CodeBlock {
                     {
                         continue;
                     }
-                    let label = significance_context_label(
-                        self.orientation,
-                        self.coding_neighbours_in_stripe(u, v, v0, stripe_h),
-                    );
+                    let label =
+                        contexts[(self.coding_state_in_stripe(u, v, v0, stripe_h) & 0xff) as usize];
                     let cx = &mut ctx[SP_CTX_OFFSET + label as usize];
                     // §D.2.1: this leftover coefficient is coded (a 0 or
                     // 1 magnitude bit) by the cleanup pass on this plane.
@@ -1174,6 +1233,7 @@ impl CodeBlock {
         ctx: &mut [MqContext; NUM_CONTEXTS],
     ) {
         self.ensure_coding_state();
+        let contexts = significance_contexts(self.orientation);
         self.clear_pass_flags();
         let weight: u32 = 1u32 << bitplane;
         let mut v0 = 0usize;
@@ -1186,10 +1246,8 @@ impl CodeBlock {
                     if self.coefficients[idx].sigma {
                         continue;
                     }
-                    let label = significance_context_label(
-                        self.orientation,
-                        self.coding_neighbours_in_stripe(u, v, v0, stripe_h),
-                    );
+                    let label =
+                        contexts[(self.coding_state_in_stripe(u, v, v0, stripe_h) & 0xff) as usize];
                     if label == 0 {
                         continue;
                     }
@@ -1229,10 +1287,11 @@ impl CodeBlock {
                     if !coef.sigma || self.coding_state[idx] & NEWLY_SIGNIFICANT != 0 {
                         continue;
                     }
-                    let label = refinement_context_label(
-                        self.coding_neighbours_in_stripe(u, v, v0, stripe_h),
-                        coef.already_refined,
-                    );
+                    let label = if coef.already_refined {
+                        2
+                    } else {
+                        u8::from(self.coding_state_in_stripe(u, v, v0, stripe_h) & 0xff != 0)
+                    };
                     let bit = ((targets[idx].magnitude >> bitplane) & 1) as u8;
                     encoder.encode(&mut ctx[REFINEMENT_CTX_OFFSET + label as usize], bit);
                     let mut updated = coef;
@@ -1272,11 +1331,7 @@ impl CodeBlock {
                     if self.coefficients[idx].sigma {
                         continue;
                     }
-                    let label = significance_context_label(
-                        self.orientation,
-                        self.coding_neighbours_in_stripe(u, v, v0, stripe_h),
-                    );
-                    if label == 0 {
+                    if self.coding_state_in_stripe(u, v, v0, stripe_h) & 0xff == 0 {
                         continue;
                     }
                     let bit = ((targets[idx].magnitude >> bitplane) & 1) as u8;
@@ -1347,6 +1402,7 @@ impl CodeBlock {
         ctx: &mut [MqContext; NUM_CONTEXTS],
     ) {
         self.ensure_coding_state();
+        let contexts = significance_contexts(self.orientation);
         let weight: u32 = 1u32 << bitplane;
         let mut v0 = 0usize;
         while v0 < self.height {
@@ -1390,10 +1446,8 @@ impl CodeBlock {
                     if self.coefficients[idx].sigma || self.coding_state[idx] & SP_VISITED != 0 {
                         continue;
                     }
-                    let label = significance_context_label(
-                        self.orientation,
-                        self.coding_neighbours_in_stripe(u, v, v0, stripe_h),
-                    );
+                    let label =
+                        contexts[(self.coding_state_in_stripe(u, v, v0, stripe_h) & 0xff) as usize];
                     let bit = ((targets[idx].magnitude >> bitplane) & 1) as u8;
                     self.decoded_bits[idx] += 1;
                     encoder.encode(&mut ctx[SP_CTX_OFFSET + label as usize], bit);
@@ -1427,8 +1481,8 @@ impl CodeBlock {
         ctx: &mut [MqContext; NUM_CONTEXTS],
     ) {
         let idx = u + v * self.width;
-        let nb = self.coding_neighbours_in_stripe(u, v, stripe_v0, stripe_h);
-        let (sign_label, xorbit) = sign_context_label(nb);
+        let (sign_label, xorbit) =
+            packed_sign_context_label(self.coding_state_in_stripe(u, v, stripe_v0, stripe_h));
         let sign_bit = targets[idx].sign;
         let d = (sign_bit as u8) ^ xorbit;
         encoder.encode(&mut ctx[SIGN_CTX_OFFSET + sign_label as usize], d);
@@ -1491,11 +1545,7 @@ impl CodeBlock {
                     if coef.sigma {
                         continue;
                     }
-                    let label = significance_context_label(
-                        self.orientation,
-                        self.coding_neighbours_in_stripe(u, v, v0, stripe_h),
-                    );
-                    if label == 0 {
+                    if self.coding_state_in_stripe(u, v, v0, stripe_h) & 0xff == 0 {
                         // Zero context — deferred to the cleanup pass,
                         // exactly as in the AC path.
                         continue;
@@ -1634,8 +1684,8 @@ impl CodeBlock {
         ctx: &mut [MqContext; NUM_CONTEXTS],
     ) {
         let idx = u + v * self.width;
-        let nb = self.coding_neighbours_in_stripe(u, v, stripe_v0, stripe_h);
-        let (sign_label, xorbit) = sign_context_label(nb);
+        let (sign_label, xorbit) =
+            packed_sign_context_label(self.coding_state_in_stripe(u, v, stripe_v0, stripe_h));
         let sign_cx = &mut ctx[SIGN_CTX_OFFSET + sign_label as usize];
         let d = decoder.decode(sign_cx);
         let sign_bit = (d ^ xorbit) != 0;
@@ -1718,7 +1768,7 @@ impl CodeBlock {
         }
     }
 
-    #[inline]
+    #[cfg(test)]
     fn coding_neighbours_in_stripe(
         &self,
         u: usize,
@@ -1986,7 +2036,7 @@ pub fn significance_context_label(orientation: SubBandOrientation, nb: Neighbour
 
 /// Table D.1 LL / LH (and HL after H/V swap) significance-context
 /// lookup — column triple `(∑Hi, ∑Vi, ∑Di)` to label.
-fn sp_label_ll_lh(h: u8, v: u8, d: u8) -> u8 {
+const fn sp_label_ll_lh(h: u8, v: u8, d: u8) -> u8 {
     // Table D.1, rows top to bottom (label 8 down to label 0). The
     // first matching row wins.
     if h == 2 {
@@ -2019,7 +2069,7 @@ fn sp_label_ll_lh(h: u8, v: u8, d: u8) -> u8 {
 
 /// Table D.1 HH significance-context lookup — `(∑(Hi+Vi), ∑Di)` to
 /// label.
-fn sp_label_hh(hv: u8, d: u8) -> u8 {
+const fn sp_label_hh(hv: u8, d: u8) -> u8 {
     // Rows top to bottom (label 8 down to label 0).
     if d >= 3 {
         return 8;
@@ -2080,7 +2130,7 @@ pub fn sign_context_label(nb: Neighbours) -> (u8, u8) {
 /// * significant positive, insignificant        → +1
 /// * significant negative, insignificant        → -1
 /// * both insignificant                         →  0
-fn horizontal_or_vertical_contribution(
+const fn horizontal_or_vertical_contribution(
     x0_sigma: bool,
     x0_sign: bool,
     x1_sigma: bool,
@@ -2114,7 +2164,7 @@ enum NState {
     Insig,
 }
 
-fn state(sigma: bool, sign: bool) -> NState {
+const fn state(sigma: bool, sign: bool) -> NState {
     if !sigma {
         NState::Insig
     } else if sign {
@@ -2127,7 +2177,7 @@ fn state(sigma: bool, sign: bool) -> NState {
 /// Table D.3 second step — reduce `(H_contrib, V_contrib)` to the
 /// `(context label, XORbit)` pair. Labels in the table are 9..=13;
 /// we return them relative to [`SIGN_CTX_OFFSET`] (i.e., 0..=4).
-fn sign_label_from_contributions(h: i8, v: i8) -> (u8, u8) {
+const fn sign_label_from_contributions(h: i8, v: i8) -> (u8, u8) {
     // Table D.3 rows, top to bottom:
     //   ( 1,  1) → 13 / 0
     //   ( 1,  0) → 12 / 0
@@ -2149,9 +2199,9 @@ fn sign_label_from_contributions(h: i8, v: i8) -> (u8, u8) {
         (-1, 0) => (12, 1),
         (-1, -1) => (13, 1),
         // Unreachable: contributions are constrained to {-1, 0, 1}.
-        _ => unreachable!("sign contributions outside {{-1, 0, 1}}"),
+        _ => panic!("sign contributions outside -1..=1"),
     };
-    debug_assert!((9..=13).contains(&label_abs));
+    debug_assert!(matches!(label_abs, 9..=13));
     (label_abs - SIGN_CTX_OFFSET as u8, xor)
 }
 
@@ -2937,6 +2987,7 @@ mod tests {
             for u in 0..block.width {
                 let old = normalized_signs(block.neighbours_in_stripe(u, v, v0, h));
                 let cached = block.coding_neighbours_in_stripe(u, v, v0, h);
+                let state = block.coding_state_in_stripe(u, v, v0, h);
                 assert_eq!(
                     cached, old,
                     "cache mismatch at ({u},{v}), VSC={}",
@@ -2951,11 +3002,16 @@ mod tests {
                     let label = significance_context_label(orientation, old);
                     assert_eq!(label, significance_context_label(orientation, cached));
                     assert_eq!(
+                        label,
+                        significance_contexts(orientation)[(state & 0xff) as usize]
+                    );
+                    assert_eq!(
                         label == 0,
                         block.coding_state_in_stripe(u, v, v0, h) & 0xff == 0
                     );
                 }
                 assert_eq!(sign_context_label(cached), sign_context_label(old));
+                assert_eq!(packed_sign_context_label(state), sign_context_label(old));
                 for refined in [false, true] {
                     assert_eq!(
                         refinement_context_label(cached, refined),
@@ -2963,6 +3019,35 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn packed_contexts_exhaustive_states_match_neighbour_helpers() {
+        // Include arbitrary signs on insignificant neighbours, both pass
+        // flags, and reserved high bits. Only neighbour state may select a
+        // context; the public helpers remain an independent runtime oracle.
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 1, 1);
+        for state in 0u16..=u16::MAX {
+            block.coding_state[0] = state;
+            let nb = block.coding_neighbours_in_stripe(0, 0, 0, 1);
+            for orientation in [
+                SubBandOrientation::LL,
+                SubBandOrientation::LH,
+                SubBandOrientation::HL,
+                SubBandOrientation::HH,
+            ] {
+                assert_eq!(
+                    significance_contexts(orientation)[(state & 0xff) as usize],
+                    significance_context_label(orientation, nb),
+                    "significance state={state:#06x}, orientation={orientation:?}"
+                );
+            }
+            assert_eq!(
+                packed_sign_context_label(state),
+                sign_context_label(nb),
+                "sign state={state:#06x}"
+            );
         }
     }
 
