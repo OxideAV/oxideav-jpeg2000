@@ -711,7 +711,13 @@ impl CodeBlock {
             width,
             height,
             magnitudes: coefficients.iter().map(|c| c.magnitude).collect(),
-            coding_state: coefficients.into_iter().map(coefficient_flags).collect(),
+            // Borrow here so collect cannot reuse the wider Coefficient
+            // allocation (or its spare capacity) for these u32 states.
+            coding_state: coefficients
+                .iter()
+                .copied()
+                .map(coefficient_flags)
+                .collect(),
             coding_state_ready: false,
             wide_decoded_bits: None,
             zero_bit_planes: 0,
@@ -3246,9 +3252,12 @@ mod tests {
                 })
             })
             .collect();
-        let mut block =
-            CodeBlock::from_coefficients(SubBandOrientation::HH, 4, 8, coefficients.clone());
+        let mut input = coefficients.clone();
+        input.reserve(1000);
+        let mut block = CodeBlock::from_coefficients(SubBandOrientation::HH, 4, 8, input);
         assert_eq!(block.coefficients_for_test(), coefficients);
+        assert_eq!(block.magnitudes.capacity(), coefficients.len());
+        assert_eq!(block.coding_state.capacity(), coefficients.len());
         assert!(block.wide_decoded_bits.is_none());
         block.ensure_coding_state();
         assert_coding_cache(&block);
