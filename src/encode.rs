@@ -5305,8 +5305,11 @@ mod tests {
                         for target in (minimum.saturating_sub(1))..=full.len() {
                             regression.target_bytes = Some(target);
                             let stream = encode_j2k(&[&p], 4, 4, &regression).unwrap();
-                            assert!(stream.len() <= target.max(minimum),
-                                "bypass={bypass}, terminate_all={terminate_all}, predictable={predictable}, layers={layers}, target={target}, actual={}", stream.len());
+                            assert!(
+                                stream.len() <= target.max(minimum),
+                                "bypass={bypass}, terminate_all={terminate_all}, predictable={predictable}, layers={layers}, target={target}, actual={}",
+                                stream.len()
+                            );
                             decode_j2k(&stream).expect("rate-controlled decode");
                         }
                     }
@@ -5362,8 +5365,11 @@ mod tests {
                         ] {
                             options.target_bytes = Some(target);
                             let stream = encode_j2k(&[&p], 41, 11, &options).unwrap();
-                            assert!(stream.len() <= target.max(minimum),
-                                "bypass={bypass}, terminate_all={terminate_all}, predictable={predictable_termination}, packed={packed_headers:?}, target={target}, actual={}", stream.len());
+                            assert!(
+                                stream.len() <= target.max(minimum),
+                                "bypass={bypass}, terminate_all={terminate_all}, predictable={predictable_termination}, packed={packed_headers:?}, target={target}, actual={}",
+                                stream.len()
+                            );
                             decode_j2k(&stream).expect("rate-controlled markers decode");
                         }
                     }

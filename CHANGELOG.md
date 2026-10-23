@@ -4,6 +4,7 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ## [Unreleased]
 
+- Rate control honours `target_bytes` at final code-block terminations: the λ-search probes now use each pass's actual terminated length (`truncation_rates`, with a predictable-termination size computed from the MQ registers alone) instead of the capped packet-prefix rate, so a budget-constrained stream can no longer come out larger than the budget when the truncated blocks are re-encoded exactly (4×4 bypass+predictable fixture: 90-byte budget returned 91 bytes, now 86) (#18, @Streetblock)
 - Reassembly resolves each code-block's uniform-`Nb` fallback once per block instead of rescanning `decoded_bits` for every coefficient (O(B) instead of O(B²) per block); `examples/decoder_perf.rs` benchmark (#17, @Streetblock)
 - edition 2024, MSRV 1.95
 
