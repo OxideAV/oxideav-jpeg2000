@@ -1239,9 +1239,11 @@ mod tests {
             let mut mel_vlc = writer.finish();
             assert_eq!(mel_vlc, expected);
             mel_vlc.push(0xC2);
-            assert!(mel_vlc
-                .windows(2)
-                .all(|pair| pair[0] != 0xFF || pair[1] <= 0x8F));
+            assert!(
+                mel_vlc
+                    .windows(2)
+                    .all(|pair| pair[0] != 0xFF || pair[1] <= 0x8F)
+            );
         }
     }
 
