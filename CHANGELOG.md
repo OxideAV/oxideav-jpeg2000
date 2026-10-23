@@ -4,6 +4,7 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ## [Unreleased]
 
+- Tier-1 neighbour snapshot reads the eight Figure D.2 neighbours of an interior coefficient through three row offsets, keeping the clipped offset walk for edge coefficients (exhaustive mask tests against the offset walk) (#22, @Streetblock)
 - Inverse 9/7 DWT reuses one extension scratch buffer across the rows and columns of a sub-band pass and filters rows in place instead of copying each row first; the lifting arithmetic is untouched (f64 output bit-identical) (#21, @Streetblock)
 - Tier-1 magnitude refinement (encoder and decoder) skips the neighbour read for coefficients already refined once — Table D.4 assigns them context 16 regardless of neighbourhood — leaving the codeword bit-exact (golden bytes pinned); `examples/decoder_perf.rs` now times `decode_j2k` on a codestream file and `examples/encoder_perf.rs` times the lossless encoder on a generated image (#20, @Streetblock)
 - HT (T.814) encoder: the MEL byte-stream is terminated the way Annex F.4 `termMELandVLCPackers` does — the partial last byte is zero-padded and a trailing complete 0xFF is followed by a zero byte — instead of one-padding, so the MEL/VLC interface can no longer form an `0xFF 0x90..0xFF` pair inside the HT cleanup segment (§7.1.1 forbids it; OpenJPEG rejected such streams with "Incorrect MEL segment sequence") (#19, @Streetblock)
