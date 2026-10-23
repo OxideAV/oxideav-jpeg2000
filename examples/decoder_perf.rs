@@ -3,7 +3,7 @@
 
 #![forbid(unsafe_code)]
 
-use oxideav_jpeg2000::{decode, encode, Container, EncodeOptions, Jpeg2000Image, PixelFormat};
+use oxideav_jpeg2000::{Container, EncodeOptions, Jpeg2000Image, PixelFormat, decode, encode};
 use std::{error::Error, io, time::Instant};
 
 fn generated_image(width: u32, height: u32, bits: u8) -> Result<Jpeg2000Image, Box<dyn Error>> {

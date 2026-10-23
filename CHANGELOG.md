@@ -4,6 +4,7 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ## [Unreleased]
 
+- Reassembly resolves each code-block's uniform-`Nb` fallback once per block instead of rescanning `decoded_bits` for every coefficient (O(B) instead of O(B²) per block); `examples/decoder_perf.rs` benchmark (#17, @Streetblock)
 - edition 2024, MSRV 1.95
 
 ## [0.0.17](https://github.com/OxideAV/oxideav-jpeg2000/compare/v0.0.16...v0.0.17) - 2026-10-05
