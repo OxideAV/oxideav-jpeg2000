@@ -4,6 +4,7 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ## [Unreleased]
 
+- Inverse 5/3 DWT (§F.3.8.1 Equations F-5 / F-6) indexes the two lifting neighbours directly and reflects only the two endpoints per Equation F-4, instead of evaluating the periodic-symmetric-extension index for every tap; rows are filtered in place. Checked against the closed-form extension for origins −7..7, lengths 1..129 (#24, @Streetblock)
 - Tier-1 code-block state is packed: one `u32` of magnitudes plus one `u32` of coding state per coefficient (own σ / sign / refined flags, the two per-plane pass flags, a 15-bit decoded-plane count with a full-width fallback, and the eight Figure D.2 neighbour significances with the four cardinal signs), published incrementally when a coefficient becomes significant; Table D.1 / D.3 context labels are selected from compile-time tables built from the crate's own label functions, which stay as the test oracle (exhaustive 65 536-state equivalence). Neighbour snapshots become test-only (#23, @Streetblock)
 - Tier-1 neighbour snapshot reads the eight Figure D.2 neighbours of an interior coefficient through three row offsets, keeping the clipped offset walk for edge coefficients (exhaustive mask tests against the offset walk) (#22, @Streetblock)
 - Inverse 9/7 DWT reuses one extension scratch buffer across the rows and columns of a sub-band pass and filters rows in place instead of copying each row first; the lifting arithmetic is untouched (f64 output bit-identical) (#21, @Streetblock)
