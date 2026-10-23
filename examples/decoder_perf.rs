@@ -4,7 +4,7 @@
 
 #![forbid(unsafe_code)]
 
-use oxideav_jpeg2000::{decode_j2k, DecodedImage};
+use oxideav_jpeg2000::{DecodedImage, decode_j2k};
 use std::{error::Error, io, time::Instant};
 
 fn sample_hash(image: &DecodedImage) -> u64 {

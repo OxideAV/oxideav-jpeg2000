@@ -4,7 +4,7 @@
 
 #![forbid(unsafe_code)]
 
-use oxideav_jpeg2000::{decode, encode, EncodeOptions, Jpeg2000Image, PixelFormat};
+use oxideav_jpeg2000::{EncodeOptions, Jpeg2000Image, PixelFormat, decode, encode};
 use std::{
     error::Error,
     io,
