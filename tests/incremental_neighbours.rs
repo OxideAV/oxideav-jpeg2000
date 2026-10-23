@@ -3,7 +3,7 @@ use oxideav_jpeg2000::{
     geometry::SubBandOrientation,
     mq::MqDecoder,
     mqenc::MqEncoder,
-    t1::{reset_contexts, CodeBlock, Coefficient, REFINEMENT_CTX_OFFSET},
+    t1::{CodeBlock, Coefficient, REFINEMENT_CTX_OFFSET, reset_contexts},
 };
 
 #[test]

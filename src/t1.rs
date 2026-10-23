@@ -941,7 +941,7 @@ impl CodeBlock {
             } else if uniform {
                 uniform_fallback
             } else {
-                self.zero_bit_planes + self.decoded_bits[index]
+                self.zero_bit_planes + self.decoded_bits_at(index)
             }
         }
     }
@@ -1921,20 +1921,20 @@ impl CodeBlock {
             let top = (v - 1) * self.width + u;
             let middle = v * self.width + u;
             let bottom = (v + 1) * self.width + u;
-            let c = &self.coefficients;
+            let c = |i: usize| self.coefficient_at(i);
             return Neighbours {
-                d0_sigma: c[top - 1].sigma,
-                v0_sigma: c[top].sigma,
-                v0_sign: c[top].sign,
-                d1_sigma: c[top + 1].sigma,
-                h0_sigma: c[middle - 1].sigma,
-                h0_sign: c[middle - 1].sign,
-                h1_sigma: c[middle + 1].sigma,
-                h1_sign: c[middle + 1].sign,
-                d2_sigma: c[bottom - 1].sigma,
-                v1_sigma: c[bottom].sigma,
-                v1_sign: c[bottom].sign,
-                d3_sigma: c[bottom + 1].sigma,
+                d0_sigma: c(top - 1).sigma,
+                v0_sigma: c(top).sigma,
+                v0_sign: c(top).sign,
+                d1_sigma: c(top + 1).sigma,
+                h0_sigma: c(middle - 1).sigma,
+                h0_sign: c(middle - 1).sign,
+                h1_sigma: c(middle + 1).sigma,
+                h1_sign: c(middle + 1).sign,
+                d2_sigma: c(bottom - 1).sigma,
+                v1_sigma: c(bottom).sigma,
+                v1_sign: c(bottom).sign,
+                d3_sigma: c(bottom + 1).sigma,
             };
         }
         let mut nb = Neighbours::default();
@@ -3135,7 +3135,7 @@ mod tests {
             if nu < 0 || nu >= block.width as i32 || nv < 0 || nv >= block.height as i32 {
                 continue;
             }
-            let c = block.coefficients[nu as usize + nv as usize * block.width];
+            let c = block.coefficient_at(nu as usize + nv as usize * block.width);
             nb.set(slot, c.sigma, c.sign);
         }
         nb
@@ -3162,11 +3162,15 @@ mod tests {
             let nu = u as i32 + du;
             let nv = v as i32 + dv;
             if nu >= 0 && nu < block.width as i32 && nv >= 0 && nv < block.height as i32 {
-                let c = &mut block.coefficients[nu as usize + nv as usize * block.width];
+                let idx = nu as usize + nv as usize * block.width;
+                let mut c = block.coefficient_at(idx);
                 c.sigma = sigma_mask & (1 << slot) != 0;
                 // Include true signs on insignificant neighbours: snapshots
                 // preserve the stored sign even when context coding ignores it.
                 c.sign = sign_mask & (1 << slot) != 0;
+                // The snapshot readers under test go through `coefficient_at`,
+                // not the packed neighbour cache, so no publish is needed.
+                block.set_coefficient_at(idx, c);
             }
         }
     }
@@ -3237,7 +3241,6 @@ mod tests {
             }
         }
     }
-
 
     #[test]
     fn compact_coefficient_snapshots_preserve_full_magnitude_and_all_flags() {
@@ -3456,10 +3459,12 @@ mod tests {
                         block.ensure_coding_state();
                         assert_coding_cache(&block);
                         assert_eq!(block.coefficients_for_test(), coefficients);
-                        assert!(block
-                            .coding_state
-                            .iter()
-                            .all(|&s| s & (NEWLY_SIGNIFICANT | SP_VISITED) == 0));
+                        assert!(
+                            block
+                                .coding_state
+                                .iter()
+                                .all(|&s| s & (NEWLY_SIGNIFICANT | SP_VISITED) == 0)
+                        );
                     }
                 }
             }
@@ -4096,10 +4101,14 @@ mod tests {
                 );
             }
             assert_eq!(decoded_ctx, ctx);
-            assert_eq!(decoded.coefficients, block.coefficients);
-            assert_eq!(decoded.decoded_bits, block.decoded_bits);
-            assert_eq!(decoded.newly_significant, block.newly_significant);
-            assert_eq!(decoded.sp_visited, block.sp_visited);
+            assert_eq!(
+                decoded.coefficients_for_test(),
+                block.coefficients_for_test()
+            );
+            // Packed magnitudes, flags, neighbour cache and decoded counts.
+            assert_eq!(decoded.magnitudes, block.magnitudes);
+            assert_eq!(decoded.coding_state, block.coding_state);
+            assert_eq!(decoded.wide_decoded_bits, block.wide_decoded_bits);
         }
     }
 
