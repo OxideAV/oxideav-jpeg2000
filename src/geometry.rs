@@ -538,11 +538,7 @@ fn ceil_div_pow2(tc: u32, n: u32) -> u32 {
         // therefore `(tc != 0) as u32` for `n >= 32`. The COD parser
         // bounds NL to `0..=32` (Table A.15), so `n` here is at most
         // `NL` = 32 and we hit this branch only for r = 0, NL = 32.
-        if tc == 0 {
-            0
-        } else {
-            1
-        }
+        if tc == 0 { 0 } else { 1 }
     } else {
         let step = 1u64 << n;
         let numer = tc as u64 + step - 1;
@@ -820,11 +816,7 @@ pub fn precinct_exponents_at(precincts: &[u8], r: u8) -> PrecinctExponents {
 /// Floor of `value / 2^exp` for a `u32` and an exponent `0..=31`.
 #[inline]
 fn floor_div_pow2(value: u32, exp: u8) -> u32 {
-    if exp >= 32 {
-        0
-    } else {
-        value >> exp
-    }
+    if exp >= 32 { 0 } else { value >> exp }
 }
 
 /// Ceiling of `value / 2^exp` for a `u32` and an exponent `0..=31`.
@@ -1098,11 +1090,7 @@ fn enumerate_axis(
 #[inline]
 fn pow2_mul(value: u32, exp: u8) -> u32 {
     if exp >= 32 {
-        if value == 0 {
-            0
-        } else {
-            u32::MAX
-        }
+        if value == 0 { 0 } else { u32::MAX }
     } else {
         value.checked_shl(exp as u32).unwrap_or(u32::MAX)
     }

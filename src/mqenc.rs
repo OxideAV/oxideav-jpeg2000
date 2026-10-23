@@ -410,7 +410,7 @@ mod tests {
                 let mut d = Vec::with_capacity(len);
                 for _ in 0..len {
                     state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                    d.push(u8::from((state >> 16) % bias == 0));
+                    d.push(u8::from((state >> 16).is_multiple_of(bias)));
                 }
                 for &b in &d {
                     enc.encode(&mut ecx, b);

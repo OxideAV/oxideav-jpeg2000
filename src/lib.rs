@@ -124,8 +124,8 @@ pub use api::{
     encode_to, info, probe,
 };
 pub use decode::{
-    decode_codestream, decode_j2k, decode_j2k_layers, decode_j2k_reduced, DecodedComponent,
-    DecodedImage,
+    DecodedComponent, DecodedImage, decode_codestream, decode_j2k, decode_j2k_layers,
+    decode_j2k_reduced,
 };
 pub use encode::{Container, EncodeKernel, EncodeOptions};
 pub use error::{Error, Jpeg2000Error};
@@ -137,8 +137,8 @@ pub use options::DecodeOptions;
 
 #[cfg(feature = "registry")]
 pub use registry::{
-    make_decoder, make_encoder, register_codecs, register_containers, Jpeg2000Decoder,
-    Jpeg2000Encoder, CODEC_ID_STR,
+    CODEC_ID_STR, Jpeg2000Decoder, Jpeg2000Encoder, make_decoder, make_encoder, register_codecs,
+    register_containers,
 };
 
 #[cfg(feature = "registry")]
@@ -1078,7 +1078,7 @@ fn parse_qcc(reader: &mut Reader<'_>, csiz: u16) -> Result<Qcc, Error> {
     let style_check_ok = match style {
         QuantizationStyle::None => true, // 1 byte each, any non-negative count
         QuantizationStyle::ScalarDerived => payload_len == 2,
-        QuantizationStyle::ScalarExpounded => payload_len % 2 == 0,
+        QuantizationStyle::ScalarExpounded => payload_len.is_multiple_of(2),
         QuantizationStyle::Reserved(_) => true,
     };
     if !style_check_ok {
@@ -1129,11 +1129,7 @@ fn parse_poc(reader: &mut Reader<'_>, csiz: u16) -> Result<Poc, Error> {
         // for Csiz < 257 (or 16 384 for Csiz >= 257). We surface the
         // interpreted value to spare callers the repeated check.
         let component_end = if component_end_raw == 0 {
-            if csiz < 257 {
-                256
-            } else {
-                16_384
-            }
+            if csiz < 257 { 256 } else { 16_384 }
         } else {
             component_end_raw
         };
@@ -1634,7 +1630,7 @@ pub(crate) fn collect_main_header_tlm(
             let p_size = if sp == 0 { 2usize } else { 4 };
             let body = &bytes[seg_start + 2..payload_end];
             let entry_size = t_size + p_size;
-            if body.len() % entry_size != 0 {
+            if !body.len().is_multiple_of(entry_size) {
                 return Err(Error::InvalidMarkerLength);
             }
             let mut entries = Vec::with_capacity(body.len() / entry_size);
@@ -1934,7 +1930,7 @@ pub fn encode_jpeg2000(pixels: &[u8], width: u32, height: u32) -> Result<Vec<u8>
     let n = (width as usize)
         .checked_mul(height as usize)
         .ok_or(Error::InvalidMarkerLength)?;
-    if n == 0 || pixels.len() % n != 0 {
+    if n == 0 || !pixels.len().is_multiple_of(n) {
         return Err(Error::NotImplemented);
     }
     let ncomp = pixels.len() / n;
@@ -2076,9 +2072,9 @@ mod tests {
         v.extend_from_slice(&0u32.to_be_bytes()); // XTOsiz
         v.extend_from_slice(&0u32.to_be_bytes()); // YTOsiz
         v.extend_from_slice(&0u16.to_be_bytes()); // Csiz = 0 (invalid)
-                                                  // The Lsiz range starts at 41, so we hit InvalidMarkerLength
-                                                  // before InvalidComponentCount. Either is an acceptable
-                                                  // rejection — just confirm we DON'T parse it as valid.
+        // The Lsiz range starts at 41, so we hit InvalidMarkerLength
+        // before InvalidComponentCount. Either is an acceptable
+        // rejection — just confirm we DON'T parse it as valid.
         assert!(parse_j2k_header(&v).is_err());
     }
 
@@ -2439,7 +2435,7 @@ mod tests {
         tp.extend_from_slice(&[0u8; 39]); // dummy payload
         tp.extend_from_slice(&MARKER_SOD.to_be_bytes());
         tp.extend_from_slice(&[0u8; 4]); // body
-                                         // Splice into a full codestream after the main header.
+        // Splice into a full codestream after the main header.
         let mut hdr = synth_minimal_header();
         hdr.truncate(hdr.len() - 2); // drop trailing SOT
         hdr.extend_from_slice(&tp);
@@ -2620,7 +2616,7 @@ mod tests {
         let mut poc = Vec::new();
         poc.extend_from_slice(&MARKER_POC.to_be_bytes());
         poc.extend_from_slice(&16u16.to_be_bytes()); // Lpoc
-                                                     // Entry 1: RSpoc=0 CSpoc=0 LYEpoc=1 REpoc=5 CEpoc=3 Ppoc=Lrcp(0)
+        // Entry 1: RSpoc=0 CSpoc=0 LYEpoc=1 REpoc=5 CEpoc=3 Ppoc=Lrcp(0)
         poc.push(0);
         poc.push(0);
         poc.extend_from_slice(&1u16.to_be_bytes());

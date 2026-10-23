@@ -87,8 +87,8 @@
 #![allow(clippy::needless_range_loop)]
 #![allow(clippy::manual_div_ceil)]
 
-use crate::geometry::SubBandOrientation;
 use crate::Error;
+use crate::geometry::SubBandOrientation;
 
 // =====================================================================
 // §F.3.8.2.1 — Lifting parameters for the 9-7 irreversible filter.
@@ -1279,11 +1279,7 @@ mod tests {
             let y: Vec<f64> = (0..n)
                 .map(|k| {
                     let i = i0 + k;
-                    if i.rem_euclid(2) == 0 {
-                        c
-                    } else {
-                        0.0
-                    }
+                    if i.rem_euclid(2) == 0 { c } else { 0.0 }
                 })
                 .collect();
             let mut x = vec![0.0_f64; n as usize];

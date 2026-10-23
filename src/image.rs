@@ -271,11 +271,7 @@ impl Jpeg2000PixelFormat {
     /// Number of planes: 1 for packed layouts, [`Self::components`] for
     /// the planar YCbCr ones.
     pub fn plane_count(self) -> usize {
-        if self.is_yuv() {
-            self.components()
-        } else {
-            1
-        }
+        if self.is_yuv() { self.components() } else { 1 }
     }
 
     /// Storage width of one sample: 8 or 16 bits.

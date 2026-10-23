@@ -110,10 +110,10 @@
 //! offsets; the Tables D.1 / D.2 / D.3 / D.4 / D.5 contents are
 //! transcribed verbatim from the PDF.
 
+use crate::Error;
 use crate::geometry::SubBandOrientation;
 use crate::mq::{MqContext, MqDecoder};
 use crate::mqenc::MqEncoder;
-use crate::Error;
 
 /// First Annex D context label devoted to significance propagation
 /// (Table D.1 row "0", the all-insignificant-neighbours row).

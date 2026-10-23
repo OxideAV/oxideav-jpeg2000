@@ -46,11 +46,11 @@
 //! All truth in this module comes from `docs/image/jpeg2000/` (T.814 |
 //! 15444-15). No external HTJ2K implementation was consulted.
 
-use crate::ht::{
-    apply_sig_pattern, exponent_predictor, magnitude_exponent, quad_context, HtGrid, MEL_E,
-};
-use crate::ht_tables::{CxtVlcEntry, CXT_VLC_TABLE_0, CXT_VLC_TABLE_1};
 use crate::Error;
+use crate::ht::{
+    HtGrid, MEL_E, apply_sig_pattern, exponent_predictor, magnitude_exponent, quad_context,
+};
+use crate::ht_tables::{CXT_VLC_TABLE_0, CXT_VLC_TABLE_1, CxtVlcEntry};
 
 // ---------------------------------------------------------------------------
 // §7.1.2 dual — MagSgn bit-stream writer (forward, little-endian).
@@ -446,10 +446,10 @@ fn plan_quad(
 ) -> Result<QuadPlan, Error> {
     let mut rho: u8 = 0;
     for j in 0..4 {
-        if let Some((x, y)) = grid.coord(q, j) {
-            if mu[x + y * grid.wblk] != 0 {
-                rho |= 1 << j;
-            }
+        if let Some((x, y)) = grid.coord(q, j)
+            && mu[x + y * grid.wblk] != 0
+        {
+            rho |= 1 << j;
         }
     }
     let cq = quad_context(grid, q);
@@ -479,10 +479,10 @@ fn plan_quad(
     let kappa = exponent_predictor(grid, q, rho);
     let mut e_max = 0u32;
     for j in 0..4 {
-        if rho & (1 << j) != 0 {
-            if let Some((x, y)) = grid.coord(q, j) {
-                e_max = e_max.max(magnitude_exponent(mu[x + y * grid.wblk]));
-            }
+        if rho & (1 << j) != 0
+            && let Some((x, y)) = grid.coord(q, j)
+        {
+            e_max = e_max.max(magnitude_exponent(mu[x + y * grid.wblk]));
         }
     }
     let u_big = kappa.max(e_max);
@@ -492,12 +492,12 @@ fn plan_quad(
     // each significant sample's value v_n = 2(μ_n − 1) + s_n.
     let mut b: u8 = 0;
     for j in 0..4 {
-        if rho & (1 << j) != 0 {
-            if let Some((x, y)) = grid.coord(q, j) {
-                let idx = x + y * grid.wblk;
-                let val = 2 * (mu[idx] - 1) + u32::from(sign[idx]);
-                b |= (((val >> (u_big - 1)) & 1) as u8) << j;
-            }
+        if rho & (1 << j) != 0
+            && let Some((x, y)) = grid.coord(q, j)
+        {
+            let idx = x + y * grid.wblk;
+            let val = 2 * (mu[idx] - 1) + u32::from(sign[idx]);
+            b |= (((val >> (u_big - 1)) & 1) as u8) << j;
         }
     }
     let entry = choose_cxt_vlc(first_line_pair, cq, rho, u_off, b)?;
@@ -986,16 +986,17 @@ pub fn encode_ht_codeblock(
     height: usize,
     refine: bool,
 ) -> Result<HtEncodedBlock, Error> {
-    if refine && mag.iter().any(|&m| m >= 2) {
-        if let Some(refinement) = encode_ht_refinement_segment(mag, sign, width, height) {
-            let mu: Vec<u32> = mag.iter().map(|&m| m >> 1).collect();
-            let cleanup = encode_ht_cleanup_segment(&mu, sign, width, height)?;
-            return Ok(HtEncodedBlock {
-                cleanup,
-                refinement: Some(refinement),
-                beta: 1,
-            });
-        }
+    if refine
+        && mag.iter().any(|&m| m >= 2)
+        && let Some(refinement) = encode_ht_refinement_segment(mag, sign, width, height)
+    {
+        let mu: Vec<u32> = mag.iter().map(|&m| m >> 1).collect();
+        let cleanup = encode_ht_cleanup_segment(&mu, sign, width, height)?;
+        return Ok(HtEncodedBlock {
+            cleanup,
+            refinement: Some(refinement),
+            beta: 1,
+        });
     }
     let cleanup = encode_ht_cleanup_segment(mag, sign, width, height)?;
     Ok(HtEncodedBlock {
@@ -1056,7 +1057,7 @@ mod tests {
         (0..w * h)
             .map(|_| {
                 let r = lcg(&mut s);
-                if zero_every > 0 && r % zero_every == 0 {
+                if zero_every > 0 && r.is_multiple_of(zero_every) {
                     0
                 } else {
                     (r >> 8) & ((1 << max_bits) - 1)

@@ -10,7 +10,7 @@
 //! small tolerance for the floating-point inverse-DWT differences
 //! T.800 Annex F permits between conforming decoders.
 
-use oxideav_jpeg2000::{decode_j2k, decode_rgb8, parse_codestream, ProgressionOrder};
+use oxideav_jpeg2000::{ProgressionOrder, decode_j2k, decode_rgb8, parse_codestream};
 
 const GRAY_53: &[u8] = include_bytes!("data/gray-17x13-53.j2k");
 const GRAY_53_TILED: &[u8] = include_bytes!("data/gray-17x13-tiled-8x8-53.j2k");
@@ -279,9 +279,11 @@ fn gray_53_redundant_main_header_qcc_is_pixel_exact() {
 
     // Sanity: the un-injected fixture has no QCC (so this test really
     // exercises the new path), and the insertion point is the SOT.
-    assert!(!GRAY_53[2..insert_at]
-        .windows(2)
-        .any(|w| w == MARKER_QCC.to_be_bytes()));
+    assert!(
+        !GRAY_53[2..insert_at]
+            .windows(2)
+            .any(|w| w == MARKER_QCC.to_be_bytes())
+    );
     assert_eq!(
         u16::from_be_bytes([GRAY_53[insert_at], GRAY_53[insert_at + 1]]),
         0xFF90, // SOT
@@ -327,7 +329,7 @@ fn gray_53_redundant_main_header_qcc_is_pixel_exact() {
 /// equality.
 #[test]
 fn gray_53_redundant_main_header_coc_is_pixel_exact() {
-    use oxideav_jpeg2000::{WaveletTransform, MARKER_COC};
+    use oxideav_jpeg2000::{MARKER_COC, WaveletTransform};
 
     let cs = parse_codestream(GRAY_53).expect("parse");
     let cod = &cs.header.cod;
@@ -335,9 +337,11 @@ fn gray_53_redundant_main_header_coc_is_pixel_exact() {
 
     // Sanity: the un-injected fixture has no COC (so this test really
     // exercises the new path), and the insertion point is the SOT.
-    assert!(!GRAY_53[2..insert_at]
-        .windows(2)
-        .any(|w| w == MARKER_COC.to_be_bytes()));
+    assert!(
+        !GRAY_53[2..insert_at]
+            .windows(2)
+            .any(|w| w == MARKER_COC.to_be_bytes())
+    );
     assert_eq!(
         u16::from_be_bytes([GRAY_53[insert_at], GRAY_53[insert_at + 1]]),
         0xFF90, // SOT
@@ -403,9 +407,11 @@ fn gray_53_main_header_rgn_zero_shift_is_pixel_exact() {
 
     // Sanity: the un-injected fixture has no RGN, and the insertion
     // point is the SOT.
-    assert!(!GRAY_53[2..insert_at]
-        .windows(2)
-        .any(|w| w == MARKER_RGN.to_be_bytes()));
+    assert!(
+        !GRAY_53[2..insert_at]
+            .windows(2)
+            .any(|w| w == MARKER_RGN.to_be_bytes())
+    );
     assert_eq!(
         u16::from_be_bytes([GRAY_53[insert_at], GRAY_53[insert_at + 1]]),
         0xFF90, // SOT
@@ -509,7 +515,7 @@ fn inject_into_first_tile_part_header(stream: &[u8], seg: &[u8]) -> Vec<u8> {
 /// tier-1 + IDWT instead of being rejected with `Error::NotImplemented`.
 #[test]
 fn gray_53_redundant_tile_part_cod_is_pixel_exact() {
-    use oxideav_jpeg2000::{WaveletTransform, MARKER_COD};
+    use oxideav_jpeg2000::{MARKER_COD, WaveletTransform};
 
     let cs = parse_codestream(GRAY_53).expect("parse");
     let cod = &cs.header.cod;
@@ -545,10 +551,11 @@ fn gray_53_redundant_tile_part_cod_is_pixel_exact() {
     // The injected COD must now appear in the tile-part markers (parsed,
     // not skipped-then-rejected).
     let parsed = parse_codestream(&injected).expect("parse with tile-part COD");
-    assert!(parsed.tile_parts.iter().any(|tp| tp
-        .markers
-        .iter()
-        .any(|m| matches!(m, oxideav_jpeg2000::TilePartMarker::Cod(_)))));
+    assert!(parsed.tile_parts.iter().any(|tp| {
+        tp.markers
+            .iter()
+            .any(|m| matches!(m, oxideav_jpeg2000::TilePartMarker::Cod(_)))
+    }));
 
     let img = decode_j2k(&injected).expect("decode with tile-part COD");
     assert_eq!(img.components.len(), 1);
@@ -578,10 +585,11 @@ fn gray_53_redundant_tile_part_qcd_is_pixel_exact() {
     let injected = inject_into_first_tile_part_header(GRAY_53, &seg);
 
     let parsed = parse_codestream(&injected).expect("parse with tile-part QCD");
-    assert!(parsed.tile_parts.iter().any(|tp| tp
-        .markers
-        .iter()
-        .any(|m| matches!(m, oxideav_jpeg2000::TilePartMarker::Qcd(_)))));
+    assert!(parsed.tile_parts.iter().any(|tp| {
+        tp.markers
+            .iter()
+            .any(|m| matches!(m, oxideav_jpeg2000::TilePartMarker::Qcd(_)))
+    }));
 
     let img = decode_j2k(&injected).expect("decode with tile-part QCD");
     assert_eq!(img.components.len(), 1);
@@ -841,7 +849,7 @@ fn rgb_rct_53_lossless_is_pixel_exact() {
 /// global progression / MCT path keeps consuming the `COD`.
 #[test]
 fn rgb_rct_53_redundant_main_header_coc_component1_is_pixel_exact() {
-    use oxideav_jpeg2000::{WaveletTransform, MARKER_COC};
+    use oxideav_jpeg2000::{MARKER_COC, WaveletTransform};
 
     let cs = parse_codestream(RGB_RCT_53).expect("parse");
     let cod = &cs.header.cod;
@@ -886,7 +894,7 @@ fn rgb_rct_53_interleaved_wrapper_matches_planes() {
     let bytes = decode_rgb8(RGB_RCT_53).expect("decode").into_raw();
     let expected = rgb_16x16_pattern();
     assert_eq!(bytes.len(), 16 * 16 * 3);
-    for (i, px) in bytes.chunks_exact(3).enumerate() {
+    for (i, px) in bytes.as_chunks::<3>().0.iter().enumerate() {
         assert_eq!(px[0] as i32, expected[0][i]);
         assert_eq!(px[1] as i32, expected[1][i]);
         assert_eq!(px[2] as i32, expected[2][i]);
@@ -1497,7 +1505,7 @@ fn assemble_mixed_kernel(base53: &[u8], other97: &[u8]) -> Vec<u8> {
         s.extend_from_slice(&0xFF90u16.to_be_bytes());
         s.extend_from_slice(&10u16.to_be_bytes()); // Lsot
         s.extend_from_slice(&0u16.to_be_bytes()); // Isot = tile 0
-                                                  // Psot patched below once the body length is known.
+        // Psot patched below once the body length is known.
         s.extend_from_slice(&0u32.to_be_bytes());
         s.push(0); // TPsot
         s.push(1); // TNsot
@@ -1975,7 +1983,7 @@ fn assemble_mixed_style(base: &[u8], other: &[u8]) -> Vec<u8> {
 /// (both lossless).
 #[test]
 fn htdeclared_mixed_ht_and_annex_d_components_reconstruct() {
-    use oxideav_jpeg2000::encode::{encode_j2k, EncodeOptions};
+    use oxideav_jpeg2000::encode::{EncodeOptions, encode_j2k};
     let mut seed = 0x4854_00A1u32;
     let mut noise = |n: usize| -> Vec<u8> {
         (0..n)
@@ -2106,7 +2114,7 @@ fn assemble_mixed_tile_lanes(
 /// altogether, so it cannot arbitrate this shape).
 #[test]
 fn htdeclared_mixed_lanes_across_tiles_reconstruct() {
-    use oxideav_jpeg2000::encode::{encode_j2k, EncodeOptions};
+    use oxideav_jpeg2000::encode::{EncodeOptions, encode_j2k};
     let (w, h) = (64u32, 64u32);
     let mut seed = 0x7411_C0DEu32;
     let src: Vec<u8> = (0..w * h)
@@ -2144,7 +2152,7 @@ fn htdeclared_mixed_lanes_across_tiles_reconstruct() {
 /// decoding with its own §B.10.7 segment layout.
 #[test]
 fn mixed_annex_d_styles_per_component_reconstruct() {
-    use oxideav_jpeg2000::encode::{encode_j2k, EncodeOptions};
+    use oxideav_jpeg2000::encode::{EncodeOptions, encode_j2k};
     let mut seed = 0x4854_00B1u32;
     let mut noise = |n: usize| -> Vec<u8> {
         (0..n)
@@ -2265,7 +2273,7 @@ fn pgx_payload(bytes: &[u8]) -> (bool, u32, usize, usize, Vec<i32>) {
             });
         }
     } else {
-        for p in raw[..2 * w * h].chunks_exact(2) {
+        for p in raw[..2 * w * h].as_chunks::<2>().0 {
             let u = u16::from_be_bytes([p[0], p[1]]);
             vals.push(if signed {
                 i32::from(u as i16)
@@ -2359,13 +2367,16 @@ fn gray_53_plt_pointer_marker_is_pixel_exact() {
 fn opaque_sop_eph_plt_tlm_tiled_stream_is_pixel_exact() {
     let cs = parse_codestream(GRAY_OPJ_SOP_EPH_PLT_TLM_TILED).expect("parse");
     assert_eq!(cs.tile_parts.len(), 4);
-    assert!(cs.tile_parts.iter().all(|tp| tp
-        .markers
-        .iter()
-        .any(|m| matches!(m, oxideav_jpeg2000::TilePartMarker::Plt(_)))));
-    assert!(GRAY_OPJ_SOP_EPH_PLT_TLM_TILED
-        .windows(2)
-        .any(|w| w == [0xFF, 0x55]));
+    assert!(cs.tile_parts.iter().all(|tp| {
+        tp.markers
+            .iter()
+            .any(|m| matches!(m, oxideav_jpeg2000::TilePartMarker::Plt(_)))
+    }));
+    assert!(
+        GRAY_OPJ_SOP_EPH_PLT_TLM_TILED
+            .windows(2)
+            .any(|w| w == [0xFF, 0x55])
+    );
     let img = decode_j2k(GRAY_OPJ_SOP_EPH_PLT_TLM_TILED).expect("decode");
     // P5 header: three newline-terminated lines, then 1024 samples.
     let src =

@@ -71,9 +71,9 @@
 //! / A.29 / A.30 (the SPqcd byte / 16-bit-word layouts the parser at
 //! `crate::lib.rs` already consumes raw).
 
+use crate::Error;
 use crate::geometry::SubBandOrientation;
 use crate::t1::Coefficient;
-use crate::Error;
 
 /// One parsed `(εb, µb)` pair from a single `SPqcd` / `SPqcc` entry.
 ///
@@ -143,11 +143,11 @@ impl StepSize {
     /// (Table A.30): one 16-bit big-endian word per sub-band, each
     /// holding `(εb, µb)`.
     pub fn parse_irreversible_payload(payload: &[u8]) -> Result<Vec<Self>, Error> {
-        if payload.len() % 2 != 0 {
+        if !payload.len().is_multiple_of(2) {
             return Err(Error::InvalidMarkerLength);
         }
         let mut out = Vec::with_capacity(payload.len() / 2);
-        for chunk in payload.chunks_exact(2) {
+        for chunk in payload.as_chunks::<2>().0 {
             out.push(Self::from_irreversible_word(u16::from_be_bytes([
                 chunk[0], chunk[1],
             ])));
@@ -277,11 +277,7 @@ pub fn irreversible_step_size(rb: u32, step: StepSize) -> f64 {
 /// magnitude on a maximum-precision irreversible code-stream.
 pub fn qb_signed(coeff: Coefficient) -> i64 {
     let magnitude = i64::from(coeff.magnitude);
-    if coeff.sign {
-        -magnitude
-    } else {
-        magnitude
-    }
+    if coeff.sign { -magnitude } else { magnitude }
 }
 
 /// Reconstruct the transform coefficient under **irreversible**

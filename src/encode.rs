@@ -52,22 +52,22 @@
 
 use crate::dwt::sd_2d_5x3;
 use crate::geometry::{
-    derive_precinct_code_blocks, derive_precinct_partition, derive_resolution_levels,
-    derive_tile_geometry, precinct_exponents_at, SubBandOrientation,
+    SubBandOrientation, derive_precinct_code_blocks, derive_precinct_partition,
+    derive_resolution_levels, derive_tile_geometry, precinct_exponents_at,
 };
 use crate::mqenc::MqEncoder;
 use crate::packet::{
-    encode_packet_header, CodeBlockPlan, PrecinctEncoderState, SubBandEncoderPlan, SubBandGeometry,
+    CodeBlockPlan, PrecinctEncoderState, SubBandEncoderPlan, SubBandGeometry, encode_packet_header,
 };
 use crate::progression::{
+    ComponentPositionInfo, ComponentProgressionInfo, PocVolume, ResolutionPrecinctLayout,
     cprl_packet_order, lrcp_packet_order, pcrl_packet_order, poc_volume_packet_order,
-    rlcp_packet_order, rpcl_packet_order, ComponentPositionInfo, ComponentProgressionInfo,
-    PocVolume, ResolutionPrecinctLayout,
+    rlcp_packet_order, rpcl_packet_order,
 };
-use crate::t1::{reset_contexts, CodeBlock, Coefficient};
+use crate::t1::{CodeBlock, Coefficient, reset_contexts};
 use crate::{
-    Error, PocProgression, ProgressionOrder, Siz, SizComponent, MARKER_COD, MARKER_EOC, MARKER_POC,
-    MARKER_QCD, MARKER_SIZ, MARKER_SOC, MARKER_SOD, MARKER_SOT,
+    Error, MARKER_COD, MARKER_EOC, MARKER_POC, MARKER_QCD, MARKER_SIZ, MARKER_SOC, MARKER_SOD,
+    MARKER_SOT, PocProgression, ProgressionOrder, Siz, SizComponent,
 };
 
 /// Guard-bit count `G` signalled in `Sqcd` (Table A.28) and used in the
@@ -270,11 +270,7 @@ fn forward_cascade_9x7(
     let scale = f64::from(1u32 << fine_bits);
     let q = move |y: f64| -> i32 {
         let m = (y.abs() * scale).floor() as i32;
-        if y < 0.0 {
-            -m
-        } else {
-            m
-        }
+        if y < 0.0 { -m } else { m }
     };
     struct RealPlane {
         x0: u32,
@@ -335,12 +331,12 @@ fn forward_cascade_9x7(
         let mut ll = vec![0f64; llw * llh];
         for v in 0..a.height {
             let ay = cur.y0 + v as u32;
-            if ay % 2 != 0 {
+            if !ay.is_multiple_of(2) {
                 continue;
             }
             for u in 0..a.width {
                 let ax = cur.x0 + u as u32;
-                if ax % 2 != 0 {
+                if !ax.is_multiple_of(2) {
                     continue;
                 }
                 ll[((ay / 2 - c.ly0) as usize) * llw + (ax / 2 - c.lx0) as usize] =
@@ -1014,11 +1010,7 @@ fn iplt_bytes(len: u64) -> Vec<u8> {
         .rev()
         .map(|g| {
             let bits = ((len >> (7 * g)) & 0x7F) as u8;
-            if g == 0 {
-                bits
-            } else {
-                bits | 0x80
-            }
+            if g == 0 { bits } else { bits | 0x80 }
         })
         .collect()
 }
@@ -1855,10 +1847,10 @@ fn encode_core(
     if mct && planes.len() < 3 {
         return Err(Error::NotImplemented);
     }
-    if let EncodeKernel::Lossy9x7 { fine_bits } = kernel {
-        if fine_bits > 8 {
-            return Err(Error::NotImplemented);
-        }
+    if let EncodeKernel::Lossy9x7 { fine_bits } = kernel
+        && fine_bits > 8
+    {
+        return Err(Error::NotImplemented);
     }
     // Table A.16: only the five defined §B.12.1 orders are encodable.
     let order_byte = |o: ProgressionOrder| -> Result<u8, Error> {
@@ -2068,10 +2060,10 @@ fn encode_core(
             if mct && k != kernel {
                 return Err(Error::NotImplemented);
             }
-            if let EncodeKernel::Lossy9x7 { fine_bits } = k {
-                if fine_bits > 8 {
-                    return Err(Error::NotImplemented);
-                }
+            if let EncodeKernel::Lossy9x7 { fine_bits } = k
+                && fine_bits > 8
+            {
+                return Err(Error::NotImplemented);
             }
             cp.kernel = k;
         }
@@ -2442,7 +2434,7 @@ fn encode_core(
                                     // r > 0 carries no LL band (already
                                     // rejected on the plane lookup).
                                     SubBandOrientation::LL => {
-                                        return Err(Error::InvalidPacketHeader)
+                                        return Err(Error::InvalidPacketHeader);
                                     }
                                 };
                                 Some(&m[ci].high[lev - 1][oi])
@@ -2478,12 +2470,11 @@ fn encode_core(
                                     // quantized coefficients up by 2^s so
                                     // their bits sit above every
                                     // background bit-plane.
-                                    if let Some(mp) = mask_plane {
-                                        if mp.data[((v - mp.y0) as usize) * mp.width
+                                    if let Some(mp) = mask_plane
+                                        && mp.data[((v - mp.y0) as usize) * mp.width
                                             + (u - mp.x0) as usize]
-                                        {
-                                            magnitude <<= roi_s[ci];
-                                        }
+                                    {
+                                        magnitude <<= roi_s[ci];
                                     }
                                     targets.push(Coefficient {
                                         magnitude,
@@ -4474,10 +4465,12 @@ mod tests {
         };
         let stream = roundtrip_params(&[&p], 48, 40, &params);
         let header = crate::parse_j2k_header(&stream).expect("header");
-        assert!(header
-            .cod
-            .code_block_style_flags()
-            .termination_on_each_coding_pass());
+        assert!(
+            header
+                .cod
+                .code_block_style_flags()
+                .termination_on_each_coding_pass()
+        );
         // Per-pass termination costs bytes vs the single-segment stream.
         let plain = encode_j2k(
             &[&p],
@@ -4512,10 +4505,12 @@ mod tests {
             };
             let stream = encode_j2k(&[&p], 48, 48, &params).expect("encode");
             let header = crate::parse_j2k_header(&stream).expect("header");
-            assert!(header
-                .cod
-                .code_block_style_flags()
-                .selective_arithmetic_coding_bypass());
+            assert!(
+                header
+                    .cod
+                    .code_block_style_flags()
+                    .selective_arithmetic_coding_bypass()
+            );
             let img = decode_j2k(&stream).expect("decode bypass stream");
             let max_err = img.components[0]
                 .samples
@@ -5970,51 +5965,59 @@ mod tests {
         let y = vec![0u8; 16 * 16];
         let c = vec![0u8; 8 * 8];
         // Wrong pair count.
-        assert!(encode_j2k(
-            &[&y, &c],
-            16,
-            16,
-            &EncodeOptions {
-                sub_sampling: vec![(1, 1)],
-                ..EncodeOptions::default()
-            }
-        )
-        .is_err());
+        assert!(
+            encode_j2k(
+                &[&y, &c],
+                16,
+                16,
+                &EncodeOptions {
+                    sub_sampling: vec![(1, 1)],
+                    ..EncodeOptions::default()
+                }
+            )
+            .is_err()
+        );
         // Zero factor.
-        assert!(encode_j2k(
-            &[&y, &c],
-            16,
-            16,
-            &EncodeOptions {
-                sub_sampling: vec![(1, 1), (0, 2)],
-                ..EncodeOptions::default()
-            }
-        )
-        .is_err());
+        assert!(
+            encode_j2k(
+                &[&y, &c],
+                16,
+                16,
+                &EncodeOptions {
+                    sub_sampling: vec![(1, 1), (0, 2)],
+                    ..EncodeOptions::default()
+                }
+            )
+            .is_err()
+        );
         // Plane size must match the sub-sampled extent.
-        assert!(encode_j2k(
-            &[&y, &y],
-            16,
-            16,
-            &EncodeOptions {
-                sub_sampling: vec![(1, 1), (2, 2)],
-                ..EncodeOptions::default()
-            }
-        )
-        .is_err());
+        assert!(
+            encode_j2k(
+                &[&y, &y],
+                16,
+                16,
+                &EncodeOptions {
+                    sub_sampling: vec![(1, 1), (2, 2)],
+                    ..EncodeOptions::default()
+                }
+            )
+            .is_err()
+        );
         // MCT requires shared factors across components 0-2.
         let g = vec![0u8; 16 * 16];
-        assert!(encode_j2k(
-            &[&y, &g, &c],
-            16,
-            16,
-            &EncodeOptions {
-                mct: Some(true),
-                sub_sampling: vec![(1, 1), (1, 1), (2, 2)],
-                ..EncodeOptions::default()
-            }
-        )
-        .is_err());
+        assert!(
+            encode_j2k(
+                &[&y, &g, &c],
+                16,
+                16,
+                &EncodeOptions {
+                    mct: Some(true),
+                    sub_sampling: vec![(1, 1), (1, 1), (2, 2)],
+                    ..EncodeOptions::default()
+                }
+            )
+            .is_err()
+        );
     }
 
     // -- §A.4.2 multi-tile-part emission (TPsot > 0) --------------------
@@ -7281,7 +7284,7 @@ mod tests {
     #[test]
     fn ht_multiht_skip_set_decodes_last_set() {
         use crate::packet::{
-            encode_packet_header, CodeBlockPlan, PrecinctEncoderState, SubBandGeometry,
+            CodeBlockPlan, PrecinctEncoderState, SubBandGeometry, encode_packet_header,
         };
         let pixels = noise(8, 8, 0x4854_0081);
         // NL = 0: the single LL band holds the DC-shifted pixels

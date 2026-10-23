@@ -70,17 +70,17 @@
 //!   (reversible Rqb at `Nb < Mb`).
 //!
 
+use crate::Error;
 use crate::dequant::{
-    irreversible_step_size, nominal_dynamic_range, qb_signed, reconstruct_irreversible,
-    reconstruct_reversible, subband_gain_log2, StepSize,
+    StepSize, irreversible_step_size, nominal_dynamic_range, qb_signed, reconstruct_irreversible,
+    reconstruct_reversible, subband_gain_log2,
 };
-use crate::dwt::{sr_2d_5x3, sr_2d_9x7, Interleaved2D};
+use crate::dwt::{Interleaved2D, sr_2d_5x3, sr_2d_9x7};
 use crate::geometry::{
     PrecinctCodeBlock, PrecinctCodeBlocks, PrecinctSubBand, ResolutionLevel, SubBand,
     SubBandOrientation,
 };
 use crate::t1::CodeBlock;
-use crate::Error;
 
 /// One decoded code-block ready to be scattered into a sub-band array.
 ///
@@ -421,10 +421,10 @@ impl<'a> BlockSource<'a> for &[&[CodedCodeBlock<'a>]] {
         // `r ≥ 1`. We pick the slice whose orientation matches the
         // sub-band (raster scan; falls back to empty when missing).
         for (i, group) in self.iter().enumerate() {
-            if let Some(first) = group.first() {
-                if first.coefficients.orientation() == band.orientation {
-                    return self[i];
-                }
+            if let Some(first) = group.first()
+                && first.coefficients.orientation() == band.orientation
+            {
+                return self[i];
             }
         }
         &[]

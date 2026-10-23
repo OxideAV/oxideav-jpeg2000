@@ -17,10 +17,10 @@
 //! One implementation, two entry doors.
 
 use oxideav_core::{
-    frame::VideoPlane, CodecCapabilities, CodecId, CodecInfo, CodecOptionsStruct, CodecParameters,
-    CodecRegistry, ColorPrimaries, ColorSignal, ContainerRegistry, Decoder, Encoder,
-    Error as CoreError, Frame, MatrixCoefficients, MediaType, OptionField, OptionKind, OptionValue,
-    Packet, PixelFormat, RuntimeContext, TimeBase, TransferCharacteristics, VideoFrame,
+    CodecCapabilities, CodecId, CodecInfo, CodecOptionsStruct, CodecParameters, CodecRegistry,
+    ColorPrimaries, ColorSignal, ContainerRegistry, Decoder, Encoder, Error as CoreError, Frame,
+    MatrixCoefficients, MediaType, OptionField, OptionKind, OptionValue, Packet, PixelFormat,
+    RuntimeContext, TimeBase, TransferCharacteristics, VideoFrame, frame::VideoPlane,
 };
 
 use crate::encode::{Container, EncodeKernel, EncodeOptions};
@@ -257,7 +257,9 @@ impl Jpeg2000Image {
                 .or((!params.extradata.is_empty()).then_some(params.extradata.as_slice()));
             img.palette = rgb.map(|rgb| {
                 Palette::new(
-                    rgb.chunks_exact(3)
+                    rgb.as_chunks::<3>()
+                        .0
+                        .iter()
                         .map(|c| [c[0], c[1], c[2], 255])
                         .collect(),
                 )
@@ -719,17 +721,17 @@ impl Jpeg2000Encoder {
     fn encode_options(&self) -> oxideav_core::Result<EncodeOptions> {
         let mut o = oxideav_core::parse_options::<RegistryEncodeOptions>(&self.params.options)?
             .into_options();
-        if o.target_bytes.is_none() {
-            if let Some(bit_rate) = self.params.bit_rate {
-                // Bits per second over the frame rate, or bits per frame.
-                let bits_per_frame = match self.params.frame_rate {
-                    Some(r) if r.num > 0 && r.den > 0 => {
-                        (bit_rate as u128 * r.den as u128 / r.num as u128) as u64
-                    }
-                    _ => bit_rate,
-                };
-                o.target_bytes = Some(usize::try_from(bits_per_frame / 8).unwrap_or(usize::MAX));
-            }
+        if o.target_bytes.is_none()
+            && let Some(bit_rate) = self.params.bit_rate
+        {
+            // Bits per second over the frame rate, or bits per frame.
+            let bits_per_frame = match self.params.frame_rate {
+                Some(r) if r.num > 0 && r.den > 0 => {
+                    (bit_rate as u128 * r.den as u128 / r.num as u128) as u64
+                }
+                _ => bit_rate,
+            };
+            o.target_bytes = Some(usize::try_from(bits_per_frame / 8).unwrap_or(usize::MAX));
         }
         Ok(o)
     }
@@ -760,7 +762,7 @@ impl Encoder for Jpeg2000Encoder {
             _ => {
                 return Err(CoreError::invalid(
                     "oxideav-jpeg2000 encoder: CodecParameters width/height required",
-                ))
+                ));
             }
         };
         let mut params = self.params.clone();
@@ -772,9 +774,11 @@ impl Encoder for Jpeg2000Encoder {
                 (1, 1) => PixelFormat::Gray8,
                 (1, 3) => PixelFormat::Rgb24,
                 (1, 4) => PixelFormat::Rgba,
-                _ => return Err(CoreError::unsupported(
-                    "oxideav-jpeg2000 encoder: cannot infer a packed pixel format from the stride",
-                )),
+                _ => {
+                    return Err(CoreError::unsupported(
+                        "oxideav-jpeg2000 encoder: cannot infer a packed pixel format from the stride",
+                    ));
+                }
             });
         }
         let opts = self.encode_options()?;
@@ -1160,11 +1164,13 @@ mod tests {
         let back = Jpeg2000Image::try_from((&frame, &params)).expect("bridge");
         assert_eq!(back, img);
         // Missing parameters are an error, not a panic.
-        assert!(Jpeg2000Image::from_video_frame(
-            &frame,
-            &CodecParameters::video(CodecId::new(CODEC_ID_STR))
-        )
-        .is_err());
+        assert!(
+            Jpeg2000Image::from_video_frame(
+                &frame,
+                &CodecParameters::video(CodecId::new(CODEC_ID_STR))
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -30,15 +30,15 @@
 use std::io::{Read, SeekFrom, Write};
 
 use oxideav_core::{
-    CodecId, CodecParameters, CodecResolver, ContainerRegistry, Demuxer, Error, MediaType, Muxer,
-    Packet, PixelFormat, ProbeData, ProbeScore, ReadSeek, Result, StreamInfo, TimeBase, WriteSeek,
-    MAX_PROBE_SCORE, PROBE_SCORE_EXTENSION,
+    CodecId, CodecParameters, CodecResolver, ContainerRegistry, Demuxer, Error, MAX_PROBE_SCORE,
+    MediaType, Muxer, PROBE_SCORE_EXTENSION, Packet, PixelFormat, ProbeData, ProbeScore, ReadSeek,
+    Result, StreamInfo, TimeBase, WriteSeek,
 };
 
 use crate::api::{describe, is_jp2_file, jp2_options_parts};
 use crate::image::{ColorInfo, Jpeg2000PixelFormat, Palette};
-use crate::jp2::{parse_jp2, write_jp2, Jp2WriteOptions};
-use crate::registry::{from_color_signal, to_color_signal, CODEC_ID_STR};
+use crate::jp2::{Jp2WriteOptions, parse_jp2, write_jp2};
+use crate::registry::{CODEC_ID_STR, from_color_signal, to_color_signal};
 use crate::{MARKER_SIZ, MARKER_SOC};
 
 /// Container name of the bare codestream (`.j2k` / `.j2c`).
@@ -245,7 +245,9 @@ impl Jpeg2000Muxer {
             (format == Some(Jpeg2000PixelFormat::Pal8) && !p.extradata.is_empty()).then(|| {
                 Palette::new(
                     p.extradata
-                        .chunks_exact(3)
+                        .as_chunks::<3>()
+                        .0
+                        .iter()
                         .map(|c| [c[0], c[1], c[2], 255])
                         .collect(),
                 )
@@ -353,7 +355,7 @@ impl Muxer for Jpeg2000Muxer {
             _ => {
                 return Err(Error::invalid(format!(
                     "{name} muxer: packet is neither a JPEG 2000 codestream nor a JP2 file"
-                )))
+                )));
             }
         };
         self.output.write_all(&out)?;
