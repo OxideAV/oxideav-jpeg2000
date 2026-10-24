@@ -565,6 +565,7 @@ impl<'a> MqDecoder<'a> {
     /// `0xFF` prefix. Otherwise `B1` carries a stuff bit: `BP`
     /// advances and `B` is added aligned so the stuff bit lands on the
     /// low bit of `Chigh` (`C += B1 << 9`) with `CT = 7`.
+    #[inline]
     fn bytein(&mut self) {
         let raw_b = self.data.get(self.bp).copied();
         // BP off the end means the §C.3.4 0xFF-fill is being synthesised.
@@ -609,6 +610,7 @@ impl<'a> MqDecoder<'a> {
     ///
     /// Shift `A` and `C` left one bit at a time, pulling a fresh byte
     /// via BYTEIN whenever `CT` reaches zero, until `A ≥ 0x8000`.
+    #[inline]
     fn renormd(&mut self) {
         loop {
             if self.ct == 0 {
@@ -637,6 +639,7 @@ impl<'a> MqDecoder<'a> {
     ///   runs and RENORMD follows.
     /// * `Chigh < Qe`: the LPS-path conditional exchange (Figure C.17)
     ///   runs and RENORMD follows.
+    #[inline(always)]
     pub fn decode(&mut self, cx: &mut MqContext) -> u8 {
         let entry = QE[cx.index as usize];
         let qe = entry.qe as u32;
@@ -672,6 +675,7 @@ impl<'a> MqDecoder<'a> {
     /// to NMPS. Otherwise the conditional exchange happened (the LPS
     /// sub-interval was larger): `D = 1 - MPS(CX)`, the SWITCH flag may
     /// flip the MPS sense, and the index updates to NLPS.
+    #[inline]
     fn mps_exchange(&mut self, cx: &mut MqContext, qe: u32) -> u8 {
         let entry = QE[cx.index as usize];
         if self.a < qe {
@@ -697,6 +701,7 @@ impl<'a> MqDecoder<'a> {
     /// occurred so the decision is the MPS case (index → NMPS);
     /// otherwise it is the genuine LPS case (`D = 1 - MPS`, SWITCH may
     /// flip MPS, index → NLPS).
+    #[inline]
     fn lps_exchange(&mut self, cx: &mut MqContext, qe: u32) -> u8 {
         let entry = QE[cx.index as usize];
         let d;
