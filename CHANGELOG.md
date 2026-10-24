@@ -4,6 +4,42 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ## [Unreleased]
 
+## [0.0.18](https://github.com/OxideAV/oxideav-jpeg2000/compare/v0.0.17...v0.0.18) - 2026-10-24
+
+### Fixed
+
+- fixup for #28: CHANGELOG entry
+- fixup for #25: rustfmt (edition-2024 import order in the test) + CHANGELOG entry
+- fixup for #24: CHANGELOG entry
+- fixup for #23: port the test-only readers of the removed fields + rustfmt + CHANGELOG
+- fixup for #22: CHANGELOG entry
+- fixup for #21: CHANGELOG entry
+- fixup for #20: rustfmt + CHANGELOG entry
+- fixup for #19: rustfmt + CHANGELOG entry
+- fixup for #18: rustfmt + CHANGELOG entry
+- fixup for #17: rustfmt (edition-2024 import order in the example) + CHANGELOG entry
+
+### Other
+
+- inline MQ DECODE into the Tier-1 passes, decode passes on the packed state word
+- *(decode)* convert completed 9/7 planes to f32
+- Reject unconsumed component block accumulators
+- Decode and reconstruct one tile component at a time
+- Release decoded block buffers before tile reconstruction
+- Index reversible DWT neighbours directly
+- Keep compact imported coefficient arrays tightly allocated
+- Pack Tier-1 coefficient flags and decoded counts into block state
+- Select Tier-1 contexts directly from packed neighbour states
+- Cache Tier-1 neighbour states in packed pass flags
+- Read interior Tier-1 neighbours using row offsets
+- Reuse inverse 9/7 wavelet scratch buffers
+- Skip redundant neighbour reads in MQ refinement decoding
+- Skip redundant neighbour reads in MQ refinement encoding
+- Fix HT MEL termination at the VLC interface
+- honor target byte budgets at final terminations
+- Avoid quadratic decoded-bit scans during reassembly
+- edition 2024, MSRV 1.95
+
 - Tier-1 decode: `MqDecoder::decode` is force-inlined into the pass loops (its state stays in registers across decisions), and the significance-propagation, magnitude-refinement and cleanup decode passes test and update each coefficient's packed state word directly, with the §D.7 vertically-causal clip hoisted to a per-stripe mask, instead of rebuilding a `Coefficient` snapshot and re-deriving the stripe-clipped state per sample. Decisions, contexts and reconstructions are unchanged (new encoder ↔ decoder pass-by-pass state test, both causal modes). 3840×2160 RGB8: −11.4 % (5/3) / −12.2 % (9/7) instructions retired, −4.1 % / −1.0 % cycles (#26)
 - Each completed 9/7 component plane is narrowed to the `f32` Annex G consumes as soon as its inverse DWT finishes, so no finished `f64` plane outlives its component; same scalar cast, output bit-identical. 3840×2160 RGB8 9/7 peak RSS 767 → 637 MB (#28, @Streetblock)
 - Tile decode runs tier-1 → reassembly → inverse DWT one component at a time, so only one component's decoded code-blocks are alive at once, and hands the reconstructed planes to the output by move instead of cloning; an accumulator left over for an unplanned component is now rejected (`InvalidPacketHeader`) instead of being dropped silently. 3840×2160 RGB8 peak RSS: 5/3 626 → 370 MB, 9/7 952 → 767 MB (#25, @Streetblock)
