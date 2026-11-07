@@ -4,6 +4,39 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ## [Unreleased]
 
+## [0.0.19](https://github.com/OxideAV/oxideav-jpeg2000/compare/v0.0.18...v0.0.19) - 2026-11-07
+
+### Fixed
+
+- fixup for #27: keep the % 2 tests as written (untyped literal width cannot take is_multiple_of; clippy flagged only the % 5 test)
+- fixup for #27: surface test origins inside the i32 IDWT domain + clippy is_multiple_of
+- fixup for #27: rustfmt (edition-2024 import order in surface.rs) + CHANGELOG entry
+
+### Other
+
+- Decode image grids anchored at or above 2^31 (Table A.9 origins up to 2^32 - 1)
+- Merge master into #27: keep master's Tier-1 passes, port the coefficient-surface reconstruction
+- Revert "Specialize Tier-1 decoded counts for validated Annex D schedules"
+- Revert "Use ceiling division in the validated sequence debug contract"
+- API hygiene: non_exhaustive codestream/JP2 records + encoder option enums, ComponentOverride builder
+- Use ceiling division in the validated sequence debug contract
+- Specialize Tier-1 decoded counts for validated Annex D schedules
+- Release f64 component planes before decoding the next component
+- Preserve the qualified independent reconstruction regressions
+- Integrate the existing inverse-DWT scratch reuse
+- Integrate compact Tier-1 state with reusable component reconstruction
+- Validate all coefficient bands before allocating buffers
+- Keep compact imported coefficient arrays tightly allocated
+- Release reconstructed bands as inverse wavelet synthesis advances
+- Pack Tier-1 coefficient flags and decoded counts into block state
+- Reconstruct completed blocks into component coefficient storage
+- Reject unconsumed component block accumulators
+- Decode and reconstruct one tile component at a time
+- Select Tier-1 contexts directly from packed neighbour states
+- Release decoded block buffers before tile reconstruction
+- Cache Tier-1 neighbour states in packed pass flags
+- Reuse inverse 9/7 wavelet scratch buffers
+
 ### Changed
 
 - API hygiene: `TilePartMarker`, `J2kHeader`, `TilePart`, `J2kCodestream`, `DecodedComponent`, `DecodedImage`, `EncodeKernel`, `TilePartSplit`, `PackedHeaders`, `ComponentOverride`, `Jp2Header`, `Jp2Container` and `Jp2WriteOptions` are now `#[non_exhaustive]`. The marker-segment and box mirrors (`Siz`, `Cod`, `Coc`, `Qcd`, `Qcc`, `Poc`, `PocProgression`, `Rgn`, `Plt`, `Ppt`, `Sot`, `Ftyp`, `Ihdr`, `Colr`, ...), the code enums that already carry a `Reserved` catch-all (`ProgressionOrder`, `WaveletTransform`, `QuantizationStyle`, `ColrMethod`, `EnumCs`), `CmapMapping` and the plain rectangle `RoiRegion` stay exhaustive.
