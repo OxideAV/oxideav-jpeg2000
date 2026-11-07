@@ -1813,11 +1813,7 @@ fn consume_eph_after(bytes: &[u8], offset: usize) -> Result<usize, Error> {
         return Ok(0);
     }
     let marker = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]);
-    if marker == MARKER_EPH {
-        Ok(2)
-    } else {
-        Ok(0)
-    }
+    if marker == MARKER_EPH { Ok(2) } else { Ok(0) }
 }
 
 // ---------------------------------------------------------------------------
@@ -1879,13 +1875,11 @@ pub(crate) fn walk_packet_headers_with_choices(
         if pos > body.len() {
             return Err(Error::PacketHeaderOverrun);
         }
-        if sop_allowed {
-            if let Some(nsop) = peek_sop_nsop(&body[pos..])? {
-                // The §A.8.1 counter wraps at 2^16.
-                let expected = (packet_ordinal % 65_536) as u16;
-                if nsop != expected {
-                    return Err(Error::InvalidPacketHeader);
-                }
+        if sop_allowed && let Some(nsop) = peek_sop_nsop(&body[pos..])? {
+            // The §A.8.1 counter wraps at 2^16.
+            let expected = (packet_ordinal % 65_536) as u16;
+            if nsop != expected {
+                return Err(Error::InvalidPacketHeader);
             }
         }
         let state = precincts.entry(*precinct_index).or_default();
@@ -1997,15 +1991,13 @@ pub(crate) fn walk_packet_headers_separate_with_choices(
             return Err(Error::PacketHeaderOverrun);
         }
         // §A.8.1: an SOP in the body must carry the running ordinal.
-        if sop_in_body {
-            if let Some(nsop) = peek_sop_nsop(&body[bpos..])? {
-                let expected = (packet_ordinal % 65_536) as u16;
-                if nsop != expected {
-                    return Err(Error::InvalidPacketHeader);
-                }
-                // Consume the six-byte SOP marker segment from the body.
-                bpos = bpos.checked_add(6).ok_or(Error::PacketHeaderOverrun)?;
+        if sop_in_body && let Some(nsop) = peek_sop_nsop(&body[bpos..])? {
+            let expected = (packet_ordinal % 65_536) as u16;
+            if nsop != expected {
+                return Err(Error::InvalidPacketHeader);
             }
+            // Consume the six-byte SOP marker segment from the body.
+            bpos = bpos.checked_add(6).ok_or(Error::PacketHeaderOverrun)?;
         }
         let state = precincts.entry(*precinct_index).or_default();
         let header = decode_packet_header_with_choices(
@@ -2352,13 +2344,7 @@ pub fn encode_segment_lengths(
     writer: &mut PacketBitWriter,
     mixed_ht_headroom: bool,
 ) {
-    let width_extra = |p: u32| -> u32 {
-        if p <= 1 {
-            0
-        } else {
-            p.ilog2()
-        }
-    };
+    let width_extra = |p: u32| -> u32 { if p <= 1 { 0 } else { p.ilog2() } };
     // Minimal k so every length fits (and no field exceeds 32 bits).
     // With `mixed_ht_headroom` — a T.814 §A.4 MIXED HT block whose
     // first-ever non-zero segment lands in this contribution — the
@@ -2610,7 +2596,7 @@ mod tests {
         assert!(bypass_pass_terminated(11, false)); // MR raw — terminated
         assert!(bypass_pass_terminated(12, false)); // cleanup AC — terminated
         assert!(!bypass_pass_terminated(13, false)); // SP raw — not terminated
-                                                     // Bit-2 set → every pass terminated (including both raw passes).
+        // Bit-2 set → every pass terminated (including both raw passes).
         for i in 0..14 {
             assert!(
                 bypass_pass_terminated(i, true),
@@ -3572,7 +3558,7 @@ mod tests {
     #[test]
     fn separate_walk_rejects_wrong_body_nsop() {
         let header_buf = pack_bits(&[0]); // single empty packet
-                                          // SOP carrying Nsop = 7 for what should be packet 0.
+        // SOP carrying Nsop = 7 for what should be packet 0.
         let data_buf = vec![0xFFu8, 0x91, 0x00, 0x04, 0x00, 0x07];
         let geom = PacketGeometry {
             sub_bands: vec![SubBandGeometry {
@@ -3768,7 +3754,7 @@ mod tests {
         all.extend([0xFFu8, 0x91, 0x00, 0x04, 0x00, 0x00]); // SOP, Nsop = 0
         all.extend(pack_bits(&[1, 1, 1, 0, 0, 1, 0, 1]));
         all.extend([0u8; 5]); // 5 body bytes
-                              // Packet 1: no SOP marker.
+        // Packet 1: no SOP marker.
         all.extend(pack_bits(&[1, 1, 0, 0, 0, 1, 0]));
         all.extend([0u8; 2]); // 2 body bytes
         let g = |layer| PacketGeometry {

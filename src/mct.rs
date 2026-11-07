@@ -1517,7 +1517,7 @@ mod tests {
         let mut c2 = [-1_i32];
         inverse_rct(&mut c0, &mut c1, &mut c2).unwrap();
         assert_eq!(c1[0], 11); // I1
-                               // Y0 = 10, Y1 + Y2 = -4 ⇒ ⌊-4/4⌋ = -1 ⇒ I1 = 10 - (-1) = 11.
+        // Y0 = 10, Y1 + Y2 = -4 ⇒ ⌊-4/4⌋ = -1 ⇒ I1 = 10 - (-1) = 11.
         let mut c0 = [10_i32];
         let mut c1 = [-2_i32];
         let mut c2 = [-2_i32];

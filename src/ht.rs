@@ -37,14 +37,14 @@
 //! All truth in this module comes from `docs/image/jpeg2000/` (T.814 |
 //! 15444-15). No external HTJ2K implementation was consulted.
 
+use crate::Error;
 use crate::geometry::SubBandOrientation;
 use crate::t1::{CodeBlock, Coefficient};
-use crate::Error;
 
 mod tables {
-    pub(super) use crate::ht_tables::{CxtVlcEntry, CXT_VLC_TABLE_0, CXT_VLC_TABLE_1};
+    pub(super) use crate::ht_tables::{CXT_VLC_TABLE_0, CXT_VLC_TABLE_1, CxtVlcEntry};
 }
-use tables::{CxtVlcEntry, CXT_VLC_TABLE_0, CXT_VLC_TABLE_1};
+use tables::{CXT_VLC_TABLE_0, CXT_VLC_TABLE_1, CxtVlcEntry};
 
 /// T.814 Table 2 — MEL exponent table `MEL_E[k]`, `k` in `0..=12`.
 pub(crate) const MEL_E: [u8; 13] = [0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 4, 5];
@@ -560,13 +560,13 @@ pub(crate) fn quad_context(grid: &HtGrid, q: usize) -> u8 {
         let up = q - qw; // quad directly above
         let n = grid.sigma_n(up, 1); // σⁿ  = σ_{4(q-QW)+1}
         let ne = grid.sigma_n(up, 3); // σⁿᵉ = σ_{4(q-QW)+3}
-        let nw = if q % qw != 0 {
+        let nw = if !q.is_multiple_of(qw) {
             // σ_{4(q-QW)-1} = sample j=3 of quad (up-1)
             grid.sigma_n(up - 1, 3)
         } else {
             0
         };
-        let nf = if (q + 1) % qw != 0 {
+        let nf = if !(q + 1).is_multiple_of(qw) {
             // σ_{4(q-QW)+5} = sample j=1 of quad (up+1)
             grid.sigma_n(up + 1, 1)
         } else {
@@ -575,7 +575,7 @@ pub(crate) fn quad_context(grid: &HtGrid, q: usize) -> u8 {
         // Also the west / south-west samples of the current row (the
         // "w" and "sw" of Figure 5 — the two samples of the previous
         // quad in this row).
-        let (w, sw) = if q % qw != 0 {
+        let (w, sw) = if !q.is_multiple_of(qw) {
             let p = q - 1;
             (grid.sigma_n(p, 2), grid.sigma_n(p, 3))
         } else {
@@ -598,12 +598,12 @@ pub(crate) fn exponent_predictor(grid: &HtGrid, q: usize, rho: u8) -> u32 {
     let up = q - qw;
     let e_n = grid.exp_n(up, 1);
     let e_ne = grid.exp_n(up, 3);
-    let e_nw = if q % qw != 0 {
+    let e_nw = if !q.is_multiple_of(qw) {
         grid.exp_n(up - 1, 3)
     } else {
         0
     };
-    let e_nf = if (q + 1) % qw != 0 {
+    let e_nf = if !(q + 1).is_multiple_of(qw) {
         grid.exp_n(up + 1, 1)
     } else {
         0
@@ -729,10 +729,10 @@ fn decode_sig_emb(
 /// pattern ρ_q.
 pub(crate) fn apply_sig_pattern(grid: &mut HtGrid, q: usize, rho: u8) {
     for j in 0..4 {
-        if rho & (1 << j) != 0 {
-            if let Some((x, y)) = grid.coord(q, j) {
-                grid.sigma[x + y * grid.wblk] = true;
-            }
+        if rho & (1 << j) != 0
+            && let Some((x, y)) = grid.coord(q, j)
+        {
+            grid.sigma[x + y * grid.wblk] = true;
         }
     }
 }
@@ -845,7 +845,7 @@ fn decode_quad_magsgn(grid: &mut HtGrid, magsgn: &mut MagSgnReader, q: usize) ->
         }
         let k_n = (qs.e_k >> j) & 1; // EMB known-bit
         let i_n = (qs.e_1 >> j) & 1; // EMB known-1
-                                     // m_n = σ_n · U_q − k_n  (§7.3.8).
+        // m_n = σ_n · U_q − k_n  (§7.3.8).
         let m_n = u_big.saturating_sub(k_n as u32);
         // The m_n MagSgn bits plus the known-1 bit at position m_n
         // must fit the 32-bit magnitude lane; every Mb this crate's
@@ -990,11 +990,7 @@ pub fn decode_ht_codeblock(
                 if bits != 0 && shift > bits.leading_zeros() {
                     return Err(Error::HtCorruptSegment);
                 }
-                if bits == 0 {
-                    0
-                } else {
-                    bits << shift
-                }
+                if bits == 0 { 0 } else { bits << shift }
             } else {
                 bits
             };

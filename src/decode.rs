@@ -68,25 +68,25 @@ use std::collections::BTreeMap;
 
 use crate::dequant::{self, StepSize};
 use crate::geometry::{
-    derive_precinct_code_blocks, derive_precinct_partition, derive_resolution_levels,
-    derive_tile_geometry, image_area, precinct_exponents_at, tile_grid_extent, PrecinctCodeBlocks,
-    ResolutionLevel, SubBandOrientation,
+    PrecinctCodeBlocks, ResolutionLevel, SubBandOrientation, derive_precinct_code_blocks,
+    derive_precinct_partition, derive_resolution_levels, derive_tile_geometry, image_area,
+    precinct_exponents_at, tile_grid_extent,
 };
 use crate::mct::{
-    reconstruct_tile_components_5x3_multi, reconstruct_tile_components_9x7_multi,
-    ComponentDescriptor, InverseMctMode,
+    ComponentDescriptor, InverseMctMode, reconstruct_tile_components_5x3_multi,
+    reconstruct_tile_components_9x7_multi,
 };
 use crate::packet::{PacketGeometry, SegmentSplit, SopEphMode, SubBandGeometry};
 use crate::progression::{
-    cprl_packet_order, lrcp_packet_order, pcrl_packet_order, poc_volume_packet_order,
-    rlcp_packet_order, rpcl_packet_order, ComponentPositionInfo, ComponentProgressionInfo,
-    PacketDescriptor, PocVolume, ResolutionPrecinctLayout,
+    ComponentPositionInfo, ComponentProgressionInfo, PacketDescriptor, PocVolume,
+    ResolutionPrecinctLayout, cprl_packet_order, lrcp_packet_order, pcrl_packet_order,
+    poc_volume_packet_order, rlcp_packet_order, rpcl_packet_order,
 };
 use crate::reassemble::{CodedCodeBlock, CoefficientSurface, SubBandQuantization};
-use crate::t1::{reset_contexts, BitPlaneSequencer, CodeBlock};
+use crate::t1::{BitPlaneSequencer, CodeBlock, reset_contexts};
 use crate::{
-    Error, J2kCodestream, ProgressionOrder, QuantizationStyle, Siz, WaveletTransform, MARKER_CAP,
-    MARKER_SIZ, MARKER_SOC,
+    Error, J2kCodestream, MARKER_CAP, MARKER_SIZ, MARKER_SOC, ProgressionOrder, QuantizationStyle,
+    Siz, WaveletTransform,
 };
 
 /// `PPM` marker code (T.800 §A.7.4, `0xFF60`) — packed packet
@@ -108,6 +108,7 @@ const MARKER_PPM: u16 = 0xFF60;
 /// range: `[0, 2^precision − 1]` for unsigned components,
 /// `[−2^(precision−1), 2^(precision−1) − 1]` for signed ones.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DecodedComponent {
     /// Plane width in samples (component-grid, Equation B-2).
     pub width: u32,
@@ -129,6 +130,7 @@ pub struct DecodedComponent {
 /// A fully decoded JPEG 2000 image — one [`DecodedComponent`] per SIZ
 /// component, each on its own component grid.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DecodedImage {
     /// Image-area width on the reference grid (`Xsiz − XOsiz`).
     pub width: u32,
@@ -619,11 +621,7 @@ type BlockKey = (u16, u8, u32, u32, u32, u32);
 /// passes per the §D.3 schedule (cleanup on the first plane, then
 /// `SP / MR / CL` triples): plane `k` completes on its cleanup pass.
 fn completed_bitplanes(passes: u32) -> u32 {
-    if passes == 0 {
-        0
-    } else {
-        1 + (passes - 1) / 3
-    }
+    if passes == 0 { 0 } else { 1 + (passes - 1) / 3 }
 }
 
 // ---------------------------------------------------------------------------
@@ -1533,11 +1531,7 @@ fn validate_plt_lengths(
             )
             .ok_or(Error::PsotOverflow)?;
         let start = if relocated {
-            if i == 0 {
-                0
-            } else {
-                spans[i - 1].1
-            }
+            if i == 0 { 0 } else { spans[i - 1].1 }
         } else {
             data_offset
                 .checked_sub(header.bytes_consumed)
@@ -1842,10 +1836,10 @@ fn decode_tile_from_plan(
             if desc.layer >= max_layers {
                 // A dropped later-layer contribution leaves any earlier
                 // accumulation a deliberate prefix.
-                if contrib.coding_passes > 0 {
-                    if let Some(entry) = accum.get_mut(&key) {
-                        entry.layer_truncated = true;
-                    }
+                if contrib.coding_passes > 0
+                    && let Some(entry) = accum.get_mut(&key)
+                {
+                    entry.layer_truncated = true;
                 }
                 continue;
             }
@@ -2106,8 +2100,12 @@ fn decode_tile_from_plan(
     let mut accum = accum.into_iter().peekable();
     for (c, levels) in levels_per_comp.iter().enumerate() {
         let cc = comp_coding.get(c).ok_or(Error::InvalidMarkerLength)?;
-        // Keep exactly the levels selected for synthesis. Contributions
-        // above this range remain length-accounted but are not decoded.
+        // Reduced-resolution decode: truncate the synthesis cascade to
+        // the kept levels — the output is the resolution-level-`keep`
+        // reconstruction (§F.3.1 stopped early; ISO/IEC 15444-4
+        // §B.2.3). At `discard_levels == 0` this is the full slice and
+        // the level-`NL` (tile-component) extent. Contributions above
+        // this range remain length-accounted but are not decoded.
         let keep = (cc.n_l - discard_levels) as usize;
         let levels = &levels[..=keep];
         let mut surface = match cc.transform {
@@ -3372,10 +3370,12 @@ mod tests {
 
         // The transcoded stream genuinely carries a PPT now.
         let cs = crate::parse_codestream(&relocated).expect("parse relocated");
-        assert!(cs.tile_parts[0]
-            .markers
-            .iter()
-            .any(|m| matches!(m, crate::TilePartMarker::Ppt(_))));
+        assert!(
+            cs.tile_parts[0]
+                .markers
+                .iter()
+                .any(|m| matches!(m, crate::TilePartMarker::Ppt(_)))
+        );
 
         let decoded = decode_j2k(&relocated).expect("decode relocated PPT stream");
         assert_eq!(decoded.components.len(), original.components.len());
@@ -4191,18 +4191,20 @@ mod tests {
         let a = cod(2, 2, 2, 0x00, WaveletTransform::Reversible5x3, &[]);
         let b = cod(3, 1, 1, 0x00, WaveletTransform::Reversible5x3, &[]);
         let markers = vec![crate::TilePartMarker::Cod(a), crate::TilePartMarker::Cod(b)];
-        assert!(resolve_tile_coding(
-            2,
-            HtSignalling::None,
-            &[],
-            None,
-            &params,
-            &coding,
-            &quant,
-            &roi,
-            &markers
-        )
-        .is_err());
+        assert!(
+            resolve_tile_coding(
+                2,
+                HtSignalling::None,
+                &[],
+                None,
+                &params,
+                &coding,
+                &quant,
+                &roi,
+                &markers
+            )
+            .is_err()
+        );
     }
 
     /// A `PocProgression` covering the whole component/resolution/layer
@@ -4318,17 +4320,19 @@ mod tests {
                 progressions: vec![poc_entry(ProgressionOrder::Rlcp)],
             }),
         ];
-        assert!(resolve_tile_coding(
-            2,
-            HtSignalling::None,
-            &[],
-            None,
-            &params,
-            &coding,
-            &quant,
-            &roi,
-            &markers
-        )
-        .is_err());
+        assert!(
+            resolve_tile_coding(
+                2,
+                HtSignalling::None,
+                &[],
+                None,
+                &params,
+                &coding,
+                &quant,
+                &roi,
+                &markers
+            )
+            .is_err()
+        );
     }
 }

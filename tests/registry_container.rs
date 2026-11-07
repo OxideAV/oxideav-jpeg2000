@@ -12,14 +12,14 @@ use oxideav_core::{
     PixelFormat, ProbeData, ReadSeek, RuntimeContext, StreamInfo, TimeBase, VideoFrame, WriteSeek,
 };
 use oxideav_jpeg2000::container::{
-    open_demuxer, open_muxer_j2k, open_muxer_jp2, probe_j2k, probe_jp2, CONTAINER_J2K,
-    CONTAINER_JP2,
+    CONTAINER_J2K, CONTAINER_JP2, open_demuxer, open_muxer_j2k, open_muxer_jp2, probe_j2k,
+    probe_jp2,
 };
-use oxideav_jpeg2000::jp2::{write_jp2, Colr, ColrMethod, Jp2WriteOptions};
+use oxideav_jpeg2000::jp2::{Colr, ColrMethod, Jp2WriteOptions, write_jp2};
 use oxideav_jpeg2000::registry::to_color_signal;
 use oxideav_jpeg2000::{
-    decode, encode, info, make_encoder, parse_j2k_header, register, ColorInfo, Container,
-    EncodeOptions, Jpeg2000Error, Jpeg2000Image, Palette, PixelFormat as J2k, Plane, CODEC_ID_STR,
+    CODEC_ID_STR, ColorInfo, Container, EncodeOptions, Jpeg2000Error, Jpeg2000Image, Palette,
+    PixelFormat as J2k, Plane, decode, encode, info, make_encoder, parse_j2k_header, register,
 };
 
 /// A `WriteSeek` sink whose bytes stay reachable after the muxer took
@@ -159,10 +159,11 @@ fn probe_names_the_container_from_magic_and_extension() {
         probe(&ctx, b"not a picture at all", Some("jph")).unwrap(),
         CONTAINER_JP2
     );
-    assert!(ctx
-        .containers
-        .open_demuxer(CONTAINER_J2K, reader(b"not a picture at all"), &ctx.codecs)
-        .is_err());
+    assert!(
+        ctx.containers
+            .open_demuxer(CONTAINER_J2K, reader(b"not a picture at all"), &ctx.codecs)
+            .is_err()
+    );
     // Foreign files are rejected.
     for foreign in [
         &b"farbfeld\0\0\0\x01\0\0\0\x01\0\0\0\0\0\0\0\0"[..],
@@ -515,12 +516,14 @@ fn muxers_refuse_a_second_picture_and_foreign_packets() {
             .containers
             .open_muxer(name, out, std::slice::from_ref(&stream))
             .unwrap();
-        assert!(m
-            .write_packet(&Packet::new(0, TimeBase::new(1, 1), Vec::new()))
-            .is_err());
-        assert!(m
-            .write_packet(&Packet::new(0, TimeBase::new(1, 1), b"farbfeld".to_vec()))
-            .is_err());
+        assert!(
+            m.write_packet(&Packet::new(0, TimeBase::new(1, 1), Vec::new()))
+                .is_err()
+        );
+        assert!(
+            m.write_packet(&Packet::new(0, TimeBase::new(1, 1), b"farbfeld".to_vec()))
+                .is_err()
+        );
     }
     // Stream shape is validated at open.
     let out: Box<dyn WriteSeek> = Box::new(Cursor::new(Vec::new()));
@@ -528,10 +531,11 @@ fn muxers_refuse_a_second_picture_and_foreign_packets() {
     let mut other = stream.clone();
     other.params.codec_id = CodecId::new("png");
     let out: Box<dyn WriteSeek> = Box::new(Cursor::new(Vec::new()));
-    assert!(ctx
-        .containers
-        .open_muxer(CONTAINER_J2K, out, std::slice::from_ref(&other))
-        .is_err());
+    assert!(
+        ctx.containers
+            .open_muxer(CONTAINER_J2K, out, std::slice::from_ref(&other))
+            .is_err()
+    );
 }
 
 #[test]
@@ -632,12 +636,14 @@ fn hostile_input_never_panics() {
     let out: Box<dyn WriteSeek> = Box::new(Cursor::new(Vec::new()));
     let (stream, _) = encode_via_registry(&sample_images()[0], None);
     let mut m = open_muxer_jp2(out, std::slice::from_ref(&stream)).unwrap();
-    assert!(m
-        .write_packet(&Packet::new(0, TimeBase::new(1, 1), Vec::new()))
-        .is_err());
+    assert!(
+        m.write_packet(&Packet::new(0, TimeBase::new(1, 1), Vec::new()))
+            .is_err()
+    );
     let out: Box<dyn WriteSeek> = Box::new(Cursor::new(Vec::new()));
     let mut m = open_muxer_j2k(out, std::slice::from_ref(&stream)).unwrap();
-    assert!(m
-        .write_packet(&Packet::new(0, TimeBase::new(1, 1), Vec::new()))
-        .is_err());
+    assert!(
+        m.write_packet(&Packet::new(0, TimeBase::new(1, 1), Vec::new()))
+            .is_err()
+    );
 }

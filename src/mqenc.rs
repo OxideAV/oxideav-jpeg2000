@@ -289,6 +289,19 @@ impl MqEncoder {
         }
         self.out
     }
+
+    /// Size of a predictable termination without copying the completed
+    /// byte prefix. BYTEOUT can modify only the most recent output byte,
+    /// so the registers and that byte suffice to reproduce the tail.
+    pub(crate) fn predictable_flush_len(&self) -> usize {
+        let tail = Self {
+            a: self.a,
+            c: self.c,
+            ct: self.ct,
+            out: self.out.last().copied().into_iter().collect(),
+        };
+        self.out.len().saturating_sub(1) + tail.flush_predictable().len()
+    }
 }
 
 impl Default for MqEncoder {
@@ -301,6 +314,29 @@ impl Default for MqEncoder {
 mod tests {
     use super::*;
     use crate::mq::{MqContext, MqDecoder};
+
+    #[test]
+    fn predictable_flush_len_matches_full_snapshot() {
+        let mut encoder = MqEncoder::new();
+        let mut contexts = [MqContext::default(); 19];
+        let mut state = 0xB17B_0D6Eu32;
+        assert_eq!(
+            encoder.predictable_flush_len(),
+            encoder.clone().flush_predictable().len()
+        );
+        for i in 0..4096 {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            let bit = ((state >> 29) & 1) as u8;
+            let context = i % contexts.len();
+            encoder.encode(&mut contexts[context], bit);
+            assert_eq!(
+                encoder.predictable_flush_len(),
+                encoder.clone().flush_predictable().len(),
+                "snapshot after {} decisions",
+                i + 1
+            );
+        }
+    }
 
     /// Encode `decisions` under a fresh default context, flush, then
     /// decode the bytes back through the §C.3 decoder with the same
@@ -410,7 +446,7 @@ mod tests {
                 let mut d = Vec::with_capacity(len);
                 for _ in 0..len {
                     state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                    d.push(u8::from((state >> 16) % bias == 0));
+                    d.push(u8::from((state >> 16).is_multiple_of(bias)));
                 }
                 for &b in &d {
                     enc.encode(&mut ecx, b);

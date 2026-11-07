@@ -16,7 +16,7 @@
 
 use std::io::{Read, Write};
 
-use crate::encode::{encode_j2k, encode_j2k_u16, Container, EncodeOptions};
+use crate::encode::{Container, EncodeOptions, encode_j2k, encode_j2k_u16};
 use crate::error::{Error, Jpeg2000Error};
 use crate::image::{
     ColorInfo, ColorRange, ImageInfo, Jpeg2000Image, Metadata, Palette, PixelFormat, Plane,
@@ -27,7 +27,7 @@ use crate::jp2::{
     Jp2WriteOptions, Pclr, PclrColumn,
 };
 use crate::options::DecodeOptions;
-use crate::{DecodedComponent, DecodedImage, J2kHeader, Siz, MARKER_SIZ, MARKER_SOC};
+use crate::{DecodedComponent, DecodedImage, J2kHeader, MARKER_SIZ, MARKER_SOC, Siz};
 
 // ---------------------------------------------------------------------------
 // probe
@@ -305,7 +305,7 @@ fn layout_for(chans: &[Chan], ycc: bool, index_depth: Option<u8>) -> Result<Layo
         if c1 != c2 || (n == 4 && (chans[3].hsep, chans[3].vsep) != base) {
             return Err(bad());
         }
-        if c1.0 % base.0 != 0 || c1.1 % base.1 != 0 {
+        if !c1.0.is_multiple_of(base.0) || !c1.1.is_multiple_of(base.1) {
             return Err(bad());
         }
         (c1.0 / base.0, c1.1 / base.1)

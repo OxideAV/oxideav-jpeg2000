@@ -4,6 +4,64 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ## [Unreleased]
 
+### Changed
+
+- API hygiene: `TilePartMarker`, `J2kHeader`, `TilePart`, `J2kCodestream`, `DecodedComponent`, `DecodedImage`, `EncodeKernel`, `TilePartSplit`, `PackedHeaders`, `ComponentOverride`, `Jp2Header`, `Jp2Container` and `Jp2WriteOptions` are now `#[non_exhaustive]`. The marker-segment and box mirrors (`Siz`, `Cod`, `Coc`, `Qcd`, `Qcc`, `Poc`, `PocProgression`, `Rgn`, `Plt`, `Ppt`, `Sot`, `Ftyp`, `Ihdr`, `Colr`, ...), the code enums that already carry a `Reserved` catch-all (`ProgressionOrder`, `WaveletTransform`, `QuantizationStyle`, `ColrMethod`, `EnumCs`), `CmapMapping` and the plain rectangle `RoiRegion` stay exhaustive.
+
+### Added
+
+- `ComponentOverride::new(component)` plus `with_decomposition_levels` / `with_code_block_exp` / `with_precincts` / `with_kernel`.
+- `Jp2WriteOptions::with_colour` / `with_palette` / `with_component_mapping` / `with_channel_definitions` / `with_resolution` / `with_colourspace_unknown`.
+
+## [0.0.18](https://github.com/OxideAV/oxideav-jpeg2000/compare/v0.0.17...v0.0.18) - 2026-10-24
+
+### Fixed
+
+- fixup for #28: CHANGELOG entry
+- fixup for #25: rustfmt (edition-2024 import order in the test) + CHANGELOG entry
+- fixup for #24: CHANGELOG entry
+- fixup for #23: port the test-only readers of the removed fields + rustfmt + CHANGELOG
+- fixup for #22: CHANGELOG entry
+- fixup for #21: CHANGELOG entry
+- fixup for #20: rustfmt + CHANGELOG entry
+- fixup for #19: rustfmt + CHANGELOG entry
+- fixup for #18: rustfmt + CHANGELOG entry
+- fixup for #17: rustfmt (edition-2024 import order in the example) + CHANGELOG entry
+
+### Other
+
+- inline MQ DECODE into the Tier-1 passes, decode passes on the packed state word
+- *(decode)* convert completed 9/7 planes to f32
+- Reject unconsumed component block accumulators
+- Decode and reconstruct one tile component at a time
+- Release decoded block buffers before tile reconstruction
+- Index reversible DWT neighbours directly
+- Keep compact imported coefficient arrays tightly allocated
+- Pack Tier-1 coefficient flags and decoded counts into block state
+- Select Tier-1 contexts directly from packed neighbour states
+- Cache Tier-1 neighbour states in packed pass flags
+- Read interior Tier-1 neighbours using row offsets
+- Reuse inverse 9/7 wavelet scratch buffers
+- Skip redundant neighbour reads in MQ refinement decoding
+- Skip redundant neighbour reads in MQ refinement encoding
+- Fix HT MEL termination at the VLC interface
+- honor target byte budgets at final terminations
+- Avoid quadratic decoded-bit scans during reassembly
+- edition 2024, MSRV 1.95
+
+- Tier-1 decode: `MqDecoder::decode` is force-inlined into the pass loops (its state stays in registers across decisions), and the significance-propagation, magnitude-refinement and cleanup decode passes test and update each coefficient's packed state word directly, with the §D.7 vertically-causal clip hoisted to a per-stripe mask, instead of rebuilding a `Coefficient` snapshot and re-deriving the stripe-clipped state per sample. Decisions, contexts and reconstructions are unchanged (new encoder ↔ decoder pass-by-pass state test, both causal modes). 3840×2160 RGB8: −11.4 % (5/3) / −12.2 % (9/7) instructions retired, −4.1 % / −1.0 % cycles (#26)
+- Each completed 9/7 component plane is narrowed to the `f32` Annex G consumes as soon as its inverse DWT finishes, so no finished `f64` plane outlives its component; same scalar cast, output bit-identical. 3840×2160 RGB8 9/7 peak RSS 767 → 637 MB (#28, @Streetblock)
+- Tile decode runs tier-1 → reassembly → inverse DWT one component at a time, so only one component's decoded code-blocks are alive at once, and hands the reconstructed planes to the output by move instead of cloning; an accumulator left over for an unplanned component is now rejected (`InvalidPacketHeader`) instead of being dropped silently. 3840×2160 RGB8 peak RSS: 5/3 626 → 370 MB, 9/7 952 → 767 MB (#25, @Streetblock)
+- Inverse 5/3 DWT (§F.3.8.1 Equations F-5 / F-6) indexes the two lifting neighbours directly and reflects only the two endpoints per Equation F-4, instead of evaluating the periodic-symmetric-extension index for every tap; rows are filtered in place. Checked against the closed-form extension for origins −7..7, lengths 1..129 (#24, @Streetblock)
+- Tier-1 code-block state is packed: one `u32` of magnitudes plus one `u32` of coding state per coefficient (own σ / sign / refined flags, the two per-plane pass flags, a 15-bit decoded-plane count with a full-width fallback, and the eight Figure D.2 neighbour significances with the four cardinal signs), published incrementally when a coefficient becomes significant; Table D.1 / D.3 context labels are selected from compile-time tables built from the crate's own label functions, which stay as the test oracle (exhaustive 65 536-state equivalence). Neighbour snapshots become test-only (#23, @Streetblock)
+- Tier-1 neighbour snapshot reads the eight Figure D.2 neighbours of an interior coefficient through three row offsets, keeping the clipped offset walk for edge coefficients (exhaustive mask tests against the offset walk) (#22, @Streetblock)
+- Inverse 9/7 DWT reuses one extension scratch buffer across the rows and columns of a sub-band pass and filters rows in place instead of copying each row first; the lifting arithmetic is untouched (f64 output bit-identical) (#21, @Streetblock)
+- Tier-1 magnitude refinement (encoder and decoder) skips the neighbour read for coefficients already refined once — Table D.4 assigns them context 16 regardless of neighbourhood — leaving the codeword bit-exact (golden bytes pinned); `examples/decoder_perf.rs` now times `decode_j2k` on a codestream file and `examples/encoder_perf.rs` times the lossless encoder on a generated image (#20, @Streetblock)
+- HT (T.814) encoder: the MEL byte-stream is terminated the way Annex F.4 `termMELandVLCPackers` does — the partial last byte is zero-padded and a trailing complete 0xFF is followed by a zero byte — instead of one-padding, so the MEL/VLC interface can no longer form an `0xFF 0x90..0xFF` pair inside the HT cleanup segment (§7.1.1 forbids it; OpenJPEG rejected such streams with "Incorrect MEL segment sequence") (#19, @Streetblock)
+- Rate control honours `target_bytes` at final code-block terminations: the λ-search probes now use each pass's actual terminated length (`truncation_rates`, with a predictable-termination size computed from the MQ registers alone) instead of the capped packet-prefix rate, so a budget-constrained stream can no longer come out larger than the budget when the truncated blocks are re-encoded exactly (4×4 bypass+predictable fixture: 90-byte budget returned 91 bytes, now 86) (#18, @Streetblock)
+- Reassembly resolves each code-block's uniform-`Nb` fallback once per block instead of rescanning `decoded_bits` for every coefficient (O(B) instead of O(B²) per block); `examples/decoder_perf.rs` benchmark (#17, @Streetblock)
+- edition 2024, MSRV 1.95
+
 ## [0.0.17](https://github.com/OxideAV/oxideav-jpeg2000/compare/v0.0.16...v0.0.17) - 2026-10-05
 
 ### Other

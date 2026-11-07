@@ -110,10 +110,10 @@
 //! offsets; the Tables D.1 / D.2 / D.3 / D.4 / D.5 contents are
 //! transcribed verbatim from the PDF.
 
+use crate::Error;
 use crate::geometry::SubBandOrientation;
 use crate::mq::{MqContext, MqDecoder};
 use crate::mqenc::MqEncoder;
-use crate::Error;
 
 /// First Annex D context label devoted to significance propagation
 /// (Table D.1 row "0", the all-insignificant-neighbours row).
@@ -1068,24 +1068,33 @@ impl CodeBlock {
 
         let weight: u32 = 1u32 << bitplane;
         let mut newly = 0usize;
+        // §D.7 vertically causal clip for the last row of each stripe:
+        // D2 / V1 / D3 significance (bits 5..7) and the V1 sign (bit 11),
+        // exactly the bits `coding_state_in_stripe` removes.
+        let causal_clip: u32 = if self.vertically_causal {
+            (7 << 5) | (1 << 11)
+        } else {
+            0
+        };
+        let width = self.width;
 
-        // §D.1: stripes of height 4, top to bottom. Within a stripe the
-        // scan is column-by-column, top to bottom of the stripe.
         let mut v0 = 0usize;
         while v0 < self.height {
             let stripe_h = core::cmp::min(4, self.height - v0);
-            for u in 0..self.width {
+            for u in 0..width {
                 for dv in 0..stripe_h {
                     let v = v0 + dv;
-                    let coef = self.coefficient_at(u + v * self.width);
+                    let idx = u + v * width;
+                    let state = self.coding_state[idx];
 
                     // SP pass: only insignificant coefficients with a
                     // non-zero Table D.1 context are considered.
-                    if coef.sigma {
+                    if state & SELF_SIGMA != 0 {
                         continue;
                     }
-                    let label =
-                        contexts[(self.coding_state_in_stripe(u, v, v0, stripe_h) & 0xff) as usize];
+                    let clip = if dv + 1 == stripe_h { causal_clip } else { 0 };
+                    let visible = state & !clip;
+                    let label = contexts[(visible & 0xff) as usize];
                     if label == 0 {
                         // Zero context — deferred to the cleanup pass.
                         continue;
@@ -1093,35 +1102,30 @@ impl CodeBlock {
 
                     let cx = &mut ctx[SP_CTX_OFFSET + label as usize];
                     let bit = decoder.decode(cx);
-                    // §D.3.4 / Table D.10 D9: this coefficient's bit was
-                    // coded in the SP pass — the same plane's cleanup
-                    // pass must skip it whatever the outcome.
-                    self.coding_state[u + v * self.width] |= SP_VISITED;
-                    // §D.2.1: a magnitude MSB was decoded for this
-                    // coefficient on this bit-plane (whether it read 0
-                    // or 1) — count it toward Nb(u, v).
-                    self.increment_decoded_bits(u + v * self.width);
+                    // §D.3.4 / Table D.10 D9: coded in the SP pass, so the
+                    // same plane's cleanup pass skips it; §D.2.1: one
+                    // magnitude bit decoded toward Nb(u, v).
+                    let mut next = state | SP_VISITED;
+                    if self.wide_decoded_bits.is_none() && state & COUNT_MASK != COUNT_MASK {
+                        next += 1 << COUNT_SHIFT;
+                        self.coding_state[idx] = next;
+                    } else {
+                        self.coding_state[idx] = next;
+                        self.increment_decoded_bits(idx);
+                        next = self.coding_state[idx];
+                    }
                     if bit == 1 {
-                        // Newly significant — set σ, accumulate the
-                        // bit-plane's positional value into magnitude,
-                        // then immediately run the §D.3.2 sign-bit
-                        // subroutine.
-                        let (sign_label, xorbit) = packed_sign_context_label(
-                            self.coding_state_in_stripe(u, v, v0, stripe_h),
-                        );
+                        // Newly significant: §D.3.2 sign decoding against
+                        // the Table D.3 context of the visible neighbours.
+                        let (sign_label, xorbit) = packed_sign_context_label(visible as u16);
                         let sign_cx = &mut ctx[SIGN_CTX_OFFSET + sign_label as usize];
-                        let d = decoder.decode(sign_cx);
-                        let sign_bit = (d ^ xorbit) != 0;
-
-                        let updated = Coefficient {
-                            magnitude: coef.magnitude | weight,
-                            sigma: true,
-                            sign: sign_bit,
-                            already_refined: coef.already_refined,
-                        };
-                        self.set_coefficient_at(u + v * self.width, updated);
+                        let sign_bit = (decoder.decode(sign_cx) ^ xorbit) != 0;
+                        self.magnitudes[idx] |= weight;
+                        self.coding_state[idx] = (next & !SELF_SIGN)
+                            | SELF_SIGMA
+                            | (u32::from(sign_bit) * SELF_SIGN)
+                            | NEWLY_SIGNIFICANT;
                         self.publish_significance(u, v, sign_bit);
-                        self.coding_state[u + v * self.width] |= NEWLY_SIGNIFICANT;
                         newly += 1;
                     }
                 }
@@ -1169,42 +1173,48 @@ impl CodeBlock {
         self.ensure_coding_state();
         let weight: u32 = 1u32 << bitplane;
         let mut refined = 0usize;
+        // §D.7: under vertically causal context formation the last row of
+        // each stripe does not see D2 / V1 / D3 (bits 5..7); only the
+        // significance byte feeds the Table D.4 label, so the clip is a
+        // mask on that byte.
+        let causal_clip: u32 = if self.vertically_causal { 7 << 5 } else { 0 };
+        let width = self.width;
 
         let mut v0 = 0usize;
         while v0 < self.height {
             let stripe_h = core::cmp::min(4, self.height - v0);
-            for u in 0..self.width {
+            for u in 0..width {
                 for dv in 0..stripe_h {
-                    let v = v0 + dv;
-                    let idx = u + v * self.width;
-                    let coef = self.coefficient_at(idx);
+                    let idx = u + (v0 + dv) * width;
+                    let state = self.coding_state[idx];
 
                     // §D.3.3: refine coefficients that are already
                     // significant, *except* those that became significant
                     // in the immediately preceding SP pass.
-                    if !coef.sigma || self.coding_state[idx] & NEWLY_SIGNIFICANT != 0 {
+                    if state & (SELF_SIGMA | NEWLY_SIGNIFICANT) != SELF_SIGMA {
                         continue;
                     }
 
-                    // Table D.4 context: the neighbour summation uses the
-                    // significance states currently known to the decoder.
-                    let label = if coef.already_refined {
+                    // Table D.4 context: label 16 once refined, else 15 when
+                    // any (stripe-clipped) neighbour is significant, else 14.
+                    let label = if state & SELF_REFINED != 0 {
                         2
                     } else {
-                        u8::from(self.coding_state_in_stripe(u, v, v0, stripe_h) & 0xff != 0)
+                        let clip = if dv + 1 == stripe_h { causal_clip } else { 0 };
+                        u8::from(state & 0xff & !clip != 0)
                     };
                     let cx = &mut ctx[REFINEMENT_CTX_OFFSET + label as usize];
-                    let bit = decoder.decode(cx);
-
-                    let mut updated = coef;
-                    if bit == 1 {
-                        updated.magnitude |= weight;
+                    if decoder.decode(cx) == 1 {
+                        self.magnitudes[idx] |= weight;
                     }
-                    updated.already_refined = true;
-                    self.set_coefficient_at(idx, updated);
                     // §D.2.1: one refinement (magnitude) bit decoded for
                     // this already-significant coefficient on this plane.
-                    self.increment_decoded_bits(idx);
+                    if self.wide_decoded_bits.is_none() && state & COUNT_MASK != COUNT_MASK {
+                        self.coding_state[idx] = (state | SELF_REFINED) + (1 << COUNT_SHIFT);
+                    } else {
+                        self.coding_state[idx] = state | SELF_REFINED;
+                        self.increment_decoded_bits(idx);
+                    }
                     refined += 1;
                 }
             }
@@ -1267,6 +1277,10 @@ impl CodeBlock {
         let contexts = significance_contexts(self.orientation);
         let weight: u32 = 1u32 << bitplane;
         let mut newly = 0usize;
+        // §D.7 vertically causal clip of the stripe's last row (D2 / V1 /
+        // D3 significance), as in `coding_state_in_stripe`.
+        let causal_clip: u32 = if self.vertically_causal { 7 << 5 } else { 0 };
+        let width = self.width;
 
         let mut v0 = 0usize;
         while v0 < self.height {
@@ -1317,23 +1331,25 @@ impl CodeBlock {
                 // run-length mode did not apply).
                 for dv in start_dv..stripe_h {
                     let v = v0 + dv;
-                    // Table D.10 decision D9: skip coefficients that are
-                    // already significant — or whose bit was already
-                    // coded during this bit-plane's significance
-                    // propagation pass (§D.3.4 "the remaining
-                    // coefficients … not handled by the significance
-                    // propagation pass").
-                    if self.coefficient_at(u + v * self.width).sigma
-                        || self.coding_state[u + v * self.width] & SP_VISITED != 0
-                    {
+                    let idx = u + v * width;
+                    let state = self.coding_state[idx];
+                    // Skip coefficients already significant or already
+                    // coded by this plane's significance propagation
+                    // pass (§D.3.4 "the remaining coefficients … not
+                    // handled by the significance propagation pass").
+                    if state & (SELF_SIGMA | SP_VISITED) != 0 {
                         continue;
                     }
-                    let label =
-                        contexts[(self.coding_state_in_stripe(u, v, v0, stripe_h) & 0xff) as usize];
+                    let clip = if dv + 1 == stripe_h { causal_clip } else { 0 };
+                    let label = contexts[(state & !clip & 0xff) as usize];
                     let cx = &mut ctx[SP_CTX_OFFSET + label as usize];
                     // §D.2.1: this leftover coefficient is coded (a 0 or
                     // 1 magnitude bit) by the cleanup pass on this plane.
-                    self.increment_decoded_bits(u + v * self.width);
+                    if self.wide_decoded_bits.is_none() && state & COUNT_MASK != COUNT_MASK {
+                        self.coding_state[idx] = state + (1 << COUNT_SHIFT);
+                    } else {
+                        self.increment_decoded_bits(idx);
+                    }
                     if decoder.decode(cx) == 1 {
                         self.make_significant_with_sign(u, v, weight, v0, stripe_h, decoder, ctx);
                         newly += 1;
@@ -1941,26 +1957,26 @@ impl CodeBlock {
     /// §D.7 vertically-causal clip on top of this read.
     #[cfg(test)]
     fn neighbours(&self, u: usize, v: usize) -> Neighbours {
-        // Private experiment: direct, safe reads for an interior sample.
-        // The original clipping loop below handles every code-block edge.
+        // Interior samples have all eight neighbours inside the code-block.
+        // Keep the clipped path below for samples on a code-block edge.
         if u > 0 && u + 1 < self.width && v > 0 && v + 1 < self.height {
             let top = (v - 1) * self.width + u;
             let middle = v * self.width + u;
             let bottom = (v + 1) * self.width + u;
-            let c = self.coefficients_for_test();
+            let c = |i: usize| self.coefficient_at(i);
             return Neighbours {
-                d0_sigma: c[top - 1].sigma,
-                v0_sigma: c[top].sigma,
-                v0_sign: c[top].sign,
-                d1_sigma: c[top + 1].sigma,
-                h0_sigma: c[middle - 1].sigma,
-                h0_sign: c[middle - 1].sign,
-                h1_sigma: c[middle + 1].sigma,
-                h1_sign: c[middle + 1].sign,
-                d2_sigma: c[bottom - 1].sigma,
-                v1_sigma: c[bottom].sigma,
-                v1_sign: c[bottom].sign,
-                d3_sigma: c[bottom + 1].sigma,
+                d0_sigma: c(top - 1).sigma,
+                v0_sigma: c(top).sigma,
+                v0_sign: c(top).sign,
+                d1_sigma: c(top + 1).sigma,
+                h0_sigma: c(middle - 1).sigma,
+                h0_sign: c(middle - 1).sign,
+                h1_sigma: c(middle + 1).sigma,
+                h1_sign: c(middle + 1).sign,
+                d2_sigma: c(bottom - 1).sigma,
+                v1_sigma: c(bottom).sigma,
+                v1_sign: c(bottom).sign,
+                d3_sigma: c(bottom + 1).sigma,
             };
         }
         let mut nb = Neighbours::default();
@@ -3131,6 +3147,143 @@ impl BitPlaneSequencer {
 mod tests {
     use super::*;
 
+    // Test-only oracle: retain the original offset iteration and clipping,
+    // independently of the direct row-address reads in the interior path.
+    fn neighbour_snapshot_reference(
+        block: &CodeBlock,
+        u: usize,
+        v: usize,
+        clip_below: bool,
+    ) -> Neighbours {
+        let mut nb = Neighbours::default();
+        let positions = [
+            (-1, -1, NeighbourSlot::D0),
+            (0, -1, NeighbourSlot::V0),
+            (1, -1, NeighbourSlot::D1),
+            (-1, 0, NeighbourSlot::H0),
+            (1, 0, NeighbourSlot::H1),
+            (-1, 1, NeighbourSlot::D2),
+            (0, 1, NeighbourSlot::V1),
+            (1, 1, NeighbourSlot::D3),
+        ];
+        for (du, dv, slot) in positions {
+            // Model causal clipping by omitting below-row reads rather
+            // than copying the implementation's post-read field resets.
+            if clip_below && dv == 1 {
+                continue;
+            }
+            let nu = u as i32 + du;
+            let nv = v as i32 + dv;
+            if nu < 0 || nu >= block.width as i32 || nv < 0 || nv >= block.height as i32 {
+                continue;
+            }
+            let c = block.coefficient_at(nu as usize + nv as usize * block.width);
+            nb.set(slot, c.sigma, c.sign);
+        }
+        nb
+    }
+
+    fn set_neighbour_snapshot_masks(
+        block: &mut CodeBlock,
+        u: usize,
+        v: usize,
+        sigma_mask: u8,
+        sign_mask: u8,
+    ) {
+        let offsets = [
+            (-1, -1),
+            (0, -1),
+            (1, -1),
+            (-1, 0),
+            (1, 0),
+            (-1, 1),
+            (0, 1),
+            (1, 1),
+        ];
+        for (slot, (du, dv)) in offsets.into_iter().enumerate() {
+            let nu = u as i32 + du;
+            let nv = v as i32 + dv;
+            if nu >= 0 && nu < block.width as i32 && nv >= 0 && nv < block.height as i32 {
+                let idx = nu as usize + nv as usize * block.width;
+                let mut c = block.coefficient_at(idx);
+                c.sigma = sigma_mask & (1 << slot) != 0;
+                // Include true signs on insignificant neighbours: snapshots
+                // preserve the stored sign even when context coding ignores it.
+                c.sign = sign_mask & (1 << slot) != 0;
+                // The snapshot readers under test go through `coefficient_at`,
+                // not the packed neighbour cache, so no publish is needed.
+                block.set_coefficient_at(idx, c);
+            }
+        }
+    }
+
+    #[test]
+    fn neighbours_interior_matches_offset_reference_for_all_masks() {
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 3, 3);
+        for sigma_mask in 0..=u8::MAX {
+            for sign_mask in 0..=u8::MAX {
+                set_neighbour_snapshot_masks(&mut block, 1, 1, sigma_mask, sign_mask);
+                // Whole-structure equality checks all eight significance
+                // fields and all four cardinal sign fields.
+                assert_eq!(
+                    block.neighbours(1, 1),
+                    neighbour_snapshot_reference(&block, 1, 1, false),
+                    "interior sigma={sigma_mask:#04x} sign={sign_mask:#04x}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn neighbours_edges_and_causal_stripes_match_offset_reference() {
+        // Thin blocks, every edge/corner, and trailing stripe heights 1–3.
+        // In the 3x5/6/7 fixtures, row 3 is an interior stripe bottom
+        // with a real next row, so causal clipping is observable.
+        for (width, height) in [
+            (1, 1),
+            (1, 7),
+            (7, 1),
+            (2, 5),
+            (5, 2),
+            (3, 5),
+            (3, 6),
+            (3, 7),
+        ] {
+            let mut block = CodeBlock::new(SubBandOrientation::LL, width, height);
+            for v in 0..height {
+                for u in 0..width {
+                    let stripe_v0 = v / 4 * 4;
+                    let stripe_h = (height - stripe_v0).min(4);
+                    for sigma_mask in 0..=u8::MAX {
+                        // Diagonal signs have no snapshot field. All 16
+                        // combinations of the four stored signs suffice here.
+                        for cardinal_sign_mask in 0..16u8 {
+                            let sign_mask = ((cardinal_sign_mask & 1) << 1)
+                                | ((cardinal_sign_mask & 2) << 2)
+                                | ((cardinal_sign_mask & 4) << 2)
+                                | ((cardinal_sign_mask & 8) << 3);
+                            set_neighbour_snapshot_masks(&mut block, u, v, sigma_mask, sign_mask);
+                            assert_eq!(
+                                block.neighbours(u, v),
+                                neighbour_snapshot_reference(&block, u, v, false),
+                                "plain {width}x{height} ({u},{v}) sigma={sigma_mask:#04x} sign={sign_mask:#04x}",
+                            );
+                            for causal in [false, true] {
+                                block.vertically_causal = causal;
+                                let clip_below = causal && v + 1 == stripe_v0 + stripe_h;
+                                assert_eq!(
+                                    block.neighbours_in_stripe(u, v, stripe_v0, stripe_h),
+                                    neighbour_snapshot_reference(&block, u, v, clip_below),
+                                    "stripe {width}x{height} ({u},{v}) sigma={sigma_mask:#04x} sign={sign_mask:#04x} causal={causal}",
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn compact_coefficient_snapshots_preserve_full_magnitude_and_all_flags() {
         let coefficients: Vec<_> = [0, 1, 1 << 31, u32::MAX]
@@ -3216,7 +3369,6 @@ mod tests {
         assert_eq!(block.coefficients_for_test(), coefficients);
         assert_eq!(block.max_decoded_bits(), 17);
     }
-
     fn normalized_signs(mut nb: Neighbours) -> Neighbours {
         nb.v0_sign &= nb.v0_sigma;
         nb.h0_sign &= nb.h0_sigma;
@@ -3397,10 +3549,12 @@ mod tests {
                         block.ensure_coding_state();
                         assert_coding_cache(&block);
                         assert_eq!(block.coefficients_for_test(), coefficients);
-                        assert!(block
-                            .coding_state
-                            .iter()
-                            .all(|&s| s & (NEWLY_SIGNIFICANT | SP_VISITED) == 0));
+                        assert!(
+                            block
+                                .coding_state
+                                .iter()
+                                .all(|&s| s & (NEWLY_SIGNIFICANT | SP_VISITED) == 0)
+                        );
                     }
                 }
             }
@@ -3465,6 +3619,117 @@ mod tests {
                     assert_eq!(reconstructed.coding_state, block.coding_state);
                     // Changing VSC between passes affects the read mask only.
                     assert_coding_cache(&block.with_vertically_causal_context(!causal));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn packed_decode_passes_match_encoder_state_with_and_without_causal_clip() {
+        // The decode passes read the packed state word directly; the
+        // encoder passes still go through `coding_state_in_stripe`. A
+        // block coded by the encoder must decode to the identical
+        // magnitudes, flags, neighbour cache and decoded-bit counts after
+        // every pass, for full and partial stripes and both §D.7 modes.
+        let mut seed = 0x51ed_270bu32;
+        for (width, height) in [(13, 11), (4, 4), (1, 9), (9, 1), (32, 32)] {
+            for causal in [false, true] {
+                for orientation in [
+                    SubBandOrientation::LL,
+                    SubBandOrientation::HL,
+                    SubBandOrientation::HH,
+                ] {
+                    let planes = 9u32;
+                    let targets: Vec<Coefficient> = (0..width * height)
+                        .map(|_| {
+                            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                            // Sparse-ish magnitudes so every context class
+                            // (zero, run-length, SP, MR) occurs.
+                            let magnitude = if seed >> 29 == 0 {
+                                0
+                            } else {
+                                (seed >> 7) & 0x1ff
+                            };
+                            Coefficient {
+                                magnitude,
+                                sigma: false,
+                                sign: seed & 1 != 0,
+                                already_refined: false,
+                            }
+                        })
+                        .collect();
+                    let mut enc_block = CodeBlock::new(orientation, width, height)
+                        .with_vertically_causal_context(causal);
+                    let mut encoder = MqEncoder::new();
+                    let mut enc_ctx = reset_contexts();
+                    let mut snapshots = Vec::new();
+                    for p in (0..planes).rev() {
+                        if p + 1 != planes {
+                            enc_block.significance_propagation_encode(
+                                p,
+                                &targets,
+                                &mut encoder,
+                                &mut enc_ctx,
+                            );
+                            snapshots.push(enc_block.clone());
+                            enc_block.magnitude_refinement_encode(
+                                p,
+                                &targets,
+                                &mut encoder,
+                                &mut enc_ctx,
+                            );
+                            snapshots.push(enc_block.clone());
+                        }
+                        enc_block.cleanup_encode(p, &targets, &mut encoder, &mut enc_ctx);
+                        snapshots.push(enc_block.clone());
+                    }
+                    let bytes = encoder.flush();
+                    let mut dec_block = CodeBlock::new(orientation, width, height)
+                        .with_vertically_causal_context(causal);
+                    let mut decoder = MqDecoder::new(&bytes);
+                    let mut dec_ctx = reset_contexts();
+                    let mut snapshots = snapshots.into_iter();
+                    let mut check = |dec: &CodeBlock, what: &str| {
+                        let enc = snapshots.next().unwrap();
+                        let tag =
+                            format!("{width}x{height} causal={causal} {orientation:?} {what}");
+                        assert_eq!(dec.magnitudes, enc.magnitudes, "{tag}");
+                        // The decoder's cleanup marks its new significances
+                        // NEWLY_SIGNIFICANT, the encoder's does not; the
+                        // next SP pass clears the flag before any MR pass
+                        // reads it, so it is masked after cleanup only.
+                        let mask = if what == "CU" { !NEWLY_SIGNIFICANT } else { !0 };
+                        let dec_state: Vec<u32> =
+                            dec.coding_state.iter().map(|s| s & mask).collect();
+                        let enc_state: Vec<u32> =
+                            enc.coding_state.iter().map(|s| s & mask).collect();
+                        assert_eq!(dec_state, enc_state, "{tag}");
+                        assert_eq!(dec.wide_decoded_bits, enc.wide_decoded_bits, "{tag}");
+                    };
+                    for p in (0..planes).rev() {
+                        if p + 1 != planes {
+                            dec_block
+                                .significance_propagation_pass(p, &mut decoder, &mut dec_ctx)
+                                .unwrap();
+                            check(&dec_block, "SP");
+                            dec_block
+                                .magnitude_refinement_pass(p, &mut decoder, &mut dec_ctx)
+                                .unwrap();
+                            check(&dec_block, "MR");
+                        }
+                        dec_block
+                            .cleanup_pass(p, &mut decoder, &mut dec_ctx)
+                            .unwrap();
+                        check(&dec_block, "CU");
+                    }
+                    assert_eq!(dec_ctx, enc_ctx);
+                    for (i, t) in targets.iter().enumerate() {
+                        let c = dec_block.coefficient_at(i);
+                        assert_eq!(c.magnitude, t.magnitude);
+                        if t.magnitude != 0 {
+                            assert_eq!(c.sign, t.sign);
+                        }
+                    }
                 }
             }
         }
@@ -3931,6 +4196,121 @@ mod tests {
             ctx16_before,
             "context 16 should be used by the second refinement"
         );
+    }
+
+    #[test]
+    fn refinement_preserves_first_and_later_contexts_codeword_and_decoded_state() {
+        let (width, height) = (8, 9);
+        let mut targets = vec![Coefficient::default(); width * height];
+        let mut known = targets.clone();
+        for v in 0..height {
+            for u in 0..width {
+                let i = u + v * width;
+                targets[i].magnitude = 0x8000 | ((i as u32 * 1741 + 9271) & 0x7fff);
+                targets[i].sign = i % 3 == 0;
+                // Isolated and adjacent coefficients exercise first-refinement
+                // contexts 14 and 15. The pair across a stripe boundary also
+                // exercises the vertically-causal context change.
+                if (u == 0 && v == 0) || (u == 1 && (v == 3 || v == 4)) || (u >= 4 && v >= 2) {
+                    known[i] = Coefficient {
+                        magnitude: 0x8000,
+                        sigma: true,
+                        sign: targets[i].sign,
+                        already_refined: false,
+                    };
+                }
+            }
+        }
+        for causal in [false, true] {
+            let mut block =
+                CodeBlock::from_coefficients(SubBandOrientation::LL, width, height, known.clone())
+                    .with_vertically_causal_context(causal);
+            let mut encoder = MqEncoder::new();
+            let mut ctx = reset_contexts();
+            block.magnitude_refinement_encode(14, &targets, &mut encoder, &mut ctx);
+            let first14 = if causal { 6 } else { 1 };
+            assert_eq!(ctx[REFINEMENT_CTX_OFFSET].index(), first14);
+            assert!(!ctx[REFINEMENT_CTX_OFFSET].mps());
+            assert_eq!(ctx[REFINEMENT_CTX_OFFSET + 1].index(), 14);
+            assert!(!ctx[REFINEMENT_CTX_OFFSET + 1].mps());
+            assert_eq!(
+                ctx[REFINEMENT_CTX_OFFSET + 2],
+                reset_contexts()[REFINEMENT_CTX_OFFSET + 2]
+            );
+            let first_ctx = ctx;
+            for p in (0..14).rev() {
+                block.magnitude_refinement_encode(p, &targets, &mut encoder, &mut ctx);
+            }
+            // Only context 16 adapts after the first refinement.
+            assert_eq!(ctx[REFINEMENT_CTX_OFFSET].index(), first14);
+            assert_eq!(ctx[REFINEMENT_CTX_OFFSET + 1].index(), 14);
+            assert_eq!(ctx[REFINEMENT_CTX_OFFSET + 2].index(), 16);
+            assert!(!ctx[REFINEMENT_CTX_OFFSET + 2].mps());
+            for (i, original) in known.iter().enumerate() {
+                let coefficient = block.coefficient(i % width, i / width);
+                assert_eq!(coefficient.sigma, original.sigma);
+                if original.sigma {
+                    assert!(coefficient.already_refined);
+                    assert_eq!(coefficient.magnitude, targets[i].magnitude);
+                    assert_eq!(coefficient.sign, targets[i].sign);
+                    assert_eq!(block.decoded_bits(i % width, i / width), 15);
+                } else {
+                    assert_eq!(coefficient, *original);
+                    assert_eq!(block.decoded_bits(i % width, i / width), 0);
+                }
+            }
+            // Captured from commit 2c41bb83 before the shortcut: mixed signs,
+            // fifteen refinement planes, edges and a partial bottom stripe.
+            let golden: &[u8] = if causal {
+                &[
+                    24, 101, 4, 166, 254, 49, 114, 26, 91, 29, 25, 167, 54, 86, 196, 21, 182, 7,
+                    164, 180, 94, 252, 87, 16, 149, 69, 210, 43, 215, 227, 150, 106, 167, 143, 232,
+                    132, 32, 111, 103, 215, 75, 189, 108, 26, 66, 29, 117, 76, 230, 128, 79, 58,
+                    235, 144, 83, 144, 92, 253, 132, 150, 180,
+                ]
+            } else {
+                &[
+                    11, 74, 185, 184, 236, 115, 200, 105, 108, 116, 102, 156, 217, 91, 16, 86, 216,
+                    30, 146, 209, 123, 241, 92, 66, 85, 23, 72, 175, 95, 142, 89, 170, 158, 63,
+                    162, 16, 129, 189, 159, 93, 46, 245, 176, 105, 8, 117, 213, 51, 154, 1, 60,
+                    235, 174, 65, 78, 65, 115, 246, 18, 90, 211,
+                ]
+            };
+            assert_eq!(encoder.flush(), golden);
+
+            // Decode the independent pre-shortcut codeword, not the current
+            // encoder's output, and check both first and later contexts.
+            let mut decoded =
+                CodeBlock::from_coefficients(SubBandOrientation::LL, width, height, known.clone())
+                    .with_vertically_causal_context(causal);
+            let mut decoder = MqDecoder::new(golden);
+            let mut decoded_ctx = reset_contexts();
+            let eligible = known.iter().filter(|c| c.sigma).count();
+            assert_eq!(
+                decoded
+                    .magnitude_refinement_pass(14, &mut decoder, &mut decoded_ctx)
+                    .unwrap(),
+                eligible
+            );
+            assert_eq!(decoded_ctx, first_ctx);
+            for p in (0..14).rev() {
+                assert_eq!(
+                    decoded
+                        .magnitude_refinement_pass(p, &mut decoder, &mut decoded_ctx)
+                        .unwrap(),
+                    eligible
+                );
+            }
+            assert_eq!(decoded_ctx, ctx);
+            assert_eq!(
+                decoded.coefficients_for_test(),
+                block.coefficients_for_test()
+            );
+            // Packed magnitudes, flags, neighbour cache and decoded counts.
+            assert_eq!(decoded.magnitudes, block.magnitudes);
+            assert_eq!(decoded.coding_state, block.coding_state);
+            assert_eq!(decoded.wide_decoded_bits, block.wide_decoded_bits);
+        }
     }
 
     #[test]

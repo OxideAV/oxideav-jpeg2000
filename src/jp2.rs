@@ -452,6 +452,7 @@ pub struct Resolution {
 
 /// Parsed JP2 Header superbox content (T.800 §I.5.3 / Figure I.7).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Jp2Header {
     /// `ihdr` — required first child of `jp2h` (T.800 §I.5.3.1).
     pub ihdr: Ihdr,
@@ -485,6 +486,7 @@ pub struct Jp2Header {
 /// **not** retained — this round restricts the surface to the box
 /// chain conforming JP2 readers must understand.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Jp2Container {
     /// Parsed `ftyp` box (T.800 §I.5.2).
     pub ftyp: Ftyp,
@@ -636,7 +638,7 @@ fn parse_ftyp_content(content: &[u8]) -> Result<Ftyp, Error> {
     }
     // Compatibility list is the remainder; T.800 Table I.4 requires
     // it to be a whole number of 4-byte entries.
-    if (content.len() - 8) % 4 != 0 {
+    if !(content.len() - 8).is_multiple_of(4) {
         return Err(Error::InvalidMarkerLength);
     }
     let brand = u32::from_be_bytes([content[0], content[1], content[2], content[3]]);
@@ -845,11 +847,11 @@ fn parse_pclr_content(content: &[u8]) -> Result<Pclr, Error> {
 /// (T.800 §I.5.3.5 / Figure I.12 / Table I.15). The channel count is
 /// the box length divided by the fixed 4-byte entry size.
 fn parse_cmap_content(content: &[u8]) -> Result<Vec<CmapEntry>, Error> {
-    if content.is_empty() || content.len() % 4 != 0 {
+    if content.is_empty() || !content.len().is_multiple_of(4) {
         return Err(Error::InvalidMarkerLength);
     }
     let mut entries = Vec::with_capacity(content.len() / 4);
-    for chunk in content.chunks_exact(4) {
+    for chunk in content.as_chunks::<4>().0 {
         let component = u16::from_be_bytes([chunk[0], chunk[1]]);
         // Table I.15: CMP in 0..=16384.
         if component > 16384 {
@@ -885,7 +887,7 @@ fn parse_cdef_content(content: &[u8]) -> Result<Vec<ChannelDef>, Error> {
         return Err(Error::InvalidMarkerLength);
     }
     let mut defs = Vec::with_capacity(n);
-    for chunk in content[2..].chunks_exact(6) {
+    for chunk in content[2..].as_chunks::<6>().0 {
         defs.push(ChannelDef {
             channel: u16::from_be_bytes([chunk[0], chunk[1]]),
             channel_type: u16::from_be_bytes([chunk[2], chunk[3]]),
@@ -1060,10 +1062,10 @@ fn parse_jp2h_content(content: &[u8], jph: bool) -> Result<Jp2Header, Error> {
             if e.component >= ihdr.component_count {
                 return Err(Error::InvalidMarkerLength);
             }
-            if let CmapMapping::Palette { column } = e.mapping {
-                if usize::from(column) >= npc {
-                    return Err(Error::InvalidMarkerLength);
-                }
+            if let CmapMapping::Palette { column } = e.mapping
+                && usize::from(column) >= npc
+            {
+                return Err(Error::InvalidMarkerLength);
             }
         }
     }
@@ -1336,6 +1338,7 @@ pub(crate) fn cdef_presentation_order(defs: &[ChannelDef], n: usize) -> Vec<usiz
 /// from the codestream's `SIZ`; everything here is the caller's
 /// colour / channel / resolution description.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Jp2WriteOptions {
     /// Colour Specification boxes (§I.5.3.3), in precedence order. A
     /// Part-1 JP2 file needs at least one; a JPH file (T.814 Annex D.2)
@@ -1360,6 +1363,48 @@ pub struct Jp2WriteOptions {
 }
 
 impl Jp2WriteOptions {
+    /// Set [`Self::colour`].
+    #[must_use]
+    pub fn with_colour(mut self, v: Vec<Colr>) -> Self {
+        self.colour = v;
+        self
+    }
+
+    /// Set [`Self::palette`].
+    #[must_use]
+    pub fn with_palette(mut self, v: Option<Pclr>) -> Self {
+        self.palette = v;
+        self
+    }
+
+    /// Set [`Self::component_mapping`].
+    #[must_use]
+    pub fn with_component_mapping(mut self, v: Option<Vec<CmapEntry>>) -> Self {
+        self.component_mapping = v;
+        self
+    }
+
+    /// Set [`Self::channel_definitions`].
+    #[must_use]
+    pub fn with_channel_definitions(mut self, v: Option<Vec<ChannelDef>>) -> Self {
+        self.channel_definitions = v;
+        self
+    }
+
+    /// Set [`Self::resolution`].
+    #[must_use]
+    pub fn with_resolution(mut self, v: Option<Resolution>) -> Self {
+        self.resolution = v;
+        self
+    }
+
+    /// Set [`Self::colourspace_unknown`].
+    #[must_use]
+    pub fn with_colourspace_unknown(mut self, v: bool) -> Self {
+        self.colourspace_unknown = v;
+        self
+    }
+
     /// A single enumerated Colour Specification box (`METH = 1`,
     /// `PREC = 0`, `APPROX = 0`, Table I.10).
     pub fn enumerated(cs: EnumCs) -> Self {
@@ -1399,7 +1444,7 @@ impl Jp2WriteOptions {
                     channel_definitions: None,
                     resolution: None,
                     colourspace_unknown: true,
-                }
+                };
             }
         };
         let mut opts = Self::enumerated(cs);

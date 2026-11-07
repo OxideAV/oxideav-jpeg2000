@@ -39,18 +39,19 @@
 //!   `ε̄ᵏ_q` bits (their §7.3.8 known bit — the `U_q − 1` magnitude
 //!   bit — is 1 whenever `E_n = U_q ≥ 2`, which `u_off = 1` implies
 //!   since `κ_q ≥ 1`),
-//! * partial trailing bytes pad with `1` bits, and a pending MEL run
+//! * MagSgn/VLC trailing bytes pad with `1` bits, MEL pads with `0`
+//!   bits to keep its byte-stream interface free of false markers, and a pending MEL run
 //!   flushes as a single `1` (a claimed-complete run the decoder never
 //!   reads past).
 //!
 //! All truth in this module comes from `docs/image/jpeg2000/` (T.814 |
 //! 15444-15). No external HTJ2K implementation was consulted.
 
-use crate::ht::{
-    apply_sig_pattern, exponent_predictor, magnitude_exponent, quad_context, HtGrid, MEL_E,
-};
-use crate::ht_tables::{CxtVlcEntry, CXT_VLC_TABLE_0, CXT_VLC_TABLE_1};
 use crate::Error;
+use crate::ht::{
+    HtGrid, MEL_E, apply_sig_pattern, exponent_predictor, magnitude_exponent, quad_context,
+};
+use crate::ht_tables::{CXT_VLC_TABLE_0, CXT_VLC_TABLE_1, CxtVlcEntry};
 
 // ---------------------------------------------------------------------------
 // §7.1.2 dual — MagSgn bit-stream writer (forward, little-endian).
@@ -149,11 +150,18 @@ impl MelWriter {
 
     fn finish(mut self) -> Vec<u8> {
         if self.used > 0 {
-            // Left-align the partial byte and pad the tail with 1s (the
-            // reader consumes MSB-first and never requests the pad).
+            // T.814 7.1.1 forbids false markers (FF followed by >8F). The
+            // Annex F.4 reference termination zero-pads MEL. We keep the
+            // streams separate: left-align MEL with zero padding, making its
+            // final byte non-FF regardless of the first VLC byte.
             let pad = self.cap - self.used;
-            self.tmp = (self.tmp << pad) | ((1 << pad) - 1);
+            self.tmp <<= pad;
             self.out.push(self.tmp as u8);
+        } else if self.cap == 7 {
+            // A complete FF was just emitted. Its successor must carry the
+            // zero stuffing bit even when MEL has no further data bits; a
+            // zero termination byte protects the independently packed VLC.
+            self.out.push(0);
         }
         self.out
     }
@@ -446,10 +454,10 @@ fn plan_quad(
 ) -> Result<QuadPlan, Error> {
     let mut rho: u8 = 0;
     for j in 0..4 {
-        if let Some((x, y)) = grid.coord(q, j) {
-            if mu[x + y * grid.wblk] != 0 {
-                rho |= 1 << j;
-            }
+        if let Some((x, y)) = grid.coord(q, j)
+            && mu[x + y * grid.wblk] != 0
+        {
+            rho |= 1 << j;
         }
     }
     let cq = quad_context(grid, q);
@@ -479,10 +487,10 @@ fn plan_quad(
     let kappa = exponent_predictor(grid, q, rho);
     let mut e_max = 0u32;
     for j in 0..4 {
-        if rho & (1 << j) != 0 {
-            if let Some((x, y)) = grid.coord(q, j) {
-                e_max = e_max.max(magnitude_exponent(mu[x + y * grid.wblk]));
-            }
+        if rho & (1 << j) != 0
+            && let Some((x, y)) = grid.coord(q, j)
+        {
+            e_max = e_max.max(magnitude_exponent(mu[x + y * grid.wblk]));
         }
     }
     let u_big = kappa.max(e_max);
@@ -492,12 +500,12 @@ fn plan_quad(
     // each significant sample's value v_n = 2(μ_n − 1) + s_n.
     let mut b: u8 = 0;
     for j in 0..4 {
-        if rho & (1 << j) != 0 {
-            if let Some((x, y)) = grid.coord(q, j) {
-                let idx = x + y * grid.wblk;
-                let val = 2 * (mu[idx] - 1) + u32::from(sign[idx]);
-                b |= (((val >> (u_big - 1)) & 1) as u8) << j;
-            }
+        if rho & (1 << j) != 0
+            && let Some((x, y)) = grid.coord(q, j)
+        {
+            let idx = x + y * grid.wblk;
+            let val = 2 * (mu[idx] - 1) + u32::from(sign[idx]);
+            b |= (((val >> (u_big - 1)) & 1) as u8) << j;
         }
     }
     let entry = choose_cxt_vlc(first_line_pair, cq, rho, u_off, b)?;
@@ -986,16 +994,17 @@ pub fn encode_ht_codeblock(
     height: usize,
     refine: bool,
 ) -> Result<HtEncodedBlock, Error> {
-    if refine && mag.iter().any(|&m| m >= 2) {
-        if let Some(refinement) = encode_ht_refinement_segment(mag, sign, width, height) {
-            let mu: Vec<u32> = mag.iter().map(|&m| m >> 1).collect();
-            let cleanup = encode_ht_cleanup_segment(&mu, sign, width, height)?;
-            return Ok(HtEncodedBlock {
-                cleanup,
-                refinement: Some(refinement),
-                beta: 1,
-            });
-        }
+    if refine
+        && mag.iter().any(|&m| m >= 2)
+        && let Some(refinement) = encode_ht_refinement_segment(mag, sign, width, height)
+    {
+        let mu: Vec<u32> = mag.iter().map(|&m| m >> 1).collect();
+        let cleanup = encode_ht_cleanup_segment(&mu, sign, width, height)?;
+        return Ok(HtEncodedBlock {
+            cleanup,
+            refinement: Some(refinement),
+            beta: 1,
+        });
     }
     let cleanup = encode_ht_cleanup_segment(mag, sign, width, height)?;
     Ok(HtEncodedBlock {
@@ -1056,7 +1065,7 @@ mod tests {
         (0..w * h)
             .map(|_| {
                 let r = lcg(&mut s);
-                if zero_every > 0 && r % zero_every == 0 {
+                if zero_every > 0 && r.is_multiple_of(zero_every) {
                     0
                 } else {
                     (r >> 8) & ((1 << max_bits) - 1)
@@ -1207,6 +1216,45 @@ mod tests {
         mu[1] = 2;
         let sign = vec![false; w * h];
         roundtrip(&mu, &sign, w, h);
+    }
+
+    #[test]
+    fn mel_termination_does_not_create_a_false_marker_at_the_vlc_interface() {
+        // The 7.1.1 segment constraint applies at byte-stream interfaces too.
+        // A partial all-one MEL byte used to become
+        // FF, colliding with this valid first VLC byte and OpenJPEG's MEL
+        // prefetch check. The bit sequences, not decoder roundtrips, establish
+        // the stream-interface regression.
+        for (bits, expected) in [
+            (vec![1], vec![0x80]),
+            (vec![1; 7], vec![0xFE]),
+            (vec![1; 8], vec![0xFF, 0]),
+            (vec![1; 9], vec![0xFF, 0x40]),
+            (vec![1; 15], vec![0xFF, 0x7F]),
+        ] {
+            let mut writer = MelWriter::new();
+            for bit in bits {
+                writer.bit(bit);
+            }
+            let mut mel_vlc = writer.finish();
+            assert_eq!(mel_vlc, expected);
+            mel_vlc.push(0xC2);
+            assert!(
+                mel_vlc
+                    .windows(2)
+                    .all(|pair| pair[0] != 0xFF || pair[1] <= 0x8F)
+            );
+        }
+    }
+
+    #[test]
+    fn mel_termination_keeps_non_ff_aligned_bytes_and_empty_stream_unchanged() {
+        assert!(MelWriter::new().finish().is_empty());
+        let mut writer = MelWriter::new();
+        for bit in [1, 0, 1, 0, 0, 1, 0, 1] {
+            writer.bit(bit);
+        }
+        assert_eq!(writer.finish(), [0xA5]);
     }
 
     #[test]

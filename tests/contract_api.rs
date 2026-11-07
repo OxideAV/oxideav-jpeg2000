@@ -9,10 +9,10 @@
 use std::io::Cursor;
 
 use oxideav_jpeg2000::{
-    decode, decode_from, decode_j2k, decode_j2k_layers, decode_j2k_reduced, decode_rgb8,
-    decode_rgba8, decode_with, encode, encode_rgb8, encode_rgba8, encode_to, info, probe,
     ColorInfo, ColorRange, Container, DecodeOptions, EncodeOptions, Error, Jpeg2000Image, Metadata,
-    Palette, PixelFormat, Plane,
+    Palette, PixelFormat, Plane, decode, decode_from, decode_j2k, decode_j2k_layers,
+    decode_j2k_reduced, decode_rgb8, decode_rgba8, decode_with, encode, encode_rgb8, encode_rgba8,
+    encode_to, info, probe,
 };
 
 const GRAY_17X13_53: &[u8] = include_bytes!("data/gray-17x13-53.j2k");
@@ -157,10 +157,11 @@ fn info_describes_layouts_without_decoding() {
     let siz = oxideav_jpeg2000::parse_j2k_header(RGB_SUB21_53)
         .unwrap()
         .siz;
-    assert!(siz
-        .components
-        .iter()
-        .all(|c| (c.h_separation, c.v_separation) == (2, 1)));
+    assert!(
+        siz.components
+            .iter()
+            .all(|c| (c.h_separation, c.v_separation) == (2, 1))
+    );
     assert_eq!(
         i.format,
         PixelFormat::Rgb24,
@@ -176,10 +177,11 @@ fn info_describes_layouts_without_decoding() {
         siz.components[0].h_separation,
         siz.components[0].v_separation,
     );
-    assert!(siz
-        .components
-        .iter()
-        .all(|c| (c.h_separation, c.v_separation) == (xr, yr)));
+    assert!(
+        siz.components
+            .iter()
+            .all(|c| (c.h_separation, c.v_separation) == (xr, yr))
+    );
     assert_eq!(
         i.format,
         PixelFormat::Rgb24,

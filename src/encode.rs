@@ -52,22 +52,22 @@
 
 use crate::dwt::sd_2d_5x3;
 use crate::geometry::{
-    derive_precinct_code_blocks, derive_precinct_partition, derive_resolution_levels,
-    derive_tile_geometry, precinct_exponents_at, SubBandOrientation,
+    SubBandOrientation, derive_precinct_code_blocks, derive_precinct_partition,
+    derive_resolution_levels, derive_tile_geometry, precinct_exponents_at,
 };
 use crate::mqenc::MqEncoder;
 use crate::packet::{
-    encode_packet_header, CodeBlockPlan, PrecinctEncoderState, SubBandEncoderPlan, SubBandGeometry,
+    CodeBlockPlan, PrecinctEncoderState, SubBandEncoderPlan, SubBandGeometry, encode_packet_header,
 };
 use crate::progression::{
+    ComponentPositionInfo, ComponentProgressionInfo, PocVolume, ResolutionPrecinctLayout,
     cprl_packet_order, lrcp_packet_order, pcrl_packet_order, poc_volume_packet_order,
-    rlcp_packet_order, rpcl_packet_order, ComponentPositionInfo, ComponentProgressionInfo,
-    PocVolume, ResolutionPrecinctLayout,
+    rlcp_packet_order, rpcl_packet_order,
 };
-use crate::t1::{reset_contexts, CodeBlock, Coefficient};
+use crate::t1::{CodeBlock, Coefficient, reset_contexts};
 use crate::{
-    Error, PocProgression, ProgressionOrder, Siz, SizComponent, MARKER_COD, MARKER_EOC, MARKER_POC,
-    MARKER_QCD, MARKER_SIZ, MARKER_SOC, MARKER_SOD, MARKER_SOT,
+    Error, MARKER_COD, MARKER_EOC, MARKER_POC, MARKER_QCD, MARKER_SIZ, MARKER_SOC, MARKER_SOD,
+    MARKER_SOT, PocProgression, ProgressionOrder, Siz, SizComponent,
 };
 
 /// Guard-bit count `G` signalled in `Sqcd` (Table A.28) and used in the
@@ -270,11 +270,7 @@ fn forward_cascade_9x7(
     let scale = f64::from(1u32 << fine_bits);
     let q = move |y: f64| -> i32 {
         let m = (y.abs() * scale).floor() as i32;
-        if y < 0.0 {
-            -m
-        } else {
-            m
-        }
+        if y < 0.0 { -m } else { m }
     };
     struct RealPlane {
         x0: u32,
@@ -335,12 +331,12 @@ fn forward_cascade_9x7(
         let mut ll = vec![0f64; llw * llh];
         for v in 0..a.height {
             let ay = cur.y0 + v as u32;
-            if ay % 2 != 0 {
+            if !ay.is_multiple_of(2) {
                 continue;
             }
             for u in 0..a.width {
                 let ax = cur.x0 + u as u32;
-                if ax % 2 != 0 {
+                if !ax.is_multiple_of(2) {
                     continue;
                 }
                 ll[((ay / 2 - c.ly0) as usize) * llw + (ax / 2 - c.lx0) as usize] =
@@ -554,6 +550,11 @@ struct EncodedBlock {
     /// terminated segment covering passes `1..=n`), one entry per pass;
     /// empty when the caller did not request them (single layer).
     pass_rates: Vec<u32>,
+    /// Actual terminated lengths at each possible final truncation.
+    /// Unlike packet-prefix rates, these are not capped by later passes.
+    /// Kept only for rate control, where assembly probes must have the
+    /// same length as the final, exactly terminated re-encode.
+    truncation_rates: Vec<u32>,
     /// Annex J.13.4 per-pass distortions `D^n` (unweighted squared
     /// error under the midpoint-reconstruction model), one entry per
     /// pass; empty unless rate control requested them.
@@ -760,6 +761,7 @@ fn encode_code_block(
     let encoder = MqEncoder::new();
     let mut ctx = reset_contexts();
     let mut rates: Vec<u32> = Vec::new();
+    let mut truncation_rates: Vec<u32> = Vec::new();
     let mut dists: Vec<f64> = Vec::new();
     // Annex J.13.4 distortion under the §E.1.1.2 midpoint (r = 0.5)
     // reconstruction model: after `done` completed planes a
@@ -873,6 +875,13 @@ fn encode_code_block(
                 Sink::Raw(w) => finish_raw(w.clone()).len(),
             };
             rates.push((committed.len() + pending) as u32);
+            if pass_dist {
+                let terminated = match &sink {
+                    Sink::Mq(e) if predictable => e.predictable_flush_len(),
+                    _ => pending,
+                };
+                truncation_rates.push((committed.len() + terminated) as u32);
+            }
         }
         if pass_dist {
             dists.push(dist_of(&enc_block));
@@ -894,6 +903,9 @@ fn encode_code_block(
                 // §B.10.7.2 segment attribution derives from these
                 // boundaries, so they must match the emitted bytes.
                 *rates.last_mut().expect("pass recorded") = committed.len() as u32;
+                if let Some(rate) = truncation_rates.last_mut() {
+                    *rate = committed.len() as u32;
+                }
             }
             if capture.bypass && crate::packet::bypass_pass_is_raw(i + 1) {
                 sink = Sink::Raw(crate::t1::RawBitWriter::new());
@@ -910,6 +922,9 @@ fn encode_code_block(
         // The last snapshot and the final flush share the same coder
         // state, so they agree; pin it exactly regardless.
         *rates.last_mut().expect("at least one pass") = bytes.len() as u32;
+        if let Some(rate) = truncation_rates.last_mut() {
+            *rate = bytes.len() as u32;
+        }
         if styled {
             // A mid-span §C.2.9 flush snapshot is *not* monotone — a
             // flush can shrink as further decisions arrive (SETBITS may
@@ -945,6 +960,7 @@ fn encode_code_block(
         coding_passes: limit,
         bytes,
         pass_rates: rates,
+        truncation_rates,
         pass_dist: dists,
         d0,
         weight: 1.0,
@@ -1013,11 +1029,7 @@ fn iplt_bytes(len: u64) -> Vec<u8> {
         .rev()
         .map(|g| {
             let bits = ((len >> (7 * g)) & 0x7F) as u8;
-            if g == 0 {
-                bits
-            } else {
-                bits | 0x80
-            }
+            if g == 0 { bits } else { bits | 0x80 }
         })
         .collect()
 }
@@ -1060,6 +1072,7 @@ pub fn encode_j2k_lossless(
 
 /// How the encoder transforms and quantises the sample planes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EncodeKernel {
     /// Reversible 5-3, Table A.28 style 0 (no quantization) — lossless.
     Lossless5x3,
@@ -1085,6 +1098,7 @@ pub enum EncodeKernel {
 /// `TNsot` (8-bit, so at most 255 tile-parts per tile) is stamped on
 /// every part.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum TilePartSplit {
     /// One tile-part per tile (`TPsot` = 0, `TNsot` = 1). Default.
     #[default]
@@ -1109,6 +1123,7 @@ pub enum TilePartSplit {
 /// the body while a signalled `EPH` trails each header inside the
 /// relocated payload (§A.8.1 / §A.8.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum PackedHeaders {
     /// §B.10 — headers interleave with packet data in the tile-part
     /// bodies. Default.
@@ -1166,6 +1181,7 @@ pub struct RoiRegion {
 /// kernel across components 0–2, so kernel overrides under
 /// [`EncodeOptions::mct`] must match the tile-wide kernel).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ComponentOverride {
     /// Component index (`Ccoc` / `Cqcc`) this override applies to.
     pub component: u16,
@@ -1183,6 +1199,48 @@ pub struct ComponentOverride {
     pub precincts: Option<Vec<u8>>,
     /// Per-component wavelet kernel + quantisation family.
     pub kernel: Option<EncodeKernel>,
+}
+
+impl ComponentOverride {
+    /// An override for `component` that inherits every tile-wide
+    /// setting; chain the `with_*` setters to change individual ones.
+    pub fn new(component: u16) -> Self {
+        Self {
+            component,
+            decomposition_levels: None,
+            code_block_exp: None,
+            precincts: None,
+            kernel: None,
+        }
+    }
+
+    /// Set [`Self::decomposition_levels`].
+    #[must_use]
+    pub fn with_decomposition_levels(mut self, levels: Option<u8>) -> Self {
+        self.decomposition_levels = levels;
+        self
+    }
+
+    /// Set [`Self::code_block_exp`].
+    #[must_use]
+    pub fn with_code_block_exp(mut self, exp: Option<(u8, u8)>) -> Self {
+        self.code_block_exp = exp;
+        self
+    }
+
+    /// Set [`Self::precincts`].
+    #[must_use]
+    pub fn with_precincts(mut self, precincts: Option<Vec<u8>>) -> Self {
+        self.precincts = precincts;
+        self
+    }
+
+    /// Set [`Self::kernel`].
+    #[must_use]
+    pub fn with_kernel(mut self, kernel: Option<EncodeKernel>) -> Self {
+        self.kernel = kernel;
+        self
+    }
 }
 
 /// Which file shape [`crate::encode()`] writes.
@@ -1854,10 +1912,10 @@ fn encode_core(
     if mct && planes.len() < 3 {
         return Err(Error::NotImplemented);
     }
-    if let EncodeKernel::Lossy9x7 { fine_bits } = kernel {
-        if fine_bits > 8 {
-            return Err(Error::NotImplemented);
-        }
+    if let EncodeKernel::Lossy9x7 { fine_bits } = kernel
+        && fine_bits > 8
+    {
+        return Err(Error::NotImplemented);
     }
     // Table A.16: only the five defined §B.12.1 orders are encodable.
     let order_byte = |o: ProgressionOrder| -> Result<u8, Error> {
@@ -2067,10 +2125,10 @@ fn encode_core(
             if mct && k != kernel {
                 return Err(Error::NotImplemented);
             }
-            if let EncodeKernel::Lossy9x7 { fine_bits } = k {
-                if fine_bits > 8 {
-                    return Err(Error::NotImplemented);
-                }
+            if let EncodeKernel::Lossy9x7 { fine_bits } = k
+                && fine_bits > 8
+            {
+                return Err(Error::NotImplemented);
             }
             cp.kernel = k;
         }
@@ -2441,7 +2499,7 @@ fn encode_core(
                                     // r > 0 carries no LL band (already
                                     // rejected on the plane lookup).
                                     SubBandOrientation::LL => {
-                                        return Err(Error::InvalidPacketHeader)
+                                        return Err(Error::InvalidPacketHeader);
                                     }
                                 };
                                 Some(&m[ci].high[lev - 1][oi])
@@ -2477,12 +2535,11 @@ fn encode_core(
                                     // quantized coefficients up by 2^s so
                                     // their bits sit above every
                                     // background bit-plane.
-                                    if let Some(mp) = mask_plane {
-                                        if mp.data[((v - mp.y0) as usize) * mp.width
+                                    if let Some(mp) = mask_plane
+                                        && mp.data[((v - mp.y0) as usize) * mp.width
                                             + (u - mp.x0) as usize]
-                                        {
-                                            magnitude <<= roi_s[ci];
-                                        }
+                                    {
+                                        magnitude <<= roi_s[ci];
                                     }
                                     targets.push(Coefficient {
                                         magnitude,
@@ -2546,6 +2603,7 @@ fn encode_core(
                                             coding_passes: 3 * (j_eff - 1) + 1,
                                             bytes,
                                             pass_rates: Vec::new(),
+                                            truncation_rates: Vec::new(),
                                             pass_dist: Vec::new(),
                                             d0: 0.0,
                                             weight: 1.0,
@@ -2577,6 +2635,7 @@ fn encode_core(
                                             coding_passes: z_blk,
                                             bytes,
                                             pass_rates: Vec::new(),
+                                            truncation_rates: Vec::new(),
                                             pass_dist: Vec::new(),
                                             d0: 0.0,
                                             weight: 1.0,
@@ -2643,6 +2702,7 @@ fn encode_core(
                                                 coding_passes: 1,
                                                 bytes: hb.cleanup,
                                                 pass_rates: Vec::new(),
+                                                truncation_rates: Vec::new(),
                                                 pass_dist: Vec::new(),
                                                 d0: 0.0,
                                                 weight: 1.0,
@@ -2749,8 +2809,8 @@ fn encode_core(
     // `trunc` optionally caps each block's included passes (indexed by
     // block ordinal — the PCRD rate-control choice); `exact` re-encodes
     // truncated blocks so their emitted codeword segment is exactly
-    // §C.2.9-terminated (the λ search skips that and cuts at R^n, which
-    // has the identical length).
+    // §C.2.9-terminated. The λ search skips re-encoding and uses the
+    // actual final truncation length captured during tier-1 instead.
     //
     // Layer split (T.800 §B.10.7.1 + Annex J.13.2 guidance): each
     // code-block's consecutive coding passes are distributed over the L
@@ -2833,16 +2893,24 @@ fn encode_core(
                         },
                     )?
                     .expect("non-empty block re-encodes");
-                    // For a styled block truncated mid-span, the stored
-                    // rate was capped backward to the span-covering
-                    // truncation length, so the re-encode (whose final
-                    // partial-span flush is the uncapped snapshot) may
-                    // run a byte or two longer; elsewhere they agree.
-                    debug_assert!(re.bytes.len() as u32 >= enc.pass_rates[n_eff as usize - 1]);
+                    // A final termination need not have the capped
+                    // packet-prefix length, but must match the actual
+                    // truncation length used by the budget probes.
+                    debug_assert_eq!(
+                        re.bytes.len() as u32,
+                        enc.truncation_rates[n_eff as usize - 1]
+                    );
                     re.bytes
                 } else {
-                    let cut = (enc.pass_rates[n_eff as usize - 1] as usize).min(enc.bytes.len());
-                    enc.bytes[..cut].to_vec()
+                    // This stream is used only for its size. A final
+                    // mid-span termination can be longer than either
+                    // the capped packet-prefix rate or the full block.
+                    // Keep its actual length, including a placeholder
+                    // tail when it extends past the stored full bytes.
+                    let cut = enc.truncation_rates[n_eff as usize - 1] as usize;
+                    let mut seg = enc.bytes[..cut.min(enc.bytes.len())].to_vec();
+                    seg.resize(cut, 0);
+                    seg
                 };
                 if let Some(hm) = &enc.ht_multi {
                     // T.814 MULTIHT layout: layer ↦ HT set (or
@@ -3716,7 +3784,16 @@ fn encode_core(
         }
     }
     let trunc = best.unwrap_or_else(|| vec![0; num_blocks]);
-    assemble(Some(&trunc), true)
+    let stream = assemble(Some(&trunc), true)?;
+    if let Objective::Bytes(target) = objective {
+        // Only the all-empty minimum stream may exceed an impossible
+        // budget. Never return an oversized non-empty rate allocation
+        // if a termination-size invariant is violated.
+        if stream.len() > target && trunc.iter().any(|&passes| passes != 0) {
+            return Err(Error::InvalidPacketHeader);
+        }
+    }
+    Ok(stream)
 }
 
 #[cfg(test)]
@@ -4473,10 +4550,12 @@ mod tests {
         };
         let stream = roundtrip_params(&[&p], 48, 40, &params);
         let header = crate::parse_j2k_header(&stream).expect("header");
-        assert!(header
-            .cod
-            .code_block_style_flags()
-            .termination_on_each_coding_pass());
+        assert!(
+            header
+                .cod
+                .code_block_style_flags()
+                .termination_on_each_coding_pass()
+        );
         // Per-pass termination costs bytes vs the single-segment stream.
         let plain = encode_j2k(
             &[&p],
@@ -4511,10 +4590,12 @@ mod tests {
             };
             let stream = encode_j2k(&[&p], 48, 48, &params).expect("encode");
             let header = crate::parse_j2k_header(&stream).expect("header");
-            assert!(header
-                .cod
-                .code_block_style_flags()
-                .selective_arithmetic_coding_bypass());
+            assert!(
+                header
+                    .cod
+                    .code_block_style_flags()
+                    .selective_arithmetic_coding_bypass()
+            );
             let img = decode_j2k(&stream).expect("decode bypass stream");
             let max_err = img.components[0]
                 .samples
@@ -5230,6 +5311,116 @@ mod tests {
         assert!(rc.len() <= target);
         let img = decode_j2k(&rc).expect("decode");
         assert_eq!(img.components[0].samples.len(), 64 * 48);
+    }
+
+    #[test]
+    fn rate_control_final_termination_meets_byte_budget() {
+        // Regression: predictable bypass termination at a mid-span cut
+        // used to return 91 bytes for a 90-byte budget (minimum = 86).
+        let p = [
+            45, 171, 162, 182, 223, 206, 186, 87, 58, 254, 211, 189, 130, 143, 145, 28,
+        ];
+        let mut regression = EncodeOptions {
+            decomposition_levels: 1,
+            code_block_exp: (2, 2),
+            bypass: true,
+            predictable_termination: true,
+            target_bytes: Some(90),
+            ..EncodeOptions::default()
+        };
+        let stream = encode_j2k(&[&p], 4, 4, &regression).expect("regression encode");
+        assert!(stream.len() <= 90);
+        decode_j2k(&stream).expect("regression decode");
+
+        // Exercise every legal byte budget, including marker-only best
+        // effort, across plain/MQ, bypass, per-pass and predictable
+        // termination, with both single- and multi-layer packet splits.
+        for bypass in [false, true] {
+            for terminate_all in [false, true] {
+                for predictable in [false, true] {
+                    for layers in [1, 4] {
+                        regression.bypass = bypass;
+                        regression.terminate_all = terminate_all;
+                        regression.predictable_termination = predictable;
+                        regression.layers = layers;
+                        regression.target_bytes = None;
+                        let full = encode_j2k(&[&p], 4, 4, &regression).unwrap();
+                        regression.target_bytes = Some(0);
+                        let minimum = encode_j2k(&[&p], 4, 4, &regression).unwrap().len();
+                        for target in (minimum.saturating_sub(1))..=full.len() {
+                            regression.target_bytes = Some(target);
+                            let stream = encode_j2k(&[&p], 4, 4, &regression).unwrap();
+                            assert!(
+                                stream.len() <= target.max(minimum),
+                                "bypass={bypass}, terminate_all={terminate_all}, predictable={predictable}, layers={layers}, target={target}, actual={}",
+                                stream.len()
+                            );
+                            decode_j2k(&stream).expect("rate-controlled decode");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rate_control_final_size_with_packet_markers() {
+        let mut state = 0u8;
+        let p: Vec<u8> = (0..41u32 * 11)
+            .map(|k| {
+                state = state.wrapping_mul(197).wrapping_add(k as u8);
+                state
+            })
+            .collect();
+        for bypass in [false, true] {
+            for terminate_all in [false, true] {
+                for predictable_termination in [false, true] {
+                    for packed_headers in [
+                        PackedHeaders::InStream,
+                        PackedHeaders::Ppm,
+                        PackedHeaders::Ppt,
+                    ] {
+                        let mut options = EncodeOptions {
+                            decomposition_levels: 1,
+                            code_block_exp: (2, 2),
+                            tile_size: Some((23, 7)),
+                            tile_parts: TilePartSplit::ByLayer,
+                            layers: 4,
+                            sop: true,
+                            eph: true,
+                            plt: true,
+                            tlm: true,
+                            packed_headers,
+                            bypass,
+                            terminate_all,
+                            predictable_termination,
+                            ..EncodeOptions::default()
+                        };
+                        let full = encode_j2k(&[&p], 41, 11, &options).unwrap().len();
+                        options.target_bytes = Some(0);
+                        let minimum = encode_j2k(&[&p], 41, 11, &options).unwrap().len();
+                        for target in [
+                            minimum - 1,
+                            minimum,
+                            minimum + 1,
+                            full / 2,
+                            (minimum + full) / 2,
+                            full - 1,
+                            full,
+                        ] {
+                            options.target_bytes = Some(target);
+                            let stream = encode_j2k(&[&p], 41, 11, &options).unwrap();
+                            assert!(
+                                stream.len() <= target.max(minimum),
+                                "bypass={bypass}, terminate_all={terminate_all}, predictable={predictable_termination}, packed={packed_headers:?}, target={target}, actual={}",
+                                stream.len()
+                            );
+                            decode_j2k(&stream).expect("rate-controlled markers decode");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // -- Annex J.13.3 PCRD rate control ---------------------------------
@@ -5969,51 +6160,59 @@ mod tests {
         let y = vec![0u8; 16 * 16];
         let c = vec![0u8; 8 * 8];
         // Wrong pair count.
-        assert!(encode_j2k(
-            &[&y, &c],
-            16,
-            16,
-            &EncodeOptions {
-                sub_sampling: vec![(1, 1)],
-                ..EncodeOptions::default()
-            }
-        )
-        .is_err());
+        assert!(
+            encode_j2k(
+                &[&y, &c],
+                16,
+                16,
+                &EncodeOptions {
+                    sub_sampling: vec![(1, 1)],
+                    ..EncodeOptions::default()
+                }
+            )
+            .is_err()
+        );
         // Zero factor.
-        assert!(encode_j2k(
-            &[&y, &c],
-            16,
-            16,
-            &EncodeOptions {
-                sub_sampling: vec![(1, 1), (0, 2)],
-                ..EncodeOptions::default()
-            }
-        )
-        .is_err());
+        assert!(
+            encode_j2k(
+                &[&y, &c],
+                16,
+                16,
+                &EncodeOptions {
+                    sub_sampling: vec![(1, 1), (0, 2)],
+                    ..EncodeOptions::default()
+                }
+            )
+            .is_err()
+        );
         // Plane size must match the sub-sampled extent.
-        assert!(encode_j2k(
-            &[&y, &y],
-            16,
-            16,
-            &EncodeOptions {
-                sub_sampling: vec![(1, 1), (2, 2)],
-                ..EncodeOptions::default()
-            }
-        )
-        .is_err());
+        assert!(
+            encode_j2k(
+                &[&y, &y],
+                16,
+                16,
+                &EncodeOptions {
+                    sub_sampling: vec![(1, 1), (2, 2)],
+                    ..EncodeOptions::default()
+                }
+            )
+            .is_err()
+        );
         // MCT requires shared factors across components 0-2.
         let g = vec![0u8; 16 * 16];
-        assert!(encode_j2k(
-            &[&y, &g, &c],
-            16,
-            16,
-            &EncodeOptions {
-                mct: Some(true),
-                sub_sampling: vec![(1, 1), (1, 1), (2, 2)],
-                ..EncodeOptions::default()
-            }
-        )
-        .is_err());
+        assert!(
+            encode_j2k(
+                &[&y, &g, &c],
+                16,
+                16,
+                &EncodeOptions {
+                    mct: Some(true),
+                    sub_sampling: vec![(1, 1), (1, 1), (2, 2)],
+                    ..EncodeOptions::default()
+                }
+            )
+            .is_err()
+        );
     }
 
     // -- §A.4.2 multi-tile-part emission (TPsot > 0) --------------------
@@ -7280,7 +7479,7 @@ mod tests {
     #[test]
     fn ht_multiht_skip_set_decodes_last_set() {
         use crate::packet::{
-            encode_packet_header, CodeBlockPlan, PrecinctEncoderState, SubBandGeometry,
+            CodeBlockPlan, PrecinctEncoderState, SubBandGeometry, encode_packet_header,
         };
         let pixels = noise(8, 8, 0x4854_0081);
         // NL = 0: the single LL band holds the DC-shifted pixels

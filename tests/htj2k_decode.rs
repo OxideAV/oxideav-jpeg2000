@@ -194,7 +194,9 @@ fn fuzz_regressions_error_cleanly() {
 fn parse_pgm16(b: &[u8]) -> (usize, usize, Vec<i32>) {
     let (w, h, start) = pnm_geometry(b);
     let data = b[start..start + 2 * w * h]
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|p| i32::from(u16::from_be_bytes([p[0], p[1]])))
         .collect();
     (w, h, data)

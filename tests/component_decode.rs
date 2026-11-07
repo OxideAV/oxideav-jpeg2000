@@ -2,7 +2,7 @@
 
 use oxideav_jpeg2000::encode::encode_j2k;
 use oxideav_jpeg2000::{
-    decode_j2k, decode_j2k_layers, decode_j2k_reduced, EncodeOptions, ProgressionOrder,
+    EncodeOptions, ProgressionOrder, decode_j2k, decode_j2k_layers, decode_j2k_reduced,
 };
 
 const WIDTH: u32 = 17;

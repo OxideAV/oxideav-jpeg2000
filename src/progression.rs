@@ -507,7 +507,7 @@ impl ResolutionPrecinctLayout {
     ///   to the surrounding loop nesting rather than to any
     ///   per-component rounding of `trx0`.
     fn ref_grid_x(&self, r: u8, n_l: u8, xrsiz: u8, px: u32, tile_tx0: u32) -> u64 {
-        if px == 0 && self.trx0 % (1u32 << self.ppx) != 0 {
+        if px == 0 && !self.trx0.is_multiple_of(1u32 << self.ppx) {
             // Partial first precinct: fires at x = tx0 (the trx0
             // divisibility test above is equivalent to the spec's
             // `trx0 · 2^(NL − r)` form with both sides divided by
@@ -523,7 +523,7 @@ impl ResolutionPrecinctLayout {
     /// fires for precinct row `py` (`0..num_high`). The y-axis
     /// analogue of [`Self::ref_grid_x`].
     fn ref_grid_y(&self, r: u8, n_l: u8, yrsiz: u8, py: u32, tile_ty0: u32) -> u64 {
-        if py == 0 && self.try0 % (1u32 << self.ppy) != 0 {
+        if py == 0 && !self.try0.is_multiple_of(1u32 << self.ppy) {
             return tile_ty0 as u64;
         }
         let cell_top = ((self.anchor_y as u64) + (py as u64)) << (self.ppy as u64);
@@ -2006,10 +2006,11 @@ mod tests {
             .collect();
         assert_eq!(r5_block, vec![(0, 0), (1, 0)]);
         // Every packet at r >= 3 has component 0.
-        assert!(out
-            .iter()
-            .filter(|p| p.resolution >= 3)
-            .all(|p| p.component == 0));
+        assert!(
+            out.iter()
+                .filter(|p| p.resolution >= 3)
+                .all(|p| p.component == 0)
+        );
     }
 
     // =======================================================================

@@ -113,19 +113,19 @@ impl DecodeOptions {
     /// Check a `width × height` picture whose decoder working set is
     /// `bytes` against the limits.
     pub(crate) fn check(&self, width: u32, height: u32, bytes: u64) -> Result<(), Error> {
-        if let Some(m) = self.max_width {
-            if width > m {
-                return Err(Jpeg2000Error::limit(format!(
-                    "width {width} exceeds max_width {m}"
-                )));
-            }
+        if let Some(m) = self.max_width
+            && width > m
+        {
+            return Err(Jpeg2000Error::limit(format!(
+                "width {width} exceeds max_width {m}"
+            )));
         }
-        if let Some(m) = self.max_height {
-            if height > m {
-                return Err(Jpeg2000Error::limit(format!(
-                    "height {height} exceeds max_height {m}"
-                )));
-            }
+        if let Some(m) = self.max_height
+            && height > m
+        {
+            return Err(Jpeg2000Error::limit(format!(
+                "height {height} exceeds max_height {m}"
+            )));
         }
         if let Some(m) = self.max_pixels {
             let pixels = u64::from(width) * u64::from(height);
@@ -135,12 +135,12 @@ impl DecodeOptions {
                 )));
             }
         }
-        if let Some(m) = self.max_bytes {
-            if bytes > m {
-                return Err(Jpeg2000Error::limit(format!(
-                    "decoder working set of {bytes} bytes exceeds max_bytes {m}"
-                )));
-            }
+        if let Some(m) = self.max_bytes
+            && bytes > m
+        {
+            return Err(Jpeg2000Error::limit(format!(
+                "decoder working set of {bytes} bytes exceeds max_bytes {m}"
+            )));
         }
         Ok(())
     }
