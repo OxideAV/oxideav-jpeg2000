@@ -3430,7 +3430,7 @@ mod tests {
         ] {
             block.magnitudes.fill(u32::MAX);
             block.coding_state.fill(u32::MAX);
-            block.coding_state_ready = width.is_multiple_of(2);
+            block.coding_state_ready = width % 2 == 0;
             block.wide_decoded_bits = Some(vec![u32::MAX; block.width * block.height]);
             block.zero_bit_planes = 2;
             block.vertically_causal = true;

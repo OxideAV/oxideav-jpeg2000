@@ -265,7 +265,7 @@ mod tests {
                             magnitude,
                             sigma: magnitude != 0,
                             sign: i % 3 == 1,
-                            already_refined: i.is_multiple_of(2),
+                            already_refined: i % 2 == 0,
                         }
                     })
                     .collect();
