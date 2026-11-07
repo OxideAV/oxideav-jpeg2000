@@ -245,7 +245,7 @@ mod tests {
         let mut blocks = Vec::new();
         for y in (band.tby0..band.tby1).step_by(2) {
             for x in (band.tbx0..band.tbx1).step_by(3) {
-                if (x - band.tbx0 + 2 * (y - band.tby0) + mode) % 5 == 0 {
+                if (x - band.tbx0 + 2 * (y - band.tby0) + mode).is_multiple_of(5) {
                     continue;
                 }
                 let placement = PrecinctCodeBlock {
@@ -265,7 +265,7 @@ mod tests {
                             magnitude,
                             sigma: magnitude != 0,
                             sign: i % 3 == 1,
-                            already_refined: i % 2 == 0,
+                            already_refined: i.is_multiple_of(2),
                         }
                     })
                     .collect();
@@ -286,7 +286,9 @@ mod tests {
 
     #[test]
     fn surface_matches_public_reconstruction_and_idwt_exactly() {
-        for (x0, y0) in [(0, 0), (3, 1), (0x8000_0003, 0x8000_0001)] {
+        // Large odd origins keep the parity cases while staying inside the
+        // i32 index domain the inverse DWT takes (`trx0 as i32`).
+        for (x0, y0) in [(0, 0), (3, 1), (0x4000_0003, 0x4000_0001)] {
             for (width, height) in [(17, 13), (1, 1), (1, 9)] {
                 for n_l in 0..=3 {
                     let all_levels = derive_resolution_levels(
