@@ -13,6 +13,10 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 - `ComponentOverride::new(component)` plus `with_decomposition_levels` / `with_code_block_exp` / `with_precincts` / `with_kernel`.
 - `Jp2WriteOptions::with_colour` / `with_palette` / `with_component_mapping` / `with_channel_definitions` / `with_resolution` / `with_colourspace_unknown`.
 
+### Performance
+
+- Decode scatters each finished code-block straight into a per-component coefficient surface (validated before any allocation, one owned buffer per sub-band) and reuses a single Annex D work block, instead of keeping every decoded block alive until the component's IDWT; synthesis moves LL into the carry and frees each level's high bands as soon as they are consumed. Output is unchanged; peak memory on large images drops substantially (#27, thanks @Streetblock).
+
 ## [0.0.18](https://github.com/OxideAV/oxideav-jpeg2000/compare/v0.0.17...v0.0.18) - 2026-10-24
 
 ### Fixed

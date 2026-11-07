@@ -686,6 +686,32 @@ impl CodeBlock {
         }
     }
 
+    /// Reuse the block buffers for a different, independent decode.
+    /// Call only after all selected contributions of the previous block
+    /// have been consumed and its coefficients have been reconstructed.
+    /// Every pass/precision/style field is reset; capacity alone survives.
+    pub(crate) fn reset_for_decode(
+        &mut self,
+        orientation: SubBandOrientation,
+        width: usize,
+        height: usize,
+    ) {
+        assert!(width >= 1 && height >= 1);
+        let len = width * height;
+        self.orientation = orientation;
+        self.width = width;
+        self.height = height;
+        self.magnitudes.resize(len, 0);
+        self.magnitudes.fill(0);
+        self.coding_state.resize(len, 0);
+        self.coding_state.fill(0);
+        self.coding_state_ready = true;
+        self.wide_decoded_bits = None;
+        self.zero_bit_planes = 0;
+        self.vertically_causal = false;
+        self.roi_nb = None;
+    }
+
     /// Construct a code-block directly from a flat row-major coefficient
     /// vector — useful for sibling modules (e.g. [`crate::reassemble`])
     /// that need to round-trip a fully-decoded code-block through their
@@ -3388,6 +3414,54 @@ mod tests {
                         refinement_context_label(cached, refined),
                         refinement_context_label(old, refined)
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reusable_decode_block_clears_dirty_packed_cache_and_every_state() {
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 7, 5);
+        for (orientation, width, height) in [
+            (SubBandOrientation::HH, 2, 3),
+            (SubBandOrientation::HL, 7, 5),
+            (SubBandOrientation::LH, 1, 1),
+            (SubBandOrientation::LL, 8, 7),
+        ] {
+            block.magnitudes.fill(u32::MAX);
+            block.coding_state.fill(u32::MAX);
+            block.coding_state_ready = width % 2 == 0;
+            block.wide_decoded_bits = Some(vec![u32::MAX; block.width * block.height]);
+            block.zero_bit_planes = 2;
+            block.vertically_causal = true;
+            block.roi_nb = Some(vec![3; block.width * block.height]);
+            let old_capacity = block.magnitudes.capacity();
+            let old_ptr = block.magnitudes.as_ptr();
+            let state_capacity = block.coding_state.capacity();
+            let state_ptr = block.coding_state.as_ptr();
+            block.reset_for_decode(orientation, width, height);
+            let fresh = CodeBlock::new(orientation, width, height);
+            assert_eq!(block.orientation, fresh.orientation);
+            assert_eq!(block.width, fresh.width);
+            assert_eq!(block.height, fresh.height);
+            assert_eq!(block.magnitudes, fresh.magnitudes);
+            assert_eq!(block.coding_state, fresh.coding_state);
+            assert_eq!(block.coding_state_ready, fresh.coding_state_ready);
+            assert_eq!(block.wide_decoded_bits, fresh.wide_decoded_bits);
+            assert_eq!(block.zero_bit_planes, fresh.zero_bit_planes);
+            assert_eq!(block.vertically_causal, fresh.vertically_causal);
+            assert_eq!(block.roi_nb, fresh.roi_nb);
+            if width * height <= old_capacity {
+                assert_eq!(block.magnitudes.as_ptr(), old_ptr);
+            }
+            if width * height <= state_capacity {
+                assert_eq!(block.coding_state.as_ptr(), state_ptr);
+            }
+            assert_coding_cache(&block);
+            for v in 0..height {
+                for u in 0..width {
+                    assert_eq!(block.effective_nb_resolver(11)(u, v), 11);
+                    assert_eq!(block.coefficient(u, v), Coefficient::default());
                 }
             }
         }
