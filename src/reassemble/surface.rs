@@ -5,13 +5,13 @@
 //! module uses the existing OxideAV dequantisation and inverse DWT routines;
 //! it changes the lifetime of block state, not their arithmetic.
 
-use super::{check_placement, r_qb_to_i32, CodedCodeBlock, SubBandQuantization};
+use super::{CodedCodeBlock, SubBandQuantization, check_placement, r_qb_to_i32};
+use crate::Error;
 use crate::dequant::{
     irreversible_step_size, qb_signed, reconstruct_irreversible, reconstruct_reversible,
 };
-use crate::dwt::{sr_2d_5x3, sr_2d_9x7, Interleaved2D};
+use crate::dwt::{Interleaved2D, sr_2d_5x3, sr_2d_9x7};
 use crate::geometry::{ResolutionLevel, SubBand, SubBandOrientation};
-use crate::Error;
 
 struct BandRegion<T> {
     band: SubBand,
@@ -226,8 +226,8 @@ impl CoefficientSurface<'_, f64> {
 mod tests {
     use super::*;
     use crate::dequant::StepSize;
-    use crate::geometry::{derive_resolution_levels, PrecinctCodeBlock, TileComponentGeometry};
-    use crate::reassemble::{idwt_5x3, idwt_9x7, BlockSource};
+    use crate::geometry::{PrecinctCodeBlock, TileComponentGeometry, derive_resolution_levels};
+    use crate::reassemble::{BlockSource, idwt_5x3, idwt_9x7};
     use crate::t1::{CodeBlock, Coefficient};
 
     struct Oracle<'a>(Vec<(SubBand, Vec<CodedCodeBlock<'a>>)>);
