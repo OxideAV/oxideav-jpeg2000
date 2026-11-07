@@ -111,6 +111,7 @@ const MARKER_PPM: u16 = 0xFF60;
 /// range: `[0, 2^precision − 1]` for unsigned components,
 /// `[−2^(precision−1), 2^(precision−1) − 1]` for signed ones.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DecodedComponent {
     /// Plane width in samples (component-grid, Equation B-2).
     pub width: u32,
@@ -132,6 +133,7 @@ pub struct DecodedComponent {
 /// A fully decoded JPEG 2000 image — one [`DecodedComponent`] per SIZ
 /// component, each on its own component grid.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DecodedImage {
     /// Image-area width on the reference grid (`Xsiz − XOsiz`).
     pub width: u32,

@@ -491,6 +491,7 @@ pub struct Qcd {
 /// First-pass parsed main-header summary returned by
 /// [`parse_j2k_header`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct J2kHeader {
     /// Parsed SIZ marker segment (T.800 §A.5.1).
     pub siz: Siz,
@@ -660,6 +661,7 @@ pub struct Ppt {
 /// enumerates the permitted markers — exactly those listed here, plus
 /// the optional [`Com`](Self::Com) catch-all (Comment, T.800 §A.9.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TilePartMarker {
     /// `COD` override for this tile-part (T.800 §A.6.1).
     Cod(Cod),
@@ -723,6 +725,7 @@ pub struct Sot {
 /// order. T.800 Table A.2 enumerates which markers are permitted;
 /// see [`TilePartMarker`] for the variants.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TilePart {
     /// The parsed SOT marker segment for this tile-part.
     pub sot: Sot,
@@ -747,6 +750,7 @@ pub struct TilePart {
 /// Parsed JPEG 2000 Part-1 codestream — main header plus the
 /// ordered list of tile-parts produced by [`walk_tile_parts`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct J2kCodestream {
     /// Main-header marker segments (round 1).
     pub header: J2kHeader,

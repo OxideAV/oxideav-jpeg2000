@@ -193,13 +193,11 @@ fuzz_target!(|data: &[u8]| {
         } else {
             None
         };
-        vec![ComponentOverride {
-            component: u16::from(c.u8()) % ncomp as u16,
-            decomposition_levels: c.bool().then(|| c.u8() % 6),
-            code_block_exp: c.bool().then(|| (2 + c.u8() % 4, 2 + c.u8() % 4)),
-            precincts: c.bool().then(Vec::new),
-            kernel: over_kernel,
-        }]
+        vec![ComponentOverride::new(u16::from(c.u8()) % ncomp as u16)
+            .with_decomposition_levels(c.bool().then(|| c.u8() % 6))
+            .with_code_block_exp(c.bool().then(|| (2 + c.u8() % 4, 2 + c.u8() % 4)))
+            .with_precincts(c.bool().then(Vec::new))
+            .with_kernel(over_kernel)]
     } else {
         Vec::new()
     };

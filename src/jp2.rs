@@ -452,6 +452,7 @@ pub struct Resolution {
 
 /// Parsed JP2 Header superbox content (T.800 §I.5.3 / Figure I.7).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Jp2Header {
     /// `ihdr` — required first child of `jp2h` (T.800 §I.5.3.1).
     pub ihdr: Ihdr,
@@ -485,6 +486,7 @@ pub struct Jp2Header {
 /// **not** retained — this round restricts the surface to the box
 /// chain conforming JP2 readers must understand.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Jp2Container {
     /// Parsed `ftyp` box (T.800 §I.5.2).
     pub ftyp: Ftyp,
@@ -1336,6 +1338,7 @@ pub(crate) fn cdef_presentation_order(defs: &[ChannelDef], n: usize) -> Vec<usiz
 /// from the codestream's `SIZ`; everything here is the caller's
 /// colour / channel / resolution description.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Jp2WriteOptions {
     /// Colour Specification boxes (§I.5.3.3), in precedence order. A
     /// Part-1 JP2 file needs at least one; a JPH file (T.814 Annex D.2)
@@ -1360,6 +1363,48 @@ pub struct Jp2WriteOptions {
 }
 
 impl Jp2WriteOptions {
+    /// Set [`Self::colour`].
+    #[must_use]
+    pub fn with_colour(mut self, v: Vec<Colr>) -> Self {
+        self.colour = v;
+        self
+    }
+
+    /// Set [`Self::palette`].
+    #[must_use]
+    pub fn with_palette(mut self, v: Option<Pclr>) -> Self {
+        self.palette = v;
+        self
+    }
+
+    /// Set [`Self::component_mapping`].
+    #[must_use]
+    pub fn with_component_mapping(mut self, v: Option<Vec<CmapEntry>>) -> Self {
+        self.component_mapping = v;
+        self
+    }
+
+    /// Set [`Self::channel_definitions`].
+    #[must_use]
+    pub fn with_channel_definitions(mut self, v: Option<Vec<ChannelDef>>) -> Self {
+        self.channel_definitions = v;
+        self
+    }
+
+    /// Set [`Self::resolution`].
+    #[must_use]
+    pub fn with_resolution(mut self, v: Option<Resolution>) -> Self {
+        self.resolution = v;
+        self
+    }
+
+    /// Set [`Self::colourspace_unknown`].
+    #[must_use]
+    pub fn with_colourspace_unknown(mut self, v: bool) -> Self {
+        self.colourspace_unknown = v;
+        self
+    }
+
     /// A single enumerated Colour Specification box (`METH = 1`,
     /// `PREC = 0`, `APPROX = 0`, Table I.10).
     pub fn enumerated(cs: EnumCs) -> Self {

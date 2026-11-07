@@ -4,6 +4,15 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ## [Unreleased]
 
+### Changed
+
+- API hygiene: `TilePartMarker`, `J2kHeader`, `TilePart`, `J2kCodestream`, `DecodedComponent`, `DecodedImage`, `EncodeKernel`, `TilePartSplit`, `PackedHeaders`, `ComponentOverride`, `Jp2Header`, `Jp2Container` and `Jp2WriteOptions` are now `#[non_exhaustive]`. The marker-segment and box mirrors (`Siz`, `Cod`, `Coc`, `Qcd`, `Qcc`, `Poc`, `PocProgression`, `Rgn`, `Plt`, `Ppt`, `Sot`, `Ftyp`, `Ihdr`, `Colr`, ...), the code enums that already carry a `Reserved` catch-all (`ProgressionOrder`, `WaveletTransform`, `QuantizationStyle`, `ColrMethod`, `EnumCs`), `CmapMapping` and the plain rectangle `RoiRegion` stay exhaustive.
+
+### Added
+
+- `ComponentOverride::new(component)` plus `with_decomposition_levels` / `with_code_block_exp` / `with_precincts` / `with_kernel`.
+- `Jp2WriteOptions::with_colour` / `with_palette` / `with_component_mapping` / `with_channel_definitions` / `with_resolution` / `with_colourspace_unknown`.
+
 ## [0.0.18](https://github.com/OxideAV/oxideav-jpeg2000/compare/v0.0.17...v0.0.18) - 2026-10-24
 
 ### Fixed

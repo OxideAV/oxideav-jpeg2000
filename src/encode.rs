@@ -1072,6 +1072,7 @@ pub fn encode_j2k_lossless(
 
 /// How the encoder transforms and quantises the sample planes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EncodeKernel {
     /// Reversible 5-3, Table A.28 style 0 (no quantization) — lossless.
     Lossless5x3,
@@ -1097,6 +1098,7 @@ pub enum EncodeKernel {
 /// `TNsot` (8-bit, so at most 255 tile-parts per tile) is stamped on
 /// every part.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum TilePartSplit {
     /// One tile-part per tile (`TPsot` = 0, `TNsot` = 1). Default.
     #[default]
@@ -1121,6 +1123,7 @@ pub enum TilePartSplit {
 /// the body while a signalled `EPH` trails each header inside the
 /// relocated payload (§A.8.1 / §A.8.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum PackedHeaders {
     /// §B.10 — headers interleave with packet data in the tile-part
     /// bodies. Default.
@@ -1178,6 +1181,7 @@ pub struct RoiRegion {
 /// kernel across components 0–2, so kernel overrides under
 /// [`EncodeOptions::mct`] must match the tile-wide kernel).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ComponentOverride {
     /// Component index (`Ccoc` / `Cqcc`) this override applies to.
     pub component: u16,
@@ -1195,6 +1199,48 @@ pub struct ComponentOverride {
     pub precincts: Option<Vec<u8>>,
     /// Per-component wavelet kernel + quantisation family.
     pub kernel: Option<EncodeKernel>,
+}
+
+impl ComponentOverride {
+    /// An override for `component` that inherits every tile-wide
+    /// setting; chain the `with_*` setters to change individual ones.
+    pub fn new(component: u16) -> Self {
+        Self {
+            component,
+            decomposition_levels: None,
+            code_block_exp: None,
+            precincts: None,
+            kernel: None,
+        }
+    }
+
+    /// Set [`Self::decomposition_levels`].
+    #[must_use]
+    pub fn with_decomposition_levels(mut self, levels: Option<u8>) -> Self {
+        self.decomposition_levels = levels;
+        self
+    }
+
+    /// Set [`Self::code_block_exp`].
+    #[must_use]
+    pub fn with_code_block_exp(mut self, exp: Option<(u8, u8)>) -> Self {
+        self.code_block_exp = exp;
+        self
+    }
+
+    /// Set [`Self::precincts`].
+    #[must_use]
+    pub fn with_precincts(mut self, precincts: Option<Vec<u8>>) -> Self {
+        self.precincts = precincts;
+        self
+    }
+
+    /// Set [`Self::kernel`].
+    #[must_use]
+    pub fn with_kernel(mut self, kernel: Option<EncodeKernel>) -> Self {
+        self.kernel = kernel;
+        self
+    }
 }
 
 /// Which file shape [`crate::encode()`] writes.
