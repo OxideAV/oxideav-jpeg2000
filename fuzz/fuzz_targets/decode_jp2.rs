@@ -26,7 +26,7 @@
 //! Raw input is capped at 64 KiB. Like the `decode_j2k` harness, the
 //! decoder allocates per-pixel buffers from the attacker-controlled
 //! `SIZ` geometry, so the harness pre-parses the embedded codestream
-//! header and skips files whose reference-grid area exceeds 2²⁰
+//! header and skips files whose image area exceeds 2²⁰
 //! samples or that carry more than 4 components. The palette
 //! expansion multiplies planes by `NPC`, so the `cmap` channel count
 //! is capped at 8.
@@ -66,7 +66,12 @@ fuzz_target!(|data: &[u8]| {
     let Ok(header) = parse_j2k_header(codestream) else {
         return;
     };
-    let area = u64::from(header.siz.x_size) * u64::from(header.siz.y_size);
+    // Cap the image area (Equation B-2: `Xsiz − XOsiz` by `Ysiz − YOsiz`),
+    // not the reference-grid extent: a small image anchored at an origin
+    // of 2^31 or more must stay reachable (Table A.9 origins span the
+    // whole u32 range).
+    let area = u64::from(header.siz.x_size.saturating_sub(header.siz.x_offset))
+        * u64::from(header.siz.y_size.saturating_sub(header.siz.y_offset));
     if area > MAX_AREA || header.siz.components.len() > MAX_COMPONENTS {
         return;
     }

@@ -196,8 +196,11 @@ pub fn reassemble_subband_5x3(
     if width == 0 || height == 0 {
         return Ok(Vec::new());
     }
-    let mut out = vec![0_i32; width * height];
-    let mut written = vec![false; width * height];
+    let len = width
+        .checked_mul(height)
+        .ok_or(Error::InvalidMarkerLength)?;
+    let mut out = vec![0_i32; len];
+    let mut written = vec![false; len];
 
     for cb in blocks {
         check_placement(band, &cb.placement, cb.coefficients)?;
@@ -265,8 +268,11 @@ pub fn reassemble_subband_9x7(
     if width == 0 || height == 0 {
         return Ok(Vec::new());
     }
-    let mut out = vec![0.0_f64; width * height];
-    let mut written = vec![false; width * height];
+    let len = width
+        .checked_mul(height)
+        .ok_or(Error::InvalidMarkerLength)?;
+    let mut out = vec![0.0_f64; len];
+    let mut written = vec![false; len];
     let step_size = irreversible_step_size(quant.rb, quant.step);
 
     for cb in blocks {
@@ -635,8 +641,8 @@ pub fn idwt_5x3<'a, S: BlockSource<'a>>(
     for k in 1..levels.len() {
         let level_k = &levels[k];
         let arrays_k = reassemble_resolution_5x3(level_k, source, &mb_per_level[k], r)?;
-        let i0 = level_k.trx0 as i32;
-        let j0 = level_k.try0 as i32;
+        let i0 = crate::dwt::origin_parity(level_k.trx0);
+        let j0 = crate::dwt::origin_parity(level_k.try0);
         let interleaved = sr_2d_5x3(
             &carry_ll,
             carry_dims,
@@ -695,8 +701,8 @@ pub fn idwt_9x7<'a, S: BlockSource<'a>>(
     for k in 1..levels.len() {
         let level_k = &levels[k];
         let arrays_k = reassemble_resolution_9x7(level_k, source, &quant_per_level[k], r)?;
-        let i0 = level_k.trx0 as i32;
-        let j0 = level_k.try0 as i32;
+        let i0 = crate::dwt::origin_parity(level_k.trx0);
+        let j0 = crate::dwt::origin_parity(level_k.try0);
         let interleaved = sr_2d_9x7(
             &carry_ll,
             carry_dims,

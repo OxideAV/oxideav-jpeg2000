@@ -25,7 +25,7 @@
 //!
 //! ## Input + geometry caps
 //!
-//! Identical to the `decode_j2k` harness (64 KiB, 2²⁰ reference-grid
+//! Identical to the `decode_j2k` harness (64 KiB, 2²⁰ image-area
 //! samples, ≤ 4 components) so the two targets share seed corpora.
 
 use libfuzzer_sys::fuzz_target;
@@ -42,7 +42,12 @@ fuzz_target!(|data: &[u8]| {
     let Ok(header) = parse_j2k_header(data) else {
         return;
     };
-    let area = u64::from(header.siz.x_size) * u64::from(header.siz.y_size);
+    // Cap the image area (Equation B-2: `Xsiz − XOsiz` by `Ysiz − YOsiz`),
+    // not the reference-grid extent: a small image anchored at an origin
+    // of 2^31 or more must stay reachable (Table A.9 origins span the
+    // whole u32 range).
+    let area = u64::from(header.siz.x_size.saturating_sub(header.siz.x_offset))
+        * u64::from(header.siz.y_size.saturating_sub(header.siz.y_offset));
     if area > MAX_AREA || header.siz.components.len() > MAX_COMPONENTS {
         return;
     }

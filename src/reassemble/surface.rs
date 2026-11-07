@@ -152,8 +152,8 @@ impl<'a, T: Default + Clone> CoefficientSurface<'a, T> {
             let hl = regions.next().unwrap();
             let lh = regions.next().unwrap();
             let hh = regions.next().unwrap();
-            // These are exactly the band slices and origin casts passed by
-            // the existing public IDWT cascade. No precision or rounding
+            // These are exactly the band slices and origin parities passed
+            // by the existing public IDWT cascade. No precision or rounding
             // change is introduced by the lifetime of these buffers.
             let grid = inverse(
                 &carry,
@@ -164,8 +164,8 @@ impl<'a, T: Default + Clone> CoefficientSurface<'a, T> {
                 (lh.band.width() as usize, lh.band.height() as usize),
                 &hh.data,
                 (hh.band.width() as usize, hh.band.height() as usize),
-                level.trx0 as i32,
-                level.try0 as i32,
+                crate::dwt::origin_parity(level.trx0),
+                crate::dwt::origin_parity(level.try0),
             )?;
             // Later resolutions need only the new LL carry, never these
             // coded bands. Release them before the next synthesis step.
@@ -253,8 +253,8 @@ mod tests {
                     cby: (y - band.tby0) / 2,
                     x0: x,
                     y0: y,
-                    x1: (x + 3).min(band.tbx1),
-                    y1: (y + 2).min(band.tby1),
+                    x1: x.saturating_add(3).min(band.tbx1),
+                    y1: y.saturating_add(2).min(band.tby1),
                 };
                 let width = placement.width() as usize;
                 let height = placement.height() as usize;
@@ -286,9 +286,15 @@ mod tests {
 
     #[test]
     fn surface_matches_public_reconstruction_and_idwt_exactly() {
-        // Large odd origins keep the parity cases while staying inside the
-        // i32 index domain the inverse DWT takes (`trx0 as i32`).
-        for (x0, y0) in [(0, 0), (3, 1), (0x4000_0003, 0x4000_0001)] {
+        // Odd and even origins on both sides of 2^31, up to the top of the
+        // Table A.9 range (`x0 + 17` / `y0 + 13` still fit in u32).
+        for (x0, y0) in [
+            (0, 0),
+            (3, 1),
+            (0x4000_0003, 0x4000_0001),
+            (0x8000_0001, 0x7FFF_FFFF),
+            (0xFFFF_FFEE, 0xFFFF_FFF2),
+        ] {
             for (width, height) in [(17, 13), (1, 1), (1, 9)] {
                 for n_l in 0..=3 {
                     let all_levels = derive_resolution_levels(
@@ -386,6 +392,173 @@ mod tests {
                                 "f64 differs: origin {x0}/{y0}, {width}x{height}, NL {n_l}, keep {keep}, mode {mode}"
                             );
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Blocks whose placement and coefficients depend only on positions
+    /// relative to the band origin, so two parity-equivalent geometries
+    /// receive identical sub-band data.
+    fn relative_blocks(band: SubBand) -> Vec<(PrecinctCodeBlock, CodeBlock)> {
+        let mut blocks = Vec::new();
+        for ry in (0..band.height()).step_by(2) {
+            for rx in (0..band.width()).step_by(3) {
+                let (x, y) = (band.tbx0 + rx, band.tby0 + ry);
+                let placement = PrecinctCodeBlock {
+                    cbx: rx / 3,
+                    cby: ry / 2,
+                    x0: x,
+                    y0: y,
+                    x1: x + 3.min(band.width() - rx),
+                    y1: y + 2.min(band.height() - ry),
+                };
+                let width = placement.width() as usize;
+                let height = placement.height() as usize;
+                let coefficients = (0..width * height)
+                    .map(|i| {
+                        let magnitude = ((i as u32 * 37 + rx * 11 + ry * 5) % 256) * 2;
+                        Coefficient {
+                            magnitude,
+                            sigma: magnitude != 0,
+                            sign: (i as u32 + rx) % 3 == 1,
+                            already_refined: false,
+                        }
+                    })
+                    .collect();
+                blocks.push((
+                    placement,
+                    CodeBlock::from_coefficients(band.orientation, width, height, coefficients),
+                ));
+            }
+        }
+        blocks
+    }
+
+    /// Reconstruct one tile-component through the coefficient surface
+    /// (5-3 and 9-7) and the public cascade; all three must agree, and the
+    /// result is returned for cross-origin comparison.
+    fn reconstruct_relative(
+        x0: u32,
+        y0: u32,
+        width: u32,
+        height: u32,
+        n_l: u8,
+    ) -> (Interleaved2D<i32>, Vec<u64>) {
+        let levels = derive_resolution_levels(
+            TileComponentGeometry {
+                tcx0: x0,
+                tcy0: y0,
+                tcx1: x0 + width,
+                tcy1: y0 + height,
+            },
+            n_l,
+        );
+        let owned: Vec<_> = levels
+            .iter()
+            .flat_map(|level| &level.sub_bands)
+            .map(|&band| (band, relative_blocks(band)))
+            .collect();
+        let source = Oracle(
+            owned
+                .iter()
+                .map(|(band, blocks)| {
+                    (
+                        *band,
+                        blocks
+                            .iter()
+                            .map(|(placement, block)| CodedCodeBlock {
+                                placement: *placement,
+                                coefficients: block,
+                                nb: 5,
+                            })
+                            .collect(),
+                    )
+                })
+                .collect(),
+        );
+        let quant = |band: &SubBand| {
+            SubBandQuantization::resolve(
+                8,
+                1,
+                band.orientation,
+                StepSize {
+                    epsilon: 7,
+                    mantissa: 301,
+                },
+            )
+            .unwrap()
+        };
+        let mut reversible = CoefficientSurface::<i32>::new(&levels).unwrap();
+        let mut irreversible = CoefficientSurface::<f64>::new(&levels).unwrap();
+        for (resolution, level) in levels.iter().enumerate() {
+            for (sub_band, band) in level.sub_bands.iter().enumerate() {
+                for &cb in source.blocks_for(band) {
+                    reversible
+                        .scatter_5x3(resolution, sub_band, cb, 7, 0.5)
+                        .unwrap();
+                    irreversible
+                        .scatter_9x7(resolution, sub_band, cb, quant(band), 0.5)
+                        .unwrap();
+                }
+            }
+        }
+        let mb_per_level: Vec<_> = levels
+            .iter()
+            .map(|level| vec![7; level.sub_bands.len()])
+            .collect();
+        let quant_per_level: Vec<Vec<_>> = levels
+            .iter()
+            .map(|level| level.sub_bands.iter().map(quant).collect())
+            .collect();
+        let rev = reversible.into_idwt_5x3().unwrap();
+        assert_eq!(rev, idwt_5x3(&levels, &source, &mb_per_level, 0.5).unwrap());
+        let irr = irreversible.into_idwt_9x7().unwrap();
+        let irr_bits: Vec<u64> = irr.data.iter().map(|v| v.to_bits()).collect();
+        let public = idwt_9x7(&levels, &source, &quant_per_level, 0.5).unwrap();
+        assert_eq!(
+            irr_bits,
+            public.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+        assert_eq!((irr.width, irr.height), (rev.width, rev.height));
+        (rev, irr_bits)
+    }
+
+    #[test]
+    fn huge_origins_reconstruct_like_parity_equivalent_small_origins() {
+        // T.800 Table A.9 lets the grid origin reach 2^32 − 1. For
+        // `NL ≤ 5` every Equation B-14 / B-15 corner parity and every band
+        // size depends on the origin modulo 64, so an origin and its
+        // residue modulo 64 must reconstruct the same 5-3 and 9-7 arrays.
+        // The resolution-level origins here sit just below and just above
+        // 2^31 (e.g. `0xFFFF_FFF1 → 0x7FFF_FFF9` at level NL − 1), where a
+        // truncating `as i32` origin plus the row length used to overflow.
+        let origins = [
+            0x8000_0001u32,
+            0x8000_0000,
+            0x7FFF_FFFF,
+            0xFFFF_FFF0,
+            0xFFFF_FFF1,
+            0xFFFF_FFF5,
+        ];
+        for &x0 in &origins {
+            for &y0 in &origins {
+                for (width, height) in [(9, 7), (1, 1), (1, 9), (10, 1)] {
+                    // Stay inside the u32 grid (`x0 + width <= 2^32 − 1`).
+                    if x0.checked_add(width).is_none() || y0.checked_add(height).is_none() {
+                        continue;
+                    }
+                    for n_l in 0..=5 {
+                        let big = reconstruct_relative(x0, y0, width, height, n_l);
+                        let small = reconstruct_relative(x0 % 64, y0 % 64, width, height, n_l);
+                        assert_eq!(
+                            big,
+                            small,
+                            "origin ({x0:#x}, {y0:#x}) vs ({}, {}), {width}x{height}, NL {n_l}",
+                            x0 % 64,
+                            y0 % 64
+                        );
                     }
                 }
             }

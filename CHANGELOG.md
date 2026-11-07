@@ -13,6 +13,14 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 - `ComponentOverride::new(component)` plus `with_decomposition_levels` / `with_code_block_exp` / `with_precincts` / `with_kernel`.
 - `Jp2WriteOptions::with_colour` / `with_palette` / `with_component_mapping` / `with_channel_definitions` / `with_resolution` / `with_colourspace_unknown`.
 
+### Fixed
+
+- Image-grid origins at or above 2^31 (Table A.9 allows `XOsiz` / `YOsiz` / `XTOsiz` / `YTOsiz` up to `2^32 − 1`): the inverse and forward DWT took resolution-level origins as truncating `trx0 as i32` casts, so `i0 + len` and the 9-7 `2·⌊i0/2⌋` extension bounds overflowed (a debug-build panic, wrapped index ranges in release) once a level origin sat near `i32::MAX` or below `i32::MIN + 4`. The filters now work on the parity-equivalent range `[i0 mod 2, i0 mod 2 + len)` — §F.3.6–§F.4 depend on the origin only through its parity — and callers pass `dwt::origin_parity`; inverted or oversized ranges are errors.
+- Precinct / code-block cell edges that reach exactly `2^32` (e.g. a level at `0xFFFF_FF00` with `PP = 15`) wrapped to `0` in the §B.6 / §B.7 enumeration (`checked_shl` does not detect shifted-out bits), emptying the precinct so the tile decoded as flat DC. They now saturate.
+- `ceil(Xsiz / XRsiz)` and `ceil((Xsiz − XTOsiz) / XTsiz)` no longer form `a + b − 1` in `u32`, and Equation B-4's `XTsiz + XTOsiz > XOsiz` is checked in `u64`: grids ending at `2^32 − 1` with sub-sampling, a whole-grid tile `XTsiz = 2^32 − 1`, and a tile `XTsiz = Xsiz` anchored at `XTOsiz = XOsiz ≥ 2^31` were rejected as malformed.
+- A component plane too large to address (e.g. `Xsiz = Ysiz = 2^32 − 1` in one tile) returns `Error::LimitExceeded` instead of an allocation panic.
+- Fuzz harnesses `decode_j2k` / `decode_variants` / `decode_jp2` cap the image area (`Xsiz − XOsiz` × `Ysiz − YOsiz`) instead of the reference-grid extent, so small images at large origins are reachable.
+
 ### Performance
 
 - Decode scatters each finished code-block straight into a per-component coefficient surface (validated before any allocation, one owned buffer per sub-band) and reuses a single Annex D work block, instead of keeping every decoded block alive until the component's IDWT; synthesis moves LL into the carry and frees each level's high bands as soon as they are consumed. Output is unchanged; peak memory on large images drops substantially (#27, thanks @Streetblock).

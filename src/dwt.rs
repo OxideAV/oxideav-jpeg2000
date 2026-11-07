@@ -227,8 +227,8 @@ fn length_one_5x3(y_i0: i32, i0: i32) -> i32 {
 /// or `x.len() != il - i0` (length-mismatch is a caller bug, but
 /// surfacing it as a typed Error keeps the §F.3.6 boundary tidy).
 pub fn idwt_1d_5x3(y: &[i32], x: &mut [i32], i0: i32, il: i32) -> Result<(), Error> {
-    let len = (il - i0) as usize;
-    if y.len() != len || x.len() != len || i0 >= il {
+    let (i0, _, len) = signal_span(i0, il)?;
+    if y.len() != len || x.len() != len {
         return Err(Error::InvalidMarkerLength);
     }
     // §F.3.6 length-one branch.
@@ -305,8 +305,8 @@ fn idwt_1d_9x7_with_scratch(
     il: i32,
     buf: &mut Vec<f64>,
 ) -> Result<(), Error> {
-    let len = (il - i0) as usize;
-    if y.len() != len || x.len() != len || i0 >= il {
+    let (i0, il, len) = signal_span(i0, il)?;
+    if y.len() != len || x.len() != len {
         return Err(Error::InvalidMarkerLength);
     }
     if len == 1 {
@@ -582,7 +582,7 @@ pub fn hor_sr_5x3(a: &mut Interleaved2D<i32>, i0: i32) -> Result<(), Error> {
     if a.width == 0 || a.height == 0 {
         return Ok(());
     }
-    let il = i0 + a.width as i32;
+    let (i0, il) = lattice_span(i0, a.width)?;
     let mut tmp = vec![0_i32; a.width];
     for v in 0..a.height {
         let row = &a.data[v * a.width..(v + 1) * a.width];
@@ -602,7 +602,7 @@ pub fn ver_sr_5x3(a: &mut Interleaved2D<i32>, j0: i32) -> Result<(), Error> {
     if a.width == 0 || a.height == 0 {
         return Ok(());
     }
-    let jl = j0 + a.height as i32;
+    let (j0, jl) = lattice_span(j0, a.height)?;
     let mut col = vec![0_i32; a.height];
     let mut out = vec![0_i32; a.height];
     for u in 0..a.width {
@@ -624,7 +624,7 @@ pub fn hor_sr_9x7(a: &mut Interleaved2D<f64>, i0: i32) -> Result<(), Error> {
     if a.width == 0 || a.height == 0 {
         return Ok(());
     }
-    let il = i0 + a.width as i32;
+    let (i0, il) = lattice_span(i0, a.width)?;
     let mut tmp = vec![0.0_f64; a.width];
     let mut scratch = Vec::new();
     for v in 0..a.height {
@@ -642,7 +642,7 @@ pub fn ver_sr_9x7(a: &mut Interleaved2D<f64>, j0: i32) -> Result<(), Error> {
     if a.width == 0 || a.height == 0 {
         return Ok(());
     }
-    let jl = j0 + a.height as i32;
+    let (j0, jl) = lattice_span(j0, a.height)?;
     let mut col = vec![0.0_f64; a.height];
     let mut out = vec![0.0_f64; a.height];
     let mut scratch = Vec::new();
@@ -751,8 +751,8 @@ fn length_one_fwd_5x3(x_i0: i32, i0: i32) -> i32 {
 /// Returns [`Error::InvalidMarkerLength`] on a length mismatch or an
 /// empty / inverted range.
 pub fn fdwt_1d_5x3(x: &[i32], y: &mut [i32], i0: i32, il: i32) -> Result<(), Error> {
-    let len = (il - i0) as usize;
-    if x.len() != len || y.len() != len || i0 >= il {
+    let (i0, il, len) = signal_span(i0, il)?;
+    if x.len() != len || y.len() != len {
         return Err(Error::InvalidMarkerLength);
     }
     if len == 1 {
@@ -808,8 +808,8 @@ fn length_one_fwd_9x7(x_i0: f64, i0: i32) -> f64 {
 /// Returns [`Error::InvalidMarkerLength`] on a length mismatch or an
 /// empty / inverted range.
 pub fn fdwt_1d_9x7(x: &[f64], y: &mut [f64], i0: i32, il: i32) -> Result<(), Error> {
-    let len = (il - i0) as usize;
-    if x.len() != len || y.len() != len || i0 >= il {
+    let (i0, il, len) = signal_span(i0, il)?;
+    if x.len() != len || y.len() != len {
         return Err(Error::InvalidMarkerLength);
     }
     if len == 1 {
@@ -863,7 +863,7 @@ pub fn fdwt_1d_9x7(x: &[f64], y: &mut [f64], i0: i32, il: i32) -> Result<(), Err
 
 /// §F.4 forward row filter (5-3): analyse every row of `a` in place.
 pub fn hor_sd_5x3(a: &mut Interleaved2D<i32>, i0: i32) -> Result<(), Error> {
-    let il = i0 + a.width as i32;
+    let (i0, il) = lattice_span(i0, a.width)?;
     let mut tmp = vec![0_i32; a.width];
     for v in 0..a.height {
         let row_vec = a.data[v * a.width..(v + 1) * a.width].to_vec();
@@ -875,7 +875,7 @@ pub fn hor_sd_5x3(a: &mut Interleaved2D<i32>, i0: i32) -> Result<(), Error> {
 
 /// §F.4 forward column filter (5-3): analyse every column of `a` in place.
 pub fn ver_sd_5x3(a: &mut Interleaved2D<i32>, j0: i32) -> Result<(), Error> {
-    let jl = j0 + a.height as i32;
+    let (j0, jl) = lattice_span(j0, a.height)?;
     let mut col = vec![0_i32; a.height];
     let mut out = vec![0_i32; a.height];
     for u in 0..a.width {
@@ -892,7 +892,7 @@ pub fn ver_sd_5x3(a: &mut Interleaved2D<i32>, j0: i32) -> Result<(), Error> {
 
 /// §F.4 forward row filter (9-7): analyse every row of `a` in place.
 pub fn hor_sd_9x7(a: &mut Interleaved2D<f64>, i0: i32) -> Result<(), Error> {
-    let il = i0 + a.width as i32;
+    let (i0, il) = lattice_span(i0, a.width)?;
     let mut tmp = vec![0.0_f64; a.width];
     for v in 0..a.height {
         let row_vec = a.data[v * a.width..(v + 1) * a.width].to_vec();
@@ -904,7 +904,7 @@ pub fn hor_sd_9x7(a: &mut Interleaved2D<f64>, i0: i32) -> Result<(), Error> {
 
 /// §F.4 forward column filter (9-7): analyse every column of `a` in place.
 pub fn ver_sd_9x7(a: &mut Interleaved2D<f64>, j0: i32) -> Result<(), Error> {
-    let jl = j0 + a.height as i32;
+    let (j0, jl) = lattice_span(j0, a.height)?;
     let mut col = vec![0.0_f64; a.height];
     let mut out = vec![0.0_f64; a.height];
     for u in 0..a.width {
@@ -969,6 +969,64 @@ pub fn sd_2d_9x7(
 // =====================================================================
 // Helpers.
 // =====================================================================
+
+/// Longest 1-D signal the filters accept. The §F.3.8 working buffers
+/// extend a signal by a handful of samples on each side and are indexed
+/// in `i32`, so the cap keeps every extended index far inside `i32`. It
+/// is orders of magnitude beyond any tile-component that fits in memory.
+const MAX_SIGNAL_LEN: i64 = 1 << 30;
+
+/// Validate the signal range `[i0, il)` and translate it to the
+/// parity-equivalent range starting at `i0 mod 2`.
+///
+/// Every §F.3.6 – §F.3.8 rule (and the §F.4 forward counterparts)
+/// depends on the origin only through its parity: the length-one rule
+/// tests `i0` even / odd, the Table F.2 / F.3 extensions are keyed on the
+/// parities of `i0` and `il`, Equation F-4 folds relative to `i0`, and the
+/// Equation F-5 – F-7 index ranges `⌊i0/2⌋ + c ≤ n < ⌈il/2⌉ + c` move with
+/// the signal. An even translation therefore yields the same output
+/// array, and working in the translated range keeps all index arithmetic
+/// bounded for any origin — in particular resolution-level origins at or
+/// above `2^31` (Table A.9 lets `XOsiz` / `YOsiz` reach `2^32 − 1`), whose
+/// `i32` image is negative or close enough to `i32::MAX` for `i0 + len`
+/// to overflow.
+///
+/// Returns `(i0', il', len)`.
+///
+/// # Errors
+///
+/// [`Error::InvalidMarkerLength`] for an empty / inverted range or one
+/// longer than [`MAX_SIGNAL_LEN`].
+fn signal_span(i0: i32, il: i32) -> Result<(i32, i32, usize), Error> {
+    let len = i64::from(il) - i64::from(i0);
+    if len <= 0 || len > MAX_SIGNAL_LEN {
+        return Err(Error::InvalidMarkerLength);
+    }
+    let p = i0.rem_euclid(2);
+    Ok((p, p + len as i32, len as usize))
+}
+
+/// [`signal_span`] for one row / column of a 2-D lattice: the
+/// parity-reduced `(origin', end')` of a `len`-sample signal anchored at
+/// `origin`.
+fn lattice_span(origin: i32, len: usize) -> Result<(i32, i32), Error> {
+    let len = i64::try_from(len).map_err(|_| Error::InvalidMarkerLength)?;
+    if len > MAX_SIGNAL_LEN {
+        return Err(Error::InvalidMarkerLength);
+    }
+    let p = origin.rem_euclid(2);
+    Ok((p, p + len as i32))
+}
+
+/// The lattice parity of an unsigned reference-grid / resolution-level
+/// origin, as the `i32` origin the 2-D filters take.
+///
+/// Only the parity reaches the filters (see [`signal_span`]), so this is
+/// an exact stand-in for a `u32` origin of any magnitude.
+#[inline]
+pub fn origin_parity(origin: u32) -> i32 {
+    (origin & 1) as i32
+}
 
 /// Floor-division for `i32` (round toward minus infinity).
 ///
@@ -1815,5 +1873,74 @@ mod tests {
                 assert!((p - q).abs() < 1e-5, "9-7 2D round-trip: {p} vs {q}");
             }
         }
+    }
+
+    #[test]
+    fn extreme_origins_filter_like_their_parity() {
+        // §F.3.6 – §F.4 depend on the origin only through its parity, so an
+        // origin anywhere in i32 — including the ends of the range, where
+        // `i0 + len` and `2 * ⌊i0/2⌋` used to overflow — must give the
+        // output of origin `i0 mod 2`.
+        let mut state = 0x5EED_u32;
+        for len in [1usize, 2, 3, 8, 13] {
+            let y: Vec<i32> = (0..len)
+                .map(|_| (lcg(&mut state) % 512) as i32 - 256)
+                .collect();
+            let yf: Vec<f64> = y.iter().map(|&v| f64::from(v) * 0.75).collect();
+            let len_i = len as i32;
+            for i0 in [
+                i32::MIN,
+                i32::MIN + 1,
+                -1,
+                i32::MAX - len_i,
+                i32::MAX - len_i - 1,
+            ] {
+                let p = i0.rem_euclid(2);
+                let il = i0 + len_i;
+                let mut want = vec![0; len];
+                let mut got = vec![0; len];
+                idwt_1d_5x3(&y, &mut want, p, p + len_i).unwrap();
+                idwt_1d_5x3(&y, &mut got, i0, il).unwrap();
+                assert_eq!(got, want, "5-3 inverse i0={i0} len={len}");
+                super::fdwt_1d_5x3(&y, &mut want, p, p + len_i).unwrap();
+                super::fdwt_1d_5x3(&y, &mut got, i0, il).unwrap();
+                assert_eq!(got, want, "5-3 forward i0={i0} len={len}");
+                let mut want = vec![0.0; len];
+                let mut got = vec![0.0; len];
+                idwt_1d_9x7(&yf, &mut want, p, p + len_i).unwrap();
+                idwt_1d_9x7(&yf, &mut got, i0, il).unwrap();
+                assert_eq!(got, want, "9-7 inverse i0={i0} len={len}");
+                fdwt_1d_9x7(&yf, &mut want, p, p + len_i).unwrap();
+                fdwt_1d_9x7(&yf, &mut got, i0, il).unwrap();
+                assert_eq!(got, want, "9-7 forward i0={i0} len={len}");
+            }
+        }
+        // 2-D lattices anchored at the far end of i32 (the `trx0 as i32`
+        // image of a reference-grid origin ≥ 2^31) and at u32 origins
+        // through `origin_parity`.
+        let (w, h) = (5usize, 4usize);
+        let samples: Vec<i32> = (0..w * h).map(|i| (i as i32 * 29) % 97 - 40).collect();
+        for (i0, j0) in [(i32::MAX, i32::MAX - 1), (i32::MIN + 1, i32::MIN)] {
+            let want = sd_2d_5x3(samples.clone(), w, h, i0 & 1, j0 & 1).unwrap();
+            let got = sd_2d_5x3(samples.clone(), w, h, i0, j0).unwrap();
+            assert_eq!(got, want);
+            let mut back = got.clone();
+            hor_sr_5x3(&mut back, i0).unwrap();
+            ver_sr_5x3(&mut back, j0).unwrap();
+            assert_eq!(back.data, samples);
+        }
+        assert_eq!(origin_parity(0xFFFF_FFFF), 1);
+        assert_eq!(origin_parity(0x8000_0000), 0);
+    }
+
+    #[test]
+    fn inverted_or_oversized_ranges_are_errors_not_panics() {
+        let mut out = [0_i32; 2];
+        assert!(idwt_1d_5x3(&[1, 2], &mut out, i32::MAX, i32::MIN).is_err());
+        assert!(idwt_1d_5x3(&[1, 2], &mut out, i32::MIN, i32::MAX).is_err());
+        assert!(super::fdwt_1d_5x3(&[1, 2], &mut out, 5, 5).is_err());
+        let mut outf = [0.0_f64; 2];
+        assert!(idwt_1d_9x7(&[1.0, 2.0], &mut outf, i32::MIN, i32::MAX).is_err());
+        assert!(fdwt_1d_9x7(&[1.0, 2.0], &mut outf, 0, -1).is_err());
     }
 }

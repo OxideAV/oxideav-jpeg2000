@@ -2789,6 +2789,20 @@ fn decode_codestream_impl(
         let len = (rw as usize)
             .checked_mul(rh as usize)
             .ok_or(Error::InvalidMarkerLength)?;
+        // Table A.9 lets a single component span `(2^32 − 1)^2` samples.
+        // A plane (or the `f64` coefficient surface of a tile covering
+        // it) whose byte size passes the allocator's `isize::MAX` ceiling
+        // is a deterministic allocation panic, so it is rejected as a
+        // limit. Smaller-but-huge planes are what `DecodeOptions`'
+        // `max_pixels` / `max_bytes` bound.
+        if len
+            .checked_mul(std::mem::size_of::<f64>())
+            .is_none_or(|bytes| bytes > isize::MAX as usize)
+        {
+            return Err(Error::limit(format!(
+                "component plane {rw}x{rh} exceeds the addressable memory"
+            )));
+        }
         components.push(DecodedComponent {
             width: rw,
             height: rh,
@@ -2986,7 +3000,7 @@ fn decode_codestream_impl(
             if tw == 0 || th == 0 {
                 continue;
             }
-            if plane.len() != tw * th {
+            if Some(plane.len()) != tw.checked_mul(th) {
                 return Err(Error::InvalidMarkerLength);
             }
             let comp = &mut components[c];

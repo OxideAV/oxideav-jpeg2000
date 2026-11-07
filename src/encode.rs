@@ -240,8 +240,8 @@ fn forward_cascade(
             cur.data,
             cur.width,
             cur.height,
-            cur.x0 as i32,
-            cur.y0 as i32,
+            crate::dwt::origin_parity(cur.x0),
+            crate::dwt::origin_parity(cur.y0),
         )
         .expect("analysis dims match by construction");
         let (ll, hl, lh, hh) = deinterleave_map(&a.data, a.width, a.height, cur.x0, cur.y0, |s| s);
@@ -314,8 +314,8 @@ fn forward_cascade_9x7(
             cur.data,
             cur.width,
             cur.height,
-            cur.x0 as i32,
-            cur.y0 as i32,
+            crate::dwt::origin_parity(cur.x0),
+            crate::dwt::origin_parity(cur.y0),
         )
         .expect("analysis dims match by construction");
         let (_llq, hl, lh, hh) = deinterleave_map(&a.data, a.width, a.height, cur.x0, cur.y0, q);

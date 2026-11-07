@@ -32,7 +32,7 @@
 //!
 //! Raw input is capped at 64 KiB. `decode_j2k` allocates per-pixel
 //! buffers from the attacker-controlled `SIZ` geometry, so the harness
-//! pre-parses the header and skips streams whose reference-grid area
+//! pre-parses the header and skips streams whose image area
 //! exceeds 2²⁰ samples or that carry more than 4 components — large
 //! enough to reach every code path (multi-tile, sub-sampling,
 //! multi-component), small enough that a fuzz iteration never
@@ -52,7 +52,12 @@ fuzz_target!(|data: &[u8]| {
     let Ok(header) = parse_j2k_header(data) else {
         return;
     };
-    let area = u64::from(header.siz.x_size) * u64::from(header.siz.y_size);
+    // Cap the image area (Equation B-2: `Xsiz − XOsiz` by `Ysiz − YOsiz`),
+    // not the reference-grid extent: a small image anchored at an origin
+    // of 2^31 or more must stay reachable (Table A.9 origins span the
+    // whole u32 range).
+    let area = u64::from(header.siz.x_size.saturating_sub(header.siz.x_offset))
+        * u64::from(header.siz.y_size.saturating_sub(header.siz.y_offset));
     if area > MAX_AREA || header.siz.components.len() > MAX_COMPONENTS {
         return;
     }

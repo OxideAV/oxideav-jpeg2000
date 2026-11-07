@@ -182,10 +182,11 @@ fn ceil_div_u32(a: u32, b: u32) -> Result<u32, Error> {
         // means.
         return Err(Error::InvalidMarkerLength);
     }
-    // ceil(a/b) = floor((a + b - 1) / b). Use checked add to keep u32
-    // overflow surfaced rather than wrap-around.
-    let sum = a.checked_add(b - 1).ok_or(Error::InvalidMarkerLength)?;
-    Ok(sum / b)
+    // `div_ceil` never forms `a + b − 1`, so the whole Table A.9 range
+    // is representable: `ceil(0xFFFF_FFFF / 2) = 0x8000_0000` and
+    // `ceil(0xFFFF_FFFF / 0xFFFF_FFFF) = 1` (a single tile spanning the
+    // full reference grid). The quotient never exceeds `a`.
+    Ok(a.div_ceil(b))
 }
 
 /// Validate the SIZ parameters against T.800 Equations B-3 / B-4 and
@@ -209,18 +210,13 @@ pub fn validate_siz(siz: &Siz) -> Result<(), Error> {
         return Err(Error::InvalidMarkerLength);
     }
     // Equation B-4: XTsiz + XTOsiz > XOsiz, YTsiz + YTOsiz > YOsiz.
-    let xt_plus = siz
-        .tile_width
-        .checked_add(siz.tile_x_offset)
-        .ok_or(Error::InvalidMarkerLength)?;
-    if xt_plus <= siz.x_offset {
+    // The sums are formed in u64: both terms may approach 2^32 (a single
+    // tile `XTsiz = Xsiz` anchored at `XTOsiz = XOsiz ≥ 2^31` is legal),
+    // and a sum past u32 trivially satisfies the inequality.
+    if u64::from(siz.tile_width) + u64::from(siz.tile_x_offset) <= u64::from(siz.x_offset) {
         return Err(Error::InvalidMarkerLength);
     }
-    let yt_plus = siz
-        .tile_height
-        .checked_add(siz.tile_y_offset)
-        .ok_or(Error::InvalidMarkerLength)?;
-    if yt_plus <= siz.y_offset {
+    if u64::from(siz.tile_height) + u64::from(siz.tile_y_offset) <= u64::from(siz.y_offset) {
         return Err(Error::InvalidMarkerLength);
     }
     Ok(())
@@ -1084,15 +1080,23 @@ fn enumerate_axis(
     (grid, cells)
 }
 
-/// `value * 2^exp` saturating to `u32::MAX` (a code-block / precinct
-/// edge can in principle exceed `u32` for hostile exponents; the sub-band
-/// bounds always clip it back into range so the saturation is harmless).
+/// `value * 2^exp` saturating to `u32::MAX`.
+///
+/// A code-block / precinct cell edge reaches `2^32` whenever the cell
+/// containing the last addressable reference-grid sample ends exactly at
+/// the top of the Table A.9 range (e.g. `trx0 = 0xFFFF_FF00`, `PP = 15`:
+/// the single cell is `[0x1_FFFF · 2^15, 0x2_0000 · 2^15)`). Sub-band
+/// bounds are at most `2^32 − 1`, so clamping the edge to `u32::MAX`
+/// never changes the clipped cell. The product is formed in `u64`: a
+/// plain `u32` shift would silently drop the carried-out bits
+/// (`checked_shl` only rejects shift amounts ≥ 32), turning that edge
+/// into `0` and emptying the cell.
 #[inline]
 fn pow2_mul(value: u32, exp: u8) -> u32 {
     if exp >= 32 {
         if value == 0 { 0 } else { u32::MAX }
     } else {
-        value.checked_shl(exp as u32).unwrap_or(u32::MAX)
+        u32::try_from(u64::from(value) << exp).unwrap_or(u32::MAX)
     }
 }
 
@@ -1437,6 +1441,75 @@ mod tests {
         siz.tile_x_offset = 0;
         let err = validate_siz(&siz).unwrap_err();
         assert!(matches!(err, Error::InvalidMarkerLength));
+    }
+
+    #[test]
+    fn grid_corners_at_the_top_of_table_a9_are_representable() {
+        // Xsiz / Ysiz = 2^32 − 1 with 2:1 sub-sampling: ceil(Xsiz / 2) =
+        // 2^31 must not be formed as `Xsiz + 1`. A single tile spanning
+        // the whole grid (XTsiz = 2^32 − 1) is one tile, and a tile
+        // anchored at XTOsiz = XOsiz = 2^31 with XTsiz = Xsiz satisfies
+        // Equation B-4 even though `XTsiz + XTOsiz` passes u32.
+        let mut siz = siz_b4_worked_example();
+        siz.x_size = u32::MAX;
+        siz.y_size = u32::MAX;
+        siz.x_offset = 0xFFFF_FF00;
+        siz.y_offset = 0x8000_0001;
+        siz.tile_x_offset = 0x8000_0000;
+        siz.tile_y_offset = 0x8000_0000;
+        siz.tile_width = u32::MAX;
+        siz.tile_height = u32::MAX;
+        validate_siz(&siz).unwrap();
+        assert_eq!(tile_grid_extent(&siz).unwrap(), (1, 1));
+        let area = image_area(&siz).unwrap();
+        assert_eq!(
+            (area[1].x0, area[1].y0, area[1].x1, area[1].y1),
+            (0x7FFF_FF80, 0x4000_0001, 0x8000_0000, 0x8000_0000)
+        );
+        let tile = derive_tile_geometry(&siz, 0).unwrap();
+        assert_eq!(
+            (tile.tx0, tile.ty0, tile.tx1, tile.ty1),
+            (0xFFFF_FF00, 0x8000_0001, u32::MAX, u32::MAX)
+        );
+        assert_eq!(tile.components[1].tcx1, 0x8000_0000);
+        // Origin-anchored full-range tile.
+        siz.tile_x_offset = 0;
+        siz.tile_y_offset = 0;
+        assert_eq!(tile_grid_extent(&siz).unwrap(), (1, 1));
+        // Equation B-4 still rejects a tile grid that misses the image.
+        siz.tile_width = 0xFFFF_FF00;
+        assert!(validate_siz(&siz).is_err());
+    }
+
+    #[test]
+    fn cell_edges_reaching_2_pow_32_saturate_instead_of_wrapping() {
+        assert_eq!(pow2_mul(0x2_0000, 15), u32::MAX);
+        assert_eq!(pow2_mul(0x1_FFFF, 15), 0xFFFF_8000);
+        assert_eq!(pow2_mul(1, 31), 0x8000_0000);
+        assert_eq!(pow2_mul(2, 31), u32::MAX);
+        assert_eq!(pow2_mul(0, 40), 0);
+        // A level whose single precinct and code-block end at 2^32
+        // keeps its code-block.
+        let levels = derive_resolution_levels(
+            TileComponentGeometry {
+                tcx0: 0xFFFF_FFC0,
+                tcy0: 0,
+                tcx1: 0xFFFF_FFCD,
+                tcy1: 11,
+            },
+            0,
+        );
+        let pcb = derive_precinct_code_blocks(
+            &levels[0],
+            PrecinctExponents { ppx: 15, ppy: 15 },
+            6,
+            6,
+            0,
+        )
+        .unwrap();
+        let blocks: Vec<_> = pcb.sub_bands.iter().flat_map(|b| &b.code_blocks).collect();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!((blocks[0].x0, blocks[0].x1), (0xFFFF_FFC0, 0xFFFF_FFCD));
     }
 
     #[test]
