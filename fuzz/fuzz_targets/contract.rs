@@ -9,7 +9,9 @@
 //! a successful `decode` must agree with `info` on geometry and layout,
 //! validate, and convert to RGB(A) without panicking. The first byte
 //! of the input scripts the options so the reduced / layer-limited /
-//! strict paths get their share of the corpus.
+//! strict paths get their share of the corpus. Every input is also
+//! decoded under a worker budget of three, which must reproduce the
+//! serial outcome exactly.
 //!
 //! ## Bounds
 //!
@@ -45,6 +47,25 @@ fuzz_target!(|data: &[u8]| {
     } else {
         decode_with(bytes, &DecodeOptions::default().with_max_width(1024).with_max_height(1024).with_max_bytes(64 << 20))
     };
+    // The worker budget is output-neutral: a threaded decode returns
+    // the serial planes, or the serial error.
+    let threaded = if script & 8 != 0 {
+        decode_with(bytes, &opts.clone().with_threads(3))
+    } else {
+        decode_with(
+            bytes,
+            &DecodeOptions::default()
+                .with_max_width(1024)
+                .with_max_height(1024)
+                .with_max_bytes(64 << 20)
+                .with_threads(3),
+        )
+    };
+    match (&img, &threaded) {
+        (Ok(serial), Ok(threaded)) => assert_eq!(serial.planes, threaded.planes),
+        (Err(serial), Err(threaded)) => assert_eq!(serial.to_string(), threaded.to_string()),
+        _ => panic!("thread budget changed the decode outcome"),
+    }
     if let Ok(img) = img {
         img.validate().expect("decoded image validates");
         if let Ok(i) = &info {

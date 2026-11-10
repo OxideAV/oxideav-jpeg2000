@@ -6,8 +6,10 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Added
 
+- `PLM` (T.800 §A.7.2, packet lengths in the main header), both directions. `EncodeOptions::plm` / `with_plm` (registry key `plm`) emits the `(Nplm, Iplm…)` series for every tile-part in `Zplm`-indexed segments; a tile-part whose lengths need more than the 8-bit `Nplm` can count makes the encode an error, as the marker "shall not be used" there. The decoder gathers the series (runs may continue in the next segment; a segment or run ending inside a packet length, a truncated series and a repeated `Zplm` are rejected) and cross-validates it against the walked packets of every tile-part exactly as it does `PLT`; a disagreement is the new `Error::PlmMismatch`. Previously a `PLM` was skipped unread and never written.
 - Worker budget: `DecodeOptions::threads` / `with_threads` and `EncodeOptions::threads` / `with_threads`; the framework `Decoder` / `Encoder` adapters take it from `set_execution_context` (`oxideav_core::ExecutionContext`). Serial by default (nothing is spawned at a budget of 1); scoped `std` threads, no new dependency.
 - `examples/perf_suite.rs` (encode + decode timings over synthetic rgb8 / rgb16 / lossy 9-7 / 4K / HTJ2K cases, contract API or registry path, any thread budget) and `examples/corpus_hash.rs` (decoded-sample and codestream hashes over a file corpus plus an encoder option matrix, for comparing two builds).
+- Fuzz: `contract` decodes every input a second time under a worker budget of three and requires the serial outcome (planes or error text); `roundtrip_encode` requires a threaded encode to emit the serial bytes and scripts the `plm` option.
 
 ### Performance
 

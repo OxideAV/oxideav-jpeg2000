@@ -399,6 +399,12 @@ impl CodecOptionsStruct for RegistryEncodeOptions {
             help: "Emit a TLM tile-part-length marker.",
         },
         OptionField {
+            name: "plm",
+            kind: OptionKind::Bool,
+            default: OptionValue::Bool(false),
+            help: "Emit main-header PLM packet-length markers (at most 255 length bytes per tile-part).",
+        },
+        OptionField {
             name: "sop",
             kind: OptionKind::Bool,
             default: OptionValue::Bool(false),
@@ -490,6 +496,7 @@ impl CodecOptionsStruct for RegistryEncodeOptions {
             "ht" => o.high_throughput = value.as_bool()?,
             "plt" => o.plt = value.as_bool()?,
             "tlm" => o.tlm = value.as_bool()?,
+            "plm" => o.plm = value.as_bool()?,
             "sop" => o.sop = value.as_bool()?,
             "eph" => o.eph = value.as_bool()?,
             "comment" => {
@@ -701,7 +708,7 @@ pub fn make_encoder(params: &CodecParameters) -> oxideav_core::Result<Box<dyn En
 /// `frame_rate`, else bits per frame) becomes a PCRD byte budget, and
 /// the `CodecOptions` keys are those of [`RegistryEncodeOptions`]
 /// (`lossless`, `fine_bits`, `psnr`, `target_bytes`, `levels`,
-/// `layers`, `progression`, `tile`, `ht`, `plt`, `tlm`, `sop`, `eph`,
+/// `layers`, `progression`, `tile`, `ht`, `plt`, `tlm`, `plm`, `sop`, `eph`,
 /// `comment`, `container` — default `j2k`).
 #[derive(Debug)]
 pub struct Jpeg2000Encoder {

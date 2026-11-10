@@ -130,6 +130,13 @@ pub enum Jpeg2000Error {
     /// span, an incomplete trailing `Iplt`, or duplicate `Zplt`
     /// sequencing. Signals a lost, resized or reordered packet.
     PltMismatch,
+    /// The main-header `PLM` packet-length lists (T.800 §A.7.2)
+    /// disagree with the codestream: the `(Nplm, Iplm)` series does
+    /// not hold exactly one entry per tile-part, an entry's packet
+    /// count or an `Iplm` != the real packets of its tile-part, a
+    /// marker segment ends inside a packet length, the series is
+    /// truncated, or `Zplm` indices repeat.
+    PlmMismatch,
     /// An HTJ2K (ITU-T T.814 | ISO/IEC 15444-15) HT segment did not
     /// conform to the §7.1 bit-stream-recovery constraints — e.g. a
     /// stuffing bit was non-zero, a state machine ran past its bound,
@@ -233,6 +240,10 @@ impl core::fmt::Display for Jpeg2000Error {
             Error::PltMismatch => write!(
                 f,
                 "oxideav-jpeg2000: PLT packet lengths disagree with the actual packets (T.800 A.7.3)"
+            ),
+            Error::PlmMismatch => write!(
+                f,
+                "oxideav-jpeg2000: PLM packet lengths disagree with the actual packets (T.800 A.7.2)"
             ),
             Error::HtCorruptSegment => write!(
                 f,

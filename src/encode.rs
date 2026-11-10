@@ -1505,6 +1505,19 @@ pub struct EncodeOptions {
     /// with `ST = 1` (8-bit `Ttlm`) while every tile index fits, else
     /// `ST = 2`, and `SP = 1` (32-bit `Ptlm`). Default `false`.
     pub tlm: bool,
+    /// §A.7.2 packet-length pointer marker in the main header: `PLM`
+    /// marker segments (`Zplm`-indexed, each ending on a completed
+    /// packet length) list, for every tile-part in codestream order,
+    /// the byte count `Nplm` of its Table A.36 `Iplm` lengths followed
+    /// by one length per packet — the same lengths `PLT` carries in
+    /// the tile-part headers, and the two may be combined. `Nplm` is
+    /// an 8-bit count: "if a codestream contains one or more
+    /// tile-parts exceeding the limitations of PLM markers, these
+    /// markers shall not be used", so an image whose tile-part needs
+    /// more than 255 `Iplm` bytes is rejected with this option set
+    /// (use smaller tiles, a tile-part split, or `PLT`). Default
+    /// `false`.
+    pub plm: bool,
     /// §A.9.2 comment: when set, one main-header `COM` marker segment
     /// with `Rcom = 1` (Table A.44, ISO/IEC 8859-15 text) carries the
     /// string — ASCII only here (a subset of 8859-15), non-empty, at
@@ -1593,6 +1606,7 @@ impl Default for EncodeOptions {
             packed_headers: PackedHeaders::InStream,
             plt: false,
             tlm: false,
+            plm: false,
             comment: None,
             high_throughput: false,
             ht_refinement: false,
@@ -1719,6 +1733,13 @@ impl EncodeOptions {
     /// Emit a main-header `TLM` tile-part-length marker.
     pub fn with_tlm(mut self, tlm: bool) -> Self {
         self.tlm = tlm;
+        self
+    }
+
+    /// Emit main-header `PLM` packet-length markers (see
+    /// [`Self::plm`] for the per-tile-part limit).
+    pub fn with_plm(mut self, plm: bool) -> Self {
+        self.plm = plm;
         self
     }
 
@@ -3740,6 +3761,48 @@ fn encode_core(
                     payload.extend_from_slice(&psot.to_be_bytes());
                 }
                 push_segment(&mut out, crate::MARKER_TLM, &payload);
+            }
+        }
+
+        // PLM (§A.7.2, Tables A.35 / A.36): per tile-part in codestream
+        // order, Nplm (the byte count of its Iplm lengths) then one
+        // Table A.36 length per packet; chunked into Zplm-indexed
+        // segments that never end on a bare Nplm prefix or inside a
+        // length.
+        if params.plm {
+            let mut atoms: Vec<PackedAtom> = Vec::new();
+            for parts in &tile_bodies {
+                for part in parts {
+                    let lengths: Vec<Vec<u8>> = part
+                        .packet_lens
+                        .iter()
+                        .map(|&len| iplt_bytes(len as u64))
+                        .collect();
+                    let nplm: usize = lengths.iter().map(Vec::len).sum();
+                    // Nplm is 8 bits: a tile-part past the marker's
+                    // reach means PLM "shall not be used".
+                    let nplm = u8::try_from(nplm).map_err(|_| Error::NotImplemented)?;
+                    atoms.push(PackedAtom {
+                        bytes: vec![nplm],
+                        boundary: lengths.is_empty(),
+                    });
+                    atoms.extend(lengths.into_iter().map(|bytes| PackedAtom {
+                        bytes,
+                        boundary: true,
+                    }));
+                }
+            }
+            // Lplm = 2 + 1 (Zplm) + payload ≤ 65 535.
+            let chunks = chunk_packed_headers(&atoms, 65_535 - 3)?;
+            if chunks.len() > 256 {
+                // Zplm is an 8-bit index (Table A.35).
+                return Err(Error::NotImplemented);
+            }
+            for (z, chunk) in chunks.iter().enumerate() {
+                let mut payload = Vec::with_capacity(1 + chunk.len());
+                payload.push(z as u8); // Zplm
+                payload.extend_from_slice(chunk);
+                push_segment(&mut out, crate::MARKER_PLM, &payload);
             }
         }
 

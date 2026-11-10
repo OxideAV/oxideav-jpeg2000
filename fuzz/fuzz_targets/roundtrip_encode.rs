@@ -255,6 +255,7 @@ fuzz_target!(|data: &[u8]| {
     params.packed_headers = packed_headers;
     params.plt = c.bool();
     params.tlm = c.bool();
+    params.plm = c.bool();
     params.comment = c.bool().then(|| "fuzz".into());
     params.high_throughput = ht && !mixed;
     params.ht_refinement = mode == 5;
@@ -281,10 +282,24 @@ fuzz_target!(|data: &[u8]| {
         .collect();
     let plane_refs: Vec<&[u8]> = planes_data.iter().map(Vec::as_slice).collect();
 
+    // The worker budget is output-neutral: a threaded encode emits the
+    // serial bytes (rate allocation included) or fails the same way.
+    let threaded = encode_j2k(
+        &plane_refs,
+        width,
+        height,
+        &params.clone().with_threads(3),
+    );
     let Ok(stream) = encode_j2k(&plane_refs, width, height, &params) else {
         // Illegal combination — the clean reject is the tested contract.
+        assert!(threaded.is_err(), "threaded encode accepted a rejected combination");
         return;
     };
+    assert_eq!(
+        threaded.expect("threaded encode of an accepted combination"),
+        stream,
+        "thread budget changed the codestream"
+    );
 
     // JP2 / JPH wrapping with the conventional header: the container
     // writer re-parses its own output, and the container decoder must

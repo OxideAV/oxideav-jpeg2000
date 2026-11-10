@@ -153,7 +153,7 @@ differs from the label's depth. Decoder options: `reduce`, `layers`,
 The encoder accepts every `Jpeg2000PixelFormat` (plus `Bgr24` / `Bgra`,
 re-ordered) and the `CodecOptions` keys `lossless`, `fine_bits`,
 `psnr`, `target_bytes` (or `bit_rate` / `frame_rate`), `levels`,
-`layers`, `progression`, `tile`, `ht`, `plt`, `tlm`, `sop`, `eph`,
+`layers`, `progression`, `tile`, `ht`, `plt`, `tlm`, `plm`, `sop`, `eph`,
 `comment`, `container` (default `j2k` — the framework carries colour on
 the frame; `jp2` / `jph` wrap the file). `From<Jpeg2000Image> for
 VideoFrame`, `Jpeg2000Image::from_video_frame(&VideoFrame,
@@ -210,7 +210,7 @@ first `n` quality layers. `threads` is the worker budget (see
 rate control), `tile_size`, the Table A.19 style flags (`bypass`,
 `terminate_all`, `reset_probabilities`, `vertically_causal`,
 `predictable_termination`, `segmentation_symbols`), `sop` / `eph`,
-`plt` / `tlm`, `comment`, `high_throughput` / `ht_refinement` /
+`plt` / `tlm` / `plm`, `comment`, `high_throughput` / `ht_refinement` /
 `ht_mixed` (T.814), `tile_parts`, `poc`, `packed_headers`, `roi`,
 `sub_sampling` and `component_overrides` (the last two for the
 plane-level encoders; `encode` derives sub-sampling from the layout),
@@ -295,10 +295,12 @@ non-zero **image and tile origin offsets** (XOsiz/YOsiz + XTOsiz/YTOsiz
 reference-grid anchoring, 5-3 and 9-7), **tile-parts split by layer**
 (TPsot > 0 chains), **tile-parts interleaved across tiles** (the
 §A.4.2 round-robin layout, with the TPsot ordering / TNsot count
-rules enforced against lost or mis-assembled chains), **PLT** and
-**TLM** pointer markers (both actively **cross-validated** against the
-walked packets / tile-parts — a corrupted pointer is rejected, not
-skipped), **MCT-off**
+rules enforced against lost or mis-assembled chains), **PLT**, **PLM**
+and **TLM** pointer markers (all actively **cross-validated** against
+the walked packets / tile-parts — a corrupted pointer is rejected, not
+skipped; a `PLM` series must list every tile-part, may continue an
+`Nplm` run in the next `Zplm` segment, and may not break inside a
+packet length), **MCT-off**
 RGB, **signed 8- and 12-bit** and **unsigned 16-bit** depths,
 all-component **reference-grid sub-sampling** (XRsiz = 2 planes pinned
 against §B.2.6 PGX reference decodes), the **JP2 container** from a
@@ -715,6 +717,16 @@ it):
     corrupted entry) across framings, relocations, splits, styles,
     PCRD, ROI and the HT lanes; an opaque-encoder SOP + EPH + PLT +
     TLM fixture pins the `Iplt`-spans-from-SOP convention.
+  - **`PLM` pointer marker** (§A.7.2): `plm` lists every tile-part's
+    packet lengths in the main header — `Nplm` (the byte count of the
+    tile-part's Table A.36 lengths) then one `Iplm` per packet, in
+    codestream order, chunked into `Zplm`-indexed segments that never
+    end on a bare `Nplm` or inside a length. `Nplm` is 8 bits, so a
+    tile-part needing more than 255 length bytes makes the option an
+    error ("these markers shall not be used") — split the tile into
+    parts or use `PLT`. Combines with `PLT` / `TLM`, PPM / PPT
+    relocation (lengths then exclude the headers), tile-part splits,
+    rate control and the HT lanes.
   - **`COM` comment** (§A.9.2): a main-header `Rcom = 1` Latin text
     segment via `EncodeOptions::comment`.
   - **Packed packet headers** (§A.7.4 / §A.7.5): every §B.10 packet
@@ -771,7 +783,7 @@ it):
   `Rgb48Le` / `Rgba64Le` layouts, `bit_rate` (over `frame_rate`, or
   per frame) as a PCRD byte budget, and a `CodecOptions` bag
   (`lossless`, `fine_bits`, `psnr`, `target_bytes`, `levels`,
-  `layers`, `progression`, `tile`, `ht`, `plt` / `tlm` / `sop` /
+  `layers`, `progression`, `tile`, `ht`, `plt` / `tlm` / `plm` / `sop` /
   `eph`, `comment`, `container = jp2`); the contract `encode_rgb8` /
   `encode_rgba8` / `encode` are the standalone doors to the same
   pipeline.
@@ -841,11 +853,6 @@ combination.
 
 These surface a clean `Error::NotImplemented` rather than mis-decoding:
 
-- **`PLM`** (§A.7.2, main-header packet lengths): not emitted — this
-  crate's decoder treats a `PLM` as an opaque main-header segment
-  rather than cross-validating it, so an emitted `PLM` would be
-  unverifiable here; `PLT` + `TLM` carry the same information in
-  validated form.
 - A mixed-kernel tile that also signals a multiple-component transform
   (`Rmct = 1`) — the RCT / ICT requires one kernel across components
   0–2. (The `COC` overrides themselves — per-component `NL` /

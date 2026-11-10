@@ -3,7 +3,7 @@
 //! ```text
 //! cargo run --release --example perf_suite -- [--threads N] [--rounds N]
 //!     [--case SUBSTRING] [--only enc|dec] [--registry] [--hash-only]
-//!     [--save DIR]
+//!     [--save DIR] [--load DIR]
 //! ```
 //!
 //! Cases: `rgb8-1024` and `rgb16-1024` lossless 5-3, `rgb8-512` lossy
@@ -15,8 +15,12 @@
 //! two builds (or two thread budgets) can be compared for identical
 //! output. Image synthesis, hashing and verification are not timed.
 //!
-//! `--save DIR` also writes each case's codestream to `DIR/<case>.j2k`
-//! (input for `decoder_perf` or a black-box decoder).
+//! `--only enc` skips decoding altogether and `--only dec` encodes just
+//! once. `--save DIR` also writes each case's codestream to
+//! `DIR/<case>.j2k` (input for `decoder_perf` or a black-box decoder);
+//! `--load DIR` (with `--only dec`) reads the codestream from there
+//! instead of encoding, so the process holds nothing but the decode —
+//! the shape to measure decoder peak memory with.
 //!
 //! `--registry` drives the same cases through the framework
 //! `Encoder` / `Decoder` adapters (requires the default `registry`
@@ -105,6 +109,9 @@ struct Case {
     height: u32,
     bits: u8,
     options: EncodeOptions,
+    /// The same settings as `CodecOptions` keys for the registry path.
+    #[cfg_attr(not(feature = "registry"), allow(dead_code))]
+    registry_keys: &'static [(&'static str, &'static str)],
     lossless: bool,
 }
 
@@ -117,6 +124,7 @@ fn cases() -> Vec<Case> {
             height: 1024,
             bits: 8,
             options: base().with_decomposition_levels(5),
+            registry_keys: &[("levels", "5")],
             lossless: true,
         },
         Case {
@@ -125,6 +133,7 @@ fn cases() -> Vec<Case> {
             height: 1024,
             bits: 16,
             options: base().with_decomposition_levels(5),
+            registry_keys: &[("levels", "5")],
             lossless: true,
         },
         Case {
@@ -133,6 +142,7 @@ fn cases() -> Vec<Case> {
             height: 512,
             bits: 8,
             options: base().with_decomposition_levels(5).with_lossy(2),
+            registry_keys: &[("levels", "5"), ("lossless", "false"), ("fine_bits", "2")],
             lossless: false,
         },
         Case {
@@ -145,6 +155,13 @@ fn cases() -> Vec<Case> {
                 .with_lossy(2)
                 .with_layers(4)
                 .with_target_bytes(96 * 1024),
+            registry_keys: &[
+                ("levels", "5"),
+                ("lossless", "false"),
+                ("fine_bits", "2"),
+                ("layers", "4"),
+                ("target_bytes", "98304"),
+            ],
             lossless: false,
         },
         Case {
@@ -153,6 +170,7 @@ fn cases() -> Vec<Case> {
             height: 2160,
             bits: 8,
             options: base().with_decomposition_levels(5),
+            registry_keys: &[("levels", "5")],
             lossless: true,
         },
         Case {
@@ -163,6 +181,7 @@ fn cases() -> Vec<Case> {
             options: base()
                 .with_decomposition_levels(5)
                 .with_high_throughput(true),
+            registry_keys: &[("levels", "5"), ("ht", "true")],
             lossless: true,
         },
     ]
@@ -175,6 +194,9 @@ fn fastest(times: &[Duration]) -> f64 {
 }
 
 fn median(times: &mut [Duration]) -> f64 {
+    if times.is_empty() {
+        return 0.0;
+    }
     times.sort_unstable();
     let middle = times.len() / 2;
     let seconds = if times.len().is_multiple_of(2) {
@@ -202,6 +224,11 @@ mod registry_path {
         } else {
             oxideav_core::PixelFormat::Rgb48Le
         });
+        let mut options = oxideav_core::CodecOptions::new();
+        for (key, value) in case.registry_keys {
+            options = options.set(*key, *value);
+        }
+        params.options = options;
         params
     }
 
@@ -251,6 +278,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut hash_only = false;
     let mut only: Option<String> = None;
     let mut save: Option<std::path::PathBuf> = None;
+    let mut load: Option<std::path::PathBuf> = None;
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
         let mut value = || {
@@ -264,12 +292,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             "--case" => filter = Some(value()?),
             "--only" => only = Some(value()?),
             "--save" => save = Some(value()?.into()),
+            "--load" => load = Some(value()?.into()),
             "--registry" => registry = true,
             "--hash-only" => hash_only = true,
             _ => {
                 return Err(io::Error::other(
                     "use [--threads N] [--rounds N] [--case SUBSTRING] [--only enc|dec] \
-                     [--registry] [--hash-only] [--save DIR]",
+                     [--registry] [--hash-only] [--save DIR] [--load DIR]",
                 )
                 .into());
             }
@@ -289,10 +318,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     let (encode_rounds, decode_rounds) = match only.as_deref() {
         None => (rounds, rounds),
-        Some("enc") => (rounds, 1),
-        Some("dec") => (1, rounds),
+        Some("enc") => (rounds, 0),
+        Some("dec") => (0, rounds),
         Some(_) => return Err(io::Error::other("--only takes enc or dec").into()),
     };
+    if load.is_some() && (encode_rounds != 0 || registry) {
+        return Err(io::Error::other("--load needs --only dec on the contract path").into());
+    }
     println!(
         "path={} threads={threads} rounds={rounds}",
         if registry { "registry" } else { "contract" }
@@ -305,30 +337,43 @@ fn main() -> Result<(), Box<dyn Error>> {
         if filter.as_ref().is_some_and(|f| !case.name.contains(f)) {
             continue;
         }
-        let image = synthetic_rgb(case.width, case.height, case.bits)?;
+        // With --load the process never holds the source picture.
+        let image = match &load {
+            Some(_) => None,
+            None => Some(synthetic_rgb(case.width, case.height, case.bits)?),
+        };
         let encode_options = case.options.clone().with_threads(threads);
         let decode_options = DecodeOptions::new().with_threads(threads);
         #[cfg(feature = "registry")]
-        let frame = registry_path::frame(&image);
+        let frame = image.as_ref().map(registry_path::frame);
 
-        let encode_once = || -> Result<Vec<u8>, Box<dyn Error>> {
+        let encode_once = |image: &Jpeg2000Image| -> Result<Vec<u8>, Box<dyn Error>> {
             #[cfg(feature = "registry")]
             if registry {
-                return registry_path::encode(&case, &frame, threads);
+                let frame = frame
+                    .as_ref()
+                    .expect("a frame exists whenever an image does");
+                return registry_path::encode(&case, frame, threads);
             }
-            Ok(encode(&image, &encode_options)?)
+            Ok(encode(image, &encode_options)?)
         };
-        let reference = encode_once()?;
+        let reference = match (&load, &image) {
+            (Some(directory), _) => std::fs::read(directory.join(format!("{}.j2k", case.name)))?,
+            (None, Some(image)) => encode_once(image)?,
+            (None, None) => unreachable!("an image is synthesised unless a stream is loaded"),
+        };
         if let Some(directory) = &save {
             std::fs::write(directory.join(format!("{}.j2k", case.name)), &reference)?;
         }
         let mut encode_times = Vec::with_capacity(encode_rounds);
-        for _ in 0..encode_rounds {
-            let start = Instant::now();
-            let bytes = encode_once()?;
-            encode_times.push(start.elapsed());
-            if bytes != reference {
-                return Err(io::Error::other("repeated encode changed the codestream").into());
+        if let Some(image) = &image {
+            for _ in 0..encode_rounds {
+                let start = Instant::now();
+                let bytes = encode_once(image)?;
+                encode_times.push(start.elapsed());
+                if bytes != reference {
+                    return Err(io::Error::other("repeated encode changed the codestream").into());
+                }
             }
         }
 
@@ -347,20 +392,25 @@ fn main() -> Result<(), Box<dyn Error>> {
             let start = Instant::now();
             let decoded = decode_with(&reference, &decode_options)?;
             let elapsed = start.elapsed();
-            if case.lossless
+            if let Some(image) = &image
+                && case.lossless
                 && decoded.planes.first().map(|p| &p.data) != image.planes.first().map(|p| &p.data)
             {
                 return Err(io::Error::other("lossless decode changed the samples").into());
             }
             Ok((elapsed, hash_image(&decoded)))
         };
-        let (_, samples) = decode_once()?;
+        let mut samples = 0u64;
         let mut decode_times = Vec::with_capacity(decode_rounds);
-        for _ in 0..decode_rounds {
-            let (elapsed, hash) = decode_once()?;
-            decode_times.push(elapsed);
-            if hash != samples {
-                return Err(io::Error::other("repeated decode changed the samples").into());
+        if decode_rounds > 0 {
+            // One untimed warm-up, which also pins the expected hash.
+            samples = decode_once()?.1;
+            for _ in 0..decode_rounds {
+                let (elapsed, hash) = decode_once()?;
+                decode_times.push(elapsed);
+                if hash != samples {
+                    return Err(io::Error::other("repeated decode changed the samples").into());
+                }
             }
         }
         println!(

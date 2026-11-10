@@ -1242,6 +1242,9 @@ fn decode_tile(
     // When present, the walked packets are cross-validated against
     // the listed lengths — see `validate_plt_lengths`.
     plt: Option<&[TilePartPlt]>,
+    // §A.7.2 main-header `PLM` packet-length lists for this tile's
+    // tile-parts, in the same shape and cross-validated the same way.
+    plm: Option<&[TilePartPlt]>,
     // Worker budget for the tier-1 / synthesis fan-out (1 = serial).
     threads: usize,
 ) -> Result<Vec<Vec<i32>>, Error> {
@@ -1274,8 +1277,15 @@ fn decode_tile(
         .iter()
         .any(|(_, _, split)| *split == SegmentSplit::Mixed);
     let decode_with = |headers: &[(crate::packet::PacketHeader, usize)]| {
+        if let Some(plm) = plm {
+            validate_plt_lengths(plm, headers, relocated_headers.is_some(), || {
+                Error::PlmMismatch
+            })?;
+        }
         if let Some(plt) = plt {
-            validate_plt_lengths(plt, headers, relocated_headers.is_some())?;
+            validate_plt_lengths(plt, headers, relocated_headers.is_some(), || {
+                Error::PltMismatch
+            })?;
         }
         decode_tile_from_plan(
             siz,
@@ -1555,6 +1565,10 @@ fn validate_plt_lengths(
     plt: &[TilePartPlt],
     headers: &[(crate::packet::PacketHeader, usize)],
     relocated: bool,
+    // The error a disagreement reports — the list came from `PLT`
+    // segments or from the main header's `PLM` (§A.7.2, the same
+    // Table A.36 lengths with the same meaning).
+    mismatch: fn() -> Error,
 ) -> Result<(), Error> {
     // Reconstruct each packet's [start, end) span inside the
     // concatenated tile body. For the in-stream framing the header
@@ -1593,11 +1607,11 @@ fn validate_plt_lengths(
         if let Some(lengths) = lengths {
             let got = &spans[first..next_packet];
             if got.len() != lengths.len() {
-                return Err(Error::PltMismatch);
+                return Err(mismatch());
             }
             for ((start, end), &listed) in got.iter().zip(lengths.iter()) {
                 if (end - start) as u64 != listed {
-                    return Err(Error::PltMismatch);
+                    return Err(mismatch());
                 }
             }
         }
@@ -2837,6 +2851,17 @@ fn decode_codestream_impl(
             }
         }
     }
+    // §A.7.2: a main-header `PLM` lists the packet lengths of *every*
+    // tile-part, "one value for each tile-part" in codestream order.
+    // The lists are cross-validated against the walked packets tile by
+    // tile below, exactly as the `PLT` lists are; a series that does
+    // not cover the tile-part chain one to one is rejected here.
+    let main_plm = crate::collect_main_header_plm(bytes, cs.header.bytes_consumed)?;
+    if let Some(plm) = &main_plm
+        && plm.len() != cs.tile_parts.len()
+    {
+        return Err(Error::PlmMismatch);
+    }
     if main_ppm.is_some() {
         for tp in &cs.tile_parts {
             if tp
@@ -3054,6 +3079,23 @@ fn decode_codestream_impl(
             plt_plan.push((tp.body_len, Some(lengths)));
         }
 
+        // §A.7.2: this tile's share of the main-header `PLM` lists —
+        // one per tile-part, addressed by codestream ordinal.
+        let plm_plan: Option<Vec<TilePartPlt>> = match &main_plm {
+            Some(plm) => {
+                let mut plan = Vec::with_capacity(parts.len());
+                for tp in &parts {
+                    let ord = *tp_ordinal
+                        .get(&(tp.sot.tile_index, tp.sot.tile_part_index))
+                        .ok_or(Error::InvalidTilePartIndex)?;
+                    let lengths = plm.get(ord).ok_or(Error::PlmMismatch)?;
+                    plan.push((tp.body_len, Some(lengths.clone())));
+                }
+                Some(plan)
+            }
+            None => None,
+        };
+
         let tile_planes = decode_tile(
             siz,
             &tile_coding.params,
@@ -3067,6 +3109,7 @@ fn decode_codestream_impl(
             discard_levels,
             max_layers,
             any_plt.then_some(plt_plan.as_slice()),
+            plm_plan.as_deref(),
             threads,
         )?;
 

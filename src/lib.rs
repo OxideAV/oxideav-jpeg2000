@@ -188,6 +188,9 @@ pub const MARKER_POC: u16 = 0xFF5F;
 /// `PLT` — Packet length, tile-part header (T.800 Table A.37).
 #[doc(hidden)]
 pub const MARKER_PLT: u16 = 0xFF58;
+/// `PLM` — Packet length, main header (T.800 Table A.35).
+#[doc(hidden)]
+pub const MARKER_PLM: u16 = 0xFF57;
 /// `PPT` — Packed packet headers, tile-part header (T.800 Table A.39).
 #[doc(hidden)]
 pub const MARKER_PPT: u16 = 0xFF61;
@@ -1682,6 +1685,97 @@ pub(crate) fn collect_main_header_tlm(
     Ok(Some(out))
 }
 
+/// Gather the main header's §A.7.2 `PLM` marker segments into the
+/// packet-length list of every tile-part: entry `k` holds the `Iplm`
+/// lengths of the `k`-th tile-part in codestream order. `Ok(None)`
+/// when the header carries no `PLM`.
+///
+/// The `(Nplm, Iplm…)` series of the segments are concatenated in
+/// increasing `Zplm` order (a repeated index makes that ambiguous).
+/// An `Nplm` byte count may run on into the next segment — "the next
+/// PLM marker segment will not have an Nplm parameter after Zplm, but
+/// the continuation of the Iplm series" — but "every marker segment in
+/// this series shall end with a completed packet header length", so a
+/// segment (and an `Nplm` run) that stops inside a Table A.36 length
+/// is rejected, as is a series that ends before its last `Nplm` run
+/// is complete.
+pub(crate) fn collect_main_header_plm(
+    bytes: &[u8],
+    header_end: usize,
+) -> Result<Option<Vec<Vec<u64>>>, Error> {
+    let mut segs: Vec<(u8, &[u8])> = Vec::new();
+    let mut pos = 2usize; // skip SOC (no length field)
+    while pos + 4 <= header_end {
+        let marker = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]);
+        let len = u16::from_be_bytes([bytes[pos + 2], bytes[pos + 3]]) as usize;
+        if len < 2 {
+            return Err(Error::InvalidMarkerLength);
+        }
+        if marker == MARKER_PLM {
+            // Table A.35: Lplm >= 4 — the length, Zplm and at least
+            // one byte of the series.
+            if len < 4 {
+                return Err(Error::InvalidMarkerLength);
+            }
+            let payload_end = pos + 2 + len;
+            if payload_end > header_end {
+                return Err(Error::InvalidMarkerLength);
+            }
+            segs.push((bytes[pos + 4], &bytes[pos + 5..payload_end]));
+        }
+        pos += 2 + len;
+    }
+    if segs.is_empty() {
+        return Ok(None);
+    }
+    segs.sort_by_key(|(z, _)| *z);
+    if segs.windows(2).any(|w| w[0].0 == w[1].0) {
+        return Err(Error::PlmMismatch);
+    }
+    let mut tile_parts: Vec<Vec<u64>> = Vec::new();
+    // Bytes of the current tile-part's Iplm run still to come (0: the
+    // next byte is an Nplm), and the Table A.36 length being built.
+    let mut run_left = 0usize;
+    let mut length = 0u64;
+    let mut mid_length = false;
+    for (_, series) in segs {
+        for &byte in series {
+            if run_left == 0 {
+                run_left = usize::from(byte);
+                tile_parts.push(Vec::new());
+                continue;
+            }
+            run_left -= 1;
+            // Seven bits per byte, most significant group first; a
+            // packet length is at most a 32-bit quantity.
+            length = (length << 7) | u64::from(byte & 0x7F);
+            if length > u64::from(u32::MAX) {
+                return Err(Error::PlmMismatch);
+            }
+            mid_length = byte & 0x80 != 0;
+            if !mid_length {
+                tile_parts
+                    .last_mut()
+                    .ok_or(Error::PlmMismatch)?
+                    .push(length);
+                length = 0;
+            } else if run_left == 0 {
+                // The Nplm byte count ended inside a length.
+                return Err(Error::PlmMismatch);
+            }
+        }
+        if mid_length {
+            // "Every marker segment in this series shall end with a
+            // completed packet header length."
+            return Err(Error::PlmMismatch);
+        }
+    }
+    if run_left != 0 {
+        return Err(Error::PlmMismatch);
+    }
+    Ok(Some(tile_parts))
+}
+
 // ---------------------------------------------------------------------------
 // Tile-part walker (T.800 §A.4.2 / §A.4.3 — SOT + SOD).
 // ---------------------------------------------------------------------------
@@ -3055,5 +3149,91 @@ mod tests {
         payload.extend_from_slice(&[0x1, 0x2]);
         let err = collect_ppm(&[ppm_segment(0, &payload)]).unwrap_err();
         assert!(matches!(err, Error::InvalidMarkerLength));
+    }
+
+    // -- §A.7.2 PLM series ---------------------------------------------
+
+    /// `SOC` followed by one `PLM` segment per `(Zplm, series bytes)`.
+    fn plm_header(segments: &[(u8, &[u8])]) -> Vec<u8> {
+        let mut bytes = vec![0xFF, 0x4F];
+        for (z, series) in segments {
+            bytes.extend_from_slice(&MARKER_PLM.to_be_bytes());
+            bytes.extend_from_slice(&((series.len() + 3) as u16).to_be_bytes());
+            bytes.push(*z);
+            bytes.extend_from_slice(series);
+        }
+        bytes
+    }
+
+    fn plm_lists(segments: &[(u8, &[u8])]) -> Result<Option<Vec<Vec<u64>>>, Error> {
+        let bytes = plm_header(segments);
+        collect_main_header_plm(&bytes, bytes.len())
+    }
+
+    #[test]
+    fn plm_absent_is_none() {
+        assert_eq!(collect_main_header_plm(&[0xFF, 0x4F], 2).unwrap(), None);
+    }
+
+    #[test]
+    fn plm_series_lists_one_entry_per_nplm_run() {
+        // Tile-part 0: lengths 5, 128 (0x81 0x00), 512 (0x84 0x00);
+        // tile-part 1: no packets; tile-part 2: length 0x3FFF.
+        let series = [5, 5, 0x81, 0x00, 0x84, 0x00, 0, 2, 0xFF, 0x7F];
+        assert_eq!(
+            plm_lists(&[(0, &series)]).unwrap(),
+            Some(vec![vec![5, 128, 512], vec![], vec![0x3FFF]])
+        );
+    }
+
+    #[test]
+    fn plm_run_continues_in_the_next_segment_by_zplm_order() {
+        // The first tile-part's five Iplm bytes are split 3 + 2, on a
+        // completed length; the segments arrive out of Zplm order.
+        let lists = plm_lists(&[(7, &[0x84, 0x00, 1, 9]), (2, &[5, 5, 0x81, 0x00])]).unwrap();
+        assert_eq!(lists, Some(vec![vec![5, 128, 512], vec![9]]));
+    }
+
+    #[test]
+    fn plm_malformed_series_are_rejected() {
+        // A segment ending inside a packet length.
+        assert!(matches!(
+            plm_lists(&[(0, &[3, 5, 0x81]), (1, &[0x00])]),
+            Err(Error::PlmMismatch)
+        ));
+        // An Nplm run ending inside a packet length.
+        assert!(matches!(
+            plm_lists(&[(0, &[1, 0x81, 1, 0x00])]),
+            Err(Error::PlmMismatch)
+        ));
+        // A series ending before its last run is complete.
+        assert!(matches!(
+            plm_lists(&[(0, &[4, 1, 2])]),
+            Err(Error::PlmMismatch)
+        ));
+        // A repeated Zplm.
+        assert!(matches!(
+            plm_lists(&[(1, &[1, 1]), (1, &[1, 2])]),
+            Err(Error::PlmMismatch)
+        ));
+        // A packet length past 32 bits.
+        assert!(matches!(
+            plm_lists(&[(0, &[6, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F])]),
+            Err(Error::PlmMismatch)
+        ));
+        // Table A.35: Lplm of at least 4.
+        let mut bare = vec![0xFF, 0x4F];
+        bare.extend_from_slice(&[0xFF, 0x57, 0x00, 0x03, 0x00]);
+        assert!(matches!(
+            collect_main_header_plm(&bare, bare.len()),
+            Err(Error::InvalidMarkerLength)
+        ));
+        // A segment running past the header.
+        let mut long = vec![0xFF, 0x4F];
+        long.extend_from_slice(&[0xFF, 0x57, 0x00, 0x09, 0x00, 1, 1]);
+        assert!(matches!(
+            collect_main_header_plm(&long, long.len()),
+            Err(Error::InvalidMarkerLength)
+        ));
     }
 }

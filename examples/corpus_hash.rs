@@ -1,7 +1,7 @@
 //! Output-pinning tool for optimisation work:
 //!
 //! ```text
-//! cargo run --release --example corpus_hash -- [--threads N] [DIR|FILE]...
+//! cargo run --release --example corpus_hash -- [--threads N] [--dump DIR] [DIR|FILE]...
 //! ```
 //!
 //! Decodes every file under the given paths (recursively, sorted) three
@@ -10,7 +10,9 @@
 //! text; then encodes a matrix of small synthetic images across the
 //! encoder's option space and prints each codestream's hash. Diffing
 //! the output of two builds (or two thread budgets) shows whether a
-//! change kept decoded samples and emitted bytes identical.
+//! change kept decoded samples and emitted bytes identical. `--dump DIR`
+//! also writes every matrix codestream to `DIR` (for a black-box
+//! decoder to cross-check).
 
 #![forbid(unsafe_code)]
 
@@ -86,7 +88,7 @@ fn synthetic(width: u32, height: u32, format: PixelFormat, seed: u32) -> Jpeg200
     Jpeg2000Image::packed(width, height, format, data).expect("synthetic image is well-formed")
 }
 
-fn encode_matrix(threads: usize) {
+fn encode_matrix(threads: usize, dump: Option<&std::path::Path>) {
     let base = || {
         EncodeOptions::new()
             .with_container(Container::J2k)
@@ -149,6 +151,15 @@ fn encode_matrix(threads: usize) {
         ),
         ("lossy2-psnr", lossy(2).with_target_psnr(38.0)),
         ("lossy2-nomct", lossy(2).with_mct(false)),
+        ("plm", base().with_plm(true)),
+        (
+            "plm-plt-tlm-tiles",
+            base()
+                .with_plm(true)
+                .with_plt(true)
+                .with_tlm(true)
+                .with_tile_size((40, 56)),
+        ),
         ("ht", base().with_high_throughput(true)),
         ("ht-lossy", lossy(3).with_high_throughput(true)),
         (
@@ -239,6 +250,13 @@ fn encode_matrix(threads: usize) {
         for (name, options) in &variants {
             match encode(image, options) {
                 Ok(bytes) => {
+                    if let Some(directory) = dump {
+                        let extension = if *name == "default-jp2" { "jp2" } else { "j2k" };
+                        let path = directory.join(format!("{image_name}_{name}.{extension}"));
+                        if let Err(error) = std::fs::write(&path, &bytes) {
+                            println!("dump {}: {error}", path.display());
+                        }
+                    }
                     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
                     fnv(&mut hash, &bytes);
                     println!(
@@ -256,10 +274,13 @@ fn encode_matrix(threads: usize) {
 fn main() -> Result<(), Box<dyn Error>> {
     let mut threads = 1usize;
     let mut roots = Vec::new();
+    let mut dump: Option<PathBuf> = None;
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
         if argument == "--threads" {
             threads = arguments.next().ok_or("--threads needs a value")?.parse()?;
+        } else if argument == "--dump" {
+            dump = Some(arguments.next().ok_or("--dump needs a value")?.into());
         } else {
             roots.push(PathBuf::from(argument));
         }
@@ -282,6 +303,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             describe(decode_with(&bytes, &first_layer)),
         );
     }
-    encode_matrix(threads);
+    encode_matrix(threads, dump.as_deref());
     Ok(())
 }
