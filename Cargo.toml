@@ -1,6 +1,6 @@
 [package]
 name = "oxideav-jpeg2000"
-version = "0.0.19"
+version = "0.0.20"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
