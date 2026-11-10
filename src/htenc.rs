@@ -77,22 +77,22 @@ impl MagSgnWriter {
         }
     }
 
-    fn bit(&mut self, b: u32) {
-        self.tmp |= (b & 1) << self.used;
-        self.used += 1;
-        if self.used == self.cap {
-            self.out.push(self.tmp as u8);
-            self.cap = if self.tmp == 0xFF { 7 } else { 8 };
-            self.tmp = 0;
-            self.used = 0;
-        }
-    }
-
     /// Emit `m` bits of `val`, LSB first (§7.3.8 `decodeMagSgnValue`
     /// inner loop, reversed).
-    fn bits(&mut self, val: u32, m: u32) {
-        for i in 0..m {
-            self.bit((val >> i) & 1);
+    fn bits(&mut self, mut val: u32, mut m: u32) {
+        while m > 0 {
+            // Every bit the current byte still has room for, at once.
+            let take = m.min(self.cap - self.used);
+            self.tmp |= (val & ((1u32 << take) - 1)) << self.used;
+            self.used += take;
+            val >>= take;
+            m -= take;
+            if self.used == self.cap {
+                self.out.push(self.tmp as u8);
+                self.cap = if self.tmp == 0xFF { 7 } else { 8 };
+                self.tmp = 0;
+                self.used = 0;
+            }
         }
     }
 

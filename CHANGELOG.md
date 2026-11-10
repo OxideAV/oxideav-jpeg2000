@@ -18,6 +18,10 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 - MQ coder: DECODE and ENCODE evaluate the conditional-exchange flowcharts as one selection and renormalize with a single shift per run of bits inside a byte (the bit-at-a-time loop remains only across byte boundaries).
 - Tier-1 forward passes run on the packed neighbour-state word like the decode passes (no per-coefficient snapshot / write-back, the §D.7 clip hoisted, the run-length eligibility of a stripe column is one OR over its four states).
 - Encoder rate bookkeeping: the per-pass truncation length is computed from the coder registers and its last byte instead of flushing a clone of the whole codeword, and the per-pass distortion sum takes an exact integer lane.
+- Rate control no longer re-encodes truncated code-blocks: the exactly terminated codeword at every pass boundary (the bytes already final plus the termination tail — FLUSH, the predictable procedure or the raw-segment finish) is captured while the block is coded, so the final assembly and every PSNR-search probe splice it instead of running Tier-1 again up to the truncation pass. Debug builds still re-code each truncated block and assert the spliced bytes equal it. The per-block coefficient copies kept for that re-encode are gone from release builds.
+- Encoder front end: components are extracted, transformed and split from the packed input concurrently under the budget; the sub-band split walks rows instead of dispatching per sample, and the 9-7 path no longer quantises the LL band it is about to discard at every level.
+- Decoder back end: a tile that covers a whole component hands its plane over instead of being copied into a second, zero-filled one (one image-sized allocation less on single-tile streams); 2D_INTERLEAVE runs row by row and the packed output layout is written pixel by pixel, both shared out under the budget.
+- HTJ2K MagSgn bits are imported / exported a byte's worth at a time.
 
 ## [0.0.19](https://github.com/OxideAV/oxideav-jpeg2000/compare/v0.0.18...v0.0.19) - 2026-11-07
 

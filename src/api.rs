@@ -591,7 +591,7 @@ pub fn decode_with(bytes: &[u8], opts: &DecodeOptions) -> Result<Jpeg2000Image, 
             Some(c) => jp2::apply_channel_mapping(&c.header, decoded)?.components,
             None => decoded.components,
         };
-        build_image(channels, plan.layout, plan.width, plan.height)?
+        build_image(channels, plan.layout, plan.width, plan.height, opts.threads)?
     };
     image.color = plan.color;
     image.metadata = Metadata::new().with_icc(plan.icc);
@@ -622,6 +622,7 @@ fn build_image(
     layout: Layout,
     width: u32,
     height: u32,
+    threads: usize,
 ) -> Result<Jpeg2000Image, Error> {
     let format = layout.format;
     let bits = layout.bit_depth;
@@ -655,41 +656,43 @@ fn build_image(
             .map(|c| {
                 let stride = c.width as usize * bps;
                 let mut data = vec![0u8; stride * c.height as usize];
-                write_samples(&mut data, &c.samples, 0, 1, bps, max);
+                write_packed(&mut data, &[&c.samples], bps, max, threads);
                 Plane::new(stride, data)
             })
             .collect()
     } else {
-        let n = channels.len();
-        let stride = width as usize * n * bps;
+        let stride = width as usize * channels.len() * bps;
         let mut data = vec![0u8; stride * height as usize];
-        for (ci, c) in channels.iter().enumerate() {
-            write_samples(&mut data, &c.samples, ci, n, bps, max);
-        }
+        let sources: Vec<&[i32]> = channels.iter().map(|c| c.samples.as_slice()).collect();
+        write_packed(&mut data, &sources, bps, max, threads);
         vec![Plane::new(stride, data)]
     };
     Jpeg2000Image::new(width, height, format, planes)?.with_bit_depth(bits)
 }
 
-/// Write `samples` (clamped to `0..=max`) into `data` at sample slots
-/// `k × step + offset`, one or two little-endian bytes each.
-fn write_samples(
-    data: &mut [u8],
-    samples: &[i32],
-    offset: usize,
-    step: usize,
-    bps: usize,
-    max: i64,
-) {
-    for (k, &s) in samples.iter().enumerate() {
-        let v = i64::from(s).clamp(0, max);
-        let at = (k * step + offset) * bps;
-        if bps == 1 {
-            data[at] = v as u8;
-        } else {
-            data[at..at + 2].copy_from_slice(&(v as u16).to_le_bytes());
+/// Interleave the channel planes `sources` (clamped to `0..=max`) into
+/// `data`, pixel by pixel, one or two little-endian bytes per sample;
+/// pixels are shared out over up to `threads` workers.
+fn write_packed(data: &mut [u8], sources: &[&[i32]], bps: usize, max: i64, threads: usize) {
+    let pixel = sources.len() * bps;
+    let max = max.clamp(0, i64::from(i32::MAX)) as i32;
+    let budget = if data.len() < 1 << 18 { 1 } else { threads };
+    crate::parallel::for_each_run(budget, data, pixel, |first, run| {
+        for (channel, source) in sources.iter().enumerate() {
+            let source = &source[first..];
+            let slots = run.chunks_exact_mut(pixel).zip(source);
+            if bps == 1 {
+                for (slot, &sample) in slots {
+                    slot[channel] = sample.clamp(0, max) as u8;
+                }
+            } else {
+                for (slot, &sample) in slots {
+                    let value = sample.clamp(0, max) as u16;
+                    slot[channel * 2..channel * 2 + 2].copy_from_slice(&value.to_le_bytes());
+                }
+            }
         }
-    }
+    });
 }
 
 /// [`decode`] then [`Jpeg2000Image::to_rgb8`]: tightly packed 8-bit RGB.
@@ -772,7 +775,7 @@ pub fn encode(image: &Jpeg2000Image, opts: &EncodeOptions) -> Result<Vec<u8>, Er
     // Split the planes into per-component sample vectors.
     let bps = format.bytes_per_sample();
     let codestream = if bps == 1 {
-        let planes: Vec<Vec<u8>> = component_planes(image, |b| b[0]);
+        let planes: Vec<Vec<u8>> = component_planes(image, opts.threads, |b| b[0]);
         let refs: Vec<&[u8]> = planes.iter().map(Vec::as_slice).collect();
         if bits == 8 {
             encode_j2k(&refs, w, h, &params)?
@@ -785,7 +788,8 @@ pub fn encode(image: &Jpeg2000Image, opts: &EncodeOptions) -> Result<Vec<u8>, Er
             encode_j2k_u16(&refs, w, h, bits, &params)?
         }
     } else {
-        let planes: Vec<Vec<u16>> = component_planes(image, |b| u16::from_le_bytes([b[0], b[1]]));
+        let planes: Vec<Vec<u16>> =
+            component_planes(image, opts.threads, |b| u16::from_le_bytes([b[0], b[1]]));
         let refs: Vec<&[u16]> = planes.iter().map(Vec::as_slice).collect();
         encode_j2k_u16(&refs, w, h, bits, &params)?
     };
@@ -802,38 +806,38 @@ pub fn encode(image: &Jpeg2000Image, opts: &EncodeOptions) -> Result<Vec<u8>, Er
 
 /// Gather component `c`'s samples from the image planes in row-major
 /// order, `read` decoding one sample from its bytes.
-fn component_planes<T: Copy>(image: &Jpeg2000Image, read: impl Fn(&[u8]) -> T) -> Vec<Vec<T>> {
+fn component_planes<T: Copy + Send>(
+    image: &Jpeg2000Image,
+    threads: usize,
+    read: impl Fn(&[u8]) -> T + Sync,
+) -> Vec<Vec<T>> {
     let format = image.format;
     let bps = format.bytes_per_sample();
     let n = format.components();
-    (0..n)
-        .map(|c| {
-            if format.is_yuv() {
-                let (pw, ph) = format.plane_dimensions(c, image.width, image.height);
-                let p = &image.planes[c];
-                let mut out = Vec::with_capacity(pw as usize * ph as usize);
-                for y in 0..ph as usize {
-                    let row = &p.data[y * p.stride..];
-                    for x in 0..pw as usize {
-                        out.push(read(&row[x * bps..x * bps + bps]));
-                    }
-                }
-                out
-            } else {
-                let p = &image.planes[0];
-                let (w, h) = (image.width as usize, image.height as usize);
-                let mut out = Vec::with_capacity(w * h);
-                for y in 0..h {
-                    let row = &p.data[y * p.stride..];
-                    for x in 0..w {
-                        let at = (x * n + c) * bps;
-                        out.push(read(&row[at..at + bps]));
-                    }
-                }
-                out
+    crate::parallel::collect_ordered(threads, n, |c| {
+        if format.is_yuv() {
+            let (pw, ph) = format.plane_dimensions(c, image.width, image.height);
+            let p = &image.planes[c];
+            let mut out = Vec::with_capacity(pw as usize * ph as usize);
+            for y in 0..ph as usize {
+                let row = &p.data[y * p.stride..][..pw as usize * bps];
+                out.extend(row.chunks_exact(bps).map(&read));
             }
-        })
-        .collect()
+            out
+        } else {
+            let p = &image.planes[0];
+            let (w, h) = (image.width as usize, image.height as usize);
+            let mut out = Vec::with_capacity(w * h);
+            for y in 0..h {
+                let row = &p.data[y * p.stride..][..w * n * bps];
+                out.extend(
+                    row.chunks_exact(n * bps)
+                        .map(|pixel| read(&pixel[c * bps..(c + 1) * bps])),
+                );
+            }
+            out
+        }
+    })
 }
 
 /// The JP2 Header description of an image: colour from

@@ -725,6 +725,116 @@ impl<'a> MqDecoder<'a> {
 mod tests {
     use super::*;
 
+    /// DECODE transcribed flowchart by flowchart (Figures C.15 – C.18):
+    /// the MPS-path and LPS-path conditional exchanges as separate
+    /// branches and a one-bit RENORMD loop. The reference the
+    /// single-selection `decode` must match.
+    fn decode_by_flowchart(dec: &mut MqDecoder<'_>, cx: &mut MqContext) -> u8 {
+        let entry = QE[cx.index as usize];
+        let qe = entry.qe as u32;
+        dec.a -= qe;
+        let d;
+        if (dec.c >> 16) < qe {
+            if dec.a < qe {
+                d = cx.mps as u8;
+                cx.index = entry.nmps;
+            } else {
+                d = !cx.mps as u8;
+                if entry.switch {
+                    cx.mps = !cx.mps;
+                }
+                cx.index = entry.nlps;
+            }
+            dec.a = qe;
+        } else {
+            dec.c -= qe << 16;
+            if dec.a & 0x8000 != 0 {
+                return cx.mps as u8;
+            }
+            if dec.a < qe {
+                d = !cx.mps as u8;
+                if entry.switch {
+                    cx.mps = !cx.mps;
+                }
+                cx.index = entry.nlps;
+            } else {
+                d = cx.mps as u8;
+                cx.index = entry.nmps;
+            }
+        }
+        loop {
+            if dec.ct == 0 {
+                dec.bytein();
+            }
+            dec.a <<= 1;
+            dec.c <<= 1;
+            dec.ct -= 1;
+            if dec.a & 0x8000 != 0 {
+                break;
+            }
+        }
+        d
+    }
+
+    #[test]
+    fn decode_matches_the_flowchart_transcription_step_by_step() {
+        let mut state = 0x6C07_8965u32;
+        let mut next = move || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            state >> 8
+        };
+        // Arbitrary byte streams — marker-like 0xFF runs, stuffed
+        // pairs, empty and short inputs that run into the synthesised
+        // fill — decoded against arbitrary context sequences.
+        for round in 0..400 {
+            let len = match round % 5 {
+                0 => next() as usize % 4,
+                1 => next() as usize % 40,
+                _ => 200 + next() as usize % 600,
+            };
+            let ff_bias = round % 4;
+            let bytes: Vec<u8> = (0..len)
+                .map(|_| {
+                    let value = next();
+                    if ff_bias != 0 && value % (2 + 3 * ff_bias) == 0 {
+                        0xFF
+                    } else {
+                        (value >> 4) as u8
+                    }
+                })
+                .collect();
+            let mut fast = MqDecoder::new(&bytes);
+            let mut reference = MqDecoder::new(&bytes);
+            let mut fast_cx = [MqContext::default(); 19];
+            fast_cx[18] = MqContext::uniform();
+            fast_cx[17] = MqContext::run_length();
+            fast_cx[0] = MqContext::zero_neighbours();
+            let mut reference_cx = fast_cx;
+            for step in 0..(len * 12 + 300) {
+                let context = if round % 3 == 0 {
+                    step % 3
+                } else {
+                    next() as usize % fast_cx.len()
+                };
+                let d = fast.decode(&mut fast_cx[context]);
+                let expected = decode_by_flowchart(&mut reference, &mut reference_cx[context]);
+                assert_eq!(d, expected, "round {round} step {step}");
+                assert_eq!(
+                    (fast.a, fast.c, fast.ct, fast.bp, fast.synthetic_fill_used),
+                    (
+                        reference.a,
+                        reference.c,
+                        reference.ct,
+                        reference.bp,
+                        reference.synthetic_fill_used
+                    ),
+                    "round {round} step {step}"
+                );
+                assert_eq!(fast_cx[context], reference_cx[context]);
+            }
+        }
+    }
+
     // -- Table C.2 invariants (T.800 §C.2.5) --------------------------
 
     #[test]

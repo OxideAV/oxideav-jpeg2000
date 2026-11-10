@@ -430,49 +430,9 @@ pub fn interleave_2d_i32(
     i0: i32,
     j0: i32,
 ) -> Result<Interleaved2D<i32>, Error> {
-    let out_w = ll_dims.0 + hl_dims.0;
-    let out_h = ll_dims.1 + lh_dims.1;
-    validate_subband_grid(ll_dims, hl_dims, lh_dims, hh_dims)?;
-    if ll.len() != ll_dims.0 * ll_dims.1
-        || hl.len() != hl_dims.0 * hl_dims.1
-        || lh.len() != lh_dims.0 * lh_dims.1
-        || hh.len() != hh_dims.0 * hh_dims.1
-    {
-        return Err(Error::InvalidMarkerLength);
-    }
-    // Relative offset of the first low-pass column/row: 0 for an even
-    // anchor, 1 for an odd one (2·⌈i0/2⌉ − i0). The high-pass offset is
-    // its complement.
-    let lo_x = (i0 & 1) as usize;
-    let hi_x = 1 - lo_x;
-    let lo_y = (j0 & 1) as usize;
-    let hi_y = 1 - lo_y;
-    let mut data = vec![0_i32; out_w * out_h];
-    for v in 0..ll_dims.1 {
-        for u in 0..ll_dims.0 {
-            data[(2 * v + lo_y) * out_w + 2 * u + lo_x] = ll[v * ll_dims.0 + u];
-        }
-    }
-    for v in 0..hl_dims.1 {
-        for u in 0..hl_dims.0 {
-            data[(2 * v + lo_y) * out_w + 2 * u + hi_x] = hl[v * hl_dims.0 + u];
-        }
-    }
-    for v in 0..lh_dims.1 {
-        for u in 0..lh_dims.0 {
-            data[(2 * v + hi_y) * out_w + 2 * u + lo_x] = lh[v * lh_dims.0 + u];
-        }
-    }
-    for v in 0..hh_dims.1 {
-        for u in 0..hh_dims.0 {
-            data[(2 * v + hi_y) * out_w + 2 * u + hi_x] = hh[v * hh_dims.0 + u];
-        }
-    }
-    Ok(Interleaved2D {
-        data,
-        width: out_w,
-        height: out_h,
-    })
+    interleave_2d(
+        ll, ll_dims, hl, hl_dims, lh, lh_dims, hh, hh_dims, i0, j0, 1,
+    )
 }
 
 /// §F.3.3 — `f64` variant of [`interleave_2d_i32`] for the 9-7
@@ -490,6 +450,32 @@ pub fn interleave_2d_f64(
     i0: i32,
     j0: i32,
 ) -> Result<Interleaved2D<f64>, Error> {
+    interleave_2d(
+        ll, ll_dims, hl, hl_dims, lh, lh_dims, hh, hh_dims, i0, j0, 1,
+    )
+}
+
+/// §F.3.3 2D_INTERLEAVE for either sample type, output rows shared out
+/// over up to `threads` workers.
+///
+/// Each output row draws from one low-pass and one high-pass row —
+/// (`LL`, `HL`) on the rows of low-pass vertical parity, (`LH`, `HH`)
+/// on the others — alternating column by column from the low-pass
+/// horizontal parity.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn interleave_2d<T: Copy + Default + Send + Sync>(
+    ll: &[T],
+    ll_dims: (usize, usize),
+    hl: &[T],
+    hl_dims: (usize, usize),
+    lh: &[T],
+    lh_dims: (usize, usize),
+    hh: &[T],
+    hh_dims: (usize, usize),
+    i0: i32,
+    j0: i32,
+    threads: usize,
+) -> Result<Interleaved2D<T>, Error> {
     let out_w = ll_dims.0 + hl_dims.0;
     let out_h = ll_dims.1 + lh_dims.1;
     validate_subband_grid(ll_dims, hl_dims, lh_dims, hh_dims)?;
@@ -500,31 +486,72 @@ pub fn interleave_2d_f64(
     {
         return Err(Error::InvalidMarkerLength);
     }
+    // Relative offset of the first low-pass column/row: 0 for an even
+    // anchor, 1 for an odd one (2·⌈i0/2⌉ − i0). The high-pass offset is
+    // its complement.
     let lo_x = (i0 & 1) as usize;
     let hi_x = 1 - lo_x;
     let lo_y = (j0 & 1) as usize;
     let hi_y = 1 - lo_y;
-    let mut data = vec![0.0_f64; out_w * out_h];
-    for v in 0..ll_dims.1 {
-        for u in 0..ll_dims.0 {
-            data[(2 * v + lo_y) * out_w + 2 * u + lo_x] = ll[v * ll_dims.0 + u];
-        }
+    let mut data = vec![T::default(); out_w * out_h];
+    // On a regular lattice the band that owns offset 0 has as many
+    // samples as the other one, or exactly one more.
+    let regular = |first: usize, second: usize| first == second || first == second + 1;
+    let (lo_w, hi_w) = (ll_dims.0, hl_dims.0);
+    let regular_x = if lo_x == 0 {
+        regular(lo_w, hi_w)
+    } else {
+        regular(hi_w, lo_w)
+    };
+    let regular_y = if lo_y == 0 {
+        regular(ll_dims.1, lh_dims.1)
+    } else {
+        regular(lh_dims.1, ll_dims.1)
+    };
+    if !(regular_x && regular_y) || out_w == 0 {
+        // Band extents no single lattice produces: place sample by
+        // sample at the Equation-defined positions.
+        let mut place = |band: &[T], dims: (usize, usize), off_x: usize, off_y: usize| {
+            for v in 0..dims.1 {
+                for u in 0..dims.0 {
+                    data[(2 * v + off_y) * out_w + 2 * u + off_x] = band[v * dims.0 + u];
+                }
+            }
+        };
+        place(ll, ll_dims, lo_x, lo_y);
+        place(hl, hl_dims, hi_x, lo_y);
+        place(lh, lh_dims, lo_x, hi_y);
+        place(hh, hh_dims, hi_x, hi_y);
+        return Ok(Interleaved2D {
+            data,
+            width: out_w,
+            height: out_h,
+        });
     }
-    for v in 0..hl_dims.1 {
-        for u in 0..hl_dims.0 {
-            data[(2 * v + lo_y) * out_w + 2 * u + hi_x] = hl[v * hl_dims.0 + u];
+    let budget = if data.len() < THREADED_MIN_SAMPLES {
+        1
+    } else {
+        threads
+    };
+    crate::parallel::for_each_run(budget, &mut data, out_w, |first_row, rows| {
+        for (offset, row) in rows.chunks_mut(out_w).enumerate() {
+            let y = first_row + offset;
+            // Rows of low-pass vertical parity sit at lo_y, lo_y + 2, …
+            let (low, high, v) = if y % 2 == lo_y {
+                (ll, hl, y / 2)
+            } else {
+                (lh, hh, y / 2)
+            };
+            let low = &low[v * lo_w..(v + 1) * lo_w];
+            let high = &high[v * hi_w..(v + 1) * hi_w];
+            for (slot, &value) in row[lo_x..].iter_mut().step_by(2).zip(low) {
+                *slot = value;
+            }
+            for (slot, &value) in row[hi_x..].iter_mut().step_by(2).zip(high) {
+                *slot = value;
+            }
         }
-    }
-    for v in 0..lh_dims.1 {
-        for u in 0..lh_dims.0 {
-            data[(2 * v + hi_y) * out_w + 2 * u + lo_x] = lh[v * lh_dims.0 + u];
-        }
-    }
-    for v in 0..hh_dims.1 {
-        for u in 0..hh_dims.0 {
-            data[(2 * v + hi_y) * out_w + 2 * u + hi_x] = hh[v * hh_dims.0 + u];
-        }
-    }
+    });
     Ok(Interleaved2D {
         data,
         width: out_w,
@@ -866,7 +893,9 @@ pub(crate) fn sr_2d_5x3_threaded(
     j0: i32,
     threads: usize,
 ) -> Result<Interleaved2D<i32>, Error> {
-    let mut a = interleave_2d_i32(ll, ll_dims, hl, hl_dims, lh, lh_dims, hh, hh_dims, i0, j0)?;
+    let mut a = interleave_2d(
+        ll, ll_dims, hl, hl_dims, lh, lh_dims, hh, hh_dims, i0, j0, threads,
+    )?;
     hor_lift(&mut a, i0, threads, synthesize_line_5x3)?;
     ver_lift(&mut a, j0, threads, synthesize_rows_5x3)?;
     Ok(a)
@@ -888,7 +917,9 @@ pub(crate) fn sr_2d_9x7_threaded(
     j0: i32,
     threads: usize,
 ) -> Result<Interleaved2D<f64>, Error> {
-    let mut a = interleave_2d_f64(ll, ll_dims, hl, hl_dims, lh, lh_dims, hh, hh_dims, i0, j0)?;
+    let mut a = interleave_2d(
+        ll, ll_dims, hl, hl_dims, lh, lh_dims, hh, hh_dims, i0, j0, threads,
+    )?;
     hor_lift(&mut a, i0, threads, synthesize_line_9x7)?;
     ver_lift(&mut a, j0, threads, synthesize_rows_9x7)?;
     Ok(a)

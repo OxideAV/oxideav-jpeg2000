@@ -166,26 +166,43 @@ fn deinterleave_map<T: Copy>(
     h: usize,
     x0: u32,
     y0: u32,
+    want_ll: bool,
     map: impl Fn(T) -> i32,
 ) -> (BandPlane, BandPlane, BandPlane, BandPlane) {
     let c = split_corners(x0, y0, x0 + w as u32, y0 + h as u32);
     let (llw, hw) = ((c.lx1 - c.lx0) as usize, (c.hx1 - c.hx0) as usize);
     let (llh, hh) = ((c.ly1 - c.ly0) as usize, (c.hy1 - c.hy0) as usize);
-    let mut ll = vec![0i32; llw * llh];
+    let mut ll = vec![0i32; if want_ll { llw * llh } else { 0 }];
     let mut hl = vec![0i32; hw * llh];
     let mut lh = vec![0i32; llw * hh];
     let mut hhb = vec![0i32; hw * hh];
-    for v in 0..h {
-        let ay = y0 + v as u32;
-        for u in 0..w {
-            let ax = x0 + u as u32;
-            let s = map(data[v * w + u]);
-            match (ax % 2, ay % 2) {
-                (0, 0) => ll[((ay / 2 - c.ly0) as usize) * llw + (ax / 2 - c.lx0) as usize] = s,
-                (1, 0) => hl[((ay / 2 - c.ly0) as usize) * hw + (ax / 2 - c.hx0) as usize] = s,
-                (0, 1) => lh[((ay / 2 - c.hy0) as usize) * llw + (ax / 2 - c.lx0) as usize] = s,
-                (1, 1) => hhb[((ay / 2 - c.hy0) as usize) * hw + (ax / 2 - c.hx0) as usize] = s,
-                _ => unreachable!(),
+    // Along each axis the lattice alternates low / high from the first
+    // even absolute coordinate, so lattice row `v` is band row `v / 2`
+    // and its low-pass (high-pass) samples are every second one from
+    // offset `x0 mod 2` (the complement), in band-column order.
+    let (lo_x, lo_y) = ((x0 & 1) as usize, (y0 & 1) as usize);
+    if w > 0 {
+        for (v, row) in data.chunks_exact(w).take(h).enumerate() {
+            let r = v / 2;
+            let low_row = v % 2 == lo_y;
+            let evens = row[lo_x..].iter().step_by(2);
+            let odds = row[1 - lo_x..].iter().step_by(2);
+            if low_row {
+                if want_ll {
+                    for (slot, &s) in ll[r * llw..(r + 1) * llw].iter_mut().zip(evens) {
+                        *slot = map(s);
+                    }
+                }
+                for (slot, &s) in hl[r * hw..(r + 1) * hw].iter_mut().zip(odds) {
+                    *slot = map(s);
+                }
+            } else {
+                for (slot, &s) in lh[r * llw..(r + 1) * llw].iter_mut().zip(evens) {
+                    *slot = map(s);
+                }
+                for (slot, &s) in hhb[r * hw..(r + 1) * hw].iter_mut().zip(odds) {
+                    *slot = map(s);
+                }
             }
         }
     }
@@ -246,7 +263,8 @@ fn forward_cascade(
             threads,
         )
         .expect("analysis dims match by construction");
-        let (ll, hl, lh, hh) = deinterleave_map(&a.data, a.width, a.height, cur.x0, cur.y0, |s| s);
+        let (ll, hl, lh, hh) =
+            deinterleave_map(&a.data, a.width, a.height, cur.x0, cur.y0, true, |s| s);
         high.push([hl, lh, hh]);
         cur = ll;
     }
@@ -323,7 +341,8 @@ fn forward_cascade_9x7(
             threads,
         )
         .expect("analysis dims match by construction");
-        let (_llq, hl, lh, hh) = deinterleave_map(&a.data, a.width, a.height, cur.x0, cur.y0, q);
+        let (_, hl, lh, hh) =
+            deinterleave_map(&a.data, a.width, a.height, cur.x0, cur.y0, false, q);
         // Real-valued LL for the next level (even absolute lattice
         // sites on both axes).
         let c = split_corners(
@@ -333,21 +352,12 @@ fn forward_cascade_9x7(
             cur.y0 + a.height as u32,
         );
         let (llw, llh) = ((c.lx1 - c.lx0) as usize, (c.ly1 - c.ly0) as usize);
-        let mut ll = vec![0f64; llw * llh];
-        for v in 0..a.height {
-            let ay = cur.y0 + v as u32;
-            if !ay.is_multiple_of(2) {
-                continue;
-            }
-            for u in 0..a.width {
-                let ax = cur.x0 + u as u32;
-                if !ax.is_multiple_of(2) {
-                    continue;
-                }
-                ll[((ay / 2 - c.ly0) as usize) * llw + (ax / 2 - c.lx0) as usize] =
-                    a.data[v * a.width + u];
-            }
+        let mut ll = Vec::with_capacity(llw * llh);
+        let (lo_x, lo_y) = ((cur.x0 & 1) as usize, (cur.y0 & 1) as usize);
+        for row in a.data.chunks_exact(a.width).skip(lo_y).step_by(2) {
+            ll.extend(row[lo_x..].iter().step_by(2));
         }
+        debug_assert_eq!(ll.len(), llw * llh);
         high.push([hl, lh, hh]);
         cur = RealPlane {
             x0: c.lx0,
@@ -560,6 +570,13 @@ struct EncodedBlock {
     /// Kept only for rate control, where assembly probes must have the
     /// same length as the final, exactly terminated re-encode.
     truncation_rates: Vec<u32>,
+    /// The exactly terminated codeword at each possible final
+    /// truncation, as `(prefix, tail)`: the first `prefix` bytes of
+    /// `bytes` followed by `tail` is the segment a coder stopped after
+    /// that pass emits (the coder can revise only its most recent
+    /// byte, so everything before it is shared with the full
+    /// codeword). One entry per pass; kept only for rate control.
+    truncation_tails: Vec<(u32, Vec<u8>)>,
     /// Annex J.13.4 per-pass distortions `D^n` (unweighted squared
     /// error under the midpoint-reconstruction model), one entry per
     /// pass; empty unless rate control requested them.
@@ -572,9 +589,10 @@ struct EncodedBlock {
     /// Global code-block ordinal — indexes the rate-control truncation
     /// vector.
     ordinal: usize,
-    /// Re-encode context for exact §C.2.9 termination at a truncation
-    /// point: `(orientation, width, height, coefficients, mb)`. Only
-    /// kept when rate control is active.
+    /// Re-encode context `(orientation, width, height, coefficients,
+    /// mb)`: debug builds re-code a truncated block from scratch to
+    /// cross-check `truncation_tails`. Only kept when rate control is
+    /// active in a build with debug assertions.
     reencode: Option<(SubBandOrientation, usize, usize, Vec<Coefficient>, u32)>,
     /// `Some(Lcup)` for a T.814 HT code-block: `bytes` holds the HT
     /// cleanup segment (`Lcup` bytes) followed by the optional
@@ -767,6 +785,7 @@ fn encode_code_block(
     let mut ctx = reset_contexts();
     let mut rates: Vec<u32> = Vec::new();
     let mut truncation_rates: Vec<u32> = Vec::new();
+    let mut truncation_tails: Vec<(u32, Vec<u8>)> = Vec::new();
     let mut dists: Vec<f64> = Vec::new();
     // Annex J.13.4 distortion under the §E.1.1.2 midpoint (r = 0.5)
     // reconstruction model: after `done` completed planes a
@@ -906,11 +925,16 @@ fn encode_code_block(
             };
             rates.push((committed.len() + pending) as u32);
             if pass_dist {
-                let terminated = match &sink {
-                    Sink::Mq(e) if predictable => e.predictable_flush_len(),
-                    _ => pending,
+                // The codeword a coder stopping here would emit: the
+                // real termination procedure of the current sink over
+                // the bytes already final.
+                let (prefix, tail) = match &sink {
+                    Sink::Mq(e) => e.terminated_tail(predictable),
+                    Sink::Raw(w) => (0, finish_raw(w.clone())),
                 };
-                truncation_rates.push((committed.len() + terminated) as u32);
+                let prefix = committed.len() + prefix;
+                truncation_rates.push((prefix + tail.len()) as u32);
+                truncation_tails.push((prefix as u32, tail));
             }
         }
         if pass_dist {
@@ -991,6 +1015,7 @@ fn encode_code_block(
         bytes,
         pass_rates: rates,
         truncation_rates,
+        truncation_tails,
         pass_dist: dists,
         d0,
         weight: 1.0,
@@ -2309,15 +2334,57 @@ fn encode_core(
                 let tc = &tile.components[ci];
                 let (xr, _yr) = separation(ci);
                 let cw = width.div_ceil(xr) as usize;
-                let p = &planes[ci];
+                let (x0, x1) = (tc.tcx0 as usize, tc.tcx1 as usize);
                 let mut out = Vec::with_capacity((tc.width() as usize) * (tc.height() as usize));
-                for y in tc.tcy0..tc.tcy1 {
-                    let row = (y as usize) * cw;
-                    for x in tc.tcx0..tc.tcx1 {
-                        out.push(p.get(row + x as usize) - dc);
+                for y in tc.tcy0 as usize..tc.tcy1 as usize {
+                    let row = y * cw;
+                    match &planes[ci] {
+                        SamplePlane::U8(p) => {
+                            out.extend(p[row + x0..row + x1].iter().map(|&v| i32::from(v) - dc));
+                        }
+                        SamplePlane::U16(p) => {
+                            out.extend(p[row + x0..row + x1].iter().map(|&v| i32::from(v) - dc));
+                        }
                     }
                 }
                 out
+            };
+            // Components transform independently: up to `outer` of
+            // them at once, each cascade with the rest of the budget.
+            let outer = crate::parallel::effective_workers(params.threads, planes.len());
+            let inner = (params.threads / outer).max(1);
+            // A plane handed to exactly one cascade job.
+            fn hand_over<T>(cells: &[std::sync::Mutex<Option<Vec<T>>>], ci: usize) -> Vec<T> {
+                cells[ci]
+                    .lock()
+                    .ok()
+                    .and_then(|mut cell| cell.take())
+                    .expect("each component plane is taken once")
+            }
+            let cascade_5x3 = |ci: usize, plane: Vec<i32>| {
+                let tc = &tile.components[ci];
+                forward_cascade(
+                    plane,
+                    tc.tcx0,
+                    tc.tcy0,
+                    tc.width() as usize,
+                    tc.height() as usize,
+                    comp_params[ci].nl,
+                    inner,
+                )
+            };
+            let cascade_9x7 = |ci: usize, plane: Vec<f64>, fine_bits: u8| {
+                let tc = &tile.components[ci];
+                forward_cascade_9x7(
+                    plane,
+                    tc.tcx0,
+                    tc.tcy0,
+                    tc.width() as usize,
+                    tc.height() as usize,
+                    comp_params[ci].nl,
+                    fine_bits,
+                    inner,
+                )
             };
             if mct {
                 // Table A.17: the MCT couples components 0–2 on one
@@ -2325,89 +2392,57 @@ fn encode_core(
                 // applies to each cascade.
                 return Ok(match kernel {
                     EncodeKernel::Lossless5x3 => {
-                        let mut shifted: Vec<Vec<i32>> = (0..planes.len()).map(extract).collect();
+                        let mut shifted: Vec<Vec<i32>> =
+                            crate::parallel::collect_ordered(params.threads, planes.len(), extract);
                         if use_rct {
                             // Split into three disjoint &mut [i32].
                             let (head, tail) = shifted.split_at_mut(1);
                             let (mid, tail2) = tail.split_at_mut(1);
                             crate::mct::forward_rct(&mut head[0], &mut mid[0], &mut tail2[0])?;
                         }
-                        shifted
+                        let cells: Vec<_> = shifted
                             .into_iter()
-                            .enumerate()
-                            .map(|(ci, p)| {
-                                let tc = &tile.components[ci];
-                                forward_cascade(
-                                    p,
-                                    tc.tcx0,
-                                    tc.tcy0,
-                                    tc.width() as usize,
-                                    tc.height() as usize,
-                                    comp_params[ci].nl,
-                                    params.threads,
-                                )
-                            })
-                            .collect()
+                            .map(|plane| std::sync::Mutex::new(Some(plane)))
+                            .collect();
+                        crate::parallel::collect_ordered(outer, cells.len(), |ci| {
+                            cascade_5x3(ci, hand_over(&cells, ci))
+                        })
                     }
                     EncodeKernel::Lossy9x7 { fine_bits } => {
-                        let mut shifted: Vec<Vec<f64>> = (0..planes.len())
-                            .map(|ci| extract(ci).into_iter().map(f64::from).collect())
-                            .collect();
+                        let mut shifted: Vec<Vec<f64>> =
+                            crate::parallel::collect_ordered(params.threads, planes.len(), |ci| {
+                                extract(ci).into_iter().map(f64::from).collect()
+                            });
                         if use_ict {
                             let (head, tail) = shifted.split_at_mut(1);
                             let (mid, tail2) = tail.split_at_mut(1);
                             crate::mct::forward_ict_f64(&mut head[0], &mut mid[0], &mut tail2[0])?;
                         }
-                        shifted
+                        let cells: Vec<_> = shifted
                             .into_iter()
-                            .enumerate()
-                            .map(|(ci, p)| {
-                                let tc = &tile.components[ci];
-                                forward_cascade_9x7(
-                                    p,
-                                    tc.tcx0,
-                                    tc.tcy0,
-                                    tc.width() as usize,
-                                    tc.height() as usize,
-                                    comp_params[ci].nl,
-                                    fine_bits,
-                                    params.threads,
-                                )
-                            })
-                            .collect()
+                            .map(|plane| std::sync::Mutex::new(Some(plane)))
+                            .collect();
+                        crate::parallel::collect_ordered(outer, cells.len(), |ci| {
+                            cascade_9x7(ci, hand_over(&cells, ci), fine_bits)
+                        })
                     }
                 });
             }
             // No MCT: each component runs its own §A.6.2 kernel + NL
             // independently (a COC may give siblings different
             // kernels).
-            Ok((0..planes.len())
-                .map(|ci| {
-                    let cp = &comp_params[ci];
-                    let tc = &tile.components[ci];
-                    match cp.kernel {
-                        EncodeKernel::Lossless5x3 => forward_cascade(
-                            extract(ci),
-                            tc.tcx0,
-                            tc.tcy0,
-                            tc.width() as usize,
-                            tc.height() as usize,
-                            cp.nl,
-                            params.threads,
-                        ),
-                        EncodeKernel::Lossy9x7 { fine_bits } => forward_cascade_9x7(
-                            extract(ci).into_iter().map(f64::from).collect(),
-                            tc.tcx0,
-                            tc.tcy0,
-                            tc.width() as usize,
-                            tc.height() as usize,
-                            cp.nl,
-                            fine_bits,
-                            params.threads,
-                        ),
-                    }
-                })
-                .collect())
+            Ok(crate::parallel::collect_ordered(
+                outer,
+                planes.len(),
+                |ci| match comp_params[ci].kernel {
+                    EncodeKernel::Lossless5x3 => cascade_5x3(ci, extract(ci)),
+                    EncodeKernel::Lossy9x7 { fine_bits } => cascade_9x7(
+                        ci,
+                        extract(ci).into_iter().map(f64::from).collect(),
+                        fine_bits,
+                    ),
+                },
+            ))
         };
 
     // -- Tier-1: encode every code-block, keyed (tile, comp, r, k) -----
@@ -2542,6 +2577,7 @@ fn encode_core(
                         bytes,
                         pass_rates: Vec::new(),
                         truncation_rates: Vec::new(),
+                        truncation_tails: Vec::new(),
                         pass_dist: Vec::new(),
                         d0: 0.0,
                         weight: 1.0,
@@ -2574,6 +2610,7 @@ fn encode_core(
                         bytes,
                         pass_rates: Vec::new(),
                         truncation_rates: Vec::new(),
+                        truncation_tails: Vec::new(),
                         pass_dist: Vec::new(),
                         d0: 0.0,
                         weight: 1.0,
@@ -2637,6 +2674,7 @@ fn encode_core(
                             bytes: hb.cleanup,
                             pass_rates: Vec::new(),
                             truncation_rates: Vec::new(),
+                            truncation_tails: Vec::new(),
                             pass_dist: Vec::new(),
                             d0: 0.0,
                             weight: 1.0,
@@ -2845,7 +2883,7 @@ fn encode_core(
             enc.weight = job.weight;
             enc.ordinal = num_blocks;
             num_blocks += 1;
-            if rate_control {
+            if rate_control && cfg!(debug_assertions) {
                 let (bw, bh) = (job.cb.width() as usize, job.cb.height() as usize);
                 enc.reencode = Some((job.orientation, bw, bh, targets, job.mb));
             }
@@ -2977,30 +3015,35 @@ fn encode_core(
                 let seg: Vec<u8> = if n_eff == enc.coding_passes {
                     enc.bytes.clone()
                 } else if exact {
-                    // Re-encode with §C.2.9 termination at the chosen
-                    // truncation pass — same emitted bytes, exact tail.
-                    let (o, bw, bh, tg, mb) =
-                        enc.reencode.as_ref().expect("rate control keeps context");
-                    let re = encode_code_block(
-                        *o,
-                        *bw,
-                        *bh,
-                        tg,
-                        *mb,
-                        PassCapture {
-                            max_passes: Some(n_eff),
-                            ..PassCapture::styles(params)
-                        },
-                    )?
-                    .expect("non-empty block re-encodes");
-                    // A final termination need not have the capped
-                    // packet-prefix length, but must match the actual
-                    // truncation length used by the budget probes.
-                    debug_assert_eq!(
-                        re.bytes.len() as u32,
-                        enc.truncation_rates[n_eff as usize - 1]
-                    );
-                    re.bytes
+                    // The exactly terminated codeword at the chosen
+                    // truncation pass, captured while the block was
+                    // coded: the shared leading bytes, then the
+                    // termination tail.
+                    let (prefix, tail) = &enc.truncation_tails[n_eff as usize - 1];
+                    let mut seg = Vec::with_capacity(*prefix as usize + tail.len());
+                    seg.extend_from_slice(&enc.bytes[..*prefix as usize]);
+                    seg.extend_from_slice(tail);
+                    // Its length is the one the budget probes used.
+                    debug_assert_eq!(seg.len() as u32, enc.truncation_rates[n_eff as usize - 1]);
+                    #[cfg(debug_assertions)]
+                    if let Some((o, bw, bh, tg, mb)) = enc.reencode.as_ref() {
+                        // Cross-check against coding the block afresh
+                        // up to that pass with a real termination.
+                        let re = encode_code_block(
+                            *o,
+                            *bw,
+                            *bh,
+                            tg,
+                            *mb,
+                            PassCapture {
+                                max_passes: Some(n_eff),
+                                ..PassCapture::styles(params)
+                            },
+                        )?
+                        .expect("non-empty block re-encodes");
+                        debug_assert_eq!(seg, re.bytes);
+                    }
+                    seg
                 } else {
                     // This stream is used only for its size. A final
                     // mid-span termination can be longer than either

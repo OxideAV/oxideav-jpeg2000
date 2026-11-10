@@ -286,15 +286,32 @@ impl MqEncoder {
     /// Size of a predictable termination without copying the completed
     /// byte prefix. BYTEOUT can modify only the most recent output byte,
     /// so the registers and that byte suffice to reproduce the tail.
+    #[cfg(test)]
     pub(crate) fn predictable_flush_len(&self) -> usize {
         self.out.len().saturating_sub(1) + self.tail().flush_predictable().len()
     }
 
     /// Size of a §C.2.9 FLUSH of the current state — the length
     /// `self.clone().flush()` would have — without copying the
-    /// completed byte prefix (see [`Self::predictable_flush_len`]).
+    /// completed byte prefix: BYTEOUT can modify only the most recent
+    /// output byte, so the registers and that byte reproduce the tail.
     pub(crate) fn flush_len(&self) -> usize {
         self.out.len().saturating_sub(1) + self.tail().flush().len()
+    }
+
+    /// The codeword this coder would end on if terminated now, split
+    /// into the count of already-final leading bytes and the bytes
+    /// that follow them: `clone().flush()` (or `flush_predictable()`
+    /// when `predictable`) equals the first `prefix` bytes written so
+    /// far followed by `tail`. BYTEOUT can modify only the most recent
+    /// output byte, so every byte before it is final.
+    pub(crate) fn terminated_tail(&self, predictable: bool) -> (usize, Vec<u8>) {
+        let tail = if predictable {
+            self.tail().flush_predictable()
+        } else {
+            self.tail().flush()
+        };
+        (self.out.len().saturating_sub(1), tail)
     }
 
     /// The coder state over only its most recent output byte.
@@ -317,7 +334,100 @@ impl Default for MqEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mq::{MqContext, MqDecoder};
+    use crate::mq::{MqContext, MqDecoder, QE};
+
+    /// ENCODE transcribed flowchart by flowchart (Figures C.5 – C.8):
+    /// CODEMPS / CODELPS as separate branches and a one-bit RENORME
+    /// loop. The reference the single-selection `encode` must match.
+    fn encode_by_flowchart(enc: &mut MqEncoder, cx: &mut MqContext, d: u8) {
+        let entry = QE[cx.index() as usize];
+        let qe = entry.qe as u32;
+        enc.a -= qe;
+        if (d != 0) == cx.mps() {
+            if enc.a & 0x8000 != 0 {
+                enc.c += qe as u64;
+                return;
+            }
+            if enc.a < qe {
+                enc.a = qe;
+            } else {
+                enc.c += qe as u64;
+            }
+            cx.set_index(entry.nmps);
+        } else {
+            if enc.a < qe {
+                enc.c += qe as u64;
+            } else {
+                enc.a = qe;
+            }
+            if entry.switch {
+                cx.flip_mps();
+            }
+            cx.set_index(entry.nlps);
+        }
+        loop {
+            enc.a <<= 1;
+            enc.c <<= 1;
+            enc.ct -= 1;
+            if enc.ct == 0 {
+                enc.byteout();
+            }
+            if enc.a & 0x8000 != 0 {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn encode_matches_the_flowchart_transcription_step_by_step() {
+        let mut state = 0x2545_F491u32;
+        let mut next = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            state >> 8
+        };
+        // Skews from near-deterministic to uniform exercise every
+        // Table C.2 row, the exchange cases and long renormalizations.
+        for skew in [1u32, 2, 3, 5, 17, 97, 1021] {
+            let mut fast = MqEncoder::new();
+            let mut reference = MqEncoder::new();
+            let mut fast_cx = [MqContext::default(); 19];
+            fast_cx[18] = MqContext::uniform();
+            fast_cx[17] = MqContext::run_length();
+            let mut reference_cx = fast_cx;
+            for step in 0..60_000 {
+                let context = next() as usize % fast_cx.len();
+                let d = u8::from(next() % skew == 0) ^ (context as u8 & 1);
+                fast.encode(&mut fast_cx[context], d);
+                encode_by_flowchart(&mut reference, &mut reference_cx[context], d);
+                assert_eq!(
+                    (fast.a, fast.c, fast.ct, fast_cx[context]),
+                    (
+                        reference.a,
+                        reference.c,
+                        reference.ct,
+                        reference_cx[context]
+                    ),
+                    "skew {skew} step {step}"
+                );
+                if step % 97 == 0 {
+                    assert_eq!(fast.out, reference.out, "skew {skew} step {step}");
+                    assert_eq!(fast.flush_len(), reference.clone().flush().len());
+                    for predictable in [false, true] {
+                        let (prefix, tail) = fast.terminated_tail(predictable);
+                        let mut rebuilt = fast.out[..prefix].to_vec();
+                        rebuilt.extend_from_slice(&tail);
+                        let terminated = if predictable {
+                            reference.clone().flush_predictable()
+                        } else {
+                            reference.clone().flush()
+                        };
+                        assert_eq!(rebuilt, terminated, "skew {skew} step {step}");
+                    }
+                }
+            }
+            assert_eq!(fast.flush(), reference.flush(), "skew {skew}");
+        }
+    }
 
     #[test]
     fn predictable_flush_len_matches_full_snapshot() {

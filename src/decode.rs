@@ -2867,6 +2867,7 @@ fn decode_codestream_impl(
     let num_tiles = (num_x as u64) * (num_y as u64);
 
     let mut components: Vec<DecodedComponent> = Vec::with_capacity(siz.components.len());
+    let mut plane_lens: Vec<usize> = Vec::with_capacity(siz.components.len());
     for (sc, area) in siz.components.iter().zip(areas.iter()) {
         // Reduced-resolution output grid: Equation B-14's ceiling
         // division maps the component's image-area corners onto the
@@ -2897,8 +2898,11 @@ fn decode_codestream_impl(
             is_signed: sc.is_signed,
             h_separation: sc.h_separation,
             v_separation: sc.v_separation,
-            samples: vec![0i32; len],
+            // Sized on first placement: a tile that covers the whole
+            // component hands its plane over instead of being copied.
+            samples: Vec::new(),
         });
+        plane_lens.push(len);
     }
 
     // -- Group tile-parts by tile --
@@ -3069,7 +3073,7 @@ fn decode_codestream_impl(
         // Place each tile-component plane into its image-area plane at
         // the Equation B-12 offset.
         let tile = derive_tile_geometry(siz, tile_index as u32)?;
-        for (c, plane) in tile_planes.iter().enumerate() {
+        for (c, plane) in tile_planes.into_iter().enumerate() {
             let tc = &tile.components[c];
             // Reduced tile-component region: the same Equation B-14
             // ceiling division that shaped the output grids (identity
@@ -3103,11 +3107,25 @@ fn decode_codestream_impl(
             if dx + tw > cw || dy + th > comp.height as usize {
                 return Err(Error::InvalidMarkerLength);
             }
+            if comp.samples.is_empty() {
+                if dx == 0 && dy == 0 && plane.len() == plane_lens[c] {
+                    // The tile-component is the whole component plane.
+                    comp.samples = plane;
+                    continue;
+                }
+                comp.samples = vec![0i32; plane_lens[c]];
+            }
             for row in 0..th {
                 let src = &plane[row * tw..(row + 1) * tw];
                 let dst_start = (dy + row) * cw + dx;
                 comp.samples[dst_start..dst_start + tw].copy_from_slice(src);
             }
+        }
+    }
+    // Components no tile-part reached stay zero.
+    for (comp, &len) in components.iter_mut().zip(&plane_lens) {
+        if comp.samples.len() != len {
+            comp.samples = vec![0i32; len];
         }
     }
 

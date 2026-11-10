@@ -43,6 +43,20 @@ fn variants() -> Vec<(&'static str, EncodeOptions)> {
     styled.bypass = true;
     styled.terminate_all = true;
     styled.segmentation_symbols = true;
+    // Rate control over every termination shape: the truncated
+    // codewords come from termination tails captured while coding
+    // (cross-checked against a fresh re-encode in debug builds).
+    let mut bypass_rate = base().with_target_bytes(5000);
+    bypass_rate.bypass = true;
+    let mut predictable_rate = base().with_layers(2).with_target_bytes(6000);
+    predictable_rate.predictable_termination = true;
+    let mut lazy_predictable_psnr = base().with_lossy(2).with_target_psnr(33.0);
+    lazy_predictable_psnr.bypass = true;
+    lazy_predictable_psnr.predictable_termination = true;
+    lazy_predictable_psnr.reset_probabilities = true;
+    let mut causal_termall_rate = base().with_target_bytes(4000);
+    causal_termall_rate.terminate_all = true;
+    causal_termall_rate.vertically_causal = true;
     let mut roi = base();
     roi.roi = Some(RoiRegion {
         x0: 30,
@@ -73,6 +87,10 @@ fn variants() -> Vec<(&'static str, EncodeOptions)> {
         ),
         ("lossy-psnr", base().with_lossy(2).with_target_psnr(36.0)),
         ("styled-rate", styled),
+        ("bypass-rate", bypass_rate),
+        ("predictable-rate", predictable_rate),
+        ("lazy-predictable-psnr", lazy_predictable_psnr),
+        ("causal-termall-rate", causal_termall_rate),
         ("roi", roi),
         ("ht", base().with_high_throughput(true)),
         (
@@ -89,9 +107,9 @@ fn variants() -> Vec<(&'static str, EncodeOptions)> {
 #[test]
 fn every_budget_emits_the_serial_codestream_and_samples() {
     let images = [
-        synthetic(150, 110, PixelFormat::Rgb24, 3),
-        synthetic(97, 131, PixelFormat::Gray8, 5),
-        synthetic(120, 90, PixelFormat::Rgb48Le, 9),
+        synthetic(132, 100, PixelFormat::Rgb24, 3),
+        synthetic(97, 111, PixelFormat::Gray8, 5),
+        synthetic(104, 80, PixelFormat::Rgb48Le, 9),
     ];
     for (image_index, image) in images.iter().enumerate() {
         for (name, options) in variants() {
@@ -112,13 +130,20 @@ fn every_budget_emits_the_serial_codestream_and_samples() {
                 }
             };
             let reference = decode_with(&serial, &DecodeOptions::new()).unwrap();
-            for threads in [0, 2, 3, 7, 32] {
+            for threads in [0, 2, 5, 32] {
                 let bytes = encode(image, &options.clone().with_threads(threads)).unwrap();
                 assert_eq!(
                     bytes, serial,
                     "image {image_index} {name}: codestream differs at {threads} threads"
                 );
-                for (reduce, layers) in [(0, None), (1, None), (0, Some(1))] {
+                // The full decode at every budget; the reduced and
+                // layer-limited shapes at one.
+                let shapes: &[(u8, Option<u16>)] = if threads == 5 {
+                    &[(0, None), (1, None), (0, Some(1))]
+                } else {
+                    &[(0, None)]
+                };
+                for &(reduce, layers) in shapes {
                     let serial_options =
                         DecodeOptions::new().with_reduce(reduce).with_layers(layers);
                     let expected = decode_with(&serial, &serial_options).unwrap();

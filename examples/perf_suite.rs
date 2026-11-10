@@ -3,6 +3,7 @@
 //! ```text
 //! cargo run --release --example perf_suite -- [--threads N] [--rounds N]
 //!     [--case SUBSTRING] [--only enc|dec] [--registry] [--hash-only]
+//!     [--save DIR]
 //! ```
 //!
 //! Cases: `rgb8-1024` and `rgb16-1024` lossless 5-3, `rgb8-512` lossy
@@ -13,6 +14,9 @@
 //! with FNV-1a hashes of the codestream and of the decoded samples, so
 //! two builds (or two thread budgets) can be compared for identical
 //! output. Image synthesis, hashing and verification are not timed.
+//!
+//! `--save DIR` also writes each case's codestream to `DIR/<case>.j2k`
+//! (input for `decoder_perf` or a black-box decoder).
 //!
 //! `--registry` drives the same cases through the framework
 //! `Encoder` / `Decoder` adapters (requires the default `registry`
@@ -246,6 +250,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut registry = false;
     let mut hash_only = false;
     let mut only: Option<String> = None;
+    let mut save: Option<std::path::PathBuf> = None;
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
         let mut value = || {
@@ -258,12 +263,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             "--rounds" => rounds = value()?.parse()?,
             "--case" => filter = Some(value()?),
             "--only" => only = Some(value()?),
+            "--save" => save = Some(value()?.into()),
             "--registry" => registry = true,
             "--hash-only" => hash_only = true,
             _ => {
                 return Err(io::Error::other(
                     "use [--threads N] [--rounds N] [--case SUBSTRING] [--only enc|dec] \
-                     [--registry] [--hash-only]",
+                     [--registry] [--hash-only] [--save DIR]",
                 )
                 .into());
             }
@@ -313,6 +319,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             Ok(encode(&image, &encode_options)?)
         };
         let reference = encode_once()?;
+        if let Some(directory) = &save {
+            std::fs::write(directory.join(format!("{}.j2k", case.name)), &reference)?;
+        }
         let mut encode_times = Vec::with_capacity(encode_rounds);
         for _ in 0..encode_rounds {
             let start = Instant::now();

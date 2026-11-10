@@ -85,31 +85,32 @@ impl<'a> MagSgnReader<'a> {
         }
     }
 
-    /// §7.1.2 `importMagSgnBit`.
-    fn bit(&mut self) -> Result<u8, Error> {
-        if self.ms_bits == 0 {
-            self.ms_bits = if self.ms_last == 0xFF { 7 } else { 8 };
-            if self.ms_pos < self.pcup {
-                self.ms_tmp = self.dcup.get(self.ms_pos) as u32;
-                if self.ms_tmp & (1 << self.ms_bits) != 0 {
-                    return Err(Error::HtCorruptSegment);
-                }
-            } else if self.ms_pos == self.pcup {
-                self.ms_tmp = 0xFF;
-            } else {
+    /// The byte-import half of §7.1.2 `importMagSgnBit`: load the next
+    /// MagSgn byte (7 payload bits after a `0xFF`, 8 otherwise),
+    /// rejecting a set stuffing bit and any read past the one
+    /// synthesised `0xFF` that follows the `Pcup` real bytes.
+    #[inline]
+    fn import_byte(&mut self) -> Result<(), Error> {
+        self.ms_bits = if self.ms_last == 0xFF { 7 } else { 8 };
+        if self.ms_pos < self.pcup {
+            self.ms_tmp = self.dcup.get(self.ms_pos) as u32;
+            if self.ms_tmp & (1 << self.ms_bits) != 0 {
                 return Err(Error::HtCorruptSegment);
             }
-            self.ms_last = self.ms_tmp;
-            self.ms_pos += 1;
+        } else if self.ms_pos == self.pcup {
+            self.ms_tmp = 0xFF;
+        } else {
+            return Err(Error::HtCorruptSegment);
         }
-        let bit = (self.ms_tmp & 1) as u8;
-        self.ms_tmp >>= 1;
-        self.ms_bits -= 1;
-        Ok(bit)
+        self.ms_last = self.ms_tmp;
+        self.ms_pos += 1;
+        Ok(())
     }
 
     /// Unpack `m` bits as a little-endian integer (the inner loop of
-    /// §7.3.8 `decodeMagSgnValue`).
+    /// §7.3.8 `decodeMagSgnValue`): the bit-import half of §7.1.2
+    /// `importMagSgnBit`, taking every requested bit the current byte
+    /// still holds in one step.
     ///
     /// A conformant stream in this crate's supported precision range
     /// keeps every magnitude inside the 32-bit lane (`Mb` is bounded
@@ -121,8 +122,16 @@ impl<'a> MagSgnReader<'a> {
             return Err(Error::HtCorruptSegment);
         }
         let mut val = 0u32;
-        for i in 0..m {
-            val |= (self.bit()? as u32) << i;
+        let mut got = 0u32;
+        while got < m {
+            if self.ms_bits == 0 {
+                self.import_byte()?;
+            }
+            let take = (m - got).min(self.ms_bits);
+            val |= (self.ms_tmp & ((1u32 << take) - 1)) << got;
+            self.ms_tmp >>= take;
+            self.ms_bits -= take;
+            got += take;
         }
         Ok(val)
     }
