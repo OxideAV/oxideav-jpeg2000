@@ -1820,6 +1820,10 @@ fn ht_tier1_block(
     Ok(Some((block, nb_ht)))
 }
 
+/// Coded bytes a component's blocks must hold per tier-1 worker
+/// before the block decode fans out.
+const MIN_CODED_BYTES_PER_WORKER: usize = 2048;
+
 /// Everything a tier-1 block job reads besides its own accumulated
 /// contributions — shared by reference across the workers.
 struct BlockJobContext<'a> {
@@ -2475,8 +2479,16 @@ fn decode_tile_from_plan(
             discard_levels,
             reversible: matches!(cc.transform, WaveletTransform::Reversible5x3),
         };
+        // A worker is only worth starting for a couple of kilobytes of
+        // coded data (a few hundred microseconds of entropy decoding).
+        let coded_bytes: usize = jobs
+            .iter()
+            .flat_map(|(_, acc)| acc.segments.iter())
+            .map(|segment| segment.bytes.len())
+            .sum();
+        let block_budget = threads.min(coded_bytes / MIN_CODED_BYTES_PER_WORKER).max(1);
         crate::parallel::ordered_map(
-            threads,
+            block_budget,
             jobs.len(),
             || None::<CodeBlock>,
             |work_block, index| {
@@ -2943,176 +2955,186 @@ fn decode_codestream_impl(
         parts_by_tile.entry(tp.sot.tile_index).or_default().push(tp);
     }
 
-    for (tile_index, parts) in parts_by_tile {
-        if (tile_index as u64) >= num_tiles {
-            return Err(Error::InvalidTilePartIndex);
-        }
-        // §A.4.2 / Table A.5: TPsot "denotes the order from 0" and the
-        // tile's tile-parts shall appear in the codestream in that
-        // order — so in codestream order the tile's TPsot values must
-        // be exactly 0, 1, 2, … A gap, duplicate or out-of-order index
-        // means a tile-part was lost or the stream was mis-assembled;
-        // sorting and decoding anyway would silently mis-place packets,
-        // so the fault is rejected. Table A.6: a non-zero TNsot must
-        // state the tile's true tile-part count.
-        for (i, tp) in parts.iter().enumerate() {
-            if usize::from(tp.sot.tile_part_index) != i {
+    // Tiles decode independently: up to `outer` of them at once, each
+    // with the rest of the budget for its own blocks and transforms.
+    // Their planes are placed here in tile order, so the image — and
+    // the first error reported — is the same at every budget.
+    let tiles: Vec<(u16, Vec<&crate::TilePart>)> = parts_by_tile.into_iter().collect();
+    let outer = crate::parallel::effective_workers(threads, tiles.len());
+    let inner = (threads / outer).max(1);
+    let decode_one =
+        |tile_index: u16, parts: &[&crate::TilePart]| -> Result<Vec<Vec<i32>>, Error> {
+            if (tile_index as u64) >= num_tiles {
                 return Err(Error::InvalidTilePartIndex);
             }
-            if tp.sot.num_tile_parts != 0 && usize::from(tp.sot.num_tile_parts) != parts.len() {
-                return Err(Error::InvalidTilePartIndex);
+            // §A.4.2 / Table A.5: TPsot "denotes the order from 0" and the
+            // tile's tile-parts shall appear in the codestream in that
+            // order — so in codestream order the tile's TPsot values must
+            // be exactly 0, 1, 2, … A gap, duplicate or out-of-order index
+            // means a tile-part was lost or the stream was mis-assembled;
+            // sorting and decoding anyway would silently mis-place packets,
+            // so the fault is rejected. Table A.6: a non-zero TNsot must
+            // state the tile's true tile-part count.
+            for (i, tp) in parts.iter().enumerate() {
+                if usize::from(tp.sot.tile_part_index) != i {
+                    return Err(Error::InvalidTilePartIndex);
+                }
+                if tp.sot.num_tile_parts != 0 && usize::from(tp.sot.num_tile_parts) != parts.len() {
+                    return Err(Error::InvalidTilePartIndex);
+                }
             }
-        }
 
-        // §A.6.1 / §A.6.2 / §A.6.4 / §A.6.5: COD / COC / QCD / QCC / RGN
-        // overrides may appear only in the first tile-part (TPsot = 0).
-        // A coding-style marker in a later tile-part of the same tile is
-        // malformed — reject it before resolving so a stray override is
-        // never silently dropped.
-        for tp in &parts {
-            if tp.sot.tile_part_index != 0 {
-                for m in &tp.markers {
-                    match m {
-                        crate::TilePartMarker::Cod(_)
-                        | crate::TilePartMarker::Coc(_)
-                        | crate::TilePartMarker::Qcd(_)
-                        | crate::TilePartMarker::Qcc(_)
-                        | crate::TilePartMarker::Rgn(_)
-                        | crate::TilePartMarker::Poc(_) => {
-                            return Err(Error::InvalidMarkerLength);
+            // §A.6.1 / §A.6.2 / §A.6.4 / §A.6.5: COD / COC / QCD / QCC / RGN
+            // overrides may appear only in the first tile-part (TPsot = 0).
+            // A coding-style marker in a later tile-part of the same tile is
+            // malformed — reject it before resolving so a stray override is
+            // never silently dropped.
+            for tp in parts {
+                if tp.sot.tile_part_index != 0 {
+                    for m in &tp.markers {
+                        match m {
+                            crate::TilePartMarker::Cod(_)
+                            | crate::TilePartMarker::Coc(_)
+                            | crate::TilePartMarker::Qcd(_)
+                            | crate::TilePartMarker::Qcc(_)
+                            | crate::TilePartMarker::Rgn(_)
+                            | crate::TilePartMarker::Poc(_) => {
+                                return Err(Error::InvalidMarkerLength);
+                            }
+                            // PLT / PPT / COM may appear in any tile-part.
+                            crate::TilePartMarker::Plt(_)
+                            | crate::TilePartMarker::Ppt(_)
+                            | crate::TilePartMarker::Com(_) => {}
                         }
-                        // PLT / PPT / COM may appear in any tile-part.
-                        crate::TilePartMarker::Plt(_)
-                        | crate::TilePartMarker::Ppt(_)
-                        | crate::TilePartMarker::Com(_) => {}
                     }
                 }
             }
-        }
 
-        // §A.6 precedence: layer this tile's TPsot = 0 overrides on the
-        // resolved main-header parameters. With no overrides this is the
-        // main-header resolution verbatim.
-        let first_markers: &[crate::TilePartMarker] =
-            parts.first().map(|tp| tp.markers.as_slice()).unwrap_or(&[]);
-        let tile_coding = resolve_tile_coding(
-            siz.components.len(),
-            ht_sig,
-            &main_rgns,
-            main_poc.as_ref(),
-            &params,
-            &comp_coding,
-            &comp_quant,
-            &roi_shift,
-            first_markers,
-        )?;
+            // §A.6 precedence: layer this tile's TPsot = 0 overrides on the
+            // resolved main-header parameters. With no overrides this is the
+            // main-header resolution verbatim.
+            let first_markers: &[crate::TilePartMarker] =
+                parts.first().map(|tp| tp.markers.as_slice()).unwrap_or(&[]);
+            let tile_coding = resolve_tile_coding(
+                siz.components.len(),
+                ht_sig,
+                &main_rgns,
+                main_poc.as_ref(),
+                &params,
+                &comp_coding,
+                &comp_quant,
+                &roi_shift,
+                first_markers,
+            )?;
 
-        let mut body = Vec::new();
-        for tp in &parts {
-            let end = tp
-                .body_offset
-                .checked_add(tp.body_len)
-                .ok_or(Error::PsotOverflow)?;
-            let slice = bytes.get(tp.body_offset..end).ok_or(Error::PsotOverflow)?;
-            body.extend_from_slice(slice);
-        }
-
-        // §A.7.4 / §A.7.5: resolve the relocated packet-header buffer for
-        // this tile, if any.
-        //
-        // * `PPM` (main header) — concatenate the per-tile-part buffers
-        //   the `collect_main_header_ppm` series assigned to this tile's
-        //   tile-parts, in TPsot order (the same order `parts` is sorted
-        //   in). Each tile-part's buffer is addressed by its codestream
-        //   ordinal.
-        // * `PPT` (tile-part headers) — gather the `Ippt` payloads in
-        //   increasing `Zppt` order across the tile's tile-parts. Within a
-        //   tile-part the parser preserves codestream order and the
-        //   tile-parts are already TPsot-sorted, so the relocated header
-        //   stream is assembled in packet-decode order; the `Zppt` indices
-        //   must form the contiguous run `0..N` exactly once each — a gap
-        //   or duplicate signals a lost or mis-ordered PPT segment.
-        let relocated: Option<Vec<u8>> = if let Some(ppm) = &main_ppm {
-            let mut buf = Vec::new();
-            for tp in &parts {
-                let ord = *tp_ordinal
-                    .get(&(tp.sot.tile_index, tp.sot.tile_part_index))
-                    .ok_or(Error::InvalidTilePartIndex)?;
-                let entry = ppm.get(ord).ok_or(Error::InvalidMarkerLength)?;
-                buf.extend_from_slice(entry);
+            let mut body = Vec::new();
+            for tp in parts {
+                let end = tp
+                    .body_offset
+                    .checked_add(tp.body_len)
+                    .ok_or(Error::PsotOverflow)?;
+                let slice = bytes.get(tp.body_offset..end).ok_or(Error::PsotOverflow)?;
+                body.extend_from_slice(slice);
             }
-            Some(buf)
-        } else {
-            gather_ppt_headers(&parts)?
-        };
 
-        // §A.7.3: gather each tile-part's `PLT` packet-length lists
-        // (concatenated in increasing `Zplt` order — a duplicated index
-        // makes the concatenation ambiguous and is rejected). Only
-        // tile-parts that carry a `PLT` are constrained.
-        let mut any_plt = false;
-        let mut plt_plan: Vec<TilePartPlt> = Vec::with_capacity(parts.len());
-        for tp in &parts {
-            let mut segs: Vec<&crate::Plt> = tp
-                .markers
-                .iter()
-                .filter_map(|m| match m {
-                    crate::TilePartMarker::Plt(p) => Some(p),
-                    _ => None,
-                })
-                .collect();
-            if segs.is_empty() {
-                plt_plan.push((tp.body_len, None));
-                continue;
-            }
-            any_plt = true;
-            segs.sort_by_key(|p| p.z_index);
-            for w in segs.windows(2) {
-                if w[0].z_index == w[1].z_index {
-                    return Err(Error::PltMismatch);
-                }
-            }
-            let lengths: Vec<u64> = segs
-                .iter()
-                .flat_map(|p| p.packet_lengths.iter().map(|&l| u64::from(l)))
-                .collect();
-            plt_plan.push((tp.body_len, Some(lengths)));
-        }
-
-        // §A.7.2: this tile's share of the main-header `PLM` lists —
-        // one per tile-part, addressed by codestream ordinal.
-        let plm_plan: Option<Vec<TilePartPlt>> = match &main_plm {
-            Some(plm) => {
-                let mut plan = Vec::with_capacity(parts.len());
-                for tp in &parts {
+            // §A.7.4 / §A.7.5: resolve the relocated packet-header buffer for
+            // this tile, if any.
+            //
+            // * `PPM` (main header) — concatenate the per-tile-part buffers
+            //   the `collect_main_header_ppm` series assigned to this tile's
+            //   tile-parts, in TPsot order (the same order `parts` is sorted
+            //   in). Each tile-part's buffer is addressed by its codestream
+            //   ordinal.
+            // * `PPT` (tile-part headers) — gather the `Ippt` payloads in
+            //   increasing `Zppt` order across the tile's tile-parts. Within a
+            //   tile-part the parser preserves codestream order and the
+            //   tile-parts are already TPsot-sorted, so the relocated header
+            //   stream is assembled in packet-decode order; the `Zppt` indices
+            //   must form the contiguous run `0..N` exactly once each — a gap
+            //   or duplicate signals a lost or mis-ordered PPT segment.
+            let relocated: Option<Vec<u8>> = if let Some(ppm) = &main_ppm {
+                let mut buf = Vec::new();
+                for tp in parts {
                     let ord = *tp_ordinal
                         .get(&(tp.sot.tile_index, tp.sot.tile_part_index))
                         .ok_or(Error::InvalidTilePartIndex)?;
-                    let lengths = plm.get(ord).ok_or(Error::PlmMismatch)?;
-                    plan.push((tp.body_len, Some(lengths.clone())));
+                    let entry = ppm.get(ord).ok_or(Error::InvalidMarkerLength)?;
+                    buf.extend_from_slice(entry);
                 }
-                Some(plan)
+                Some(buf)
+            } else {
+                gather_ppt_headers(parts)?
+            };
+
+            // §A.7.3: gather each tile-part's `PLT` packet-length lists
+            // (concatenated in increasing `Zplt` order — a duplicated index
+            // makes the concatenation ambiguous and is rejected). Only
+            // tile-parts that carry a `PLT` are constrained.
+            let mut any_plt = false;
+            let mut plt_plan: Vec<TilePartPlt> = Vec::with_capacity(parts.len());
+            for tp in parts {
+                let mut segs: Vec<&crate::Plt> = tp
+                    .markers
+                    .iter()
+                    .filter_map(|m| match m {
+                        crate::TilePartMarker::Plt(p) => Some(p),
+                        _ => None,
+                    })
+                    .collect();
+                if segs.is_empty() {
+                    plt_plan.push((tp.body_len, None));
+                    continue;
+                }
+                any_plt = true;
+                segs.sort_by_key(|p| p.z_index);
+                for w in segs.windows(2) {
+                    if w[0].z_index == w[1].z_index {
+                        return Err(Error::PltMismatch);
+                    }
+                }
+                let lengths: Vec<u64> = segs
+                    .iter()
+                    .flat_map(|p| p.packet_lengths.iter().map(|&l| u64::from(l)))
+                    .collect();
+                plt_plan.push((tp.body_len, Some(lengths)));
             }
-            None => None,
+
+            // §A.7.2: this tile's share of the main-header `PLM` lists —
+            // one per tile-part, addressed by codestream ordinal.
+            let plm_plan: Option<Vec<TilePartPlt>> = match &main_plm {
+                Some(plm) => {
+                    let mut plan = Vec::with_capacity(parts.len());
+                    for tp in parts {
+                        let ord = *tp_ordinal
+                            .get(&(tp.sot.tile_index, tp.sot.tile_part_index))
+                            .ok_or(Error::InvalidTilePartIndex)?;
+                        let lengths = plm.get(ord).ok_or(Error::PlmMismatch)?;
+                        plan.push((tp.body_len, Some(lengths.clone())));
+                    }
+                    Some(plan)
+                }
+                None => None,
+            };
+
+            let tile_planes = decode_tile(
+                siz,
+                &tile_coding.params,
+                &tile_coding.comp_coding,
+                &tile_coding.comp_quant,
+                &tile_coding.roi_shift,
+                &tile_coding.poc_volumes,
+                tile_index as u32,
+                &body,
+                relocated.as_deref(),
+                discard_levels,
+                max_layers,
+                any_plt.then_some(plt_plan.as_slice()),
+                plm_plan.as_deref(),
+                inner,
+            )?;
+            Ok(tile_planes)
         };
-
-        let tile_planes = decode_tile(
-            siz,
-            &tile_coding.params,
-            &tile_coding.comp_coding,
-            &tile_coding.comp_quant,
-            &tile_coding.roi_shift,
-            &tile_coding.poc_volumes,
-            tile_index as u32,
-            &body,
-            relocated.as_deref(),
-            discard_levels,
-            max_layers,
-            any_plt.then_some(plt_plan.as_slice()),
-            plm_plan.as_deref(),
-            threads,
-        )?;
-
+    let mut place_tile = |tile_index: u16, tile_planes: Vec<Vec<i32>>| -> Result<(), Error> {
         // Place each tile-component plane into its image-area plane at
         // the Equation B-12 offset.
         let tile = derive_tile_geometry(siz, tile_index as u32)?;
@@ -3164,7 +3186,18 @@ fn decode_codestream_impl(
                 comp.samples[dst_start..dst_start + tw].copy_from_slice(src);
             }
         }
-    }
+        Ok(())
+    };
+    crate::parallel::ordered_map(
+        outer,
+        tiles.len(),
+        || (),
+        |(), index| {
+            let (tile_index, parts) = &tiles[index];
+            decode_one(*tile_index, parts)
+        },
+        |index, planes| place_tile(tiles[index].0, planes?),
+    )?;
     // Components no tile-part reached stay zero.
     for (comp, &len) in components.iter_mut().zip(&plane_lens) {
         if comp.samples.len() != len {

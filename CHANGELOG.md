@@ -28,6 +28,8 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 - Encoder block jobs no longer hand their coefficient copies back to the collector (they were kept alive for the whole tile), so encoder peak memory is back below the pre-threading level.
 - The wavelet fan-out scales with the lattice: a level gets one worker per 32 768 samples (at most the budget), so the small levels of the cascade no longer spawn a full set of threads each.
 - Fan-out robustness: a thread the host declines to create is one worker fewer instead of a panic (the calling thread works through the wavelet runs itself and, with no worker at all, codes the blocks in place), and no fan-out uses more than 256 workers whatever the budget.
+- Tiles run concurrently in both directions (each with its share of the budget for its own blocks and transforms) and are folded back in tile order — block ordinals, and with them the rate allocation, are assigned exactly as on one worker. Work that is too small to share is not shared: block coding fans out only past ~2 kB of coded data (decode) or 8192 samples (encode) per worker, so a picture cut into small tiles no longer spawns threads per tile (a 1024² image in 16×16 tiles decoded 4× *slower* on 8 workers than on one before this; it is now 5× faster).
+- In-order result hand-back keeps the workers within a window of twice their number past the consumer, so finished tiles / blocks waiting for their turn stay bounded; a panicking worker releases the others instead of leaving them waiting.
 
 ## [0.0.19](https://github.com/OxideAV/oxideav-jpeg2000/compare/v0.0.18...v0.0.19) - 2026-11-07
 

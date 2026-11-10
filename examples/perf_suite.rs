@@ -7,7 +7,8 @@
 //! ```
 //!
 //! Cases: `rgb8-1024` and `rgb16-1024` lossless 5-3, `rgb8-512` lossy
-//! 9-7 (plain and rate-controlled), `rgb8-4k` lossless, and an HTJ2K
+//! 9-7 (plain and rate-controlled), `rgb8-4k` lossless, a 64-tile
+//! `rgb8-1024-tiles128`, and an HTJ2K
 //! `ht-rgb8-1024` lossless stream. Each case is encoded and decoded
 //! `rounds` times after one warm-up; the median and the fastest round
 //! (milliseconds) are printed together
@@ -171,6 +172,17 @@ fn cases() -> Vec<Case> {
             bits: 8,
             options: base().with_decomposition_levels(5),
             registry_keys: &[("levels", "5")],
+            lossless: true,
+        },
+        Case {
+            name: "rgb8-1024-tiles128",
+            width: 1024,
+            height: 1024,
+            bits: 8,
+            options: base()
+                .with_decomposition_levels(5)
+                .with_tile_size((128, 128)),
+            registry_keys: &[("levels", "5"), ("tile", "128x128")],
             lossless: true,
         },
         Case {

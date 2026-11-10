@@ -858,6 +858,9 @@ fn component_planes<T: Copy + Send>(
     let format = image.format;
     let bps = format.bytes_per_sample();
     let n = format.components();
+    // A small picture is split on the calling thread.
+    let pixels = image.width as usize * image.height as usize;
+    let threads = if pixels < 1 << 16 { 1 } else { threads };
     crate::parallel::collect_ordered(threads, n, |c| {
         if format.is_yuv() {
             let (pw, ph) = format.plane_dimensions(c, image.width, image.height);

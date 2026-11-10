@@ -1857,6 +1857,10 @@ pub fn encode_j2k_lossless_rct(
     )
 }
 
+/// Samples a tile (or a set of code-blocks) must hold per worker
+/// before the encoder fans its work out.
+const MIN_SAMPLES_PER_WORKER: usize = 8192;
+
 /// One input sample plane — 8-bit or 16-bit unsigned storage.
 #[derive(Clone, Copy)]
 enum SamplePlane<'a> {
@@ -2345,126 +2349,134 @@ fn encode_core(
     // independently over its own reference-grid region (§B.3), with the
     // absolute tile corner driving the lifting parity.
     let dc = 1i32 << (precision - 1);
-    let transform_tile =
-        |tile: &crate::geometry::TileGeometry| -> Result<Vec<ComponentBands>, Error> {
-            // §B.3 Equation B-12: component ci codes the tile-component
-            // region ⌈tx0/XRsiz⌉..⌈tx1/XRsiz⌉ × ⌈ty0/YRsiz⌉..⌈ty1/YRsiz⌉
-            // on its own (sub-sampled) component grid; the absolute
-            // tile-component corner drives the §F.4 lifting parity.
-            let extract = |ci: usize| -> Vec<i32> {
-                let tc = &tile.components[ci];
-                let (xr, _yr) = separation(ci);
-                let cw = width.div_ceil(xr) as usize;
-                let (x0, x1) = (tc.tcx0 as usize, tc.tcx1 as usize);
-                let mut out = Vec::with_capacity((tc.width() as usize) * (tc.height() as usize));
-                for y in tc.tcy0 as usize..tc.tcy1 as usize {
-                    let row = y * cw;
-                    match &planes[ci] {
-                        SamplePlane::U8(p) => {
-                            out.extend(p[row + x0..row + x1].iter().map(|&v| i32::from(v) - dc));
-                        }
-                        SamplePlane::U16(p) => {
-                            out.extend(p[row + x0..row + x1].iter().map(|&v| i32::from(v) - dc));
-                        }
+    let transform_tile = |tile: &crate::geometry::TileGeometry,
+                          budget: usize|
+     -> Result<Vec<ComponentBands>, Error> {
+        // §B.3 Equation B-12: component ci codes the tile-component
+        // region ⌈tx0/XRsiz⌉..⌈tx1/XRsiz⌉ × ⌈ty0/YRsiz⌉..⌈ty1/YRsiz⌉
+        // on its own (sub-sampled) component grid; the absolute
+        // tile-component corner drives the §F.4 lifting parity.
+        let extract = |ci: usize| -> Vec<i32> {
+            let tc = &tile.components[ci];
+            let (xr, _yr) = separation(ci);
+            let cw = width.div_ceil(xr) as usize;
+            let (x0, x1) = (tc.tcx0 as usize, tc.tcx1 as usize);
+            let mut out = Vec::with_capacity((tc.width() as usize) * (tc.height() as usize));
+            for y in tc.tcy0 as usize..tc.tcy1 as usize {
+                let row = y * cw;
+                match &planes[ci] {
+                    SamplePlane::U8(p) => {
+                        out.extend(p[row + x0..row + x1].iter().map(|&v| i32::from(v) - dc));
+                    }
+                    SamplePlane::U16(p) => {
+                        out.extend(p[row + x0..row + x1].iter().map(|&v| i32::from(v) - dc));
                     }
                 }
-                out
-            };
-            // Components transform independently: up to `outer` of
-            // them at once, each cascade with the rest of the budget.
-            let outer = crate::parallel::effective_workers(params.threads, planes.len());
-            let inner = (params.threads / outer).max(1);
-            // A plane handed to exactly one cascade job.
-            fn hand_over<T>(cells: &[std::sync::Mutex<Option<Vec<T>>>], ci: usize) -> Vec<T> {
-                cells[ci]
-                    .lock()
-                    .ok()
-                    .and_then(|mut cell| cell.take())
-                    .expect("each component plane is taken once")
             }
-            let cascade_5x3 = |ci: usize, plane: Vec<i32>| {
-                let tc = &tile.components[ci];
-                forward_cascade(
-                    plane,
-                    tc.tcx0,
-                    tc.tcy0,
-                    tc.width() as usize,
-                    tc.height() as usize,
-                    comp_params[ci].nl,
-                    inner,
-                )
-            };
-            let cascade_9x7 = |ci: usize, plane: Vec<f64>, fine_bits: u8| {
-                let tc = &tile.components[ci];
-                forward_cascade_9x7(
-                    plane,
-                    tc.tcx0,
-                    tc.tcy0,
-                    tc.width() as usize,
-                    tc.height() as usize,
-                    comp_params[ci].nl,
-                    fine_bits,
-                    inner,
-                )
-            };
-            if mct {
-                // Table A.17: the MCT couples components 0–2 on one
-                // kernel (validated above); per-component NL still
-                // applies to each cascade.
-                return Ok(match kernel {
-                    EncodeKernel::Lossless5x3 => {
-                        let mut shifted: Vec<Vec<i32>> =
-                            crate::parallel::collect_ordered(params.threads, planes.len(), extract);
-                        if use_rct {
-                            // Split into three disjoint &mut [i32].
-                            let (head, tail) = shifted.split_at_mut(1);
-                            let (mid, tail2) = tail.split_at_mut(1);
-                            crate::mct::forward_rct(&mut head[0], &mut mid[0], &mut tail2[0])?;
-                        }
-                        let cells: Vec<_> = shifted
-                            .into_iter()
-                            .map(|plane| std::sync::Mutex::new(Some(plane)))
-                            .collect();
-                        crate::parallel::collect_ordered(outer, cells.len(), |ci| {
-                            cascade_5x3(ci, hand_over(&cells, ci))
-                        })
-                    }
-                    EncodeKernel::Lossy9x7 { fine_bits } => {
-                        let mut shifted: Vec<Vec<f64>> =
-                            crate::parallel::collect_ordered(params.threads, planes.len(), |ci| {
-                                extract(ci).into_iter().map(f64::from).collect()
-                            });
-                        if use_ict {
-                            let (head, tail) = shifted.split_at_mut(1);
-                            let (mid, tail2) = tail.split_at_mut(1);
-                            crate::mct::forward_ict_f64(&mut head[0], &mut mid[0], &mut tail2[0])?;
-                        }
-                        let cells: Vec<_> = shifted
-                            .into_iter()
-                            .map(|plane| std::sync::Mutex::new(Some(plane)))
-                            .collect();
-                        crate::parallel::collect_ordered(outer, cells.len(), |ci| {
-                            cascade_9x7(ci, hand_over(&cells, ci), fine_bits)
-                        })
-                    }
-                });
-            }
-            // No MCT: each component runs its own §A.6.2 kernel + NL
-            // independently (a COC may give siblings different
-            // kernels).
-            Ok(crate::parallel::collect_ordered(
-                outer,
-                planes.len(),
-                |ci| match comp_params[ci].kernel {
-                    EncodeKernel::Lossless5x3 => cascade_5x3(ci, extract(ci)),
-                    EncodeKernel::Lossy9x7 { fine_bits } => cascade_9x7(
-                        ci,
-                        extract(ci).into_iter().map(f64::from).collect(),
-                        fine_bits,
-                    ),
-                },
-            ))
+            out
         };
+        // Components transform independently: up to `outer` of
+        // them at once, each cascade with the rest of the budget.
+        // A small tile is not worth a thread of its own.
+        let tile_samples: usize = tile
+            .components
+            .iter()
+            .map(|tc| tc.width() as usize * tc.height() as usize)
+            .sum();
+        let budget = budget.min(tile_samples / MIN_SAMPLES_PER_WORKER).max(1);
+        let outer = crate::parallel::effective_workers(budget, planes.len());
+        let inner = (budget / outer).max(1);
+        // A plane handed to exactly one cascade job.
+        fn hand_over<T>(cells: &[std::sync::Mutex<Option<Vec<T>>>], ci: usize) -> Vec<T> {
+            cells[ci]
+                .lock()
+                .ok()
+                .and_then(|mut cell| cell.take())
+                .expect("each component plane is taken once")
+        }
+        let cascade_5x3 = |ci: usize, plane: Vec<i32>| {
+            let tc = &tile.components[ci];
+            forward_cascade(
+                plane,
+                tc.tcx0,
+                tc.tcy0,
+                tc.width() as usize,
+                tc.height() as usize,
+                comp_params[ci].nl,
+                inner,
+            )
+        };
+        let cascade_9x7 = |ci: usize, plane: Vec<f64>, fine_bits: u8| {
+            let tc = &tile.components[ci];
+            forward_cascade_9x7(
+                plane,
+                tc.tcx0,
+                tc.tcy0,
+                tc.width() as usize,
+                tc.height() as usize,
+                comp_params[ci].nl,
+                fine_bits,
+                inner,
+            )
+        };
+        if mct {
+            // Table A.17: the MCT couples components 0–2 on one
+            // kernel (validated above); per-component NL still
+            // applies to each cascade.
+            return Ok(match kernel {
+                EncodeKernel::Lossless5x3 => {
+                    let mut shifted: Vec<Vec<i32>> =
+                        crate::parallel::collect_ordered(budget, planes.len(), extract);
+                    if use_rct {
+                        // Split into three disjoint &mut [i32].
+                        let (head, tail) = shifted.split_at_mut(1);
+                        let (mid, tail2) = tail.split_at_mut(1);
+                        crate::mct::forward_rct(&mut head[0], &mut mid[0], &mut tail2[0])?;
+                    }
+                    let cells: Vec<_> = shifted
+                        .into_iter()
+                        .map(|plane| std::sync::Mutex::new(Some(plane)))
+                        .collect();
+                    crate::parallel::collect_ordered(outer, cells.len(), |ci| {
+                        cascade_5x3(ci, hand_over(&cells, ci))
+                    })
+                }
+                EncodeKernel::Lossy9x7 { fine_bits } => {
+                    let mut shifted: Vec<Vec<f64>> =
+                        crate::parallel::collect_ordered(budget, planes.len(), |ci| {
+                            extract(ci).into_iter().map(f64::from).collect()
+                        });
+                    if use_ict {
+                        let (head, tail) = shifted.split_at_mut(1);
+                        let (mid, tail2) = tail.split_at_mut(1);
+                        crate::mct::forward_ict_f64(&mut head[0], &mut mid[0], &mut tail2[0])?;
+                    }
+                    let cells: Vec<_> = shifted
+                        .into_iter()
+                        .map(|plane| std::sync::Mutex::new(Some(plane)))
+                        .collect();
+                    crate::parallel::collect_ordered(outer, cells.len(), |ci| {
+                        cascade_9x7(ci, hand_over(&cells, ci), fine_bits)
+                    })
+                }
+            });
+        }
+        // No MCT: each component runs its own §A.6.2 kernel + NL
+        // independently (a COC may give siblings different
+        // kernels).
+        Ok(crate::parallel::collect_ordered(
+            outer,
+            planes.len(),
+            |ci| match comp_params[ci].kernel {
+                EncodeKernel::Lossless5x3 => cascade_5x3(ci, extract(ci)),
+                EncodeKernel::Lossy9x7 { fine_bits } => cascade_9x7(
+                    ci,
+                    extract(ci).into_iter().map(f64::from).collect(),
+                    fine_bits,
+                ),
+            },
+        ))
+    };
 
     // -- Tier-1: encode every code-block, keyed (tile, comp, r, k) -----
     // Per precinct: the per-sub-band code-block grids + zero-bit-plane
@@ -2515,6 +2527,17 @@ fn encode_core(
         sub_band: usize,
         in_band: usize,
         in_precinct: usize,
+    }
+    /// One tile's share of the encode, folded into the image-wide
+    /// tables in tile order.
+    struct TileOutcome {
+        packets: BTreeMap<(u32, u16, u8, u32), PrecinctRaw>,
+        /// The coded blocks in coding order: precinct key and index
+        /// within the precinct's block list.
+        coded_order: Vec<((u32, u16, u8, u32), usize)>,
+        ht_max_bits: u32,
+        max_depth: u32,
+        progression: (Vec<ComponentProgressionInfo>, Vec<ComponentPositionInfo>),
     }
     /// A job's result: the coded block (`None` when all-zero), the HT
     /// magnitude bit count it contributes to MAGB, and — only where
@@ -2722,9 +2745,13 @@ fn encode_core(
         Ok((enc, ht_bits, kept))
     };
 
-    for t in 0..num_tiles {
+    let encode_tile = |t: u32, budget: usize| -> Result<TileOutcome, Error> {
+        let mut packets: BTreeMap<(u32, u16, u8, u32), PrecinctRaw> = BTreeMap::new();
+        let mut coded_order: Vec<((u32, u16, u8, u32), usize)> = Vec::new();
+        let mut ht_max_bits = 0u32;
+        let mut max_depth = 0u32;
         let tile = derive_tile_geometry(&siz, t)?;
-        let bands = transform_tile(&tile)?;
+        let bands = transform_tile(&tile, budget)?;
         let mut jobs: Vec<BlockJob<'_>> = Vec::new();
         // §H.3.1 wavelet-domain ROI masks for this tile's components.
         let roi_masks: Option<Vec<MaskBands>> = params.roi.as_ref().map(|rect| {
@@ -2892,8 +2919,14 @@ fn encode_core(
         }
         // Run the tile's block jobs and fold the results back in block
         // order (the same order the serial coder visited them in).
+        // (A worker is only worth starting for a couple of blocks.)
+        let job_samples: usize = jobs
+            .iter()
+            .map(|job| job.cb.width() as usize * job.cb.height() as usize)
+            .sum();
+        let block_budget = budget.min(job_samples / MIN_SAMPLES_PER_WORKER).max(1);
         let outcomes: Vec<BlockOutcome> =
-            crate::parallel::collect_ordered(params.threads, jobs.len(), |index| {
+            crate::parallel::collect_ordered(block_budget, jobs.len(), |index| {
                 encode_block(&jobs[index])
             });
         for (job, outcome) in jobs.iter().zip(outcomes) {
@@ -2910,8 +2943,9 @@ fn encode_core(
             // scale.
             max_depth = max_depth.max(enc.zero_bit_planes + (enc.coding_passes + 1) / 3);
             enc.weight = job.weight;
-            enc.ordinal = num_blocks;
-            num_blocks += 1;
+            // The global ordinal is assigned when the tiles are folded
+            // back in order.
+            coded_order.push((job.precinct, job.in_precinct));
             if rate_control && cfg!(debug_assertions) {
                 let (bw, bh) = (job.cb.width() as usize, job.cb.height() as usize);
                 enc.reencode = Some((job.orientation, bw, bh, targets, job.mb));
@@ -2927,8 +2961,44 @@ fn encode_core(
                 precincts_per_resolution: pr.clone(),
             })
             .collect();
-        tile_prog.push((prog_info, position_infos));
-    }
+        Ok(TileOutcome {
+            packets,
+            coded_order,
+            ht_max_bits,
+            max_depth,
+            progression: (prog_info, position_infos),
+        })
+    };
+
+    // Tiles code independently: up to `outer` of them at once, each
+    // with the rest of the budget for its own transforms and blocks.
+    // They are folded back in tile order, which fixes every block's
+    // ordinal exactly as the serial coder assigns it.
+    let outer = crate::parallel::effective_workers(params.threads, num_tiles as usize);
+    let inner = (params.threads / outer).max(1);
+    crate::parallel::ordered_map(
+        outer,
+        num_tiles as usize,
+        || (),
+        |(), index| encode_tile(index as u32, inner),
+        |_, outcome| -> Result<(), Error> {
+            let outcome = outcome?;
+            ht_max_bits = ht_max_bits.max(outcome.ht_max_bits);
+            max_depth = max_depth.max(outcome.max_depth);
+            packets.extend(outcome.packets);
+            for (precinct, in_precinct) in outcome.coded_order {
+                let block = packets
+                    .get_mut(&precinct)
+                    .and_then(|raw| raw.blocks.get_mut(in_precinct))
+                    .and_then(Option::as_mut)
+                    .ok_or(Error::InvalidPacketHeader)?;
+                block.ordinal = num_blocks;
+                num_blocks += 1;
+            }
+            tile_prog.push(outcome.progression);
+            Ok(())
+        },
+    )?;
 
     // -- Tier-2 packet orders (per tile; computed once) -----------------
     // With a §A.6.6 POC the concatenated §B.12.2 progression-order

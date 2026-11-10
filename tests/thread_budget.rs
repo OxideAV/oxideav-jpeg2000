@@ -79,6 +79,16 @@ fn variants() -> Vec<(&'static str, EncodeOptions)> {
             "lossless-small-blocks-layers",
             base().with_code_block_exp((3, 4)).with_layers(4),
         ),
+        // Many small tiles: tiles run concurrently and are folded back
+        // in tile order (block ordinals feed the rate allocation).
+        ("tiny-tiles", base().with_tile_size((16, 16))),
+        (
+            "tiles-rate-layers",
+            base()
+                .with_tile_size((40, 24))
+                .with_layers(3)
+                .with_target_bytes(7000),
+        ),
         ("lossless-rate", base().with_target_bytes(9000)),
         ("lossy", base().with_lossy(3)),
         (
@@ -202,13 +212,16 @@ fn the_depth_decode_takes_the_same_options() {
 #[test]
 fn corrupt_streams_fail_identically_at_every_budget() {
     let image = synthetic(128, 96, PixelFormat::Rgb24, 21);
-    let options = EncodeOptions::new()
+    let single = EncodeOptions::new()
         .with_container(Container::J2k)
         .with_code_block_exp((4, 4));
-    let clean = encode(&image, &options).unwrap();
+    let tiled = single.clone().with_tile_size((32, 32));
     let mut state = 0x9e37_79b9_u32;
-    for _ in 0..40 {
-        let mut bytes = clean.clone();
+    for round in 0..60 {
+        // Alternate one tile and twelve: with tiles, which tile fails
+        // first must not depend on which worker gets there first.
+        let clean = encode(&image, if round % 2 == 0 { &single } else { &tiled }).unwrap();
+        let mut bytes = clean;
         for _ in 0..3 {
             state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
             let at = 120 + (state >> 8) as usize % (bytes.len() - 120);

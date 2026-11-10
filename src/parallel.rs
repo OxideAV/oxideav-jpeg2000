@@ -8,7 +8,7 @@
 //! results — and the same first error — at every budget.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc;
+use std::sync::{Condvar, Mutex, mpsc};
 
 /// The most workers any fan-out uses, whatever the budget: a budget is
 /// a cap handed in by the caller, not a request to create that many
@@ -31,6 +31,10 @@ pub(crate) fn effective_workers(budget: usize, units: usize) -> usize {
 /// result is sunk, the workers wind down, and the error is returned.
 /// Work on indices past the failing one may already have been
 /// performed; it is discarded.
+///
+/// Workers never run more than a small window ahead of the sink, so
+/// the results waiting for their turn stay bounded however uneven the
+/// work is.
 pub(crate) fn ordered_map<S, T, E, I, W, K>(
     budget: usize,
     count: usize,
@@ -52,22 +56,54 @@ where
         }
         return Ok(());
     }
+    // How far past the sink's cursor a worker may start an index.
+    let window = 2 * workers;
     let next = AtomicUsize::new(0);
     let stop = AtomicBool::new(false);
+    // The sink's cursor (indices below it have been sunk), which the
+    // workers wait on when they get too far ahead.
+    let sunk = Mutex::new(0usize);
+    let advanced = Condvar::new();
+    let release_workers = || {
+        stop.store(true, Ordering::Relaxed);
+        // Taking the lock orders this wake-up after any worker's check
+        // of `stop`, so none can miss it.
+        drop(lock(&sunk));
+        advanced.notify_all();
+    };
     std::thread::scope(|scope| {
         let (sender, receiver) = mpsc::channel::<(usize, T)>();
         let mut spawned = 0usize;
         for _ in 0..workers {
             let sender = sender.clone();
             let (next, stop, init, work) = (&next, &stop, &init, &work);
+            let (sunk, advanced) = (&sunk, &advanced);
             let worker = move || {
+                // Should `work` panic, wake the workers waiting on the
+                // window so the scope can unwind instead of hanging.
+                let _wake = WakeOnPanic {
+                    stop,
+                    sunk,
+                    advanced,
+                };
                 let mut state = init();
-                while !stop.load(Ordering::Relaxed) {
+                loop {
                     let index = next.fetch_add(1, Ordering::Relaxed);
                     if index >= count {
                         break;
                     }
-                    if sender.send((index, work(&mut state, index))).is_err() {
+                    {
+                        let mut cursor = lock(sunk);
+                        while index >= *cursor + window && !stop.load(Ordering::Relaxed) {
+                            cursor = match advanced.wait(cursor) {
+                                Ok(guard) => guard,
+                                Err(poisoned) => poisoned.into_inner(),
+                            };
+                        }
+                    }
+                    if stop.load(Ordering::Relaxed)
+                        || sender.send((index, work(&mut state, index))).is_err()
+                    {
                         break;
                     }
                 }
@@ -96,23 +132,56 @@ where
         // Results arrive in completion order; hold the early ones back
         // until every lower index has been sunk.
         let mut held: Vec<Option<T>> = Vec::new();
-        held.resize_with(count, || None);
+        held.resize_with(window + 1, || None);
         let mut cursor = 0usize;
         for (index, result) in receiver {
-            held[index] = Some(result);
+            // `index < cursor + window` by the workers' wait above.
+            held[index % (window + 1)] = Some(result);
+            let before = cursor;
             while cursor < count {
-                let Some(result) = held[cursor].take() else {
+                let Some(result) = held[cursor % (window + 1)].take() else {
                     break;
                 };
                 if let Err(error) = sink(cursor, result) {
-                    stop.store(true, Ordering::Relaxed);
+                    release_workers();
                     return Err(error);
                 }
                 cursor += 1;
             }
+            if cursor != before {
+                *lock(&sunk) = cursor;
+                advanced.notify_all();
+            }
         }
         Ok(())
     })
+}
+
+/// Releases every worker of an [`ordered_map`] run when the thread
+/// holding it unwinds.
+struct WakeOnPanic<'a> {
+    stop: &'a AtomicBool,
+    sunk: &'a Mutex<usize>,
+    advanced: &'a Condvar,
+}
+
+impl Drop for WakeOnPanic<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.stop.store(true, Ordering::Relaxed);
+            drop(lock(self.sunk));
+            self.advanced.notify_all();
+        }
+    }
+}
+
+/// Lock a mutex whose protected value stays meaningful even if a
+/// holder panicked.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 /// Run `work(index)` for every `index` in `0..count` and collect the
@@ -162,13 +231,10 @@ where
     // Every worker — this thread included — takes the next unclaimed
     // run until none is left, so a thread the host refuses to create
     // costs speed, never coverage.
-    let runs = std::sync::Mutex::new(items.chunks_mut(per_run * unit).enumerate());
+    let runs = Mutex::new(items.chunks_mut(per_run * unit).enumerate());
     let drain = || {
         loop {
-            let claimed = match runs.lock() {
-                Ok(mut runs) => runs.next(),
-                Err(poisoned) => poisoned.into_inner().next(),
-            };
+            let claimed = lock(&runs).next();
             let Some((run, chunk)) = claimed else {
                 break;
             };
@@ -237,6 +303,58 @@ mod tests {
             assert_eq!(outcome, Err(17), "budget {budget}");
             assert_eq!(sunk, 17);
         }
+    }
+
+    #[test]
+    fn ordered_map_keeps_workers_within_the_window() {
+        // Index 0 is slow: without a window every other result would
+        // pile up behind it. Count how many are in flight at once.
+        let budget = 4;
+        let in_flight = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let mut expected = 0usize;
+        let outcome: Result<(), ()> = ordered_map(
+            budget,
+            400,
+            || (),
+            |(), index| {
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                if index == 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(30));
+                }
+                index
+            },
+            |index, value| {
+                assert_eq!((index, value), (expected, expected));
+                expected += 1;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                Ok(())
+            },
+        );
+        assert_eq!(outcome, Ok(()));
+        assert_eq!(expected, 400);
+        // Started-but-unsunk results never exceed the window (2 × the
+        // workers) plus the workers' own claims.
+        assert!(peak.load(Ordering::SeqCst) <= 3 * budget + 1);
+    }
+
+    #[test]
+    fn ordered_map_propagates_a_worker_panic_without_hanging() {
+        let outcome = std::panic::catch_unwind(|| {
+            let result: Result<(), ()> = ordered_map(
+                4,
+                200,
+                || (),
+                |(), index| {
+                    assert!(index != 3, "boom");
+                    index
+                },
+                |_, _| Ok(()),
+            );
+            result
+        });
+        assert!(outcome.is_err());
     }
 
     #[test]

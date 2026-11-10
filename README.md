@@ -224,15 +224,16 @@ Both directions are **serial by default** and take a worker budget:
 `DecodeOptions::with_threads(n)` / `EncodeOptions::with_threads(n)` on
 the standalone API (`decode_with`, the depth-level `decode_j2k_with`,
 `encode` and the raw-plane encoders), or the `ExecutionContext` handed
-to the framework
-`Decoder` / `Encoder` (`set_execution_context`). The budget fans out
-Tier-1 — code-blocks are independent, so they are coded on up to `n`
-scoped `std` threads (no dependency, nothing spawned at `n = 1`) — and
-the wavelet transform, whose rows and column strips are shared out the
-same way.
+to the framework `Decoder` / `Encoder` (`set_execution_context`). The
+budget is shared out over scoped `std` threads (no dependency, nothing
+spawned at `n = 1`) at three levels: tiles (independent of one
+another), the code-blocks of a tile (Tier-1, where nearly all the time
+goes), and the rows and column strips of the wavelet transform. Work
+too small to be worth a thread — a tiny tile, a handful of blocks, a
+deep wavelet level — stays on the thread that has it.
 
-The output never depends on the budget: block results are folded back
-in block order, so the encoder emits **byte-identical** codestreams
+The output never depends on the budget: tile and block results are
+folded back in their coding order, so the encoder emits **byte-identical** codestreams
 (rate allocation included) and the decoder **sample-identical** images
 at every thread count, and a corrupt stream reports the same error.
 `tests/thread_budget.rs` pins this (and the `contract` /
