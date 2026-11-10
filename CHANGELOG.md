@@ -24,6 +24,7 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 - Encoder front end: components are extracted, transformed and split from the packed input concurrently under the budget; the sub-band split walks rows instead of dispatching per sample, and the 9-7 path no longer quantises the LL band it is about to discard at every level.
 - Decoder back end: a tile that covers a whole component hands its plane over instead of being copied into a second, zero-filled one (one image-sized allocation less on single-tile streams); 2D_INTERLEAVE runs row by row and the packed output layout is written pixel by pixel, both shared out under the budget.
 - HTJ2K MagSgn bits are imported / exported a byte's worth at a time.
+- Encoder block jobs no longer hand their coefficient copies back to the collector (they were kept alive for the whole tile), so encoder peak memory is back below the pre-threading level.
 
 ## [0.0.19](https://github.com/OxideAV/oxideav-jpeg2000/compare/v0.0.18...v0.0.19) - 2026-11-07
 

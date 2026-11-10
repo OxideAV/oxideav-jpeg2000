@@ -231,9 +231,37 @@ The output never depends on the budget: block results are folded back
 in block order, so the encoder emits **byte-identical** codestreams
 (rate allocation included) and the decoder **sample-identical** images
 at every thread count, and a corrupt stream reports the same error.
-`tests/thread_budget.rs` pins this; `examples/perf_suite.rs` times the
-standard cases at any budget and `examples/corpus_hash.rs` prints
-output hashes over a corpus for comparing two builds.
+`tests/thread_budget.rs` pins this (and the `contract` /
+`roundtrip_encode` fuzz targets check it on every input);
+`examples/perf_suite.rs` times the standard cases at any budget and
+`examples/corpus_hash.rs` prints output hashes over a corpus for
+comparing two builds.
+
+### Measured
+
+`cargo run --release --example perf_suite -- --threads N` on one
+18-core Apple M5 Max that was busy with other builds at the time
+(median of 7 rounds, milliseconds, encode / decode; synthetic images —
+ramps, texture, edges and grain — so the lossless streams carry about
+3.6 bit/sample at 8 bits and 12 bit/sample at 16):
+
+| case | 1 worker | 2 | 4 | 8 | 16 |
+|---|---|---|---|---|---|
+| RGB8 1024², lossless 5-3 | 142 / 158 | 75 / 81 | 39 / 46 | 22 / 25 | 16 / 20 |
+| RGB16 1024², lossless 5-3 | 386 / 402 | 194 / 208 | 104 / 109 | 55 / 58 | 35 / 42 |
+| RGB8 512², lossy 9-7 | 47 / 52 | 25 / 29 | 14 / 17 | 7.8 / 10 | 5.8 / 9.1 |
+| RGB8 512², lossy 9-7, 4 layers, 96 kB budget | 55 / 15 | 31 / 9.3 | 18 / 5.8 | 12 / 4.8 | 11 / 5.4 |
+| RGB8 3840×2160, lossless 5-3 | 1050 / 1117 | 543 / 581 | 292 / 307 | 167 / 175 | 107 / 108 |
+| RGB8 1024², lossless HTJ2K | 56 / 56 | 33 / 32 | 19 / 20 | 12 / 13 | 7.9 / 11 |
+
+Serial time is dominated by the MQ coder (one context-adaptive binary
+decision at a time, by construction), so it scales with the number of
+coded bits; everything else — the wavelet transform, colour transform,
+Tier-2 — is a few percent. Peak memory at one worker for the 3840×2160
+case is about 235 MiB decoding and 385 MiB encoding through the
+contract API (the packed picture, one `i32` plane per component, and
+one component's coefficients), and a larger budget adds a few MiB of
+per-worker block state.
 
 ## Metadata and colour
 

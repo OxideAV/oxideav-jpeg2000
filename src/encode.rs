@@ -2517,8 +2517,9 @@ fn encode_core(
         in_precinct: usize,
     }
     /// A job's result: the coded block (`None` when all-zero), the HT
-    /// magnitude bit count it contributes to MAGB, and its targets
-    /// (kept for the rate-control re-encode).
+    /// magnitude bit count it contributes to MAGB, and — only where
+    /// the debug-build rate-control cross-check wants them — its
+    /// coefficients.
     type BlockOutcome = Result<(Option<EncodedBlock>, u32, Vec<Coefficient>), Error>;
     let encode_block = |job: &BlockJob<'_>| -> BlockOutcome {
         let (bw, bh) = (job.cb.width() as usize, job.cb.height() as usize);
@@ -2711,7 +2712,14 @@ fn encode_core(
                 annexd
             }
         };
-        Ok((enc, ht_bits, targets))
+        // The coefficients outlive the job only for the debug-build
+        // cross-check of the rate-control termination tails.
+        let kept = if rate_control && cfg!(debug_assertions) {
+            targets
+        } else {
+            Vec::new()
+        };
+        Ok((enc, ht_bits, kept))
     };
 
     for t in 0..num_tiles {
