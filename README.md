@@ -319,7 +319,8 @@ per-worker state.
 ## Metadata and colour
 
 `ColorInfo { range, primaries, transfer, matrix }` comes from the JP2
-Colour Specification box: enumerated sRGB (16) → BT.709 primaries,
+Colour Specification box (the first one whose method is known — a box
+of any other `METH` is ignored entirely, §I.5.3.3): enumerated sRGB (16) → BT.709 primaries,
 sRGB transfer, identity matrix, full range; greyscale (17) → the same
 code points on one channel; sYCC (18) → BT.709 / sRGB / BT.601 matrix,
 full range; a T.814 parameterized box (`METH = 5`) is copied verbatim;
@@ -1001,7 +1002,8 @@ These surface a clean `Error::NotImplemented` rather than mis-decoding:
 
 Every module was written from the T.800 / ISO-IEC 15444-1 standards
 documents under `docs/image/jpeg2000/` only — the codestream and JP2
-syntax (Annex A + Annex I), tier-2 packet headers (§B.10, both read and
+syntax (Annex A + Annex I; the two `uuid` identifiers for XMP and Exif
+from the clause digest staged there, never from memory), tier-2 packet headers (§B.10, both read and
 write sides), tile / sub-band / precinct / code-block geometry
 (§B.2 – §B.9), the MQ arithmetic coder (Annex C, decoder §C.3 and
 encoder §C.2), coefficient bit modelling (Annex D, decode and forward

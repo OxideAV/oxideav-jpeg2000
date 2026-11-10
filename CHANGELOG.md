@@ -17,6 +17,8 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 - Premultiplied opacity (T.800 §I.5.3.6, Table I.16 `Typ = 2`): `decode` returned the colour samples as stored — multiplied by the opacity, Equation I-5 — under layouts whose opacity is straight. The division is now undone on the colour channels the Channel Definition names (`round(Sp × max / α)`, clipped; `0` where `α = 0`), and a palette with a premultiplied opacity column expands to `Rgba`. `jp2::decode_jp2` keeps returning the stored samples.
 
+- A Colour Specification box of a method the reader does not know is ignored entirely (T.800 §I.5.3.3) instead of counting as the file's first: `info` / `decode` take the colour from the first box of a known method.
+
 ### Changed
 
 - The framework demuxer no longer reports `("icc", "present")` in `metadata()`: the profile itself is on the stream's blobs.

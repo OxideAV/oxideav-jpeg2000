@@ -124,6 +124,36 @@ fn resolution_box_travels_through_encode_and_info() {
     assert!(info(&cs).unwrap().resolution.is_none());
 }
 
+// ---- Colour Specification boxes ---------------------------------------------
+
+#[test]
+fn a_colour_specification_of_unknown_method_is_ignored_entirely() {
+    // T.800 §I.5.3.3: "If the value of METH is not 1 or 2, there may be
+    // fields in this box following the APPROX field, and a conforming
+    // JP2 reader shall ignore the entire Colour Specification box." The
+    // box that counts is then the next one.
+    let img = gradient(8, 8);
+    let plain = encode(&img, &EncodeOptions::default()).unwrap();
+    // Signature (12) + File Type (20) = 32: the JP2 Header superbox,
+    // whose Image Header box (22 bytes) ends at 62.
+    assert_eq!(&plain[36..40], b"jp2h");
+    let mut unknown = vec![0, 0, 0, 16];
+    unknown.extend_from_slice(b"colr");
+    unknown.extend_from_slice(&[9, 0, 0, 0xDE, 0xAD, 0xBE, 0xEF, 0x01]);
+    let mut file = plain.clone();
+    file.splice(62..62, unknown.iter().copied());
+    let jp2h_len = u32::from_be_bytes(plain[32..36].try_into().unwrap()) + 16;
+    file[32..36].copy_from_slice(&jp2h_len.to_be_bytes());
+
+    assert_eq!(parse_jp2(&file).unwrap().header.colr.len(), 2);
+    let (with, without) = (info(&file).unwrap(), info(&plain).unwrap());
+    assert!(without.color.is_signalled());
+    assert_eq!(with.color, without.color);
+    let back = decode(&file).unwrap();
+    assert_eq!(back.color, without.color);
+    assert_eq!(back.as_bytes(), img.as_bytes());
+}
+
 // ---- premultiplied opacity --------------------------------------------------
 
 /// Four 8-bit planes of a 4 × 2 picture: straight colour, opacity, and

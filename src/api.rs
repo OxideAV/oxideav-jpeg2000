@@ -420,13 +420,21 @@ fn layout_for(chans: &[Chan], ycc: bool, index_depth: Option<u8>) -> Result<Layo
 }
 
 /// Colour signalling, ICC profile and the YCC flag from the JP2 Header's
-/// Colour Specification boxes ([`ColorInfo`] docs): the first box sets
-/// the code points, any ICC-method box supplies the profile.
+/// Colour Specification boxes ([`ColorInfo`] docs): the first box of a
+/// known method sets the code points, any ICC-method box supplies the
+/// profile.
 fn colour_from_jp2(h: &Jp2Header) -> (ColorInfo, Option<Vec<u8>>, bool) {
     let icc = h.colr.iter().find_map(|c| c.icc_profile.clone());
     let mut color = ColorInfo::unspecified();
     let mut ycc = false;
-    if let Some(first) = h.colr.first() {
+    // §I.5.3.3: a box whose METH the reader does not know is ignored
+    // entirely, so the first box that counts is the first understood
+    // one.
+    let first = h
+        .colr
+        .iter()
+        .find(|c| !matches!(c.method, ColrMethod::Reserved(_)));
+    if let Some(first) = first {
         match (first.method, first.enumerated, first.parameterized) {
             (ColrMethod::Enumerated, Some(EnumCs::Srgb), _) => color = ColorInfo::srgb(),
             (ColrMethod::Enumerated, Some(EnumCs::Greyscale), _) => color = ColorInfo::srgb_gray(),
