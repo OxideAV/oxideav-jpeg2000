@@ -399,6 +399,25 @@ pub const RUN_LENGTH_INDEX: u8 = 3;
 /// (context label 0 in Table D.1).
 pub const ZERO_NEIGHBOURS_INDEX: u8 = 4;
 
+/// [`QE`] packed for the coder's inner step and padded to every `u8`
+/// index: one `u32` per row — `Qe` in bits 0..16, `NMPS` in 16..24,
+/// `NLPS` in 24..31, `SWITCH` in bit 31 — so a row is read with one
+/// unchecked-by-construction load. Rows past Table C.2 repeat its last
+/// (they are never reached: every stored index comes from the table).
+pub(crate) static QE_PACKED: [u32; 256] = {
+    let mut rows = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let e = &QE[if i < QE.len() { i } else { QE.len() - 1 }];
+        rows[i] = e.qe as u32
+            | ((e.nmps as u32) << 16)
+            | ((e.nlps as u32) << 24)
+            | ((e.switch as u32) << 31);
+        i += 1;
+    }
+    rows
+};
+
 /// Per-context adaptive state: the current Table C.2 index `I(CX)` and
 /// the current sense of the more-probable symbol `MPS(CX)`.
 ///
@@ -663,8 +682,8 @@ impl<'a> MqDecoder<'a> {
     /// `Chigh` drops by `Qe` otherwise.
     #[inline(always)]
     pub fn decode(&mut self, cx: &mut MqContext) -> u8 {
-        let entry = &QE[cx.index as usize];
-        let qe = entry.qe as u32;
+        let row = QE_PACKED[cx.index as usize];
+        let qe = row & 0xFFFF;
         let reduced = self.a.wrapping_sub(qe);
         let lps = (self.c >> 16) < qe;
         let renormalize = lps | (reduced & 0x8000 == 0);
@@ -672,12 +691,12 @@ impl<'a> MqDecoder<'a> {
 
         let d = (cx.mps ^ less_probable) as u8;
         let moved = if less_probable {
-            entry.nlps
+            (row >> 24) & 0x7F
         } else {
-            entry.nmps
-        };
+            (row >> 16) & 0xFF
+        } as u8;
         cx.index = if renormalize { moved } else { cx.index };
-        cx.mps ^= less_probable & entry.switch;
+        cx.mps ^= less_probable & (row >> 31 != 0);
 
         let a = if lps { qe } else { reduced };
         self.c -= if lps { 0 } else { qe << 16 };
