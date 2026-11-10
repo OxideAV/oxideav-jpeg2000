@@ -478,13 +478,161 @@ pub struct Jp2Header {
     pub resolution: Option<Resolution>,
 }
 
+// ---------------------------------------------------------------------------
+// Vendor-information boxes (T.800 §I.7).
+// ---------------------------------------------------------------------------
+
+/// Intellectual Property box type — `'jp2i'` (0x6A70_3269, T.800 §I.6).
+/// Its contents are reserved; the reader skips it.
+#[doc(hidden)]
+pub const BOX_TYPE_JP2I: u32 = 0x6A70_3269;
+/// XML box type — `'xml '` (0x786D_6C20, T.800 §I.7.1).
+#[doc(hidden)]
+pub const BOX_TYPE_XML: u32 = 0x786D_6C20;
+/// UUID box type — `'uuid'` (0x7575_6964, T.800 §I.7.2).
+#[doc(hidden)]
+pub const BOX_TYPE_UUID: u32 = 0x7575_6964;
+/// UUID Info superbox type — `'uinf'` (0x7569_6E66, T.800 §I.7.3).
+#[doc(hidden)]
+pub const BOX_TYPE_UINF: u32 = 0x7569_6E66;
+/// UUID List box type — `'ulst'` (0x756C_7374, T.800 §I.7.3.1).
+#[doc(hidden)]
+pub const BOX_TYPE_ULST: u32 = 0x756C_7374;
+/// Data Entry URL box type — `'url '` (0x7572_6C20, T.800 §I.7.3.2).
+#[doc(hidden)]
+pub const BOX_TYPE_URL: u32 = 0x7572_6C20;
+
+/// The UUID box `ID` announcing an **XMP packet** in the `DATA` field
+/// (XMP Specification Part 3, §1.1.4 "JPEG 2000", Table 8). `DATA` is
+/// the UTF-8 packet itself, from the first byte after the `ID` to the
+/// end of the box — no prefix, terminator or length field.
+pub const UUID_XMP: [u8; 16] = [
+    0xBE, 0x7A, 0xCF, 0xCB, 0x97, 0xA9, 0x42, 0xE8, 0x9C, 0x71, 0x99, 0x94, 0x91, 0xE3, 0xAF, 0xAC,
+];
+
+/// The UUID box `ID` announcing an **Exif block** in the `DATA` field:
+/// the 16 ASCII characters `JpgTiffExif->JP2`. A de-facto convention
+/// (no standards-body definition; recorded from byte observation of
+/// files written by independent producers): `DATA` starts directly at
+/// the TIFF header (`II*\0` or `MM\0*`) and runs to the end of the box,
+/// every IFD offset relative to that first byte.
+pub const UUID_EXIF: [u8; 16] = *b"JpgTiffExif->JP2";
+
+/// How many vendor boxes of each kind (`uuid`, `xml `, `uinf`)
+/// [`parse_jp2`] retains. Boxes past the cap are skipped, which §I.7
+/// allows for every one of them ("may be ignored by conforming
+/// readers"); it bounds the parse result of a file made of nothing but
+/// empty boxes.
+pub const MAX_VENDOR_BOXES: usize = 1024;
+
+/// Largest `DATA` payload [`write_jp2`] puts into one vendor box: what
+/// still fits a 32-bit `LBox` together with the 8-byte box header and a
+/// 16-byte UUID. A larger payload is [`Error::LimitExceeded`].
+pub const MAX_VENDOR_PAYLOAD: u64 = u32::MAX as u64 - 24;
+
+/// One top-level UUID box (T.800 §I.7.2) as [`parse_jp2`] found it:
+/// the 16-byte `ID` (compared as raw bytes in file order) and where its
+/// `DATA` field sits in the parsed input. The payload is not copied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct UuidBox {
+    /// `ID` — the 16-byte identifier naming the payload format.
+    pub id: [u8; 16],
+    /// Offset of the first `DATA` byte in the slice given to
+    /// [`parse_jp2`].
+    pub data_offset: usize,
+    /// Length of the `DATA` field in bytes.
+    pub data_len: usize,
+}
+
+impl UuidBox {
+    /// The `DATA` bytes inside `file` (the slice that was parsed).
+    /// `None` when `file` is shorter than the box.
+    pub fn data<'a>(&self, file: &'a [u8]) -> Option<&'a [u8]> {
+        file.get(self.data_offset..self.data_offset.checked_add(self.data_len)?)
+    }
+
+    /// `true` for the XMP identifier ([`UUID_XMP`]).
+    pub fn is_xmp(&self) -> bool {
+        self.id == UUID_XMP
+    }
+
+    /// `true` for the Exif identifier ([`UUID_EXIF`]).
+    pub fn is_exif(&self) -> bool {
+        self.id == UUID_EXIF
+    }
+}
+
+/// One top-level XML box (T.800 §I.7.1): where its `DATA` field (an
+/// XML document) sits in the parsed input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct XmlBox {
+    /// Offset of the first `DATA` byte in the slice given to
+    /// [`parse_jp2`].
+    pub data_offset: usize,
+    /// Length of the `DATA` field in bytes.
+    pub data_len: usize,
+}
+
+impl XmlBox {
+    /// The document bytes inside `file` (the slice that was parsed).
+    pub fn data<'a>(&self, file: &'a [u8]) -> Option<&'a [u8]> {
+        file.get(self.data_offset..self.data_offset.checked_add(self.data_len)?)
+    }
+}
+
+/// One UUID Info superbox (T.800 §I.7.3): a list of UUIDs (`ulst`,
+/// §I.7.3.1) and the URL (`url `, §I.7.3.2) where more information
+/// about them can be found. An index *about* vendor extensions — it
+/// carries no payload and is not needed to read a UUID box.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct UuidInfo {
+    /// `IDi` — the UUIDs the URL documents (`NU` of them, at most
+    /// 65 535).
+    pub uuids: Vec<[u8; 16]>,
+    /// `LOC` — the URL, UTF-8 without its terminating NUL.
+    pub location: String,
+}
+
+impl UuidInfo {
+    /// A UUID Info box for `uuids`, documented at `location`.
+    pub fn new(uuids: Vec<[u8; 16]>, location: impl Into<String>) -> Self {
+        UuidInfo {
+            uuids,
+            location: location.into(),
+        }
+    }
+}
+
+/// `true` when `data` opens with a TIFF header in either byte order
+/// (`II*\0` / `MM\0*`) and is long enough to hold the 0th-IFD offset.
+fn is_tiff_header(data: &[u8]) -> bool {
+    data.len() >= 8 && (data[..4] == *b"II*\0" || data[..4] == *b"MM\0*")
+}
+
+/// The Exif block of a UUID box `DATA` field: the bytes from the TIFF
+/// header on. A leading 6-byte `Exif\0\0` code (the form the block has
+/// inside a JPEG `APP1` segment) is tolerated and dropped; anything
+/// that then does not open with a TIFF header is not an Exif block.
+fn exif_block(data: &[u8]) -> Option<&[u8]> {
+    let body = data.strip_prefix(b"Exif\0\0").unwrap_or(data);
+    is_tiff_header(body).then_some(body)
+}
+
 /// Top-level parsed JP2 container as returned by [`parse_jp2`].
 ///
-/// Only the four mandatory boxes are represented as typed fields.
-/// Optional boxes (`jp2i`, `xml `, `uuid`, `uinf`, etc.) appearing
-/// between `ftyp` and `jp2c` are skipped over by [`parse_jp2`] but
-/// **not** retained — this round restricts the surface to the box
-/// chain conforming JP2 readers must understand.
+/// The four mandatory boxes are typed fields. Of the optional
+/// top-level boxes, the vendor-information set of T.800 §I.7 is
+/// retained wherever it sits after the File Type box — before or after
+/// the codestream: every UUID box ([`Self::uuid_boxes`]), every XML
+/// box ([`Self::xml_boxes`]) and every well-formed UUID Info superbox
+/// ([`Self::uuid_info`]), each list in file order and capped at
+/// [`MAX_VENDOR_BOXES`]. Payloads are referenced, not copied.
+/// [`Self::xmp`] and [`Self::exif`] pick the two well-known UUID
+/// payloads out. Any other box (`jp2i`, boxes of other
+/// specifications) is skipped (§I.8).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Jp2Container {
@@ -500,6 +648,50 @@ pub struct Jp2Container {
     /// box. Always equal to `LBox - 8` (or `LBox - 16` for an
     /// extended-length box).
     pub codestream_len: usize,
+    /// The top-level UUID boxes (§I.7.2), in file order.
+    pub uuid_boxes: Vec<UuidBox>,
+    /// The top-level XML boxes (§I.7.1), in file order.
+    pub xml_boxes: Vec<XmlBox>,
+    /// The top-level UUID Info superboxes (§I.7.3), in file order. A
+    /// malformed one (no UUID List, no Data Entry URL, a list shorter
+    /// than its count, a URL that is not UTF-8) is ignored.
+    pub uuid_info: Vec<UuidInfo>,
+}
+
+impl Jp2Container {
+    /// The XMP packet of the file: the `DATA` field of the first UUID
+    /// box whose `ID` is [`UUID_XMP`], verbatim (packet wrapper and
+    /// padding included). `file` is the slice that was parsed.
+    pub fn xmp<'a>(&self, file: &'a [u8]) -> Option<&'a [u8]> {
+        self.xmp_box(file).map(|(_, data)| data)
+    }
+
+    /// The Exif block of the file: the `DATA` field of the first UUID
+    /// box whose `ID` is [`UUID_EXIF`] and whose payload is a TIFF
+    /// structure, from the TIFF header (`II*\0` / `MM\0*`) to the end
+    /// of the box. A box with that `ID` holding anything else is
+    /// treated as unknown. `file` is the slice that was parsed.
+    pub fn exif<'a>(&self, file: &'a [u8]) -> Option<&'a [u8]> {
+        self.exif_box(file).map(|(_, data)| data)
+    }
+
+    /// [`Self::xmp`] with the index of its box in [`Self::uuid_boxes`].
+    pub(crate) fn xmp_box<'a>(&self, file: &'a [u8]) -> Option<(usize, &'a [u8])> {
+        self.uuid_boxes
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.is_xmp())
+            .find_map(|(i, b)| Some((i, b.data(file)?)))
+    }
+
+    /// [`Self::exif`] with the index of its box in [`Self::uuid_boxes`].
+    pub(crate) fn exif_box<'a>(&self, file: &'a [u8]) -> Option<(usize, &'a [u8])> {
+        self.uuid_boxes
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.is_exif())
+            .find_map(|(i, b)| Some((i, exif_block(b.data(file)?)?)))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1105,6 +1297,51 @@ fn parse_jp2h_content(content: &[u8], jph: bool) -> Result<Jp2Header, Error> {
     })
 }
 
+/// Parses the body of a `uinf` superbox (T.800 §I.7.3): the first
+/// UUID List box and the first Data Entry URL box inside it. `None`
+/// for a box that does not hold both in well-formed shape — the
+/// superbox is optional information a reader may ignore, so a broken
+/// one never fails the file.
+fn parse_uinf_content(content: &[u8]) -> Option<UuidInfo> {
+    let mut uuids: Option<Vec<[u8; 16]>> = None;
+    let mut location: Option<String> = None;
+    let mut pos = 0usize;
+    while pos < content.len() {
+        let b = read_box(content, pos).ok()?;
+        let body = &content[b.offset + b.header_len..b.offset + b.total_len()];
+        match b.box_type {
+            // §I.7.3.1 / Table I.24: NU (16 bits), then NU 16-byte IDs.
+            // The count is checked against the bytes present before
+            // the list is allocated.
+            BOX_TYPE_ULST if uuids.is_none() => {
+                let (nu, ids) = body.split_first_chunk::<2>()?;
+                let nu = usize::from(u16::from_be_bytes(*nu));
+                let (ids, _) = ids.as_chunks::<16>();
+                if ids.len() < nu {
+                    return None;
+                }
+                uuids = Some(ids[..nu].to_vec());
+            }
+            // §I.7.3.2 / Table I.25: VERS (8 bits) and FLAG (24 bits),
+            // both zero, then LOC — a NUL-terminated UTF-8 string.
+            BOX_TYPE_URL if location.is_none() => {
+                let (vers_flag, loc) = body.split_first_chunk::<4>()?;
+                if *vers_flag != [0; 4] {
+                    return None;
+                }
+                let end = loc.iter().position(|&c| c == 0).unwrap_or(loc.len());
+                location = Some(std::str::from_utf8(&loc[..end]).ok()?.to_owned());
+            }
+            _ => {}
+        }
+        pos = pos.checked_add(b.total_len())?;
+    }
+    Some(UuidInfo {
+        uuids: uuids?,
+        location: location?,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Top-level wrapper parser.
 // ---------------------------------------------------------------------------
@@ -1122,9 +1359,10 @@ fn parse_jp2h_content(content: &[u8], jph: bool) -> Result<Jp2Header, Error> {
 ///    T.800 §I.5.3.
 /// 4. `jp2c` (Contiguous Codestream) — the codestream payload.
 ///
-/// Any non-required boxes appearing between `ftyp` and `jp2c` (e.g.
-/// `jp2i`, `xml `, `uuid`) are tolerated and skipped over by
-/// length. Only the **first** `jp2c` box's payload is reported in
+/// The vendor-information boxes of §I.7 (`uuid`, `xml `, `uinf`) are
+/// retained wherever they sit after `ftyp`, before or after the
+/// codestream ([`Jp2Container`] docs); any other non-required box is
+/// skipped over by length. Only the **first** `jp2c` box's payload is reported in
 /// the returned `Jp2Container`; multi-codestream files use the same
 /// box type once per codestream but the JP2 format itself describes
 /// only the first.
@@ -1156,6 +1394,9 @@ pub fn parse_jp2(bytes: &[u8]) -> Result<Jp2Container, Error> {
     // 3..N. Walk remaining boxes until we find the jp2h and jp2c.
     let mut header: Option<Jp2Header> = None;
     let mut codestream: Option<(usize, usize)> = None;
+    let mut uuid_boxes = Vec::new();
+    let mut xml_boxes = Vec::new();
+    let mut uuid_info = Vec::new();
     while pos < bytes.len() {
         let b = read_box(bytes, pos)?;
         let body_start = b.offset + b.header_len;
@@ -1178,10 +1419,31 @@ pub fn parse_jp2(bytes: &[u8]) -> Result<Jp2Container, Error> {
             BOX_TYPE_JP2C if codestream.is_none() => {
                 codestream = Some((body_start, b.content_len));
             }
-            // All other top-level boxes — jp2i, xml , uuid, uinf,
-            // etc. — are skipped per T.800 §I.4 ("if the type of a
-            // box was not understood by a reader, it would not
-            // recognize the existence of … inside that box").
+            // §I.7.2: 16 ID bytes, then DATA to the end of the box. A
+            // box too short to hold an ID is ignored like any other
+            // box the reader does not understand.
+            BOX_TYPE_UUID if b.content_len >= 16 && uuid_boxes.len() < MAX_VENDOR_BOXES => {
+                let mut id = [0u8; 16];
+                id.copy_from_slice(&bytes[body_start..body_start + 16]);
+                uuid_boxes.push(UuidBox {
+                    id,
+                    data_offset: body_start + 16,
+                    data_len: b.content_len - 16,
+                });
+            }
+            BOX_TYPE_XML if xml_boxes.len() < MAX_VENDOR_BOXES => {
+                xml_boxes.push(XmlBox {
+                    data_offset: body_start,
+                    data_len: b.content_len,
+                });
+            }
+            BOX_TYPE_UINF if uuid_info.len() < MAX_VENDOR_BOXES => {
+                if let Some(info) = parse_uinf_content(&bytes[body_start..body_end]) {
+                    uuid_info.push(info);
+                }
+            }
+            // Every other top-level box — jp2i, boxes of other
+            // specifications — is skipped (T.800 §I.8).
             _ => {}
         }
         pos = pos
@@ -1190,26 +1452,14 @@ pub fn parse_jp2(bytes: &[u8]) -> Result<Jp2Container, Error> {
     }
     let header = header.ok_or(Error::InvalidMarkerLength)?;
     let (codestream_offset, codestream_len) = codestream.ok_or(Error::InvalidMarkerLength)?;
-    // T.800 §I.5.3 enforces that jp2h precedes jp2c in the file.
-    // Our scan above pushes the first jp2c offset; cross-check
-    // ordering by requiring the jp2h to land before that offset.
-    // (We only do this when both have been found.)
-    if codestream_offset != 0 {
-        // body_start = offset + header_len; if header was after
-        // jp2c, its `pos` would be > codestream_offset. We rely on
-        // the iteration order — `header` was set inside the same
-        // loop that observed `codestream` — but the spec language
-        // is enforced by the iteration order itself: if we saw
-        // `jp2c` first, `header` would still be `None` at that
-        // point, but we record `codestream` opportunistically.
-        // Recover ordering by re-scanning for both offsets.
-        // (Cheap: the loop already walked the file.)
-    }
     Ok(Jp2Container {
         ftyp,
         header,
         codestream_offset,
         codestream_len,
+        uuid_boxes,
+        xml_boxes,
+        uuid_info,
     })
 }
 
@@ -1360,6 +1610,24 @@ pub struct Jp2WriteOptions {
     /// `ihdr` `UnkC` (§I.5.3.1): the colour specification is only an
     /// approximation of an unknown colourspace.
     pub colourspace_unknown: bool,
+    /// An Exif block, written as a UUID box with the [`UUID_EXIF`]
+    /// identifier (§I.7.2): a TIFF structure starting at its byte-order
+    /// mark (`II*\0` / `MM\0*`). A leading `Exif\0\0` code is dropped;
+    /// anything else that does not open with a TIFF header is
+    /// [`Error::InvalidData`].
+    pub exif: Option<Vec<u8>>,
+    /// An XMP packet, written as a UUID box with the [`UUID_XMP`]
+    /// identifier (XMP Part 3 Table 8): UTF-8, stored verbatim. Bytes
+    /// that are not UTF-8 are [`Error::InvalidData`].
+    pub xmp: Option<Vec<u8>>,
+    /// Further UUID boxes (§I.7.2), `(ID, DATA)` each, written verbatim
+    /// in order.
+    pub uuid_boxes: Vec<([u8; 16], Vec<u8>)>,
+    /// XML boxes (§I.7.1), one document each, written verbatim in
+    /// order.
+    pub xml_boxes: Vec<Vec<u8>>,
+    /// UUID Info superboxes (§I.7.3), written in order.
+    pub uuid_info: Vec<UuidInfo>,
 }
 
 impl Jp2WriteOptions {
@@ -1405,6 +1673,53 @@ impl Jp2WriteOptions {
         self
     }
 
+    /// Set [`Self::exif`].
+    pub fn with_exif(mut self, v: Option<Vec<u8>>) -> Self {
+        self.exif = v;
+        self
+    }
+
+    /// Set [`Self::xmp`].
+    pub fn with_xmp(mut self, v: Option<Vec<u8>>) -> Self {
+        self.xmp = v;
+        self
+    }
+
+    /// Set [`Self::uuid_boxes`].
+    pub fn with_uuid_boxes(mut self, v: Vec<([u8; 16], Vec<u8>)>) -> Self {
+        self.uuid_boxes = v;
+        self
+    }
+
+    /// Set [`Self::xml_boxes`].
+    pub fn with_xml_boxes(mut self, v: Vec<Vec<u8>>) -> Self {
+        self.xml_boxes = v;
+        self
+    }
+
+    /// Set [`Self::uuid_info`].
+    pub fn with_uuid_info(mut self, v: Vec<UuidInfo>) -> Self {
+        self.uuid_info = v;
+        self
+    }
+
+    /// No colour description and no optional box.
+    fn empty() -> Self {
+        Jp2WriteOptions {
+            colour: Vec::new(),
+            palette: None,
+            component_mapping: None,
+            channel_definitions: None,
+            resolution: None,
+            colourspace_unknown: false,
+            exif: None,
+            xmp: None,
+            uuid_boxes: Vec::new(),
+            xml_boxes: Vec::new(),
+            uuid_info: Vec::new(),
+        }
+    }
+
     /// A single enumerated Colour Specification box (`METH = 1`,
     /// `PREC = 0`, `APPROX = 0`, Table I.10).
     pub fn enumerated(cs: EnumCs) -> Self {
@@ -1417,11 +1732,7 @@ impl Jp2WriteOptions {
                 icc_profile: None,
                 parameterized: None,
             }],
-            palette: None,
-            component_mapping: None,
-            channel_definitions: None,
-            resolution: None,
-            colourspace_unknown: false,
+            ..Self::empty()
         }
     }
 
@@ -1438,12 +1749,8 @@ impl Jp2WriteOptions {
             3 | 4 => EnumCs::Srgb,
             _ => {
                 return Jp2WriteOptions {
-                    colour: Vec::new(),
-                    palette: None,
-                    component_mapping: None,
-                    channel_definitions: None,
-                    resolution: None,
                     colourspace_unknown: true,
+                    ..Self::empty()
                 };
             }
         };
@@ -1481,6 +1788,55 @@ fn push_box(out: &mut Vec<u8>, box_type: u32, content: &[u8]) {
         out.extend_from_slice(&(total + 8).to_be_bytes());
     }
     out.extend_from_slice(content);
+}
+
+/// The [`MAX_VENDOR_PAYLOAD`] check, before anything is copied.
+fn check_vendor_payload(what: &str, len: usize) -> Result<(), Error> {
+    if len as u64 > MAX_VENDOR_PAYLOAD {
+        return Err(Error::limit(format!(
+            "{what} payload of {len} bytes exceeds the {MAX_VENDOR_PAYLOAD}-byte box limit"
+        )));
+    }
+    Ok(())
+}
+
+/// One UUID box (§I.7.2 / Table I.23): `ID`, then `DATA`.
+fn push_uuid_box(out: &mut Vec<u8>, id: &[u8; 16], data: &[u8]) -> Result<(), Error> {
+    check_vendor_payload("UUID box", data.len())?;
+    let total = (data.len() + 24) as u32;
+    out.reserve(data.len() + 24);
+    out.extend_from_slice(&total.to_be_bytes());
+    out.extend_from_slice(&BOX_TYPE_UUID.to_be_bytes());
+    out.extend_from_slice(id);
+    out.extend_from_slice(data);
+    Ok(())
+}
+
+/// The contents of a UUID Info superbox (§I.7.3): a UUID List box
+/// (Table I.24) and a Data Entry URL box (Table I.25, `VERS` = `FLAG`
+/// = 0, `LOC` NUL-terminated).
+fn uinf_content(info: &UuidInfo) -> Result<Vec<u8>, Error> {
+    let nu = u16::try_from(info.uuids.len()).map_err(|_| {
+        Error::limit(format!(
+            "UUID List box holds at most 65535 UUIDs, got {}",
+            info.uuids.len()
+        ))
+    })?;
+    if info.location.as_bytes().contains(&0) {
+        return Err(Error::invalid("Data Entry URL contains a NUL character"));
+    }
+    check_vendor_payload("Data Entry URL box", info.location.len() + 5)?;
+    let mut ulst = Vec::with_capacity(2 + info.uuids.len() * 16);
+    ulst.extend_from_slice(&nu.to_be_bytes());
+    ulst.extend(info.uuids.iter().flatten());
+    let mut url = Vec::with_capacity(5 + info.location.len());
+    url.extend_from_slice(&[0; 4]);
+    url.extend_from_slice(info.location.as_bytes());
+    url.push(0);
+    let mut c = Vec::with_capacity(ulst.len() + url.len() + 16);
+    push_box(&mut c, BOX_TYPE_ULST, &ulst);
+    push_box(&mut c, BOX_TYPE_URL, &url);
+    Ok(c)
 }
 
 fn colr_content(colr: &Colr, jph: bool) -> Result<Vec<u8>, Error> {
@@ -1690,6 +2046,34 @@ pub fn write_jp2(codestream: &[u8], options: &Jp2WriteOptions) -> Result<Vec<u8>
         push_box(&mut jp2h, BOX_TYPE_RES, &c);
     }
     push_box(&mut out, BOX_TYPE_JP2H, &jp2h);
+
+    // Vendor information (§I.7), between the header and the
+    // codestream: Exif, XMP, further UUID boxes, XML boxes, UUID Info.
+    if let Some(exif) = &options.exif {
+        let block = exif_block(exif).ok_or_else(|| {
+            Error::invalid(
+                "Exif block does not start with a TIFF header (II*\\0 / MM\\0*), \
+                 optionally after an Exif\\0\\0 code",
+            )
+        })?;
+        push_uuid_box(&mut out, &UUID_EXIF, block)?;
+    }
+    if let Some(xmp) = &options.xmp {
+        if std::str::from_utf8(xmp).is_err() {
+            return Err(Error::invalid("XMP packet is not UTF-8"));
+        }
+        push_uuid_box(&mut out, &UUID_XMP, xmp)?;
+    }
+    for (id, data) in &options.uuid_boxes {
+        push_uuid_box(&mut out, id, data)?;
+    }
+    for xml in &options.xml_boxes {
+        check_vendor_payload("XML box", xml.len())?;
+        push_box(&mut out, BOX_TYPE_XML, xml);
+    }
+    for info in &options.uuid_info {
+        push_box(&mut out, BOX_TYPE_UINF, &uinf_content(info)?);
+    }
 
     // Contiguous Codestream box (§I.5.4).
     push_box(&mut out, BOX_TYPE_JP2C, codestream);

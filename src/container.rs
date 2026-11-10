@@ -30,15 +30,18 @@
 use std::io::{Read, SeekFrom, Write};
 
 use oxideav_core::{
-    CodecId, CodecParameters, CodecResolver, ContainerRegistry, Demuxer, Error, MAX_PROBE_SCORE,
-    MediaType, Muxer, PROBE_SCORE_EXTENSION, Packet, PixelFormat, ProbeData, ProbeScore, ReadSeek,
-    Result, StreamInfo, TimeBase, WriteSeek,
+    BlobKind, CodecId, CodecParameters, CodecResolver, ContainerRegistry, Demuxer, Error,
+    MAX_PROBE_SCORE, MediaType, MetadataBlob, Muxer, PROBE_SCORE_EXTENSION, Packet, PixelFormat,
+    ProbeData, ProbeScore, ReadSeek, Result, StreamInfo, TimeBase, WriteSeek,
 };
 
 use crate::api::{describe, is_jp2_file, jp2_options_parts};
 use crate::image::{ColorInfo, Jpeg2000PixelFormat, Palette};
 use crate::jp2::{Jp2WriteOptions, parse_jp2, write_jp2};
-use crate::registry::{CODEC_ID_STR, from_color_signal, to_color_signal};
+use crate::registry::{
+    BLOB_KIND_UUID, BLOB_KIND_XML, CODEC_ID_STR, from_color_signal, metadata_from_blobs,
+    to_color_signal,
+};
 use crate::{MARKER_SIZ, MARKER_SOC};
 
 /// Container name of the bare codestream (`.j2k` / `.j2c`).
@@ -126,9 +129,23 @@ pub fn open_demuxer(
     if d.color.is_signalled() {
         params.color_signal = to_color_signal(&d.color);
     }
-    let mut metadata = Vec::new();
-    if d.has_icc {
-        metadata.push(("icc".to_owned(), "present".to_owned()));
+    // Opaque payloads travel as stream blobs: the ICC profile of the
+    // `colr` box, the Exif block and XMP packet of their `uuid` boxes,
+    // then every other `uuid` box and every `xml ` box as stored.
+    for (kind, data) in [
+        (BlobKind::ICC, d.icc),
+        (BlobKind::EXIF, d.exif),
+        (BlobKind::XMP, d.xmp),
+    ] {
+        if let Some(data) = data {
+            params.push_blob(MetadataBlob::new(kind, data));
+        }
+    }
+    for data in d.other_uuid {
+        params.push_blob(MetadataBlob::new(BLOB_KIND_UUID, data));
+    }
+    for data in d.xml {
+        params.push_blob(MetadataBlob::new(BLOB_KIND_XML, data));
     }
     let stream = StreamInfo {
         index: 0,
@@ -140,7 +157,6 @@ pub fn open_demuxer(
     Ok(Box::new(Jpeg2000Demuxer {
         name: if d.jp2 { CONTAINER_JP2 } else { CONTAINER_J2K },
         streams: vec![stream],
-        metadata,
         data: Some(buf),
     }))
 }
@@ -148,7 +164,6 @@ pub fn open_demuxer(
 struct Jpeg2000Demuxer {
     name: &'static str,
     streams: Vec<StreamInfo>,
-    metadata: Vec<(String, String)>,
     data: Option<Vec<u8>>,
 }
 
@@ -158,9 +173,6 @@ impl Demuxer for Jpeg2000Demuxer {
     }
     fn streams(&self) -> &[StreamInfo] {
         &self.streams
-    }
-    fn metadata(&self) -> &[(String, String)] {
-        &self.metadata
     }
     fn next_packet(&mut self) -> Result<Packet> {
         match self.data.take() {
@@ -193,7 +205,9 @@ pub fn open_muxer_j2k(
 /// from the stream parameters — layout from `pixel_format` (else from
 /// the `SIZ`), `Pal8` palette from `extradata`, `colr` from
 /// `color_signal` (the layout's conventional colourspace when
-/// unspecified), JPH brand for HT codestreams.
+/// unspecified) or the stream's ICC blob, the stream's Exif / XMP blobs
+/// as `uuid` boxes, its `jpeg2000-uuid` / `jpeg2000-xml` blobs as the
+/// boxes they came from, JPH brand for HT codestreams.
 pub fn open_muxer_jp2(
     output: Box<dyn WriteSeek>,
     streams: &[StreamInfo],
@@ -207,6 +221,9 @@ struct Jpeg2000Muxer {
     format: Option<Jpeg2000PixelFormat>,
     palette: Option<Palette>,
     color: ColorInfo,
+    /// The stream's blobs, for the header a bare codestream is wrapped
+    /// in.
+    blobs: Vec<MetadataBlob>,
     written: bool,
 }
 
@@ -263,6 +280,7 @@ impl Jpeg2000Muxer {
             format,
             palette,
             color,
+            blobs: p.blobs().to_vec(),
             written: false,
         }))
     }
@@ -292,19 +310,42 @@ impl Jpeg2000Muxer {
                 .unwrap_or((1, 1));
             Jpeg2000PixelFormat::for_layout(n, c0.precision_bits, chroma, chroma != (1, 1))
         });
-        match format {
-            Some(Jpeg2000PixelFormat::Pal8) if self.palette.is_none() => Err(Error::invalid(
-                "jp2 muxer: Pal8 stream without a palette in extradata",
-            )),
-            Some(f) => Ok(jp2_options_parts(
+        let meta = metadata_from_blobs(&[], &self.blobs);
+        let opts = match format {
+            Some(Jpeg2000PixelFormat::Pal8) if self.palette.is_none() => {
+                return Err(Error::invalid(
+                    "jp2 muxer: Pal8 stream without a palette in extradata",
+                ));
+            }
+            Some(f) => jp2_options_parts(
                 f,
                 self.palette.as_ref(),
                 self.color,
-                None,
+                meta.icc.as_deref(),
                 jph,
-            )),
-            None => Ok(Jp2WriteOptions::for_components(n)),
+            ),
+            None => Jp2WriteOptions::for_components(n),
+        };
+        let mut uuid_boxes = Vec::new();
+        for b in self.blobs.iter().filter(|b| b.kind == BLOB_KIND_UUID) {
+            let Some((id, data)) = b.data.split_first_chunk::<16>() else {
+                return Err(Error::invalid(format!(
+                    "jp2 muxer: a {BLOB_KIND_UUID} blob is the 16-byte ID followed by the DATA field"
+                )));
+            };
+            uuid_boxes.push((*id, data.to_vec()));
         }
+        let xml_boxes = self
+            .blobs
+            .iter()
+            .filter(|b| b.kind == BLOB_KIND_XML)
+            .map(|b| b.data.clone())
+            .collect();
+        Ok(opts
+            .with_exif(meta.exif)
+            .with_xmp(meta.xmp)
+            .with_uuid_boxes(uuid_boxes)
+            .with_xml_boxes(xml_boxes))
     }
 }
 

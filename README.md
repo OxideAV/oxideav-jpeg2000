@@ -133,15 +133,21 @@ JP2 header carries a `colr` box (a bare codestream signals no colour) —
 and emits the whole file as one keyframe packet (time base 1/1, `pts`
 0). A component set with no contract layout (signed, mixed depths, five
 or more components) still opens with `pixel_format = None`; the decoder
-then reports `Unsupported`. `metadata()` carries `("icc", "present")`
-when a `colr` box holds an ICC profile (the blob itself has no
-framework carriage yet). A multi-codestream (`jpx`) file yields its
+then reports `Unsupported`. Opaque payloads ride the stream's blobs:
+`icc` (the `colr` profile), `exif` and `xmp` (their `uuid` boxes, see
+[Metadata and colour](#metadata-and-colour)), then every other `uuid`
+box as a `jpeg2000-uuid` blob (the 16-byte ID followed by the DATA
+field) and every `xml ` box as a `jpeg2000-xml` blob (the document).
+A multi-codestream (`jpx`) file yields its
 first `jp2c`. The muxers take the registry encoder's packets and write
 what their name says: `jpeg2000` strips a JP2 wrapper to the codestream
 (refusing `Pal8`, whose palette would be lost), `jp2` wraps a bare
 codestream in a JP2 / JPH header built from the stream's layout,
 palette and colour signal (the layout's conventional colourspace when
-the stream signals none). One picture per file.
+the stream signals none) and from the stream's blobs — the `icc` blob
+as an ICC `colr`, `exif` / `xmp` as their `uuid` boxes, the
+`jpeg2000-uuid` / `jpeg2000-xml` blobs as the boxes they came from. One
+picture per file.
 
 The framework `Decoder` and `Encoder` are thin adapters over
 `decode_with` / `encode` (one implementation). Each packet is one
@@ -149,15 +155,20 @@ complete file or codestream (the framing is sniffed); the decoder
 emits the native layout above as a `VideoFrame` — one packed plane, or
 one plane per component for the YCbCr layouts — with the palette
 side-channel for `Pal8`, the colour signal when the JP2 header carried
-one, and the per-plane significant-bits side-channel when `bit_depth`
-differs from the label's depth. Decoder options: `reduce`, `layers`,
+one, the per-plane significant-bits side-channel when `bit_depth`
+differs from the label's depth, and the file's ICC / Exif / XMP as
+frame blobs (also on the decoder's parameters). Decoder options: `reduce`, `layers`,
 `strict`; the framework `DecoderLimits` tighten the standalone limits.
 The encoder accepts every `Jpeg2000PixelFormat` (plus `Bgr24` / `Bgra`,
 re-ordered) and the `CodecOptions` keys `lossless`, `fine_bits`,
 `psnr`, `target_bytes` (or `bit_rate` / `frame_rate`), `levels`,
 `layers`, `progression`, `tile`, `ht`, `plt`, `tlm`, `plm`, `sop`, `eph`,
-`comment`, `container` (default `j2k` — the framework carries colour on
-the frame; `jp2` / `jph` wrap the file). `From<Jpeg2000Image> for
+`comment`, `container` (default `j2k` — the framework carries colour and
+metadata on the frame and the stream, and the `jp2` muxer writes them;
+`jp2` / `jph` make the encoder wrap the file itself, embedding the
+frame's ICC / Exif / XMP blobs, or the stream's where the frame has
+none). The encoder's `output_params()` carry the blobs of the last
+frame for the muxer. `From<Jpeg2000Image> for
 VideoFrame`, `Jpeg2000Image::from_video_frame(&VideoFrame,
 &CodecParameters)` and `TryFrom<(&VideoFrame, &CodecParameters)>` bridge
 the two worlds.
@@ -288,15 +299,48 @@ decode as YCbCr with unspecified colour and `to_rgb8` applies the sYCC
 image's `ColorInfo` as the matching enumerated colourspace, the ICC
 profile as a restricted-ICC `colr`, any other description verbatim as a
 parameterized box in a JPH (HT) file, or the conventional colourspace
-flagged `UnkC` in a plain JP2. `Metadata.exif` / `xmp` / `gamma` are
-always `None`: Exif and XMP ride vendor `uuid` boxes whose identifiers
-the staged specifications do not define.
+flagged `UnkC` in a plain JP2.
+
+`Metadata.exif` and `Metadata.xmp` come from top-level `uuid` boxes of
+the JP2 / JPH file (T.800 §I.7.2), found wherever they sit after the
+File Type box — before or after the codestream:
+
+| Payload | `uuid` ID (16 bytes, file order) | DATA field |
+|---|---|---|
+| XMP | `BE 7A CF CB 97 A9 42 E8 9C 71 99 94 91 E3 AF AC` (XMP Specification Part 3 §1.1.4, Table 8) | the UTF-8 XMP packet, verbatim (wrapper and padding included) |
+| Exif | `4A 70 67 54 69 66 66 45 78 69 66 2D 3E 4A 50 32` — ASCII `JpgTiffExif->JP2`, a de-facto convention with no standards-body definition | a TIFF structure from its byte-order mark (`II*\0` / `MM\0*`), no `Exif\0\0` code in front |
+
+The first box of an identifier wins; an Exif identifier over bytes
+that are no TIFF structure is an unknown box (a leading `Exif\0\0` is
+tolerated and dropped). `encode` writes the two boxes between the JP2
+Header and the codestream — Exif, then XMP — after checking that the
+Exif block opens with a TIFF header and the packet is UTF-8
+(`InvalidData` otherwise); a bare codestream (`Container::J2k`) has
+nowhere to put ICC, Exif or XMP and drops them. Three files written
+end to end by independent producers (XMP, Exif, both) decode to their
+expected payloads and pixels exactly, and re-wrapping their codestreams
+with the extracted payloads reproduces each file **byte for byte**
+(`tests/jp2_metadata.rs`). Per §I.7.2 none of this touches the picture:
+an Exif orientation is surfaced, not applied. `Metadata.gamma` is
+always `None`.
+
+The depth API has the whole §I.7 set: `jp2::parse_jp2` returns every
+`uuid` box (`UuidBox`: ID + where the DATA sits), every `xml ` box
+(§I.7.1) and every UUID Info superbox (`uinf` with its `ulst` UUID
+list and `url ` Data Entry URL, §I.7.3) in file order, payloads by
+reference; `jp2::Jp2WriteOptions::{exif, xmp, uuid_boxes, xml_boxes,
+uuid_info}` write them. Reader bounds: at most 1024 boxes of each kind
+are retained (the rest are skipped, which §I.7 allows for all of
+them), a UUID list is checked against the bytes present before it is
+allocated, and a malformed `uinf` is ignored rather than failing the
+file. Writer limits are typed: a payload that does not fit a 32-bit
+box length or a list of more than 65 535 UUIDs is `LimitExceeded`.
 
 ## Limits
 
 Hostile input never panics (fuzz targets `contract`, `decode_j2k`,
-`decode_jp2`, `decode_variants`, `parse_*`, `mq_decoder`,
-`ht_block_decode`, `roundtrip_encode`). `probe` is total and
+`decode_jp2`, `decode_variants`, `parse_*`, `jp2_metadata`,
+`mq_decoder`, `ht_block_decode`, `roundtrip_encode`). `probe` is total and
 allocation-free; `info` reads the main header and JP2 boxes only; the
 decode limits fire before the first plane is allocated. Geometry that
 overflows `usize` is `Unsupported`; a configured limit is

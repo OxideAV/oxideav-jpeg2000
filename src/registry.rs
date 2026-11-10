@@ -17,15 +17,17 @@
 //! One implementation, two entry doors.
 
 use oxideav_core::{
-    CodecCapabilities, CodecId, CodecInfo, CodecOptionsStruct, CodecParameters, CodecRegistry,
-    ColorPrimaries, ColorSignal, ContainerRegistry, Decoder, Encoder, Error as CoreError,
-    ExecutionContext, Frame, MatrixCoefficients, MediaType, OptionField, OptionKind, OptionValue,
-    Packet, PixelFormat, RuntimeContext, TimeBase, TransferCharacteristics, VideoFrame,
-    frame::VideoPlane,
+    BlobKind, CodecCapabilities, CodecId, CodecInfo, CodecOptionsStruct, CodecParameters,
+    CodecRegistry, ColorPrimaries, ColorSignal, ContainerRegistry, Decoder, Encoder,
+    Error as CoreError, ExecutionContext, Frame, MatrixCoefficients, MediaType, MetadataBlob,
+    OptionField, OptionKind, OptionValue, Packet, PixelFormat, RuntimeContext, TimeBase,
+    TransferCharacteristics, VideoFrame, frame::VideoPlane,
 };
 
 use crate::encode::{Container, EncodeKernel, EncodeOptions};
-use crate::image::{ColorInfo, ColorRange, Jpeg2000Image, Jpeg2000PixelFormat, Palette, Plane};
+use crate::image::{
+    ColorInfo, ColorRange, Jpeg2000Image, Jpeg2000PixelFormat, Metadata, Palette, Plane,
+};
 use crate::options::DecodeOptions;
 use crate::{Jpeg2000Error, ProgressionOrder};
 
@@ -148,12 +150,63 @@ pub fn from_color_signal(s: &ColorSignal) -> ColorInfo {
 
 // ---- Jpeg2000Image ⇄ VideoFrame -------------------------------------------------
 
+/// Blob kind of one JP2 XML box (T.800 §I.7.1) on a stream: the XML
+/// document as stored in the box.
+pub const BLOB_KIND_XML: &str = "jpeg2000-xml";
+/// Blob kind of one JP2 UUID box (T.800 §I.7.2) that is neither the
+/// file's Exif block nor its XMP packet: the 16-byte `ID` followed by
+/// the `DATA` field, as stored in the box.
+pub const BLOB_KIND_UUID: &str = "jpeg2000-uuid";
+
+/// The well-known blobs of an image's [`Metadata`], in the order ICC,
+/// Exif, XMP — each already in the framework's payload convention (a
+/// complete ICC profile; an Exif block from its TIFF header; an XMP
+/// packet).
+pub(crate) fn metadata_blobs(m: &Metadata) -> Vec<MetadataBlob> {
+    let mut out = Vec::new();
+    if let Some(icc) = &m.icc {
+        out.push(MetadataBlob::new(BlobKind::ICC, icc.clone()));
+    }
+    if let Some(exif) = &m.exif {
+        out.push(MetadataBlob::new(BlobKind::EXIF, exif.clone()));
+    }
+    if let Some(xmp) = &m.xmp {
+        out.push(MetadataBlob::new(BlobKind::XMP, xmp.clone()));
+    }
+    out
+}
+
+/// Replace the ICC / Exif / XMP blobs of `blobs` by those of `m`,
+/// leaving every other kind in place.
+pub(crate) fn replace_metadata_blobs(blobs: &mut Vec<MetadataBlob>, m: &Metadata) {
+    blobs.retain(|b| !(b.is(&BlobKind::ICC) || b.is(&BlobKind::EXIF) || b.is(&BlobKind::XMP)));
+    blobs.splice(0..0, metadata_blobs(m));
+}
+
+/// An image's [`Metadata`] from framework blobs: a per-frame blob of a
+/// kind refines the stream-level one.
+pub(crate) fn metadata_from_blobs(frame: &[MetadataBlob], stream: &[MetadataBlob]) -> Metadata {
+    let pick = |kind: BlobKind| {
+        frame
+            .iter()
+            .chain(stream)
+            .find(|b| b.is(&kind))
+            .map(|b| b.data.clone())
+    };
+    Metadata::new()
+        .with_icc(pick(BlobKind::ICC))
+        .with_exif(pick(BlobKind::EXIF))
+        .with_xmp(pick(BlobKind::XMP))
+}
+
 /// [`From<Jpeg2000Image>`] with an explicit `pts`, moving the planes.
 /// Side-channels: the palette for `Pal8`; the colour signal when the
 /// file carried one (JP2 `colr`); the per-plane significant-bits count
 /// when `bit_depth` differs from the layout's own depth (8 / 10 / 12 /
-/// 16).
+/// 16); the metadata blobs (ICC profile, Exif block, XMP packet) the
+/// image holds.
 pub(crate) fn image_into_video_frame(image: Jpeg2000Image, pts: Option<i64>) -> VideoFrame {
+    let blobs = metadata_blobs(&image.metadata);
     let storage = image
         .format
         .fixed_bit_depth()
@@ -180,6 +233,7 @@ pub(crate) fn image_into_video_frame(image: Jpeg2000Image, pts: Option<i64>) -> 
     if bits != storage {
         frame.set_significant_bits(vec![bits; nplanes]);
     }
+    frame.set_blobs(blobs);
     frame
 }
 
@@ -211,7 +265,9 @@ impl Jpeg2000Image {
     /// `Rgba`; the palette side-channel (or `extradata` RGB triples)
     /// becomes [`Jpeg2000Image::palette`] for `Pal8`; the colour-signal
     /// side-channel becomes [`Jpeg2000Image::color`]; the significant-bits
-    /// side-channel (plane 0) becomes [`Jpeg2000Image::bit_depth`].
+    /// side-channel (plane 0) becomes [`Jpeg2000Image::bit_depth`]; the
+    /// ICC / Exif / XMP blobs of the frame — else those of the stream
+    /// parameters — become [`Jpeg2000Image::metadata`].
     pub fn from_video_frame(
         frame: &VideoFrame,
         params: &CodecParameters,
@@ -277,6 +333,7 @@ impl Jpeg2000Image {
         if let Some(bits) = frame.plane_significant_bits(0) {
             img = img.with_bit_depth(bits)?;
         }
+        img.metadata = metadata_from_blobs(&frame.blobs(), params.blobs());
         Ok(img)
     }
 }
@@ -680,6 +737,7 @@ impl Decoder for Jpeg2000Decoder {
         if image.color.is_signalled() {
             self.params.color_signal = to_color_signal(&image.color);
         }
+        replace_metadata_blobs(&mut self.params.blobs, &image.metadata);
         Ok(Frame::Video(image_into_video_frame(image, pkt.pts)))
     }
 
@@ -812,6 +870,7 @@ impl Encoder for Jpeg2000Encoder {
         self.params.width = Some(width);
         self.params.height = Some(height);
         self.params.pixel_format = Some(image.format.into());
+        replace_metadata_blobs(&mut self.params.blobs, &image.metadata);
         let mut pkt = Packet::new(0, TimeBase::new(1, 1), bytes_out);
         pkt.pts = v.pts;
         pkt.dts = v.pts;

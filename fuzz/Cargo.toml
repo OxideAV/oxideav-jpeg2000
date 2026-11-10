@@ -138,3 +138,9 @@ path = "fuzz_targets/demux.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "jp2_metadata"
+path = "fuzz_targets/jp2_metadata.rs"
+test = false
+doc = false

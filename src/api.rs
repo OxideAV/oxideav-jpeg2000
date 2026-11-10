@@ -63,6 +63,20 @@ struct Parsed<'a> {
     codestream: &'a [u8],
     header: J2kHeader,
     container: Option<Jp2Container>,
+    /// The whole input (what the container's box offsets refer to).
+    file: &'a [u8],
+}
+
+impl<'a> Parsed<'a> {
+    /// The Exif block of a JP2 file's UUID box, if any.
+    fn exif(&self) -> Option<&'a [u8]> {
+        self.container.as_ref()?.exif(self.file)
+    }
+
+    /// The XMP packet of a JP2 file's UUID box, if any.
+    fn xmp(&self) -> Option<&'a [u8]> {
+        self.container.as_ref()?.xmp(self.file)
+    }
 }
 
 fn parse(bytes: &[u8], strict: bool) -> Result<Parsed<'_>, Error> {
@@ -102,6 +116,7 @@ fn parse(bytes: &[u8], strict: bool) -> Result<Parsed<'_>, Error> {
             codestream,
             header,
             container: Some(container),
+            file: bytes,
         })
     } else {
         let header = crate::parse_j2k_header(bytes)?;
@@ -109,6 +124,7 @@ fn parse(bytes: &[u8], strict: bool) -> Result<Parsed<'_>, Error> {
             codestream: bytes,
             header,
             container: None,
+            file: bytes,
         })
     }
 }
@@ -456,6 +472,8 @@ pub fn info(bytes: &[u8]) -> Result<ImageInfo, Error> {
         parsed.container.is_some(),
     );
     info.has_alpha |= plan.palette.as_ref().is_some_and(Palette::has_alpha);
+    info.has_exif = parsed.exif().is_some();
+    info.has_xmp = parsed.xmp().is_some();
     info.high_throughput = siz.rsiz & 0x4000 != 0;
     info.reversible = cod.transform == crate::WaveletTransform::Reversible5x3;
     info.decomposition_levels = cod.decomposition_levels;
@@ -484,8 +502,16 @@ pub(crate) struct Described {
     /// Colour as the JP2 header signals it; unspecified for a bare
     /// codestream.
     pub color: ColorInfo,
-    /// A `colr` box carried an ICC profile.
-    pub has_icc: bool,
+    /// The ICC profile of a `colr` box.
+    pub icc: Option<Vec<u8>>,
+    /// The Exif block of a `uuid` box.
+    pub exif: Option<Vec<u8>>,
+    /// The XMP packet of a `uuid` box.
+    pub xmp: Option<Vec<u8>>,
+    /// Every other `uuid` box, `ID` then `DATA` as stored.
+    pub other_uuid: Vec<Vec<u8>>,
+    /// Every `xml ` box, the document as stored.
+    pub xml: Vec<Vec<u8>>,
     /// Wrapped in a JP2 / JPH file (vs a bare codestream).
     pub jp2: bool,
 }
@@ -498,6 +524,33 @@ pub(crate) struct Described {
 pub(crate) fn describe(bytes: &[u8]) -> Result<Described, Error> {
     let parsed = parse(bytes, false)?;
     let jp2h = parsed.container.as_ref().map(|c| &c.header);
+    let exif = parsed.exif().map(<[u8]>::to_vec);
+    let xmp = parsed.xmp().map(<[u8]>::to_vec);
+    let (mut other_uuid, mut xml) = (Vec::new(), Vec::new());
+    if let Some(c) = &parsed.container {
+        // The UUID boxes not surfaced as Exif / XMP above: unknown
+        // identifiers, repeats of a known one, a known identifier over
+        // a payload that is not what it announces.
+        let first_exif = c.exif_box(bytes).map(|(i, _)| i);
+        let first_xmp = c.xmp_box(bytes).map(|(i, _)| i);
+        for (i, b) in c.uuid_boxes.iter().enumerate() {
+            if Some(i) == first_exif || Some(i) == first_xmp {
+                continue;
+            }
+            if let Some(data) = b.data(bytes) {
+                let mut v = Vec::with_capacity(16 + data.len());
+                v.extend_from_slice(&b.id);
+                v.extend_from_slice(data);
+                other_uuid.push(v);
+            }
+        }
+        xml.extend(
+            c.xml_boxes
+                .iter()
+                .filter_map(|b| b.data(bytes))
+                .map(<[u8]>::to_vec),
+        );
+    }
     match plan(&parsed, 0) {
         Ok(p) => Ok(Described {
             width: p.width,
@@ -505,7 +558,11 @@ pub(crate) fn describe(bytes: &[u8]) -> Result<Described, Error> {
             format: Some(p.layout.format),
             palette: p.palette,
             color: p.color,
-            has_icc: p.icc.is_some(),
+            icc: p.icc,
+            exif,
+            xmp,
+            other_uuid,
+            xml,
             jp2: parsed.container.is_some(),
         }),
         Err(Jpeg2000Error::Unsupported(_)) => {
@@ -525,7 +582,11 @@ pub(crate) fn describe(bytes: &[u8]) -> Result<Described, Error> {
                 format: None,
                 palette: None,
                 color,
-                has_icc: icc.is_some(),
+                icc,
+                exif,
+                xmp,
+                other_uuid,
+                xml,
                 jp2: parsed.container.is_some(),
             })
         }
@@ -584,7 +645,10 @@ pub fn decode_with(bytes: &[u8], opts: &DecodeOptions) -> Result<Jpeg2000Image, 
         build_image(channels, plan.layout, plan.width, plan.height, opts.threads)?
     };
     image.color = plan.color;
-    image.metadata = Metadata::new().with_icc(plan.icc);
+    image.metadata = Metadata::new()
+        .with_icc(plan.icc)
+        .with_exif(parsed.exif().map(<[u8]>::to_vec))
+        .with_xmp(parsed.xmp().map(<[u8]>::to_vec));
     Ok(image)
 }
 
@@ -902,6 +966,8 @@ fn jp2_options(image: &Jpeg2000Image, jph: bool) -> Jp2WriteOptions {
         image.metadata.icc.as_deref(),
         jph,
     )
+    .with_exif(image.metadata.exif.clone())
+    .with_xmp(image.metadata.xmp.clone())
 }
 
 /// [`jp2_options`] from its parts — what the framework muxer has when

@@ -299,10 +299,10 @@ fn unsupported_component_set_opens_without_a_layout() {
 }
 
 #[test]
-fn demuxer_reports_icc_presence_in_metadata() {
+fn demuxer_carries_the_icc_profile_as_a_stream_blob() {
     // Wrap a codestream in a JP2 header whose `colr` carries an ICC
-    // profile: the demuxer flags it (the blob itself has no framework
-    // carriage yet).
+    // profile: the demuxer hands it over as a stream blob (opaque
+    // payloads are not text metadata).
     let cs = encode(
         &Jpeg2000Image::from_rgb8(4, 2, vec![7; 24]).unwrap(),
         &EncodeOptions::default().with_container(Container::J2k),
@@ -319,12 +319,16 @@ fn demuxer_reports_icc_presence_in_metadata() {
     }];
     let file = write_jp2(&cs, &opts).unwrap();
     let demux = open_demuxer(reader(&file), &NullCodecResolver).unwrap();
+    assert!(demux.metadata().is_empty());
+    let params = &demux.streams()[0].params;
     assert_eq!(
-        demux.metadata(),
-        &[("icc".to_owned(), "present".to_owned())]
+        params
+            .blob(&oxideav_core::BlobKind::ICC)
+            .map(|b| b.data.as_slice()),
+        Some(&[0u8; 132][..])
     );
     let plain = open_demuxer(reader(RGB_JP2), &NullCodecResolver).unwrap();
-    assert!(plain.metadata().is_empty());
+    assert!(plain.streams()[0].params.blobs().is_empty());
 }
 
 // ---- muxers -----------------------------------------------------------------

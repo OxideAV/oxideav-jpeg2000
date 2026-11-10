@@ -1266,8 +1266,8 @@ mod tests {
     fn mel_termination_does_not_create_a_false_marker_at_the_vlc_interface() {
         // The 7.1.1 segment constraint applies at byte-stream interfaces too.
         // A partial all-one MEL byte used to become
-        // FF, colliding with this valid first VLC byte and OpenJPEG's MEL
-        // prefetch check. The bit sequences, not decoder roundtrips, establish
+        // FF, colliding with this valid first VLC byte and a black-box
+        // decoder's check on the MEL bytes. The bit sequences, not decoder roundtrips, establish
         // the stream-interface regression.
         for (bits, expected) in [
             (vec![1], vec![0x80]),

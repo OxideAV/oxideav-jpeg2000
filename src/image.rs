@@ -686,19 +686,24 @@ impl Default for ColorInfo {
 /// Exif payload, an XMP packet and a file gamma.
 ///
 /// JPEG 2000 sources `icc` from a JP2 Colour Specification box with
-/// `METH = 2` (restricted ICC) or the T.814 `METH = 3` (any ICC).
-/// `exif` / `xmp` ride vendor `uuid` boxes (T.800 §I.7.2) whose
-/// identifiers are defined outside the staged specifications, so this
-/// crate leaves them `None`; `gamma` is `None` (the format carries no
-/// single gamma exponent).
+/// `METH = 2` (restricted ICC) or the T.814 `METH = 3` (any ICC), and
+/// `exif` / `xmp` from top-level `uuid` boxes of the JP2 / JPH file
+/// (T.800 §I.7.2) under the identifiers [`crate::jp2::UUID_EXIF`] and
+/// [`crate::jp2::UUID_XMP`]. [`crate::encode()`] writes the same boxes
+/// back into a JP2 / JPH file; a bare codestream has nowhere to put
+/// any of the three. `gamma` is `None` (the format carries no single
+/// gamma exponent).
 #[derive(Clone, Debug, Default, PartialEq)]
 #[non_exhaustive]
 pub struct Metadata {
     /// ICC profile bytes (JP2 `colr` `PROFILE` field).
     pub icc: Option<Vec<u8>>,
-    /// Exif payload — never filled by this crate (type docs).
+    /// Exif block: a TIFF structure starting at its byte-order mark
+    /// (`II*\0` / `MM\0*`), no `Exif\0\0` code in front (the `DATA`
+    /// field of the Exif `uuid` box).
     pub exif: Option<Vec<u8>>,
-    /// XMP packet — never filled by this crate (type docs).
+    /// XMP packet, UTF-8, `<?xpacket` wrapper and padding included
+    /// (the `DATA` field of the XMP `uuid` box).
     pub xmp: Option<Vec<u8>>,
     /// Encoding gamma exponent — never filled by this crate.
     pub gamma: Option<f32>,
@@ -889,9 +894,9 @@ pub struct ImageInfo {
     pub color: ColorInfo,
     /// `true` when a JP2 `colr` box carries an ICC profile.
     pub has_icc: bool,
-    /// Always `false` (see [`Metadata`]).
+    /// `true` when a JP2 `uuid` box carries an Exif block.
     pub has_exif: bool,
-    /// Always `false` (see [`Metadata`]).
+    /// `true` when a JP2 `uuid` box carries an XMP packet.
     pub has_xmp: bool,
     /// Significant bits per sample (`Ssiz` precision, 1–16).
     pub bit_depth: u8,
