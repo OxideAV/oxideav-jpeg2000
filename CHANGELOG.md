@@ -4,6 +4,30 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ## [Unreleased]
 
+## [0.0.20](https://github.com/OxideAV/oxideav-jpeg2000/compare/v0.0.19...v0.0.20) - 2026-11-10
+
+### Other
+
+- Colour Specification boxes of an unknown method are ignored entirely
+- MQ coder: one-word contexts carrying Qe, stepped through whole next-context words
+- JP2 header on the contract API: Resolution box in and out, premultiplied opacity undone
+- keep the staged metadata payloads byte-exact on every checkout
+- JP2 uuid metadata: Exif + XMP read and write, XML / UUID Info boxes, framework blobs
+- Pointer-marker validation: zero-length packets on tile-part boundaries (PLT / PLM with PPM / PPT)
+- 2D_INTERLEAVE against the per-sample lattice definition, every parity, threaded and not
+- Fuzzing builds fan out regardless of work size
+- final measured table (tiled case added)
+- Tile-level concurrency in both directions, work-size gates, bounded in-order hand-back
+- MQ inner step: read the Table C.2 row as one packed word
+- Fan-out helpers: tolerate refused threads, cap workers, let the caller take runs
+- Scale the wavelet fan-out with the lattice size
+- the depth-level decode under DecodeOptions (limits, strict, reduce, layers, threads)
+- Keep encoder block coefficients inside their jobs; measured table in the README
+- PLM (T.800 A.7.2): emit and cross-validate main-header packet lengths
+- Rate control without re-encoding, concurrent encoder front end, plane hand-over in the decoder
+- In-place lattice DWT with strip fan-out, single-selection MQ coder, packed-state forward passes
+- Thread budget for Tier-1 (both directions), HTJ2K CxtVLC table lookups, perf suite
+
 ### Added
 
 - Exif and XMP in JP2 / JPH files, both directions. A top-level `uuid` box (T.800 §I.7.2) with the XMP identifier `BE7ACFCB-97A9-42E8-9C71-999491E3AFAC` (XMP Specification Part 3 §1.1.4, Table 8) holds the UTF-8 packet verbatim; one with the 16 ASCII bytes `JpgTiffExif->JP2` holds an Exif block starting at its TIFF header. `decode` fills `Metadata::exif` / `Metadata::xmp` (wherever the box sits — before or after the codestream, 32-bit, `XLBox` or open-ended length; first box of an identifier wins; an Exif identifier over bytes that are no TIFF structure is an unknown box; an `Exif\0\0` code in front of the TIFF header is tolerated), `info` sets `has_exif` / `has_xmp`, and `encode` writes both boxes between the JP2 Header and the codestream from the image's metadata. The three staged files written end to end by independent producers decode to their expected payloads and pixels exactly, and re-wrapping their codestreams with the extracted payloads reproduces each file byte for byte.
