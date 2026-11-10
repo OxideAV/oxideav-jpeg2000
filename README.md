@@ -245,28 +245,33 @@ comparing two builds.
 ### Measured
 
 `cargo run --release --example perf_suite -- --threads N` on one
-18-core Apple M5 Max that was busy with other builds at the time
-(median of 7 rounds, milliseconds, encode / decode; synthetic images —
-ramps, texture, edges and grain — so the lossless streams carry about
+18-core Apple M5 Max that other builds were sharing at the time (median
+of 9 rounds, milliseconds, encode / decode; synthetic images — ramps,
+texture, edges and grain — so the lossless streams carry about
 3.6 bit/sample at 8 bits and 12 bit/sample at 16):
 
 | case | 1 worker | 2 | 4 | 8 | 16 |
 |---|---|---|---|---|---|
-| RGB8 1024², lossless 5-3 | 142 / 158 | 75 / 81 | 39 / 46 | 22 / 25 | 16 / 20 |
-| RGB16 1024², lossless 5-3 | 386 / 402 | 194 / 208 | 104 / 109 | 55 / 58 | 35 / 42 |
-| RGB8 512², lossy 9-7 | 47 / 52 | 25 / 29 | 14 / 17 | 7.8 / 10 | 5.8 / 9.1 |
-| RGB8 512², lossy 9-7, 4 layers, 96 kB budget | 55 / 15 | 31 / 9.3 | 18 / 5.8 | 12 / 4.8 | 11 / 5.4 |
-| RGB8 3840×2160, lossless 5-3 | 1050 / 1117 | 543 / 581 | 292 / 307 | 167 / 175 | 107 / 108 |
-| RGB8 1024², lossless HTJ2K | 56 / 56 | 33 / 32 | 19 / 20 | 12 / 13 | 7.9 / 11 |
+| RGB8 1024², lossless 5-3 | 121 / 132 | 63 / 68 | 33 / 36 | 20 / 22 | 13 / 15 |
+| RGB16 1024², lossless 5-3 | 309 / 320 | 158 / 164 | 87 / 89 | 48 / 50 | 30 / 33 |
+| RGB8 512², lossy 9-7 | 51 / 54 | 25 / 26 | 13 / 15 | 7.8 / 9.7 | 5.8 / 7.8 |
+| RGB8 512², lossy 9-7, 4 layers, 96 kB budget | 52 / 13 | 29 / 7.7 | 16 / 5.1 | 11 / 4.6 | 8.3 / 3.8 |
+| RGB8 3840×2160, lossless 5-3 | 984 / 1072 | 536 / 559 | 291 / 300 | 162 / 164 | 99 / 101 |
+| RGB8 1024², lossless, 64 tiles of 128² | 136 / 146 | 72 / 77 | 40 / 40 | 23 / 22 | 16 / 15 |
+| RGB8 1024², lossless HTJ2K | 61 / 59 | 36 / 37 | 20 / 20 | 12 / 12 | 9.3 / 11 |
 
 Serial time is dominated by the MQ coder (one context-adaptive binary
 decision at a time, by construction), so it scales with the number of
 coded bits; everything else — the wavelet transform, colour transform,
-Tier-2 — is a few percent. Peak memory at one worker for the 3840×2160
-case is about 235 MiB decoding and 385 MiB encoding through the
-contract API (the packed picture, one `i32` plane per component, and
-one component's coefficients), and a larger budget adds a few MiB of
-per-worker block state.
+Tier-2 — is a few percent. The part that stays on one thread (packet
+headers, assembly, the per-thread start-up) is what flattens the curve
+past 8 workers on the smaller pictures.
+
+Peak memory for the 3840×2160 case through the contract API is about
+210 MiB decoding and 350 MiB encoding at one worker (the packed
+picture, one `i32` plane per component, one component's coefficients,
+and on the encode side the coded blocks); 8 workers add 10 – 45 MiB of
+per-worker state.
 
 ## Metadata and colour
 
