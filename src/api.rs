@@ -204,6 +204,79 @@ fn predicted_channels(siz: &Siz, jp2h: Option<&Jp2Header>) -> Result<Vec<Chan>, 
     Ok(chans)
 }
 
+/// The JP2 Header of a parsed file, if it is one.
+fn jp2h_of<'p>(parsed: &'p Parsed<'_>) -> Option<&'p Jp2Header> {
+    parsed.container.as_ref().map(|c| &c.header)
+}
+
+/// Undo the premultiplication of T.800 Equation I-5 on channels in
+/// presentation order: a Channel Definition of `Typ = 2`
+/// (premultiplied opacity) says the colour channels it is associated
+/// with — all of them for `Asoc = 0`, colour `Asoc` otherwise — store
+/// `Sp = S × α / max`. The contract layouts carry straight opacity, so
+/// each such sample becomes `S = Sp × max / α`, rounded and clipped to
+/// its precision (`0` where `α = 0`). A sub-sampled colour channel
+/// takes the opacity sample co-sited with it.
+fn unpremultiply(header: &Jp2Header, channels: &mut [DecodedComponent]) {
+    let Some(defs) = &header.cdef else { return };
+    if !defs
+        .iter()
+        .any(|d| d.channel_type == ChannelDef::TYPE_PREMULTIPLIED_OPACITY)
+    {
+        return;
+    }
+    let order = jp2::cdef_presentation_order(defs, channels.len());
+    let position = |source: u16| order.iter().position(|&i| i == usize::from(source));
+    for d in defs {
+        if d.channel_type != ChannelDef::TYPE_PREMULTIPLIED_OPACITY {
+            continue;
+        }
+        let Some(a) = position(d.channel) else {
+            continue;
+        };
+        let targets: Vec<usize> = defs
+            .iter()
+            .filter(|c| {
+                c.channel_type == ChannelDef::TYPE_COLOUR
+                    && (1..=0xFFFE).contains(&c.association)
+                    && (d.association == 0 || d.association == c.association)
+            })
+            .filter_map(|c| position(c.channel))
+            .filter(|&t| t != a)
+            .collect();
+        let alpha = channels[a].clone();
+        if alpha.is_signed || alpha.precision_bits == 0 || alpha.precision_bits > 31 {
+            continue;
+        }
+        let max = (1i64 << alpha.precision_bits) - 1;
+        for t in targets {
+            let c = &mut channels[t];
+            if c.is_signed || c.precision_bits > 31 || c.width == 0 || alpha.width == 0 {
+                continue;
+            }
+            let top = (1i64 << c.precision_bits) - 1;
+            // Opacity sample co-sited with colour sample (x, y).
+            let (sx, sy) = (
+                (alpha.width / c.width).max(1) as usize,
+                (alpha.height / c.height.max(1)).max(1) as usize,
+            );
+            let (cw, aw) = (c.width as usize, alpha.width as usize);
+            for (i, s) in c.samples.iter_mut().enumerate() {
+                let (x, y) = (i % cw, i / cw);
+                let Some(&al) = alpha.samples.get(y * sy * aw + x * sx) else {
+                    continue;
+                };
+                let al = i64::from(al).clamp(0, max);
+                *s = if al == 0 {
+                    0
+                } else {
+                    ((i64::from(*s).max(0) * max + al / 2) / al).min(top) as i32
+                };
+            }
+        }
+    }
+}
+
 /// The `Pal8` plan: `Some(palette)` when the JP2 palette can ride the
 /// contract's 8-bit RGBA table — one unsigned ≤ 8-bit index component,
 /// a `pclr` of at most 256 entries in one, three or four unsigned
@@ -243,6 +316,13 @@ fn palette_plan(siz: &Siz, jp2h: Option<&Jp2Header>) -> Option<Palette> {
     if let Some(defs) = &h.cdef {
         let order = jp2::cdef_presentation_order(defs, ncol);
         if order.iter().enumerate().any(|(k, &i)| k != i) {
+            return None;
+        }
+        // Premultiplied opacity is undone on the expanded channels.
+        if defs
+            .iter()
+            .any(|d| d.channel_type == ChannelDef::TYPE_PREMULTIPLIED_OPACITY)
+        {
             return None;
         }
     }
@@ -472,6 +552,7 @@ pub fn info(bytes: &[u8]) -> Result<ImageInfo, Error> {
         parsed.container.is_some(),
     );
     info.has_alpha |= plan.palette.as_ref().is_some_and(Palette::has_alpha);
+    info.resolution = jp2h_of(&parsed).and_then(|h| h.resolution);
     info.has_exif = parsed.exif().is_some();
     info.has_xmp = parsed.xmp().is_some();
     info.high_throughput = siz.rsiz & 0x4000 != 0;
@@ -639,7 +720,11 @@ pub fn decode_with(bytes: &[u8], opts: &DecodeOptions) -> Result<Jpeg2000Image, 
         pal8_image(idx, plan.layout.bit_depth, plan.width, plan.height)?.with_palette(palette)
     } else {
         let channels = match parsed.container.as_ref() {
-            Some(c) => jp2::apply_channel_mapping(&c.header, decoded)?.components,
+            Some(c) => {
+                let mut channels = jp2::apply_channel_mapping(&c.header, decoded)?.components;
+                unpremultiply(&c.header, &mut channels);
+                channels
+            }
             None => decoded.components,
         };
         build_image(channels, plan.layout, plan.width, plan.height, opts.threads)?
@@ -909,7 +994,10 @@ pub fn encode(image: &Jpeg2000Image, opts: &EncodeOptions) -> Result<Vec<u8>, Er
         Container::Jp2 => {
             let header = crate::parse_j2k_header(&codestream)?;
             let jph = header.siz.rsiz & 0x4000 != 0;
-            jp2::write_jp2(&codestream, &jp2_options(image, jph))
+            jp2::write_jp2(
+                &codestream,
+                &jp2_options(image, jph).with_resolution(opts.resolution),
+            )
         }
     }
 }

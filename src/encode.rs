@@ -1575,6 +1575,11 @@ pub struct EncodeOptions {
     /// The framework adapter fills this from the
     /// `oxideav_core::ExecutionContext` it is handed.
     pub threads: usize,
+    /// The JP2 Resolution box (T.800 §I.5.3.7) [`crate::encode()`]
+    /// writes into a JP2 / JPH file: capture and / or default display
+    /// grid resolution. `None` (the default) writes no box; a bare
+    /// codestream has nowhere to put one.
+    pub resolution: Option<crate::jp2::Resolution>,
 }
 
 impl Default for EncodeOptions {
@@ -1613,6 +1618,7 @@ impl Default for EncodeOptions {
             ht_mixed: false,
             roi: None,
             threads: 1,
+            resolution: None,
         }
     }
 }
@@ -1752,6 +1758,12 @@ impl EncodeOptions {
     /// Set the worker budget ([`Self::threads`]; `0` is treated as `1`).
     pub fn with_threads(mut self, threads: usize) -> Self {
         self.threads = threads.max(1);
+        self
+    }
+
+    /// Set [`Self::resolution`].
+    pub fn with_resolution(mut self, resolution: Option<crate::jp2::Resolution>) -> Self {
+        self.resolution = resolution;
         self
     }
 }

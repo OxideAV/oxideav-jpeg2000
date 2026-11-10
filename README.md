@@ -227,7 +227,10 @@ rate control), `tile_size`, the Table A.19 style flags (`bypass`,
 `ht_mixed` (T.814), `tile_parts`, `poc`, `packed_headers`, `roi`,
 `sub_sampling` and `component_overrides` (the last two for the
 plane-level encoders; `encode` derives sub-sampling from the layout),
-and `threads` (the worker budget).
+`threads` (the worker budget) and `resolution` (the JP2 Resolution box:
+capture and / or default display grid resolution, e.g.
+`GridResolution::from_dpi(300.0, 300.0)`; `info` reports it as
+`ImageInfo::resolution`).
 
 ## Threading
 
@@ -323,6 +326,15 @@ with the extracted payloads reproduces each file **byte for byte**
 (`tests/jp2_metadata.rs`). Per §I.7.2 none of this touches the picture:
 an Exif orientation is surfaced, not applied. `Metadata.gamma` is
 always `None`.
+
+Opacity is straight in every contract layout. A file whose Channel
+Definition box declares **premultiplied** opacity (T.800 Table I.16
+`Typ = 2`: the colour samples are stored as `S × α / max`, Equation
+I-5) is returned with the division undone — `round(Sp × max / α)`
+clipped to the sample range, `0` where `α = 0` — on the colour
+channels the definition names (all of them for `Asoc = 0`); a
+palette with such a column expands to `Rgba` instead of `Pal8`. The
+depth API (`jp2::decode_jp2`) returns the samples as stored.
 
 The depth API has the whole §I.7 set: `jp2::parse_jp2` returns every
 `uuid` box (`UuidBox`: ID + where the DATA sits), every `xml ` box

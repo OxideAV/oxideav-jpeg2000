@@ -918,6 +918,10 @@ pub struct ImageInfo {
     pub tiles: u32,
     /// The `COD` progression order.
     pub progression: crate::ProgressionOrder,
+    /// The JP2 Resolution box (T.800 §I.5.3.7): capture and / or
+    /// default display grid resolution, in reference grid points per
+    /// metre. `None` for a bare codestream or a file without the box.
+    pub resolution: Option<crate::jp2::Resolution>,
 }
 
 impl ImageInfo {
@@ -953,6 +957,7 @@ impl ImageInfo {
             layers: 1,
             tiles: 1,
             progression: crate::ProgressionOrder::Lrcp,
+            resolution: None,
         }
     }
 }

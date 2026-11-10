@@ -440,6 +440,126 @@ impl GridResolution {
     }
 }
 
+impl GridResolution {
+    /// A resolution of `vertical` × `horizontal` reference grid points
+    /// per metre in the box's terms: for each axis an exponent and a
+    /// 16-bit numerator / denominator pair (Equations I-4 / I-5) found
+    /// by continued-fraction approximation. A value the fields can
+    /// express is stored exactly — 300 dpi is `15000 / 127 × 10²` —
+    /// and any other to within about one part in a million. `None`
+    /// unless both are finite, positive and within the fields' range.
+    pub fn from_points_per_metre(vertical: f64, horizontal: f64) -> Option<Self> {
+        let (vn, vd, ve) = approximate_resolution(vertical)?;
+        let (hn, hd, he) = approximate_resolution(horizontal)?;
+        Some(GridResolution {
+            vertical_numerator: vn,
+            vertical_denominator: vd,
+            horizontal_numerator: hn,
+            horizontal_denominator: hd,
+            vertical_exponent: ve,
+            horizontal_exponent: he,
+        })
+    }
+
+    /// [`Self::from_points_per_metre`] from dots per inch (one inch is
+    /// 0.0254 m).
+    pub fn from_dpi(vertical: f64, horizontal: f64) -> Option<Self> {
+        Self::from_points_per_metre(vertical / 0.0254, horizontal / 0.0254)
+    }
+
+    /// The vertical resolution in dots per inch.
+    pub fn vertical_dpi(&self) -> f64 {
+        self.vertical_points_per_metre() * 0.0254
+    }
+
+    /// The horizontal resolution in dots per inch.
+    pub fn horizontal_dpi(&self) -> f64 {
+        self.horizontal_points_per_metre() * 0.0254
+    }
+}
+
+/// `(numerator, denominator, exponent)` with `numerator / denominator
+/// × 10^exponent` close to `value` (Table I.20 ranges: both parts
+/// 1..=65535, exponent −128..=127). Each candidate exponent that puts
+/// the mantissa inside the 16-bit range is tried with the continued
+/// fraction convergents of the mantissa; the smallest relative error
+/// wins, the exponent nearest zero on a tie.
+fn approximate_resolution(value: f64) -> Option<(u16, u16, i8)> {
+    if !value.is_finite() || value <= 0.0 {
+        return None;
+    }
+    let magnitude = value.log10().floor() as i32;
+    let mut best: Option<(f64, i32, u16, u16)> = None;
+    for exponent in (magnitude - 4)..=(magnitude + 4) {
+        if !(-128..=127).contains(&exponent) {
+            continue;
+        }
+        let mantissa = value / 10f64.powi(exponent);
+        if !(1.0 / 65_535.0..=65_535.0).contains(&mantissa) {
+            continue;
+        }
+        // Continued-fraction convergents h/k of the mantissa while
+        // both parts fit 16 bits; where the next one would not, the
+        // largest intermediate fraction that still fits is a candidate
+        // too. The closer of the two is kept.
+        let (mut h0, mut k0, mut h1, mut k1) = (0u64, 1u64, 1u64, 0u64);
+        let mut x = mantissa;
+        let mut pick: Option<(u16, u16)> = None;
+        let closer = |cand: (u64, u64), pick: Option<(u16, u16)>| {
+            let err = |n: f64, d: f64| (n / d - mantissa).abs();
+            match pick {
+                Some((n, d))
+                    if err(f64::from(n), f64::from(d)) <= err(cand.0 as f64, cand.1 as f64) =>
+                {
+                    Some((n, d))
+                }
+                _ => Some((cand.0 as u16, cand.1 as u16)),
+            }
+        };
+        for _ in 0..40 {
+            let a = x.floor().min(1e18) as u64;
+            let (h2, k2) = (
+                a.saturating_mul(h1).saturating_add(h0),
+                a.saturating_mul(k1).saturating_add(k0),
+            );
+            if h2 > 65_535 || k2 > 65_535 {
+                let fit = |limit: u64, step: u64, base: u64| {
+                    limit
+                        .saturating_sub(base)
+                        .checked_div(step)
+                        .unwrap_or(u64::MAX)
+                };
+                let a = fit(65_535, h1, h0).min(fit(65_535, k1, k0));
+                let (h, k) = (a * h1 + h0, a * k1 + k0);
+                if a >= 1 && h >= 1 && k >= 1 && h <= 65_535 && k <= 65_535 {
+                    pick = closer((h, k), pick);
+                }
+                break;
+            }
+            if h2 >= 1 && k2 >= 1 {
+                pick = Some((h2 as u16, k2 as u16));
+            }
+            (h0, k0, h1, k1) = (h1, k1, h2, k2);
+            let frac = x - x.floor();
+            if frac < 1e-12 {
+                break;
+            }
+            x = 1.0 / frac;
+        }
+        let Some((n, d)) = pick else { continue };
+        let got = f64::from(n) / f64::from(d) * 10f64.powi(exponent);
+        let err = ((got - value) / value).abs();
+        let better = match best {
+            None => true,
+            Some((e, x, ..)) => err < e || (err == e && exponent.abs() < x.abs()),
+        };
+        if better {
+            best = Some((err, exponent, n, d));
+        }
+    }
+    best.map(|(_, e, n, d)| (n, d, e as i8))
+}
+
 /// Parsed Resolution superbox (T.800 §I.5.3.7 / Figure I.14). At
 /// least one of the two child boxes is present.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
