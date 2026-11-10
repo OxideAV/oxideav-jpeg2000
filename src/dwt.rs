@@ -2416,6 +2416,76 @@ mod tests {
     }
 
     #[test]
+    fn interleave_places_every_band_sample_at_its_lattice_site() {
+        // Every lattice a tile-component can produce: `w × h` samples
+        // anchored at parity `(i0, j0)`; the low band of an axis holds
+        // the even absolute coordinates, the high band the odd ones.
+        for (w, h) in [(1, 1), (1, 6), (6, 1), (2, 2), (5, 4), (8, 7), (300, 260)] {
+            for i0 in [0, 1] {
+                for j0 in [0, 1] {
+                    let low = |len: usize, parity: usize| (len + 1 - parity) / 2;
+                    let (lw, lh) = (low(w, i0 as usize), low(h, j0 as usize));
+                    let (hw, hh) = (w - lw, h - lh);
+                    let band = |tag: i32, len: usize| -> Vec<i32> {
+                        (0..len as i32).map(|k| tag * 1_000_000 + k).collect()
+                    };
+                    let (ll, hl) = (band(1, lw * lh), band(2, hw * lh));
+                    let (lhb, hhb) = (band(3, lw * hh), band(4, hw * hh));
+                    let (i0u, j0u) = (i0 as usize, j0 as usize);
+                    let mut expected = vec![0; w * h];
+                    for y in 0..h {
+                        for x in 0..w {
+                            // Absolute coordinate a from origin o lands
+                            // in the low band at ⌈a/2⌉ − ⌈o/2⌉ when a is
+                            // even, in the high band at ⌊a/2⌋ − ⌊o/2⌋
+                            // when it is odd.
+                            let (ax, ay) = (x + i0u, y + j0u);
+                            let (high_x, high_y) = (ax % 2 == 1, ay % 2 == 1);
+                            let u = if high_x {
+                                ax / 2 - i0u / 2
+                            } else {
+                                ax / 2 - i0u.div_ceil(2)
+                            };
+                            let v = if high_y {
+                                ay / 2 - j0u / 2
+                            } else {
+                                ay / 2 - j0u.div_ceil(2)
+                            };
+                            expected[y * w + x] = match (high_x, high_y) {
+                                (false, false) => ll[v * lw + u],
+                                (true, false) => hl[v * hw + u],
+                                (false, true) => lhb[v * lw + u],
+                                (true, true) => hhb[v * hw + u],
+                            };
+                        }
+                    }
+                    for threads in [1, 3] {
+                        let got = interleave_2d(
+                            &ll,
+                            (lw, lh),
+                            &hl,
+                            (hw, lh),
+                            &lhb,
+                            (lw, hh),
+                            &hhb,
+                            (hw, hh),
+                            i0,
+                            j0,
+                            threads,
+                        )
+                        .unwrap();
+                        assert_eq!((got.width, got.height), (w, h));
+                        assert_eq!(
+                            got.data, expected,
+                            "{w}x{h} at ({i0}, {j0}), {threads} worker(s)"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn empty_lattices_keep_their_outcomes() {
         let empty = |width: usize, height: usize| Interleaved2D {
             data: Vec::<i32>::new(),
