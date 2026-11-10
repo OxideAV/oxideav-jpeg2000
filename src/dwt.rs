@@ -1004,7 +1004,9 @@ const SAMPLES_PER_WORKER: usize = 1 << 15;
 /// small lattice is filtered on the calling thread).
 #[inline]
 fn lattice_budget(threads: usize, samples: usize) -> usize {
-    threads.min(samples / SAMPLES_PER_WORKER).max(1)
+    threads
+        .min(samples / crate::parallel::worker_share(SAMPLES_PER_WORKER))
+        .max(1)
 }
 
 /// Apply `step(current, before, after)` to every second sample of

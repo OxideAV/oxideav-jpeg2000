@@ -10,7 +10,7 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 - Worker budget: `DecodeOptions::threads` / `with_threads` and `EncodeOptions::threads` / `with_threads`; the framework `Decoder` / `Encoder` adapters take it from `set_execution_context` (`oxideav_core::ExecutionContext`). Serial by default (nothing is spawned at a budget of 1); scoped `std` threads, no new dependency.
 - `decode_j2k_with(bytes, &DecodeOptions)`: the depth-level decode (per-component `i32` planes of a raw codestream) under the same options as `decode_with` — limits checked against `SIZ` before allocation, `strict`, `reduce`, `layers` and the worker budget. `examples/decoder_perf.rs` and `examples/encoder_perf.rs` take an optional trailing worker count.
 - `examples/perf_suite.rs` (encode + decode timings over synthetic rgb8 / rgb16 / lossy 9-7 / 4K / HTJ2K cases, contract API or registry path, any thread budget) and `examples/corpus_hash.rs` (decoded-sample and codestream hashes over a file corpus plus an encoder option matrix, for comparing two builds).
-- Fuzz: `contract` decodes every input a second time under a worker budget of three and requires the serial outcome (planes or error text); `roundtrip_encode` requires a threaded encode to emit the serial bytes and scripts the `plm` option.
+- Fuzz: `contract` decodes every input a second time under a worker budget of three and requires the serial outcome (planes or error text); `roundtrip_encode` requires a threaded encode to emit the serial bytes and scripts the `plm` option. Builds made under the fuzzing configuration fan work out whatever its size, so small fuzz inputs still exercise the threaded paths.
 
 ### Performance
 

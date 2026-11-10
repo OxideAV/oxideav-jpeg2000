@@ -2383,7 +2383,8 @@ fn encode_core(
             .iter()
             .map(|tc| tc.width() as usize * tc.height() as usize)
             .sum();
-        let budget = budget.min(tile_samples / MIN_SAMPLES_PER_WORKER).max(1);
+        let share = crate::parallel::worker_share(MIN_SAMPLES_PER_WORKER);
+        let budget = budget.min(tile_samples / share).max(1);
         let outer = crate::parallel::effective_workers(budget, planes.len());
         let inner = (budget / outer).max(1);
         // A plane handed to exactly one cascade job.
@@ -2924,7 +2925,8 @@ fn encode_core(
             .iter()
             .map(|job| job.cb.width() as usize * job.cb.height() as usize)
             .sum();
-        let block_budget = budget.min(job_samples / MIN_SAMPLES_PER_WORKER).max(1);
+        let share = crate::parallel::worker_share(MIN_SAMPLES_PER_WORKER);
+        let block_budget = budget.min(job_samples / share).max(1);
         let outcomes: Vec<BlockOutcome> =
             crate::parallel::collect_ordered(block_budget, jobs.len(), |index| {
                 encode_block(&jobs[index])

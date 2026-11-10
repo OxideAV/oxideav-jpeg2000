@@ -2486,7 +2486,8 @@ fn decode_tile_from_plan(
             .flat_map(|(_, acc)| acc.segments.iter())
             .map(|segment| segment.bytes.len())
             .sum();
-        let block_budget = threads.min(coded_bytes / MIN_CODED_BYTES_PER_WORKER).max(1);
+        let share = crate::parallel::worker_share(MIN_CODED_BYTES_PER_WORKER);
+        let block_budget = threads.min(coded_bytes / share).max(1);
         crate::parallel::ordered_map(
             block_budget,
             jobs.len(),

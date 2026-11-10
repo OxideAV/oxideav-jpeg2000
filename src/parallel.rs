@@ -22,6 +22,20 @@ pub(crate) fn effective_workers(budget: usize, units: usize) -> usize {
     budget.min(units).clamp(1, MAX_WORKERS)
 }
 
+/// The share of work a caller wants per worker before fanning out:
+/// `min_per_worker` in normal builds. Fuzzing builds fan out whenever
+/// the budget allows, so that the small inputs a fuzzer favours still
+/// exercise the threaded paths against the serial ones.
+///
+/// (`fuzzing` is the configuration flag fuzzing harnesses build the
+/// crate under; it is not a declared feature, hence the lint
+/// exemption.)
+#[inline]
+#[allow(unexpected_cfgs)]
+pub(crate) fn worker_share(min_per_worker: usize) -> usize {
+    if cfg!(fuzzing) { 1 } else { min_per_worker }
+}
+
 /// Run `work(&mut state, index)` for every `index` in `0..count` and
 /// feed each result to `sink(index, result)` on the calling thread, in
 /// increasing index order.

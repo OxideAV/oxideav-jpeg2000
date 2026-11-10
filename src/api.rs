@@ -720,7 +720,9 @@ fn build_image(
 fn write_packed(data: &mut [u8], sources: &[&[i32]], bps: usize, max: i64, threads: usize) {
     let pixel = sources.len() * bps;
     let max = max.clamp(0, i64::from(i32::MAX)) as i32;
-    let budget = if data.len() < 1 << 18 { 1 } else { threads };
+    let budget = threads
+        .min(data.len() / crate::parallel::worker_share(1 << 16))
+        .max(1);
     crate::parallel::for_each_run(budget, data, pixel, |first, run| {
         for (channel, source) in sources.iter().enumerate() {
             let source = &source[first..];
@@ -860,7 +862,9 @@ fn component_planes<T: Copy + Send>(
     let n = format.components();
     // A small picture is split on the calling thread.
     let pixels = image.width as usize * image.height as usize;
-    let threads = if pixels < 1 << 16 { 1 } else { threads };
+    let threads = threads
+        .min(pixels / crate::parallel::worker_share(1 << 15))
+        .max(1);
     crate::parallel::collect_ordered(threads, n, |c| {
         if format.is_yuv() {
             let (pw, ph) = format.plane_dimensions(c, image.width, image.height);
