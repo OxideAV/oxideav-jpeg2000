@@ -528,11 +528,7 @@ pub(crate) fn interleave_2d<T: Copy + Default + Send + Sync>(
             height: out_h,
         });
     }
-    let budget = if data.len() < THREADED_MIN_SAMPLES {
-        1
-    } else {
-        threads
-    };
+    let budget = lattice_budget(threads, data.len());
     crate::parallel::for_each_run(budget, &mut data, out_w, |first_row, rows| {
         for (offset, row) in rows.chunks_mut(out_w).enumerate() {
             let y = first_row + offset;
@@ -999,9 +995,17 @@ pub(crate) fn sd_2d_9x7_threaded(
 
 /// Columns per vertical strip of the column filters.
 const STRIP_COLUMNS: usize = 256;
-/// Lattices below this many samples are filtered on the calling thread
-/// whatever the budget (spawning would cost more than the filtering).
-const THREADED_MIN_SAMPLES: usize = 1 << 16;
+/// Samples a worker must have to itself before the filters fan out:
+/// below it, spawning costs more than the filtering it would share.
+const SAMPLES_PER_WORKER: usize = 1 << 15;
+
+/// The worker budget for a lattice of `samples` samples: the caller's
+/// `threads`, capped so that every worker gets a worthwhile share (a
+/// small lattice is filtered on the calling thread).
+#[inline]
+fn lattice_budget(threads: usize, samples: usize) -> usize {
+    threads.min(samples / SAMPLES_PER_WORKER).max(1)
+}
 
 /// Apply `step(current, before, after)` to every second sample of
 /// `line` starting at `first` (0 or 1), reflecting at both ends.
@@ -1222,11 +1226,7 @@ fn hor_lift<T: Send>(
     let (i0, _) = lattice_span(i0, a.width)?;
     let parity = i0 as usize;
     let width = a.width;
-    let budget = if a.data.len() < THREADED_MIN_SAMPLES {
-        1
-    } else {
-        threads
-    };
+    let budget = lattice_budget(threads, a.data.len());
     crate::parallel::for_each_run(budget, &mut a.data, width, |_, rows| {
         for row in rows.chunks_mut(width) {
             line(row, parity);
@@ -1260,11 +1260,7 @@ fn ver_lift<T: Send>(
             strip.push(segment);
         }
     }
-    let budget = if width * height < THREADED_MIN_SAMPLES {
-        1
-    } else {
-        threads
-    };
+    let budget = lattice_budget(threads, width * height);
     crate::parallel::for_each_run(budget, &mut strips, 1, |_, run| {
         for strip in run {
             rows(strip, parity);

@@ -26,6 +26,7 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 - Decoder back end: a tile that covers a whole component hands its plane over instead of being copied into a second, zero-filled one (one image-sized allocation less on single-tile streams); 2D_INTERLEAVE runs row by row and the packed output layout is written pixel by pixel, both shared out under the budget.
 - HTJ2K MagSgn bits are imported / exported a byte's worth at a time.
 - Encoder block jobs no longer hand their coefficient copies back to the collector (they were kept alive for the whole tile), so encoder peak memory is back below the pre-threading level.
+- The wavelet fan-out scales with the lattice: a level gets one worker per 32 768 samples (at most the budget), so the small levels of the cascade no longer spawn a full set of threads each.
 
 ## [0.0.19](https://github.com/OxideAV/oxideav-jpeg2000/compare/v0.0.18...v0.0.19) - 2026-11-07
 
