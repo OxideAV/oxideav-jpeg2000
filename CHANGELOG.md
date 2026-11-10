@@ -27,6 +27,7 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 - HTJ2K MagSgn bits are imported / exported a byte's worth at a time.
 - Encoder block jobs no longer hand their coefficient copies back to the collector (they were kept alive for the whole tile), so encoder peak memory is back below the pre-threading level.
 - The wavelet fan-out scales with the lattice: a level gets one worker per 32 768 samples (at most the budget), so the small levels of the cascade no longer spawn a full set of threads each.
+- Fan-out robustness: a thread the host declines to create is one worker fewer instead of a panic (the calling thread works through the wavelet runs itself and, with no worker at all, codes the blocks in place), and no fan-out uses more than 256 workers whatever the budget.
 
 ## [0.0.19](https://github.com/OxideAV/oxideav-jpeg2000/compare/v0.0.18...v0.0.19) - 2026-11-07
 

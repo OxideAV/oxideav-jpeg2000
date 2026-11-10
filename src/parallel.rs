@@ -10,11 +10,16 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 
+/// The most workers any fan-out uses, whatever the budget: a budget is
+/// a cap handed in by the caller, not a request to create that many
+/// threads.
+const MAX_WORKERS: usize = 256;
+
 /// Clamp a worker budget to the amount of work: at least 1, at most
-/// `units`.
+/// `units` (and [`MAX_WORKERS`]).
 #[inline]
 pub(crate) fn effective_workers(budget: usize, units: usize) -> usize {
-    budget.min(units).max(1)
+    budget.min(units).clamp(1, MAX_WORKERS)
 }
 
 /// Run `work(&mut state, index)` for every `index` in `0..count` and
@@ -51,10 +56,11 @@ where
     let stop = AtomicBool::new(false);
     std::thread::scope(|scope| {
         let (sender, receiver) = mpsc::channel::<(usize, T)>();
+        let mut spawned = 0usize;
         for _ in 0..workers {
             let sender = sender.clone();
             let (next, stop, init, work) = (&next, &stop, &init, &work);
-            scope.spawn(move || {
+            let worker = move || {
                 let mut state = init();
                 while !stop.load(Ordering::Relaxed) {
                     let index = next.fetch_add(1, Ordering::Relaxed);
@@ -65,9 +71,28 @@ where
                         break;
                     }
                 }
-            });
+            };
+            // A thread the host refuses to create is simply one worker
+            // fewer: the others drain the same index counter.
+            if std::thread::Builder::new()
+                .spawn_scoped(scope, worker)
+                .is_ok()
+            {
+                spawned += 1;
+            }
         }
         drop(sender);
+        if spawned == 0 {
+            // No worker at all: do the work here, in order.
+            let mut state = init();
+            loop {
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                if index >= count {
+                    return Ok(());
+                }
+                sink(index, work(&mut state, index))?;
+            }
+        }
         // Results arrive in completion order; hold the early ones back
         // until every lower index has been sunk.
         let mut held: Vec<Option<T>> = Vec::new();
@@ -115,9 +140,10 @@ where
 }
 
 /// Split `items` into at most `budget` contiguous runs of whole
-/// `unit`-sized groups and run `work(first_group_index, run)` on each,
-/// one run per worker. With a budget of one (or a single group) the
-/// whole slice is processed on the calling thread.
+/// `unit`-sized groups and run `work(first_group_index, run)` on each.
+/// The calling thread works through the runs alongside up to
+/// `budget − 1` spawned workers; with a budget of one (or a single
+/// group) the whole slice is one run processed on the calling thread.
 pub(crate) fn for_each_run<T, W>(budget: usize, items: &mut [T], unit: usize, work: W)
 where
     T: Send,
@@ -133,11 +159,27 @@ where
         return;
     }
     let per_run = groups.div_ceil(workers);
-    std::thread::scope(|scope| {
-        let work = &work;
-        for (run, chunk) in items.chunks_mut(per_run * unit).enumerate() {
-            scope.spawn(move || work(run * per_run, chunk));
+    // Every worker — this thread included — takes the next unclaimed
+    // run until none is left, so a thread the host refuses to create
+    // costs speed, never coverage.
+    let runs = std::sync::Mutex::new(items.chunks_mut(per_run * unit).enumerate());
+    let drain = || {
+        loop {
+            let claimed = match runs.lock() {
+                Ok(mut runs) => runs.next(),
+                Err(poisoned) => poisoned.into_inner().next(),
+            };
+            let Some((run, chunk)) = claimed else {
+                break;
+            };
+            work(run * per_run, chunk);
         }
+    };
+    std::thread::scope(|scope| {
+        for _ in 1..workers {
+            let _ = std::thread::Builder::new().spawn_scoped(scope, drain);
+        }
+        drain();
     });
 }
 
