@@ -8,7 +8,8 @@
 //! Cases: `rgb8-1024` and `rgb16-1024` lossless 5-3, `rgb8-512` lossy
 //! 9-7 (plain and rate-controlled), `rgb8-4k` lossless, and an HTJ2K
 //! `ht-rgb8-1024` lossless stream. Each case is encoded and decoded
-//! `rounds` times after one warm-up; the medians are printed together
+//! `rounds` times after one warm-up; the median and the fastest round
+//! (milliseconds) are printed together
 //! with FNV-1a hashes of the codestream and of the decoded samples, so
 //! two builds (or two thread budgets) can be compared for identical
 //! output. Image synthesis, hashing and verification are not timed.
@@ -163,6 +164,12 @@ fn cases() -> Vec<Case> {
     ]
 }
 
+/// Milliseconds of the fastest round (the least disturbed one on a
+/// busy host).
+fn fastest(times: &[Duration]) -> f64 {
+    times.iter().min().map_or(0.0, Duration::as_secs_f64) * 1e3
+}
+
 fn median(times: &mut [Duration]) -> f64 {
     times.sort_unstable();
     let middle = times.len() / 2;
@@ -285,8 +292,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         if registry { "registry" } else { "contract" }
     );
     println!(
-        "{:<24} {:>10} {:>10} {:>10}  {:>16} {:>16}",
-        "case", "enc ms", "dec ms", "bytes", "stream fnv", "samples fnv"
+        "{:<24} {:>9} {:>9} {:>9} {:>9} {:>9}  {:>16} {:>16}",
+        "case", "enc med", "enc min", "dec med", "dec min", "bytes", "stream fnv", "samples fnv"
     );
     for case in cases() {
         if filter.as_ref().is_some_and(|f| !case.name.contains(f)) {
@@ -348,10 +355,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
         println!(
-            "{:<24} {:>10.2} {:>10.2} {:>10}  {:016x} {:016x}",
+            "{:<24} {:>9.2} {:>9.2} {:>9.2} {:>9.2} {:>9}  {:016x} {:016x}",
             case.name,
             median(&mut encode_times),
+            fastest(&encode_times),
             median(&mut decode_times),
+            fastest(&decode_times),
             reference.len(),
             hash_bytes(&reference),
             samples

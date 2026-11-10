@@ -577,19 +577,7 @@ pub struct Interleaved2D<T> {
 /// next-coarser LL band's coordinate system). It controls the
 /// even / odd parity of the leftmost sample.
 pub fn hor_sr_5x3(a: &mut Interleaved2D<i32>, i0: i32) -> Result<(), Error> {
-    // §B.5 degenerate lattice (a deeper level of a tiny tile can be
-    // empty on one axis): nothing to filter.
-    if a.width == 0 || a.height == 0 {
-        return Ok(());
-    }
-    let (i0, il) = lattice_span(i0, a.width)?;
-    let mut tmp = vec![0_i32; a.width];
-    for v in 0..a.height {
-        let row = &a.data[v * a.width..(v + 1) * a.width];
-        idwt_1d_5x3(row, &mut tmp, i0, il)?;
-        a.data[v * a.width..(v + 1) * a.width].copy_from_slice(&tmp);
-    }
-    Ok(())
+    hor_lift(a, i0, 1, synthesize_line_5x3)
 }
 
 /// §F.3.5 — apply the 1-D inverse sub-band reconstruction to every
@@ -597,65 +585,17 @@ pub fn hor_sr_5x3(a: &mut Interleaved2D<i32>, i0: i32) -> Result<(), Error> {
 /// role for column origin that `i0` plays for rows in
 /// [`hor_sr_5x3`].
 pub fn ver_sr_5x3(a: &mut Interleaved2D<i32>, j0: i32) -> Result<(), Error> {
-    // §B.5 degenerate lattice (a deeper level of a tiny tile can be
-    // empty on one axis): nothing to filter.
-    if a.width == 0 || a.height == 0 {
-        return Ok(());
-    }
-    let (j0, jl) = lattice_span(j0, a.height)?;
-    let mut col = vec![0_i32; a.height];
-    let mut out = vec![0_i32; a.height];
-    for u in 0..a.width {
-        for v in 0..a.height {
-            col[v] = a.data[v * a.width + u];
-        }
-        idwt_1d_5x3(&col, &mut out, j0, jl)?;
-        for v in 0..a.height {
-            a.data[v * a.width + u] = out[v];
-        }
-    }
-    Ok(())
+    ver_lift(a, j0, 1, synthesize_rows_5x3)
 }
 
 /// §F.3.4 — `f64` 9-7 irreversible row-wise inverse filter.
 pub fn hor_sr_9x7(a: &mut Interleaved2D<f64>, i0: i32) -> Result<(), Error> {
-    // §B.5 degenerate lattice (a deeper level of a tiny tile can be
-    // empty on one axis): nothing to filter.
-    if a.width == 0 || a.height == 0 {
-        return Ok(());
-    }
-    let (i0, il) = lattice_span(i0, a.width)?;
-    let mut tmp = vec![0.0_f64; a.width];
-    let mut scratch = Vec::new();
-    for v in 0..a.height {
-        let row = &a.data[v * a.width..(v + 1) * a.width];
-        idwt_1d_9x7_with_scratch(row, &mut tmp, i0, il, &mut scratch)?;
-        a.data[v * a.width..(v + 1) * a.width].copy_from_slice(&tmp);
-    }
-    Ok(())
+    hor_lift(a, i0, 1, synthesize_line_9x7)
 }
 
 /// §F.3.5 — `f64` 9-7 irreversible column-wise inverse filter.
 pub fn ver_sr_9x7(a: &mut Interleaved2D<f64>, j0: i32) -> Result<(), Error> {
-    // §B.5 degenerate lattice (a deeper level of a tiny tile can be
-    // empty on one axis): nothing to filter.
-    if a.width == 0 || a.height == 0 {
-        return Ok(());
-    }
-    let (j0, jl) = lattice_span(j0, a.height)?;
-    let mut col = vec![0.0_f64; a.height];
-    let mut out = vec![0.0_f64; a.height];
-    let mut scratch = Vec::new();
-    for u in 0..a.width {
-        for v in 0..a.height {
-            col[v] = a.data[v * a.width + u];
-        }
-        idwt_1d_9x7_with_scratch(&col, &mut out, j0, jl, &mut scratch)?;
-        for v in 0..a.height {
-            a.data[v * a.width + u] = out[v];
-        }
-    }
-    Ok(())
+    ver_lift(a, j0, 1, synthesize_rows_9x7)
 }
 
 // =====================================================================
@@ -685,10 +625,9 @@ pub fn sr_2d_5x3(
     i0: i32,
     j0: i32,
 ) -> Result<Interleaved2D<i32>, Error> {
-    let mut a = interleave_2d_i32(ll, ll_dims, hl, hl_dims, lh, lh_dims, hh, hh_dims, i0, j0)?;
-    hor_sr_5x3(&mut a, i0)?;
-    ver_sr_5x3(&mut a, j0)?;
-    Ok(a)
+    sr_2d_5x3_threaded(
+        ll, ll_dims, hl, hl_dims, lh, lh_dims, hh, hh_dims, i0, j0, 1,
+    )
 }
 
 /// §F.3.2 — `f64` 9-7 variant of [`sr_2d_5x3`].
@@ -705,10 +644,9 @@ pub fn sr_2d_9x7(
     i0: i32,
     j0: i32,
 ) -> Result<Interleaved2D<f64>, Error> {
-    let mut a = interleave_2d_f64(ll, ll_dims, hl, hl_dims, lh, lh_dims, hh, hh_dims, i0, j0)?;
-    hor_sr_9x7(&mut a, i0)?;
-    ver_sr_9x7(&mut a, j0)?;
-    Ok(a)
+    sr_2d_9x7_threaded(
+        ll, ll_dims, hl, hl_dims, lh, lh_dims, hh, hh_dims, i0, j0, 1,
+    )
 }
 
 // =====================================================================
@@ -863,60 +801,26 @@ pub fn fdwt_1d_9x7(x: &[f64], y: &mut [f64], i0: i32, il: i32) -> Result<(), Err
 
 /// §F.4 forward row filter (5-3): analyse every row of `a` in place.
 pub fn hor_sd_5x3(a: &mut Interleaved2D<i32>, i0: i32) -> Result<(), Error> {
-    let (i0, il) = lattice_span(i0, a.width)?;
-    let mut tmp = vec![0_i32; a.width];
-    for v in 0..a.height {
-        let row_vec = a.data[v * a.width..(v + 1) * a.width].to_vec();
-        fdwt_1d_5x3(&row_vec, &mut tmp, i0, il)?;
-        a.data[v * a.width..(v + 1) * a.width].copy_from_slice(&tmp);
-    }
-    Ok(())
+    reject_empty_analysis(a.width, a.height, i0)?;
+    hor_lift(a, i0, 1, analyse_line_5x3)
 }
 
 /// §F.4 forward column filter (5-3): analyse every column of `a` in place.
 pub fn ver_sd_5x3(a: &mut Interleaved2D<i32>, j0: i32) -> Result<(), Error> {
-    let (j0, jl) = lattice_span(j0, a.height)?;
-    let mut col = vec![0_i32; a.height];
-    let mut out = vec![0_i32; a.height];
-    for u in 0..a.width {
-        for v in 0..a.height {
-            col[v] = a.data[v * a.width + u];
-        }
-        fdwt_1d_5x3(&col, &mut out, j0, jl)?;
-        for v in 0..a.height {
-            a.data[v * a.width + u] = out[v];
-        }
-    }
-    Ok(())
+    reject_empty_analysis(a.height, a.width, j0)?;
+    ver_lift(a, j0, 1, analyse_rows_5x3)
 }
 
 /// §F.4 forward row filter (9-7): analyse every row of `a` in place.
 pub fn hor_sd_9x7(a: &mut Interleaved2D<f64>, i0: i32) -> Result<(), Error> {
-    let (i0, il) = lattice_span(i0, a.width)?;
-    let mut tmp = vec![0.0_f64; a.width];
-    for v in 0..a.height {
-        let row_vec = a.data[v * a.width..(v + 1) * a.width].to_vec();
-        fdwt_1d_9x7(&row_vec, &mut tmp, i0, il)?;
-        a.data[v * a.width..(v + 1) * a.width].copy_from_slice(&tmp);
-    }
-    Ok(())
+    reject_empty_analysis(a.width, a.height, i0)?;
+    hor_lift(a, i0, 1, analyse_line_9x7)
 }
 
 /// §F.4 forward column filter (9-7): analyse every column of `a` in place.
 pub fn ver_sd_9x7(a: &mut Interleaved2D<f64>, j0: i32) -> Result<(), Error> {
-    let (j0, jl) = lattice_span(j0, a.height)?;
-    let mut col = vec![0.0_f64; a.height];
-    let mut out = vec![0.0_f64; a.height];
-    for u in 0..a.width {
-        for v in 0..a.height {
-            col[v] = a.data[v * a.width + u];
-        }
-        fdwt_1d_9x7(&col, &mut out, j0, jl)?;
-        for v in 0..a.height {
-            a.data[v * a.width + u] = out[v];
-        }
-    }
-    Ok(())
+    reject_empty_analysis(a.height, a.width, j0)?;
+    ver_lift(a, j0, 1, analyse_rows_9x7)
 }
 
 /// §F.4 — one level of 2-D forward analysis (5-3), the inverse of
@@ -931,17 +835,7 @@ pub fn sd_2d_5x3(
     i0: i32,
     j0: i32,
 ) -> Result<Interleaved2D<i32>, Error> {
-    if samples.len() != width * height {
-        return Err(Error::InvalidMarkerLength);
-    }
-    let mut a = Interleaved2D {
-        data: samples,
-        width,
-        height,
-    };
-    ver_sd_5x3(&mut a, j0)?;
-    hor_sd_5x3(&mut a, i0)?;
-    Ok(a)
+    sd_2d_5x3_threaded(samples, width, height, i0, j0, 1)
 }
 
 /// §F.4 — `f64` 9-7 variant of [`sd_2d_5x3`], the inverse of
@@ -953,6 +847,63 @@ pub fn sd_2d_9x7(
     i0: i32,
     j0: i32,
 ) -> Result<Interleaved2D<f64>, Error> {
+    sd_2d_9x7_threaded(samples, width, height, i0, j0, 1)
+}
+
+/// [`sr_2d_5x3`] with the row and column filters fanned out over up to
+/// `threads` workers (identical output at every budget).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sr_2d_5x3_threaded(
+    ll: &[i32],
+    ll_dims: (usize, usize),
+    hl: &[i32],
+    hl_dims: (usize, usize),
+    lh: &[i32],
+    lh_dims: (usize, usize),
+    hh: &[i32],
+    hh_dims: (usize, usize),
+    i0: i32,
+    j0: i32,
+    threads: usize,
+) -> Result<Interleaved2D<i32>, Error> {
+    let mut a = interleave_2d_i32(ll, ll_dims, hl, hl_dims, lh, lh_dims, hh, hh_dims, i0, j0)?;
+    hor_lift(&mut a, i0, threads, synthesize_line_5x3)?;
+    ver_lift(&mut a, j0, threads, synthesize_rows_5x3)?;
+    Ok(a)
+}
+
+/// [`sr_2d_9x7`] with the row and column filters fanned out over up to
+/// `threads` workers (identical output at every budget).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sr_2d_9x7_threaded(
+    ll: &[f64],
+    ll_dims: (usize, usize),
+    hl: &[f64],
+    hl_dims: (usize, usize),
+    lh: &[f64],
+    lh_dims: (usize, usize),
+    hh: &[f64],
+    hh_dims: (usize, usize),
+    i0: i32,
+    j0: i32,
+    threads: usize,
+) -> Result<Interleaved2D<f64>, Error> {
+    let mut a = interleave_2d_f64(ll, ll_dims, hl, hl_dims, lh, lh_dims, hh, hh_dims, i0, j0)?;
+    hor_lift(&mut a, i0, threads, synthesize_line_9x7)?;
+    ver_lift(&mut a, j0, threads, synthesize_rows_9x7)?;
+    Ok(a)
+}
+
+/// [`sd_2d_5x3`] under a worker budget (identical output at every
+/// budget).
+pub(crate) fn sd_2d_5x3_threaded(
+    samples: Vec<i32>,
+    width: usize,
+    height: usize,
+    i0: i32,
+    j0: i32,
+    threads: usize,
+) -> Result<Interleaved2D<i32>, Error> {
     if samples.len() != width * height {
         return Err(Error::InvalidMarkerLength);
     }
@@ -961,9 +912,334 @@ pub fn sd_2d_9x7(
         width,
         height,
     };
-    ver_sd_9x7(&mut a, j0)?;
-    hor_sd_9x7(&mut a, i0)?;
+    reject_empty_analysis(a.height, a.width, j0)?;
+    ver_lift(&mut a, j0, threads, analyse_rows_5x3)?;
+    reject_empty_analysis(a.width, a.height, i0)?;
+    hor_lift(&mut a, i0, threads, analyse_line_5x3)?;
     Ok(a)
+}
+
+/// [`sd_2d_9x7`] under a worker budget (identical output at every
+/// budget).
+pub(crate) fn sd_2d_9x7_threaded(
+    samples: Vec<f64>,
+    width: usize,
+    height: usize,
+    i0: i32,
+    j0: i32,
+    threads: usize,
+) -> Result<Interleaved2D<f64>, Error> {
+    if samples.len() != width * height {
+        return Err(Error::InvalidMarkerLength);
+    }
+    let mut a = Interleaved2D {
+        data: samples,
+        width,
+        height,
+    };
+    reject_empty_analysis(a.height, a.width, j0)?;
+    ver_lift(&mut a, j0, threads, analyse_rows_9x7)?;
+    reject_empty_analysis(a.width, a.height, i0)?;
+    hor_lift(&mut a, i0, threads, analyse_line_9x7)?;
+    Ok(a)
+}
+
+// =====================================================================
+// In-place lifting over a whole lattice.
+// =====================================================================
+//
+// The 1-D procedures above extend the signal periodically-symmetrically
+// (Equation F-4) and lift the extended copy. Every lifting step reads
+// only the two immediate neighbours of the sample it updates, and the
+// extension is a mirror image about the first and the last sample, so
+// each step maps a mirror-symmetric signal to a mirror-symmetric one:
+// an out-of-range neighbour always holds the value of its in-range
+// mirror — index `-1` reads index `1`, index `len` reads `len − 2`.
+// Lifting the signal in place with those two reflections therefore
+// performs, sample for sample, the same arithmetic as the extended
+// procedure (the two neighbours of a boundary sample are then one and
+// the same value, so their sum is unchanged), without materialising
+// the extension.
+//
+// A row filter applies that to each row. A column filter applies each
+// step to whole rows at a time — `row[r] ← step(row[r], row[r−1],
+// row[r+1])` across all columns — inside vertical strips narrow enough
+// that a strip stays cache-resident for all of the steps.
+
+/// Columns per vertical strip of the column filters.
+const STRIP_COLUMNS: usize = 256;
+/// Lattices below this many samples are filtered on the calling thread
+/// whatever the budget (spawning would cost more than the filtering).
+const THREADED_MIN_SAMPLES: usize = 1 << 16;
+
+/// Apply `step(current, before, after)` to every second sample of
+/// `line` starting at `first` (0 or 1), reflecting at both ends.
+/// `line.len() ≥ 2`.
+#[inline(always)]
+fn lift_line<T: Copy>(line: &mut [T], first: usize, step: impl Fn(T, T, T) -> T) {
+    let len = line.len();
+    let mut k = first;
+    if k == 0 {
+        line[0] = step(line[0], line[1], line[1]);
+        k = 2;
+    }
+    while k + 1 < len {
+        line[k] = step(line[k], line[k - 1], line[k + 1]);
+        k += 2;
+    }
+    if k < len {
+        line[k] = step(line[k], line[k - 1], line[k - 1]);
+    }
+}
+
+/// Apply `step(current, above, below)` column-wise to every second row
+/// of `rows` starting at `first` (0 or 1), reflecting at both ends.
+/// `rows.len() ≥ 2`.
+#[inline(always)]
+fn lift_rows<T: Copy>(rows: &mut [&mut [T]], first: usize, step: impl Fn(T, T, T) -> T) {
+    let count = rows.len();
+    let mut r = first;
+    while r < count {
+        let (head, rest) = rows.split_at_mut(r);
+        let Some((current, tail)) = rest.split_first_mut() else {
+            break;
+        };
+        let above: &[T] = if r > 0 { &*head[r - 1] } else { &*tail[0] };
+        let below: &[T] = if r + 1 < count {
+            &*tail[0]
+        } else {
+            &*head[r - 1]
+        };
+        for ((c, &a), &b) in current.iter_mut().zip(above).zip(below) {
+            *c = step(*c, a, b);
+        }
+        r += 2;
+    }
+}
+
+/// Apply `map` to every sample of every second row from `first`.
+#[inline(always)]
+fn map_rows<T: Copy>(rows: &mut [&mut [T]], first: usize, map: impl Fn(T) -> T) {
+    for row in rows.iter_mut().skip(first).step_by(2) {
+        for c in row.iter_mut() {
+            *c = map(*c);
+        }
+    }
+}
+
+/// Apply `map` to every second sample of `line` from `first`.
+#[inline(always)]
+fn map_line<T: Copy>(line: &mut [T], first: usize, map: impl Fn(T) -> T) {
+    for c in line.iter_mut().skip(first).step_by(2) {
+        *c = map(*c);
+    }
+}
+
+// The lifting steps, written once for both orientations. `p` is the
+// parity of the absolute index of the first sample: even-indexed
+// (low-pass) samples sit at relative offsets `p, p + 2, …`, odd-indexed
+// (high-pass) ones at `1 − p, 3 − p, …`.
+
+/// Equation F-5: `X(2n) = Y(2n) − ⌊(Y(2n−1) + Y(2n+1) + 2) / 4⌋`.
+#[inline(always)]
+fn even_synthesis_5x3(c: i32, a: i32, b: i32) -> i32 {
+    c.wrapping_sub(a.wrapping_add(b).wrapping_add(2) >> 2)
+}
+
+/// Equation F-6: `X(2n+1) = Y(2n+1) + ⌊(X(2n) + X(2n+2)) / 2⌋`.
+#[inline(always)]
+fn odd_synthesis_5x3(c: i32, a: i32, b: i32) -> i32 {
+    c.wrapping_add(a.wrapping_add(b) >> 1)
+}
+
+/// The inverse of Equation F-6: `Y(2n+1) = X(2n+1) − ⌊(X(2n) + X(2n+2)) / 2⌋`.
+#[inline(always)]
+fn odd_analysis_5x3(c: i32, a: i32, b: i32) -> i32 {
+    c.wrapping_sub(a.wrapping_add(b) >> 1)
+}
+
+/// The inverse of Equation F-5: `Y(2n) = X(2n) + ⌊(Y(2n−1) + Y(2n+1) + 2) / 4⌋`.
+#[inline(always)]
+fn even_analysis_5x3(c: i32, a: i32, b: i32) -> i32 {
+    c.wrapping_add(a.wrapping_add(b).wrapping_add(2) >> 2)
+}
+
+fn synthesize_line_5x3(line: &mut [i32], p: usize) {
+    if let [only] = line {
+        *only = length_one_5x3(*only, p as i32);
+        return;
+    }
+    lift_line(line, p, even_synthesis_5x3);
+    lift_line(line, 1 - p, odd_synthesis_5x3);
+}
+
+fn synthesize_rows_5x3(rows: &mut [&mut [i32]], p: usize) {
+    if let [only] = rows {
+        for c in only.iter_mut() {
+            *c = length_one_5x3(*c, p as i32);
+        }
+        return;
+    }
+    lift_rows(rows, p, even_synthesis_5x3);
+    lift_rows(rows, 1 - p, odd_synthesis_5x3);
+}
+
+fn analyse_line_5x3(line: &mut [i32], p: usize) {
+    if let [only] = line {
+        *only = length_one_fwd_5x3(*only, p as i32);
+        return;
+    }
+    lift_line(line, 1 - p, odd_analysis_5x3);
+    lift_line(line, p, even_analysis_5x3);
+}
+
+fn analyse_rows_5x3(rows: &mut [&mut [i32]], p: usize) {
+    if let [only] = rows {
+        for c in only.iter_mut() {
+            *c = length_one_fwd_5x3(*c, p as i32);
+        }
+        return;
+    }
+    lift_rows(rows, 1 - p, odd_analysis_5x3);
+    lift_rows(rows, p, even_analysis_5x3);
+}
+
+// §F.3.8.2 steps 1–6 (synthesis) and their reversal (analysis). Each
+// closure spells the arithmetic exactly as the 1-D procedures do, so
+// the floating-point results are the same bit for bit.
+
+fn synthesize_line_9x7(line: &mut [f64], p: usize) {
+    if let [only] = line {
+        *only = length_one_9x7(*only, p as i32);
+        return;
+    }
+    map_line(line, p, |c| K_9X7 * c);
+    map_line(line, 1 - p, |c| (1.0 / K_9X7) * c);
+    lift_line(line, p, |c, a, b| c + -DELTA_9X7 * (a + b));
+    lift_line(line, 1 - p, |c, a, b| c + -GAMMA_9X7 * (a + b));
+    lift_line(line, p, |c, a, b| c + -BETA_9X7 * (a + b));
+    lift_line(line, 1 - p, |c, a, b| c + -ALPHA_9X7 * (a + b));
+}
+
+fn synthesize_rows_9x7(rows: &mut [&mut [f64]], p: usize) {
+    if let [only] = rows {
+        for c in only.iter_mut() {
+            *c = length_one_9x7(*c, p as i32);
+        }
+        return;
+    }
+    map_rows(rows, p, |c| K_9X7 * c);
+    map_rows(rows, 1 - p, |c| (1.0 / K_9X7) * c);
+    lift_rows(rows, p, |c, a, b| c + -DELTA_9X7 * (a + b));
+    lift_rows(rows, 1 - p, |c, a, b| c + -GAMMA_9X7 * (a + b));
+    lift_rows(rows, p, |c, a, b| c + -BETA_9X7 * (a + b));
+    lift_rows(rows, 1 - p, |c, a, b| c + -ALPHA_9X7 * (a + b));
+}
+
+fn analyse_line_9x7(line: &mut [f64], p: usize) {
+    if let [only] = line {
+        *only = length_one_fwd_9x7(*only, p as i32);
+        return;
+    }
+    lift_line(line, 1 - p, |c, a, b| c + ALPHA_9X7 * (a + b));
+    lift_line(line, p, |c, a, b| c + BETA_9X7 * (a + b));
+    lift_line(line, 1 - p, |c, a, b| c + GAMMA_9X7 * (a + b));
+    lift_line(line, p, |c, a, b| c + DELTA_9X7 * (a + b));
+    map_line(line, 1 - p, |c| K_9X7 * c);
+    map_line(line, p, |c| c / K_9X7);
+}
+
+fn analyse_rows_9x7(rows: &mut [&mut [f64]], p: usize) {
+    if let [only] = rows {
+        for c in only.iter_mut() {
+            *c = length_one_fwd_9x7(*c, p as i32);
+        }
+        return;
+    }
+    lift_rows(rows, 1 - p, |c, a, b| c + ALPHA_9X7 * (a + b));
+    lift_rows(rows, p, |c, a, b| c + BETA_9X7 * (a + b));
+    lift_rows(rows, 1 - p, |c, a, b| c + GAMMA_9X7 * (a + b));
+    lift_rows(rows, p, |c, a, b| c + DELTA_9X7 * (a + b));
+    map_rows(rows, 1 - p, |c| K_9X7 * c);
+    map_rows(rows, p, |c| c / K_9X7);
+}
+
+/// The analysis filters have no empty signal to work on: a lattice
+/// with samples across but none along the filtered axis is an error
+/// (after the same span validation a non-empty axis gets).
+fn reject_empty_analysis(along: usize, across: usize, origin: i32) -> Result<(), Error> {
+    if along == 0 && across > 0 {
+        lattice_span(origin, along)?;
+        return Err(Error::InvalidMarkerLength);
+    }
+    Ok(())
+}
+
+/// Filter every row of `a` in place with `line(row, parity)`, rows
+/// shared out over up to `threads` workers.
+fn hor_lift<T: Send>(
+    a: &mut Interleaved2D<T>,
+    i0: i32,
+    threads: usize,
+    line: fn(&mut [T], usize),
+) -> Result<(), Error> {
+    // §B.5 degenerate lattice (a deeper level of a tiny tile can be
+    // empty on one axis): nothing to filter.
+    if a.width == 0 || a.height == 0 {
+        return Ok(());
+    }
+    let (i0, _) = lattice_span(i0, a.width)?;
+    let parity = i0 as usize;
+    let width = a.width;
+    let budget = if a.data.len() < THREADED_MIN_SAMPLES {
+        1
+    } else {
+        threads
+    };
+    crate::parallel::for_each_run(budget, &mut a.data, width, |_, rows| {
+        for row in rows.chunks_mut(width) {
+            line(row, parity);
+        }
+    });
+    Ok(())
+}
+
+/// Filter every column of `a` in place with `rows(strip, parity)`,
+/// applied to vertical strips of at most [`STRIP_COLUMNS`] columns that
+/// are shared out over up to `threads` workers.
+fn ver_lift<T: Send>(
+    a: &mut Interleaved2D<T>,
+    j0: i32,
+    threads: usize,
+    rows: fn(&mut [&mut [T]], usize),
+) -> Result<(), Error> {
+    if a.width == 0 || a.height == 0 {
+        return Ok(());
+    }
+    let (j0, _) = lattice_span(j0, a.height)?;
+    let parity = j0 as usize;
+    let (width, height) = (a.width, a.height);
+    let strip_count = width.div_ceil(STRIP_COLUMNS);
+    // Each strip is the list of its row segments, top to bottom.
+    let mut strips: Vec<Vec<&mut [T]>> = (0..strip_count)
+        .map(|_| Vec::with_capacity(height))
+        .collect();
+    for row in a.data.chunks_mut(width) {
+        for (strip, segment) in strips.iter_mut().zip(row.chunks_mut(STRIP_COLUMNS)) {
+            strip.push(segment);
+        }
+    }
+    let budget = if width * height < THREADED_MIN_SAMPLES {
+        1
+    } else {
+        threads
+    };
+    crate::parallel::for_each_run(budget, &mut strips, 1, |_, run| {
+        for strip in run {
+            rows(strip, parity);
+        }
+    });
+    Ok(())
 }
 
 // =====================================================================
@@ -1942,5 +2218,188 @@ mod tests {
         let mut outf = [0.0_f64; 2];
         assert!(idwt_1d_9x7(&[1.0, 2.0], &mut outf, i32::MIN, i32::MAX).is_err());
         assert!(fdwt_1d_9x7(&[1.0, 2.0], &mut outf, 0, -1).is_err());
+    }
+
+    // -------------------------------------------------------------
+    // Lattice filters against the 1-D procedures.
+    // -------------------------------------------------------------
+
+    fn lattice_noise(len: usize, seed: u32) -> Vec<i32> {
+        let mut state = seed;
+        (0..len)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 12) as i32 % 4001 - 2000
+            })
+            .collect()
+    }
+
+    /// Filter each row / column of a lattice through a 1-D procedure —
+    /// the reference the in-place lattice filters must reproduce.
+    fn per_line<T: Copy + Default>(
+        data: &[T],
+        width: usize,
+        height: usize,
+        rows: bool,
+        origin: i32,
+        filter: impl Fn(&[T], &mut [T], i32, i32) -> Result<(), Error>,
+    ) -> Vec<T> {
+        let mut out = data.to_vec();
+        let (lines, len) = if rows {
+            (height, width)
+        } else {
+            (width, height)
+        };
+        for line in 0..lines {
+            let at = |k: usize| {
+                if rows {
+                    line * width + k
+                } else {
+                    k * width + line
+                }
+            };
+            let input: Vec<T> = (0..len).map(|k| data[at(k)]).collect();
+            let mut output = vec![T::default(); len];
+            filter(&input, &mut output, origin, origin + len as i32).unwrap();
+            for (k, value) in output.into_iter().enumerate() {
+                out[at(k)] = value;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn lattice_filters_reproduce_the_one_dimensional_procedures_bit_for_bit() {
+        let shapes = [
+            (1, 1),
+            (1, 7),
+            (7, 1),
+            (2, 2),
+            (2, 9),
+            (3, 3),
+            (5, 4),
+            (8, 8),
+            (13, 17),
+            (33, 6),
+            (300, 5),
+            (5, 300),
+            (700, 130),
+        ];
+        for (shape_index, &(width, height)) in shapes.iter().enumerate() {
+            for origin in [0, 1, 6, 7] {
+                let ints = lattice_noise(width * height, 17 + shape_index as u32);
+                let reals: Vec<f64> = ints.iter().map(|&v| f64::from(v) * 0.731 + 0.125).collect();
+                for threads in [1, 3] {
+                    let run_i32 = |filter: fn(&mut Interleaved2D<i32>, i32, usize)| {
+                        let mut lattice = Interleaved2D {
+                            data: ints.clone(),
+                            width,
+                            height,
+                        };
+                        filter(&mut lattice, origin, threads);
+                        lattice.data
+                    };
+                    let run_f64 = |filter: fn(&mut Interleaved2D<f64>, i32, usize)| {
+                        let mut lattice = Interleaved2D {
+                            data: reals.clone(),
+                            width,
+                            height,
+                        };
+                        filter(&mut lattice, origin, threads);
+                        lattice.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+                    };
+                    let bits = |values: Vec<f64>| -> Vec<u64> {
+                        values.iter().map(|v| v.to_bits()).collect()
+                    };
+                    let context = format!("{width}x{height} origin {origin} threads {threads}");
+
+                    assert_eq!(
+                        run_i32(|a, o, t| hor_lift(a, o, t, synthesize_line_5x3).unwrap()),
+                        per_line(&ints, width, height, true, origin, super::idwt_1d_5x3),
+                        "5-3 row synthesis {context}"
+                    );
+                    assert_eq!(
+                        run_i32(|a, o, t| ver_lift(a, o, t, synthesize_rows_5x3).unwrap()),
+                        per_line(&ints, width, height, false, origin, super::idwt_1d_5x3),
+                        "5-3 column synthesis {context}"
+                    );
+                    assert_eq!(
+                        run_i32(|a, o, t| hor_lift(a, o, t, analyse_line_5x3).unwrap()),
+                        per_line(&ints, width, height, true, origin, super::fdwt_1d_5x3),
+                        "5-3 row analysis {context}"
+                    );
+                    assert_eq!(
+                        run_i32(|a, o, t| ver_lift(a, o, t, analyse_rows_5x3).unwrap()),
+                        per_line(&ints, width, height, false, origin, super::fdwt_1d_5x3),
+                        "5-3 column analysis {context}"
+                    );
+                    assert_eq!(
+                        run_f64(|a, o, t| hor_lift(a, o, t, synthesize_line_9x7).unwrap()),
+                        bits(per_line(
+                            &reals,
+                            width,
+                            height,
+                            true,
+                            origin,
+                            super::idwt_1d_9x7
+                        )),
+                        "9-7 row synthesis {context}"
+                    );
+                    assert_eq!(
+                        run_f64(|a, o, t| ver_lift(a, o, t, synthesize_rows_9x7).unwrap()),
+                        bits(per_line(
+                            &reals,
+                            width,
+                            height,
+                            false,
+                            origin,
+                            super::idwt_1d_9x7
+                        )),
+                        "9-7 column synthesis {context}"
+                    );
+                    assert_eq!(
+                        run_f64(|a, o, t| hor_lift(a, o, t, analyse_line_9x7).unwrap()),
+                        bits(per_line(
+                            &reals,
+                            width,
+                            height,
+                            true,
+                            origin,
+                            super::fdwt_1d_9x7
+                        )),
+                        "9-7 row analysis {context}"
+                    );
+                    assert_eq!(
+                        run_f64(|a, o, t| ver_lift(a, o, t, analyse_rows_9x7).unwrap()),
+                        bits(per_line(
+                            &reals,
+                            width,
+                            height,
+                            false,
+                            origin,
+                            super::fdwt_1d_9x7
+                        )),
+                        "9-7 column analysis {context}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn empty_lattices_keep_their_outcomes() {
+        let empty = |width: usize, height: usize| Interleaved2D {
+            data: Vec::<i32>::new(),
+            width,
+            height,
+        };
+        // Synthesis treats a lattice empty on either axis as a no-op.
+        assert!(hor_sr_5x3(&mut empty(0, 4), 0).is_ok());
+        assert!(ver_sr_5x3(&mut empty(4, 0), 1).is_ok());
+        // Analysis has no empty signal to filter along its own axis.
+        assert!(hor_sd_5x3(&mut empty(0, 4), 0).is_err());
+        assert!(hor_sd_5x3(&mut empty(4, 0), 0).is_ok());
+        assert!(ver_sd_5x3(&mut empty(4, 0), 0).is_err());
+        assert!(ver_sd_5x3(&mut empty(0, 4), 0).is_ok());
     }
 }

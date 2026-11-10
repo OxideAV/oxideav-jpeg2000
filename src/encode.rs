@@ -50,7 +50,7 @@
 //! transform, §G.1.2 level shift, Annex E quantisation. Validation is
 //! a round-trip through this crate's own independently-written decoder.
 
-use crate::dwt::sd_2d_5x3;
+use crate::dwt::sd_2d_5x3_threaded;
 use crate::geometry::{
     SubBandOrientation, derive_precinct_code_blocks, derive_precinct_partition,
     derive_resolution_levels, derive_tile_geometry, precinct_exponents_at,
@@ -208,6 +208,7 @@ fn forward_cascade(
     width: usize,
     height: usize,
     nl: u8,
+    threads: usize,
 ) -> ComponentBands {
     let mut cur = BandPlane {
         x0,
@@ -236,12 +237,13 @@ fn forward_cascade(
             cur = c.plane(false, false, Vec::new());
             continue;
         }
-        let a = sd_2d_5x3(
+        let a = sd_2d_5x3_threaded(
             cur.data,
             cur.width,
             cur.height,
             crate::dwt::origin_parity(cur.x0),
             crate::dwt::origin_parity(cur.y0),
+            threads,
         )
         .expect("analysis dims match by construction");
         let (ll, hl, lh, hh) = deinterleave_map(&a.data, a.width, a.height, cur.x0, cur.y0, |s| s);
@@ -258,6 +260,7 @@ fn forward_cascade(
 /// `qb = sign(y) · ⌊|y| / Δb⌋`). The recursion continues on the
 /// **unquantised** real LL (only the emitted bands quantise), so deeper
 /// levels see full precision.
+#[allow(clippy::too_many_arguments)]
 fn forward_cascade_9x7(
     samples: Vec<f64>,
     x0: u32,
@@ -266,6 +269,7 @@ fn forward_cascade_9x7(
     height: usize,
     nl: u8,
     fine_bits: u8,
+    threads: usize,
 ) -> ComponentBands {
     let scale = f64::from(1u32 << fine_bits);
     let q = move |y: f64| -> i32 {
@@ -310,12 +314,13 @@ fn forward_cascade_9x7(
             };
             continue;
         }
-        let a = crate::dwt::sd_2d_9x7(
+        let a = crate::dwt::sd_2d_9x7_threaded(
             cur.data,
             cur.width,
             cur.height,
             crate::dwt::origin_parity(cur.x0),
             crate::dwt::origin_parity(cur.y0),
+            threads,
         )
         .expect("analysis dims match by construction");
         let (_llq, hl, lh, hh) = deinterleave_map(&a.data, a.width, a.height, cur.x0, cur.y0, q);
@@ -768,7 +773,32 @@ fn encode_code_block(
     // coefficient's magnitude is known down to plane `t = planes −
     // done`, so the decoder reconstructs `known + 2^(t−1)` (or exactly
     // `m` once t = 0, or 0 while still insignificant).
+    //
+    // Every error term is an integer below `2^planes`, so for blocks
+    // of at most 2^12 samples and 20 planes the sum of squares stays
+    // under 2^52: the sequential `f64` accumulation is then exact and
+    // equals the integer sum, which the fast lane forms directly.
+    let exact_integer_sum = planes <= 20 && targets.len() <= 1 << 12;
     let dist_of = |blk: &CodeBlock| -> f64 {
+        if exact_integer_sum {
+            let mut d = 0u64;
+            for (i, c) in targets.iter().enumerate() {
+                let m = c.magnitude;
+                let done = blk.decoded_bits_at(i).min(planes);
+                let t = planes - done;
+                let known = (m >> t) << t;
+                // Midpoint reconstruction `known + 2^(t−1)` once any
+                // bit is known (exactly `m` at t = 0), zero before.
+                let rec = if known == 0 {
+                    0
+                } else {
+                    known + ((1u32 << t) >> 1)
+                };
+                let e = u64::from(m.abs_diff(rec));
+                d += e * e;
+            }
+            return d as f64;
+        }
         let mut d = 0.0;
         for (i, c) in targets.iter().enumerate() {
             let m = c.magnitude;
@@ -871,7 +901,7 @@ fn encode_code_block(
             // terminates are pinned to the exact committed length
             // below, so this estimate never mislabels them.
             let pending = match &sink {
-                Sink::Mq(e) => e.clone().flush().len(),
+                Sink::Mq(e) => e.flush_len(),
                 Sink::Raw(w) => finish_raw(w.clone()).len(),
             };
             rates.push((committed.len() + pending) as u32);
@@ -2314,6 +2344,7 @@ fn encode_core(
                                     tc.width() as usize,
                                     tc.height() as usize,
                                     comp_params[ci].nl,
+                                    params.threads,
                                 )
                             })
                             .collect()
@@ -2340,6 +2371,7 @@ fn encode_core(
                                     tc.height() as usize,
                                     comp_params[ci].nl,
                                     fine_bits,
+                                    params.threads,
                                 )
                             })
                             .collect()
@@ -2361,6 +2393,7 @@ fn encode_core(
                             tc.width() as usize,
                             tc.height() as usize,
                             cp.nl,
+                            params.threads,
                         ),
                         EncodeKernel::Lossy9x7 { fine_bits } => forward_cascade_9x7(
                             extract(ci).into_iter().map(f64::from).collect(),
@@ -2370,6 +2403,7 @@ fn encode_core(
                             tc.height() as usize,
                             cp.nl,
                             fine_bits,
+                            params.threads,
                         ),
                     }
                 })

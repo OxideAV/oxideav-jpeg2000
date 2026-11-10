@@ -150,83 +150,76 @@ impl MqEncoder {
         }
     }
 
-    /// RENORME — renormalize the encoder (T.800 §C.2.6, Figure C.8).
+    /// RENORME — renormalize the encoder (T.800 §C.2.6, Figure C.8)
+    /// when the shift reaches the end of the current byte.
     ///
-    /// Shift `A` and `C` left one bit at a time, emitting a byte via
-    /// BYTEOUT whenever `CT` reaches zero, until `A ≥ 0x8000`.
-    fn renorme(&mut self) {
-        loop {
-            self.a <<= 1;
-            self.c <<= 1;
-            self.ct -= 1;
+    /// Figure C.8 shifts `A` and `C` left one bit at a time, emitting a
+    /// byte via BYTEOUT whenever `CT` reaches zero, until `A ≥ 0x8000`.
+    /// `shift` is that number of single-bit steps (the leading zeros of
+    /// the 16-bit `A`); the steps between two BYTEOUTs are applied
+    /// together.
+    #[cold]
+    #[inline(never)]
+    fn renorme_across_bytes(&mut self, mut shift: u32) {
+        while shift > 0 {
+            let step = shift.min(self.ct as u32);
+            self.a <<= step;
+            self.c <<= step;
+            self.ct -= step as i32;
+            shift -= step;
             if self.ct == 0 {
                 self.byteout();
-            }
-            if self.a & 0x8000 != 0 {
-                break;
             }
         }
     }
 
     /// Encode one binary decision `D` against the adaptive state in `cx`
     /// (T.800 §C.2.2 ENCODE → §C.2.3 CODE0/CODE1 → §C.2.4 CODEMPS/CODELPS).
+    ///
+    /// CODEMPS (Figure C.7) and CODELPS (Figure C.6) are evaluated as
+    /// one selection. Both first reduce `A` by `Qe`; with
+    /// `exchange = A − Qe < Qe`:
+    ///
+    /// * the MPS takes the upper sub-interval (`C += Qe`, `A = A − Qe`)
+    ///   unless the conditional exchange applies, when it takes the
+    ///   lower one (`A = Qe`, `C` unchanged) — and `exchange` can only
+    ///   hold when a renormalization is due (`A − Qe < 0x8000`);
+    /// * the LPS takes the lower sub-interval unless the conditional
+    ///   exchange applies, when it takes the upper one.
+    ///
+    /// So the lower sub-interval is coded exactly when "symbol is the
+    /// MPS" equals `exchange`. The index moves to `NLPS` (with the
+    /// SWITCH flip) for an LPS, to `NMPS` for an MPS that
+    /// renormalizes, and stays put otherwise; RENORME runs for as many
+    /// one-bit steps as the 16-bit `A` has leading zeros.
+    #[inline(always)]
     pub fn encode(&mut self, cx: &mut MqContext, d: u8) {
-        if (d != 0) == cx.mps() {
-            self.code_mps(cx);
-        } else {
-            self.code_lps(cx);
-        }
-    }
-
-    /// CODEMPS — encode the more-probable symbol (T.800 §C.2.4,
-    /// Figure C.7), with the conditional MPS/LPS exchange.
-    ///
-    /// The MPS occupies the upper sub-interval, so coding it adds `Qe` to
-    /// `C` and reduces `A` to `A − Qe`. When that leaves `A < 0x8000` a
-    /// renormalization is required and the conditional exchange applies:
-    /// if the (now smaller) MPS interval `A` is below `Qe` the intervals
-    /// were inverted, so `C` is left unchanged and `A = Qe`; otherwise the
-    /// plain `C += Qe` holds. Either way the index advances to `NMPS`.
-    fn code_mps(&mut self, cx: &mut MqContext) {
-        let entry = QE[cx.index() as usize];
+        let entry = &QE[cx.index() as usize];
         let qe = entry.qe as u32;
-        self.a = self.a.wrapping_sub(qe);
-        if self.a & 0x8000 == 0 {
-            if self.a < qe {
-                // Conditional exchange: LPS interval was the larger.
-                self.a = qe;
-            } else {
-                self.c += qe as u64;
-            }
-            cx.set_index(entry.nmps);
-            self.renorme();
-        } else {
-            self.c += qe as u64;
-        }
-    }
+        let more_probable = (d != 0) == cx.mps();
+        let reduced = self.a.wrapping_sub(qe);
+        let lower = more_probable == (reduced < qe);
+        let a = if lower { qe } else { reduced };
+        self.c += if lower { 0 } else { qe as u64 };
 
-    /// CODELPS — encode the less-probable symbol (T.800 §C.2.4,
-    /// Figure C.6), with the conditional MPS/LPS exchange.
-    ///
-    /// The LPS occupies the lower sub-interval (`A = Qe`, `C` unchanged),
-    /// but when the intervals are inverted (`A − Qe < Qe`) the conditional
-    /// exchange codes the LPS into the upper interval instead (`C += Qe`,
-    /// `A` left at `A − Qe`). The SWITCH flag may flip the MPS sense and
-    /// the index advances to `NLPS`. A renormalization always follows.
-    fn code_lps(&mut self, cx: &mut MqContext) {
-        let entry = QE[cx.index() as usize];
-        let qe = entry.qe as u32;
-        self.a = self.a.wrapping_sub(qe);
-        if self.a < qe {
-            self.c += qe as u64;
+        let moved = if more_probable {
+            entry.nmps
         } else {
-            self.a = qe;
+            entry.nlps
+        };
+        let renormalize = !more_probable | (reduced & 0x8000 == 0);
+        cx.set_index(if renormalize { moved } else { cx.index() });
+        cx.toggle_mps(!more_probable & entry.switch);
+
+        let shift = (a as u16).leading_zeros();
+        if shift < self.ct as u32 {
+            self.a = a << shift;
+            self.c <<= shift;
+            self.ct -= shift as i32;
+        } else {
+            self.a = a;
+            self.renorme_across_bytes(shift);
         }
-        if entry.switch {
-            cx.flip_mps();
-        }
-        cx.set_index(entry.nlps);
-        self.renorme();
     }
 
     /// SETBITS — force the low bits of `C` to `1` up to the interval bound
@@ -294,13 +287,24 @@ impl MqEncoder {
     /// byte prefix. BYTEOUT can modify only the most recent output byte,
     /// so the registers and that byte suffice to reproduce the tail.
     pub(crate) fn predictable_flush_len(&self) -> usize {
-        let tail = Self {
+        self.out.len().saturating_sub(1) + self.tail().flush_predictable().len()
+    }
+
+    /// Size of a §C.2.9 FLUSH of the current state — the length
+    /// `self.clone().flush()` would have — without copying the
+    /// completed byte prefix (see [`Self::predictable_flush_len`]).
+    pub(crate) fn flush_len(&self) -> usize {
+        self.out.len().saturating_sub(1) + self.tail().flush().len()
+    }
+
+    /// The coder state over only its most recent output byte.
+    fn tail(&self) -> Self {
+        Self {
             a: self.a,
             c: self.c,
             ct: self.ct,
             out: self.out.last().copied().into_iter().collect(),
-        };
-        self.out.len().saturating_sub(1) + tail.flush_predictable().len()
+        }
     }
 }
 

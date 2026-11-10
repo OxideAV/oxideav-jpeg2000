@@ -19,8 +19,9 @@
 //!   MPS-path (Figure C.16) and LPS-path (Figure C.17) conditional
 //!   MPS/LPS exchange procedures and the embedded adaptive probability
 //!   estimation (§C.2.5).
-//! * `renormd` — RENORMD (§C.3.3, Figure C.18). Shifts `A` and `C`
-//!   left until `A ≥ 0x8000`, pulling fresh bytes via BYTEIN.
+//! * RENORMD (§C.3.3, Figure C.18) — shifts `A` and `C` left until
+//!   `A ≥ 0x8000`, pulling fresh bytes via BYTEIN; applied inside
+//!   `decode` as one shift per run of bits within a byte.
 //! * `bytein` — BYTEIN (§C.3.4, Figure C.19). Reads one byte,
 //!   compensating for the `0xFF`-prefixed stuff bit and synthesising
 //!   the `0xFF`-fill end-of-stream behaviour described in §C.3.4 /
@@ -475,6 +476,12 @@ impl MqContext {
         self.mps = !self.mps;
     }
 
+    /// [`Self::flip_mps`] when `flip` holds, as a branch-free update.
+    #[inline(always)]
+    pub(crate) fn toggle_mps(&mut self, flip: bool) {
+        self.mps ^= flip;
+    }
+
     /// Reset this context to its initial state (§C.3.6). The caller
     /// supplies the initial state appropriate for this `CX`; this is a
     /// convenience for resetting to an arbitrary Table D.7 row.
@@ -606,22 +613,27 @@ impl<'a> MqDecoder<'a> {
         }
     }
 
-    /// RENORMD — renormalize the decoder (T.800 §C.3.3, Figure C.18).
+    /// RENORMD — renormalize the decoder (T.800 §C.3.3, Figure C.18)
+    /// when the whole shift does not fit the bits left in the current
+    /// byte.
     ///
-    /// Shift `A` and `C` left one bit at a time, pulling a fresh byte
-    /// via BYTEIN whenever `CT` reaches zero, until `A ≥ 0x8000`.
-    #[inline]
-    fn renormd(&mut self) {
-        loop {
+    /// Figure C.18 shifts `A` and `C` left one bit at a time, pulling a
+    /// fresh byte via BYTEIN whenever `CT` reaches zero, until
+    /// `A ≥ 0x8000`. `shift` is that number of single-bit steps (the
+    /// leading zeros of the 16-bit `A`); between two BYTEINs the steps
+    /// are applied together.
+    #[cold]
+    #[inline(never)]
+    fn renormd_across_bytes(&mut self, mut shift: u32) {
+        while shift > 0 {
             if self.ct == 0 {
                 self.bytein();
             }
-            self.a <<= 1;
-            self.c <<= 1;
-            self.ct -= 1;
-            if self.a & 0x8000 != 0 {
-                break;
-            }
+            let step = shift.min(self.ct as u32);
+            self.a <<= step;
+            self.c <<= step;
+            self.ct -= step as i32;
+            shift -= step;
         }
     }
 
@@ -639,85 +651,48 @@ impl<'a> MqDecoder<'a> {
     ///   runs and RENORMD follows.
     /// * `Chigh < Qe`: the LPS-path conditional exchange (Figure C.17)
     ///   runs and RENORMD follows.
+    ///
+    /// The three flowcharts are evaluated as one selection. With
+    /// `lps = Chigh < Qe` and `exchange = A < Qe` (after the
+    /// subtraction), Figures C.16 / C.17 return the less probable
+    /// symbol — and move to `NLPS` — exactly when `lps ≠ exchange`
+    /// (Figure C.17 inverts the sense of the test Figure C.16 makes),
+    /// and `exchange` is necessarily false on the no-renormalization
+    /// path (`A ≥ 0x8000 > Qe`). The index moves only when a
+    /// renormalization follows; `A` becomes `Qe` on the LPS branch and
+    /// `Chigh` drops by `Qe` otherwise.
     #[inline(always)]
     pub fn decode(&mut self, cx: &mut MqContext) -> u8 {
-        let entry = QE[cx.index as usize];
+        let entry = &QE[cx.index as usize];
         let qe = entry.qe as u32;
-        self.a = self.a.wrapping_sub(qe);
+        let reduced = self.a.wrapping_sub(qe);
+        let lps = (self.c >> 16) < qe;
+        let renormalize = lps | (reduced & 0x8000 == 0);
+        let less_probable = lps ^ (reduced < qe);
 
-        let d;
-        if (self.c >> 16) < qe {
-            // LPS path (Figure C.17): the LPS sub-interval is the upper
-            // part. Chigh stays (only A changes here); the comparison
-            // A < Qe decides whether the conditional exchange occurred.
-            d = self.lps_exchange(cx, qe);
-            self.renormd();
+        let d = (cx.mps ^ less_probable) as u8;
+        let moved = if less_probable {
+            entry.nlps
         } else {
-            // Chigh -= Qe (the MPS sub-interval is the lower part).
-            self.c -= qe << 16;
-            if self.a & 0x8000 == 0 {
-                // Renormalization needed → MPS-path conditional
-                // exchange (Figure C.16).
-                d = self.mps_exchange(cx, qe);
-                self.renormd();
-            } else {
-                // No renormalization: plain MPS.
-                d = cx.mps as u8;
-            }
-        }
-        d
-    }
+            entry.nmps
+        };
+        cx.index = if renormalize { moved } else { cx.index };
+        cx.mps ^= less_probable & entry.switch;
 
-    /// MPS-path conditional exchange (T.800 §C.3.2, Figure C.16).
-    ///
-    /// Reached only when renormalization is needed on the MPS branch.
-    /// If `A ≥ Qe` an MPS truly occurred: `D = MPS(CX)`, index updates
-    /// to NMPS. Otherwise the conditional exchange happened (the LPS
-    /// sub-interval was larger): `D = 1 - MPS(CX)`, the SWITCH flag may
-    /// flip the MPS sense, and the index updates to NLPS.
-    #[inline]
-    fn mps_exchange(&mut self, cx: &mut MqContext, qe: u32) -> u8 {
-        let entry = QE[cx.index as usize];
-        if self.a < qe {
-            // Conditional exchange: LPS.
-            let d = !cx.mps as u8;
-            if entry.switch {
-                cx.mps = !cx.mps;
-            }
-            cx.index = entry.nlps;
-            d
+        let a = if lps { qe } else { reduced };
+        self.c -= if lps { 0 } else { qe << 16 };
+        // RENORMD: the number of one-bit steps Figure C.18 takes is the
+        // count of leading zeros of the 16-bit `A` (zero when no
+        // renormalization is due).
+        let shift = (a as u16).leading_zeros();
+        if shift <= self.ct as u32 {
+            self.a = a << shift;
+            self.c <<= shift;
+            self.ct -= shift as i32;
         } else {
-            // MPS.
-            let d = cx.mps as u8;
-            cx.index = entry.nmps;
-            d
+            self.a = a;
+            self.renormd_across_bytes(shift);
         }
-    }
-
-    /// LPS-path conditional exchange (T.800 §C.3.2, Figure C.17).
-    ///
-    /// Reached when `Chigh < Qe`. On both branches the new `A` is set
-    /// to `Qe`. If the (pre-set) `A < Qe` the conditional exchange
-    /// occurred so the decision is the MPS case (index → NMPS);
-    /// otherwise it is the genuine LPS case (`D = 1 - MPS`, SWITCH may
-    /// flip MPS, index → NLPS).
-    #[inline]
-    fn lps_exchange(&mut self, cx: &mut MqContext, qe: u32) -> u8 {
-        let entry = QE[cx.index as usize];
-        let d;
-        if self.a < qe {
-            // Conditional exchange: MPS.
-            d = cx.mps as u8;
-            cx.index = entry.nmps;
-        } else {
-            // LPS.
-            d = !cx.mps as u8;
-            if entry.switch {
-                cx.mps = !cx.mps;
-            }
-            cx.index = entry.nlps;
-        }
-        self.a = qe;
         d
     }
 

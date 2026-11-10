@@ -114,6 +114,33 @@ where
     }
 }
 
+/// Split `items` into at most `budget` contiguous runs of whole
+/// `unit`-sized groups and run `work(first_group_index, run)` on each,
+/// one run per worker. With a budget of one (or a single group) the
+/// whole slice is processed on the calling thread.
+pub(crate) fn for_each_run<T, W>(budget: usize, items: &mut [T], unit: usize, work: W)
+where
+    T: Send,
+    W: Fn(usize, &mut [T]) + Sync,
+{
+    if unit == 0 || items.is_empty() {
+        return;
+    }
+    let groups = items.len().div_ceil(unit);
+    let workers = effective_workers(budget, groups);
+    if workers == 1 {
+        work(0, items);
+        return;
+    }
+    let per_run = groups.div_ceil(workers);
+    std::thread::scope(|scope| {
+        let work = &work;
+        for (run, chunk) in items.chunks_mut(per_run * unit).enumerate() {
+            scope.spawn(move || work(run * per_run, chunk));
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,6 +202,25 @@ mod tests {
         for count in [0usize, 1] {
             let collected = collect_ordered(8, count, |index| index + 1);
             assert_eq!(collected, (1..=count).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn for_each_run_covers_every_group_once() {
+        for budget in [1, 2, 5, 32] {
+            for unit in [1usize, 3, 7] {
+                let mut items = vec![0u32; 10 * unit + unit / 2];
+                for_each_run(budget, &mut items, unit, |first, run| {
+                    for (offset, group) in run.chunks_mut(unit).enumerate() {
+                        for item in group {
+                            *item += (first + offset) as u32 + 1;
+                        }
+                    }
+                });
+                for (group, chunk) in items.chunks(unit).enumerate() {
+                    assert!(chunk.iter().all(|&v| v == group as u32 + 1));
+                }
+            }
         }
     }
 }

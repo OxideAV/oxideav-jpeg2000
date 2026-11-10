@@ -2509,7 +2509,7 @@ fn decode_tile_from_plan(
                     // "no quantisation" style only.
                     return Err(Error::NotImplemented);
                 }
-                let grid = surface.into_idwt_5x3()?;
+                let grid = surface.into_idwt_5x3(threads)?;
                 if grid.width != tw || grid.height != th {
                     return Err(Error::InvalidMarkerLength);
                 }
@@ -2522,7 +2522,7 @@ fn decode_tile_from_plan(
                     // quantisation (derived or expounded).
                     return Err(Error::NotImplemented);
                 }
-                let grid = surface.into_idwt_9x7()?;
+                let grid = surface.into_idwt_9x7(threads)?;
                 if grid.width != tw || grid.height != th {
                     return Err(Error::InvalidMarkerLength);
                 }

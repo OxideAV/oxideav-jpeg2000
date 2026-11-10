@@ -1212,7 +1212,6 @@ impl CodeBlock {
         ctx: &mut [MqContext; NUM_CONTEXTS],
     ) -> Result<usize, Error> {
         self.ensure_coding_state();
-        let weight: u32 = 1u32 << bitplane;
         let mut refined = 0usize;
         // §D.7: under vertically causal context formation the last row of
         // each stripe does not see D2 / V1 / D3 (bits 5..7); only the
@@ -1245,9 +1244,7 @@ impl CodeBlock {
                         u8::from(state & 0xff & !clip != 0)
                     };
                     let cx = &mut ctx[REFINEMENT_CTX_OFFSET + label as usize];
-                    if decoder.decode(cx) == 1 {
-                        self.magnitudes[idx] |= weight;
-                    }
+                    self.magnitudes[idx] |= u32::from(decoder.decode(cx)) << bitplane;
                     // §D.2.1: one refinement (magnitude) bit decoded for
                     // this already-significant coefficient on this plane.
                     if self.wide_decoded_bits.is_none() && state & COUNT_MASK != COUNT_MASK {
@@ -1432,28 +1429,56 @@ impl CodeBlock {
         let contexts = significance_contexts(self.orientation);
         self.clear_pass_flags();
         let weight: u32 = 1u32 << bitplane;
+        // §D.7 clip of the stripe's last row, as in the decode pass.
+        let causal_clip: u32 = if self.vertically_causal {
+            (7 << 5) | (1 << 11)
+        } else {
+            0
+        };
+        let width = self.width;
         let mut v0 = 0usize;
         while v0 < self.height {
             let stripe_h = core::cmp::min(4, self.height - v0);
-            for u in 0..self.width {
+            for u in 0..width {
                 for dv in 0..stripe_h {
                     let v = v0 + dv;
-                    let idx = u + v * self.width;
-                    if self.coefficient_at(idx).sigma {
+                    let idx = u + v * width;
+                    let state = self.coding_state[idx];
+                    if state & SELF_SIGMA != 0 {
                         continue;
                     }
-                    let label =
-                        contexts[(self.coding_state_in_stripe(u, v, v0, stripe_h) & 0xff) as usize];
+                    let clip = if dv + 1 == stripe_h { causal_clip } else { 0 };
+                    let visible = state & !clip;
+                    let label = contexts[(visible & 0xff) as usize];
                     if label == 0 {
                         continue;
                     }
-                    let bit = ((targets[idx].magnitude >> bitplane) & 1) as u8;
+                    let target = targets[idx];
+                    let bit = ((target.magnitude >> bitplane) & 1) as u8;
                     encoder.encode(&mut ctx[SP_CTX_OFFSET + label as usize], bit);
-                    self.coding_state[idx] |= SP_VISITED;
-                    self.increment_decoded_bits(idx);
+                    let mut next = state | SP_VISITED;
+                    if self.wide_decoded_bits.is_none() && state & COUNT_MASK != COUNT_MASK {
+                        next += 1 << COUNT_SHIFT;
+                        self.coding_state[idx] = next;
+                    } else {
+                        self.coding_state[idx] = next;
+                        self.increment_decoded_bits(idx);
+                        next = self.coding_state[idx];
+                    }
                     if bit == 1 {
-                        self.code_sign_encode(u, v, weight, targets, v0, stripe_h, encoder, ctx);
-                        self.coding_state[idx] |= NEWLY_SIGNIFICANT;
+                        // §D.3.2: the decoder recovers `sb = D ⊕ XORbit`,
+                        // so the coded decision is `D = sb ⊕ XORbit`.
+                        let (sign_label, xorbit) = packed_sign_context_label(visible as u16);
+                        encoder.encode(
+                            &mut ctx[SIGN_CTX_OFFSET + sign_label as usize],
+                            (target.sign as u8) ^ xorbit,
+                        );
+                        self.magnitudes[idx] |= weight;
+                        self.coding_state[idx] = (next & !SELF_SIGN)
+                            | SELF_SIGMA
+                            | (u32::from(target.sign) * SELF_SIGN)
+                            | NEWLY_SIGNIFICANT;
+                        self.publish_significance(u, v, target.sign);
                     }
                 }
             }
@@ -1471,32 +1496,34 @@ impl CodeBlock {
         ctx: &mut [MqContext; NUM_CONTEXTS],
     ) {
         self.ensure_coding_state();
-        let weight: u32 = 1u32 << bitplane;
+        // §D.7: only the significance byte feeds the Table D.4 label.
+        let causal_clip: u32 = if self.vertically_causal { 7 << 5 } else { 0 };
+        let width = self.width;
         let mut v0 = 0usize;
         while v0 < self.height {
             let stripe_h = core::cmp::min(4, self.height - v0);
-            for u in 0..self.width {
+            for u in 0..width {
                 for dv in 0..stripe_h {
-                    let v = v0 + dv;
-                    let idx = u + v * self.width;
-                    let coef = self.coefficient_at(idx);
-                    if !coef.sigma || self.coding_state[idx] & NEWLY_SIGNIFICANT != 0 {
+                    let idx = u + (v0 + dv) * width;
+                    let state = self.coding_state[idx];
+                    if state & (SELF_SIGMA | NEWLY_SIGNIFICANT) != SELF_SIGMA {
                         continue;
                     }
-                    let label = if coef.already_refined {
+                    let label = if state & SELF_REFINED != 0 {
                         2
                     } else {
-                        u8::from(self.coding_state_in_stripe(u, v, v0, stripe_h) & 0xff != 0)
+                        let clip = if dv + 1 == stripe_h { causal_clip } else { 0 };
+                        u8::from(state & 0xff & !clip != 0)
                     };
-                    let bit = ((targets[idx].magnitude >> bitplane) & 1) as u8;
-                    encoder.encode(&mut ctx[REFINEMENT_CTX_OFFSET + label as usize], bit);
-                    let mut updated = coef;
-                    if bit == 1 {
-                        updated.magnitude |= weight;
+                    let bit = (targets[idx].magnitude >> bitplane) & 1;
+                    encoder.encode(&mut ctx[REFINEMENT_CTX_OFFSET + label as usize], bit as u8);
+                    self.magnitudes[idx] |= bit << bitplane;
+                    if self.wide_decoded_bits.is_none() && state & COUNT_MASK != COUNT_MASK {
+                        self.coding_state[idx] = (state | SELF_REFINED) + (1 << COUNT_SHIFT);
+                    } else {
+                        self.coding_state[idx] = state | SELF_REFINED;
+                        self.increment_decoded_bits(idx);
                     }
-                    updated.already_refined = true;
-                    self.set_coefficient_at(idx, updated);
-                    self.increment_decoded_bits(idx);
                 }
             }
             v0 += 4;
@@ -1600,22 +1627,24 @@ impl CodeBlock {
         self.ensure_coding_state();
         let contexts = significance_contexts(self.orientation);
         let weight: u32 = 1u32 << bitplane;
+        let causal_clip: u32 = if self.vertically_causal { 7 << 5 } else { 0 };
+        let width = self.width;
         let mut v0 = 0usize;
         while v0 < self.height {
             let stripe_h = core::cmp::min(4, self.height - v0);
-            for u in 0..self.width {
+            for u in 0..width {
                 let mut start_dv = 0usize;
                 if stripe_h == 4 && self.column_run_length_eligible(u, v0) {
                     // First column entry whose target bit is 1 on this
                     // bit-plane (top to bottom), if any.
                     let first_sig = (0..4).find(|&dv| {
-                        (targets[u + (v0 + dv) * self.width].magnitude >> bitplane) & 1 == 1
+                        (targets[u + (v0 + dv) * width].magnitude >> bitplane) & 1 == 1
                     });
                     match first_sig {
                         None => {
                             encoder.encode(&mut ctx[RUN_LENGTH_CTX], 0);
                             for dv in 0..4 {
-                                self.increment_decoded_bits(u + (v0 + dv) * self.width);
+                                self.increment_decoded_bits(u + (v0 + dv) * width);
                             }
                             continue;
                         }
@@ -1630,7 +1659,7 @@ impl CodeBlock {
                                 u, v, weight, targets, v0, stripe_h, encoder, ctx,
                             );
                             for dv in 0..=first {
-                                self.increment_decoded_bits(u + (v0 + dv) * self.width);
+                                self.increment_decoded_bits(u + (v0 + dv) * width);
                             }
                             start_dv = first + 1;
                         }
@@ -1638,14 +1667,19 @@ impl CodeBlock {
                 }
                 for dv in start_dv..stripe_h {
                     let v = v0 + dv;
-                    let idx = u + v * self.width;
-                    if self.coefficient_at(idx).sigma || self.coding_state[idx] & SP_VISITED != 0 {
+                    let idx = u + v * width;
+                    let state = self.coding_state[idx];
+                    if state & (SELF_SIGMA | SP_VISITED) != 0 {
                         continue;
                     }
-                    let label =
-                        contexts[(self.coding_state_in_stripe(u, v, v0, stripe_h) & 0xff) as usize];
+                    let clip = if dv + 1 == stripe_h { causal_clip } else { 0 };
+                    let label = contexts[(state & !clip & 0xff) as usize];
                     let bit = ((targets[idx].magnitude >> bitplane) & 1) as u8;
-                    self.increment_decoded_bits(idx);
+                    if self.wide_decoded_bits.is_none() && state & COUNT_MASK != COUNT_MASK {
+                        self.coding_state[idx] = state + (1 << COUNT_SHIFT);
+                    } else {
+                        self.increment_decoded_bits(idx);
+                    }
                     encoder.encode(&mut ctx[SP_CTX_OFFSET + label as usize], bit);
                     if bit == 1 {
                         self.code_sign_encode(u, v, weight, targets, v0, stripe_h, encoder, ctx);
@@ -1839,23 +1873,26 @@ impl CodeBlock {
     /// when the §D.7 vertically-causal flag is set, the bottom row of
     /// the stripe reads its `D2 / V1 / D3` slots as zero, exactly the
     /// way the §D.3 passes themselves read them.
+    #[inline]
     fn column_run_length_eligible(&self, u: usize, v0: usize) -> bool {
-        for dv in 0..4 {
-            let v = v0 + dv;
-            let c = self.coefficient_at(u + v * self.width);
-            // Table D.10 decision D8: the four coefficients must be
-            // *undecoded* in this bit-plane — insignificant and not
-            // already coded by the SP pass. (A zero context implies the
-            // SP pass skipped the coefficient, so the π check is
-            // defensive; significance is monotonic within a plane.)
-            if c.sigma || self.coding_state[u + v * self.width] & SP_VISITED != 0 {
-                return false;
-            }
-            if self.coding_state_in_stripe(u, v, v0, 4) & 0xff != 0 {
-                return false;
-            }
-        }
-        true
+        // Table D.10 decision D8 over the packed states: the four
+        // coefficients must be *undecoded* in this bit-plane —
+        // insignificant and not already coded by the SP pass — and
+        // each must carry the zero Table D.1 context, i.e. no
+        // significant (stripe-visible) neighbour. One OR over the
+        // column answers all of it.
+        let width = self.width;
+        let base = u + v0 * width;
+        let rows = &self.coding_state[base..];
+        let last = rows[3 * width];
+        let last_visible = if self.vertically_causal {
+            // §D.7: D2 / V1 / D3 lie below the stripe.
+            last & !(7 << 5)
+        } else {
+            last
+        };
+        let any = rows[0] | rows[width] | rows[2 * width] | last_visible;
+        any & (0xff | SELF_SIGMA | SP_VISITED) == 0
     }
 
     /// Make coefficient `(u, v)` significant: set σ, accumulate the

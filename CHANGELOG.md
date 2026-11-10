@@ -11,9 +11,13 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Performance
 
-- Tier-1 runs code-blocks concurrently under the worker budget, in both directions. Block results are folded back in block order, so codestreams are byte-identical and decoded samples identical at every thread count, rate-controlled encodes included (`tests/thread_budget.rs`).
+- Tier-1 runs code-blocks concurrently under the worker budget, in both directions, and the wavelet transform shares out its rows and column strips. Block results are folded back in block order, so codestreams are byte-identical and decoded samples identical at every thread count, rate-controlled encodes included (`tests/thread_budget.rs`).
 - HTJ2K: the §7.3.5 CxtVLC codeword match is a direct table read instead of a scan over the Annex C table per imported bit (decode), and the encoder's codeword choice is computed once per `(table, context, pattern)` key. HT block decode of a 1024² RGB image drops about 9×, HT encode about 2×.
 - Decoder reconstruction (Equations E-6 / E-8) works a block at a time: the `r · 2^(Mb − Nb)` offsets are computed once per distinct shift instead of through `exp2` per coefficient, and blocks land in the coefficient surface row by row.
+- Wavelet transform, both directions and both kernels: rows and columns are lifted in place with the Equation F-4 mirror applied to the two boundary neighbours instead of building an extended copy per row and per column, and the column filters work a row at a time inside 256-column strips (cache-resident, auto-vectorised) rather than gathering each column through the whole plane. Under a worker budget the rows and the strips are shared out. Sample for sample the arithmetic is that of the 1-D procedures (pinned bit for bit against them, 5-3 and 9-7).
+- MQ coder: DECODE and ENCODE evaluate the conditional-exchange flowcharts as one selection and renormalize with a single shift per run of bits inside a byte (the bit-at-a-time loop remains only across byte boundaries).
+- Tier-1 forward passes run on the packed neighbour-state word like the decode passes (no per-coefficient snapshot / write-back, the §D.7 clip hoisted, the run-length eligibility of a stripe column is one OR over its four states).
+- Encoder rate bookkeeping: the per-pass truncation length is computed from the coder registers and its last byte instead of flushing a clone of the whole codeword, and the per-pass distortion sum takes an exact integer lane.
 
 ## [0.0.19](https://github.com/OxideAV/oxideav-jpeg2000/compare/v0.0.18...v0.0.19) - 2026-11-07
 

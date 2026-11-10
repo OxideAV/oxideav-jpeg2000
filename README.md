@@ -223,7 +223,9 @@ Both directions are **serial by default** and take a worker budget:
 the standalone API, or the `ExecutionContext` handed to the framework
 `Decoder` / `Encoder` (`set_execution_context`). The budget fans out
 Tier-1 — code-blocks are independent, so they are coded on up to `n`
-scoped `std` threads (no dependency, nothing spawned at `n = 1`).
+scoped `std` threads (no dependency, nothing spawned at `n = 1`) — and
+the wavelet transform, whose rows and column strips are shared out the
+same way.
 
 The output never depends on the budget: block results are folded back
 in block order, so the encoder emits **byte-identical** codestreams

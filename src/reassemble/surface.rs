@@ -10,7 +10,7 @@ use super::{CodedCodeBlock, check_placement};
 use super::{SubBandQuantization, check_placement_shape, r_qb_to_i32};
 use crate::Error;
 use crate::dequant::irreversible_step_size;
-use crate::dwt::{Interleaved2D, sr_2d_5x3, sr_2d_9x7};
+use crate::dwt::{Interleaved2D, sr_2d_5x3_threaded, sr_2d_9x7_threaded};
 use crate::geometry::{PrecinctCodeBlock, ResolutionLevel, SubBand, SubBandOrientation};
 use crate::t1::CodeBlock;
 
@@ -116,6 +116,7 @@ type Inverse2D<T> = fn(
     (usize, usize),
     i32,
     i32,
+    usize,
 ) -> Result<Interleaved2D<T>, Error>;
 
 impl<'a, T: Default + Clone> CoefficientSurface<'a, T> {
@@ -211,7 +212,7 @@ impl<'a, T: Default + Clone> CoefficientSurface<'a, T> {
         Ok(())
     }
 
-    fn synthesize(self, inverse: Inverse2D<T>) -> Result<Interleaved2D<T>, Error> {
+    fn synthesize(self, inverse: Inverse2D<T>, threads: usize) -> Result<Interleaved2D<T>, Error> {
         let Self {
             levels,
             bands,
@@ -244,6 +245,7 @@ impl<'a, T: Default + Clone> CoefficientSurface<'a, T> {
                 (hh.band.width() as usize, hh.band.height() as usize),
                 crate::dwt::origin_parity(level.trx0),
                 crate::dwt::origin_parity(level.try0),
+                threads,
             )?;
             // Later resolutions need only the new LL carry, never these
             // coded bands. Release them before the next synthesis step.
@@ -305,8 +307,10 @@ impl CoefficientSurface<'_, i32> {
         )
     }
 
-    pub(crate) fn into_idwt_5x3(self) -> Result<Interleaved2D<i32>, Error> {
-        self.synthesize(sr_2d_5x3)
+    /// Run the §F.3 synthesis cascade over the scattered bands on up
+    /// to `threads` workers.
+    pub(crate) fn into_idwt_5x3(self, threads: usize) -> Result<Interleaved2D<i32>, Error> {
+        self.synthesize(sr_2d_5x3_threaded, threads)
     }
 }
 
@@ -331,8 +335,10 @@ impl CoefficientSurface<'_, f64> {
         )
     }
 
-    pub(crate) fn into_idwt_9x7(self) -> Result<Interleaved2D<f64>, Error> {
-        self.synthesize(sr_2d_9x7)
+    /// Run the §F.3 synthesis cascade over the scattered bands on up
+    /// to `threads` workers.
+    pub(crate) fn into_idwt_9x7(self, threads: usize) -> Result<Interleaved2D<f64>, Error> {
+        self.synthesize(sr_2d_9x7_threaded, threads)
     }
 }
 
@@ -512,11 +518,11 @@ mod tests {
                                 }
                             }
                             let old = idwt_5x3(levels, &source, &mb_per_level, 0.5).unwrap();
-                            let new = reversible.into_idwt_5x3().unwrap();
+                            let new = reversible.into_idwt_5x3(1).unwrap();
                             assert_eq!((new.width, new.height), (old.width, old.height));
                             assert_eq!(new.data, old.data);
                             let old = idwt_9x7(levels, &source, &quant_per_level, 0.5).unwrap();
-                            let new = irreversible.into_idwt_9x7().unwrap();
+                            let new = irreversible.into_idwt_9x7(1).unwrap();
                             assert_eq!((new.width, new.height), (old.width, old.height));
                             assert_eq!(
                                 new.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
@@ -644,9 +650,9 @@ mod tests {
             .iter()
             .map(|level| level.sub_bands.iter().map(quant).collect())
             .collect();
-        let rev = reversible.into_idwt_5x3().unwrap();
+        let rev = reversible.into_idwt_5x3(1).unwrap();
         assert_eq!(rev, idwt_5x3(&levels, &source, &mb_per_level, 0.5).unwrap());
-        let irr = irreversible.into_idwt_9x7().unwrap();
+        let irr = irreversible.into_idwt_9x7(1).unwrap();
         let irr_bits: Vec<u64> = irr.data.iter().map(|v| v.to_bits()).collect();
         let public = idwt_9x7(&levels, &source, &quant_per_level, 0.5).unwrap();
         assert_eq!(
@@ -788,7 +794,7 @@ mod tests {
             Err(Error::InvalidMarkerLength)
         ));
         // Rejected scatters did not publish coefficients into the surface.
-        let grid = surface.into_idwt_5x3().unwrap();
+        let grid = surface.into_idwt_5x3(1).unwrap();
         assert_eq!(grid.data, vec![0; 12]);
     }
 
@@ -827,7 +833,7 @@ mod tests {
         surface.scatter_5x3(0, 0, cb, 31, 0.5).unwrap();
         // The sink does not retain the borrow; reset before synthesis.
         block.reset_for_decode(SubBandOrientation::HH, 1, 1);
-        let grid = surface.into_idwt_5x3().unwrap();
+        let grid = surface.into_idwt_5x3(1).unwrap();
         assert_eq!(grid.data, expected);
         assert_eq!(grid.data.as_ptr(), allocation);
         assert_eq!(grid.data[0], i32::MAX);
@@ -877,6 +883,7 @@ mod tests {
             _hh_dims: (usize, usize),
             _i0: i32,
             _j0: i32,
+            _threads: usize,
         ) -> Result<Interleaved2D<Tracked>, Error> {
             CALLS.with(|calls| calls.set(calls.get() + 1));
             // At the first step: four LL + twelve high-band + forty-eight
@@ -903,7 +910,7 @@ mod tests {
         );
         let surface = CoefficientSurface::<Tracked>::new(&levels).unwrap();
         LIVE.with(|live| assert_eq!(live.get(), 64));
-        let grid = surface.synthesize(inverse).unwrap();
+        let grid = surface.synthesize(inverse, 1).unwrap();
         assert_eq!((grid.width, grid.height), (8, 8));
         CALLS.with(|calls| assert_eq!(calls.get(), 2));
         LIVE.with(|live| assert_eq!(live.get(), 64));
