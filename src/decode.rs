@@ -1593,29 +1593,65 @@ fn validate_plt_lengths(
         };
         spans.push((start, end));
     }
-    // Walk the tile-parts, attributing packets by their start offset.
+    // Walk the tile-parts. A listed tile-part owns exactly as many
+    // packets as its list has entries, in order, each of the listed
+    // length and each starting inside the tile-part; an unlisted one
+    // owns the packets that start inside it.
+    //
+    // With relocated headers a packet without code-block data occupies
+    // no body bytes at all, so one sitting on a tile-part boundary
+    // starts "in" both neighbours. The list is what says whose it is:
+    // a listed tile-part may end on such packets or leave them to its
+    // successor, and after an unlisted tile-part the next list may
+    // start anywhere inside the run of them.
     let mut next_packet = 0usize;
     let mut tp_start = 0usize;
+    let mut previous_listed = true;
     for (tp_body_len, lengths) in plt {
         let tp_end = tp_start
             .checked_add(*tp_body_len)
             .ok_or(Error::PsotOverflow)?;
-        let first = next_packet;
-        while next_packet < spans.len() && spans[next_packet].0 < tp_end {
-            next_packet += 1;
+        let Some(lengths) = lengths else {
+            while next_packet < spans.len() && spans[next_packet].0 < tp_end {
+                next_packet += 1;
+            }
+            previous_listed = false;
+            tp_start = tp_end;
+            continue;
+        };
+        if !previous_listed {
+            // Empty packets on the leading boundary beyond those the
+            // list opens with belong to the unlisted predecessor.
+            let on_boundary = spans[next_packet..]
+                .iter()
+                .take_while(|&&(start, end)| start == tp_start && end == tp_start)
+                .count();
+            let listed_empty = lengths.iter().take_while(|&&listed| listed == 0).count();
+            next_packet += on_boundary.saturating_sub(listed_empty);
         }
-        if let Some(lengths) = lengths {
-            let got = &spans[first..next_packet];
-            if got.len() != lengths.len() {
+        for &listed in lengths {
+            let &(start, end) = spans.get(next_packet).ok_or_else(mismatch)?;
+            // The packet must lie in this tile-part: it starts inside
+            // it, or — carrying no bytes — on its closing boundary.
+            let inside = start < tp_end || (start == tp_end && end == start);
+            if !inside || (end - start) as u64 != listed {
                 return Err(mismatch());
             }
-            for ((start, end), &listed) in got.iter().zip(lengths.iter()) {
-                if (end - start) as u64 != listed {
-                    return Err(mismatch());
-                }
-            }
+            next_packet += 1;
         }
+        // Every packet with bytes in this tile-part must be listed.
+        if spans
+            .get(next_packet)
+            .is_some_and(|&(start, _)| start < tp_end)
+        {
+            return Err(mismatch());
+        }
+        previous_listed = true;
         tp_start = tp_end;
+    }
+    // A final listed tile-part has no successor to leave packets to.
+    if previous_listed && !plt.is_empty() && next_packet != spans.len() {
+        return Err(mismatch());
     }
     Ok(())
 }

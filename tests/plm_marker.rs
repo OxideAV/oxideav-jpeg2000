@@ -103,7 +103,6 @@ fn plm_round_trips_across_layouts() {
         ("PPT", ppt),
         ("lossy", base().with_lossy(3)),
         ("HT", base().with_high_throughput(true)),
-        ("rate", base().with_target_bytes(4000)),
     ];
     for (name, options) in variants {
         let plain = encode(&rgb, &options).unwrap();
@@ -246,4 +245,84 @@ fn a_long_series_continues_across_plm_segments() {
     let lplm = (payload.len() + 2 - 5) as u16;
     cut[marker_at + 2..marker_at + 4].copy_from_slice(&lplm.to_be_bytes());
     assert!(matches!(decode(&cut), Err(Error::PlmMismatch)));
+}
+
+/// With relocated packet headers a packet without code-block data
+/// occupies no body bytes, so a rate-controlled stream ends its
+/// tile-parts on zero-length packets and has them sitting on tile-part
+/// boundaries. The lists still describe every packet, and the decoder
+/// accepts them (fuzz find: such an own-encoded stream was rejected
+/// with a `PLT` or `PLM` mismatch).
+#[test]
+fn empty_packets_on_tile_part_boundaries_satisfy_plt_and_plm() {
+    let rgb = image(39, 27, PixelFormat::Rgb24);
+    let mut streams_with_empty_tail = 0;
+    for packed in [PackedHeaders::Ppt, PackedHeaders::Ppm] {
+        for split in [
+            TilePartSplit::Single,
+            TilePartSplit::ByResolution,
+            TilePartSplit::ByLayer,
+            TilePartSplit::ByComponent,
+        ] {
+            for target in [1816, 600, 100] {
+                for (plt, plm) in [(true, false), (false, true), (true, true)] {
+                    let mut options = base()
+                        .with_decomposition_levels(5)
+                        .with_code_block_exp((3, 4))
+                        .with_lossy(5)
+                        .with_progression(ProgressionOrder::Pcrl)
+                        .with_layers(3)
+                        .with_target_bytes(target)
+                        .with_plt(plt)
+                        .with_plm(plm);
+                    options.packed_headers = packed;
+                    options.tile_parts = split;
+                    let stream = encode(&rgb, &options).unwrap();
+                    let context = format!("{packed:?} {split:?} {target} plt={plt} plm={plm}");
+                    // (The markers count against the byte budget, so the
+                    // image is not the unmarked stream's; it must decode.)
+                    let decoded = decode(&stream).unwrap_or_else(|e| panic!("{context}: {e}"));
+                    assert_eq!((decoded.width, decoded.height), (39, 27), "{context}");
+
+                    if !plm {
+                        continue;
+                    }
+                    let entries = plm_entries(&stream);
+                    if entries.last().and_then(|list| list.last()) != Some(&0) {
+                        continue;
+                    }
+                    streams_with_empty_tail += 1;
+                    // The final empty packet is still a packet of the
+                    // last tile-part: a list that leaves it out does
+                    // not describe the tile-part. Drop its `Iplm` byte
+                    // (and count one byte fewer in `Nplm` and `Lplm`).
+                    let segments = main_header_segments(&stream, PLM);
+                    if segments.len() != 1 {
+                        continue;
+                    }
+                    let (marker_at, payload) = segments[0].clone();
+                    let series = &stream[payload.start + 1..payload.end];
+                    let mut last_nplm = 0;
+                    let mut at = 0;
+                    while at < series.len() {
+                        last_nplm = at;
+                        at += 1 + usize::from(series[at]);
+                    }
+                    let mut shorter = stream[..payload.end - 1].to_vec();
+                    shorter.extend_from_slice(&stream[payload.end..]);
+                    shorter[payload.start + 1 + last_nplm] -= 1;
+                    let lplm = (payload.len() + 2 - 1) as u16;
+                    shorter[marker_at + 2..marker_at + 4].copy_from_slice(&lplm.to_be_bytes());
+                    assert!(
+                        matches!(decode(&shorter), Err(Error::PlmMismatch)),
+                        "{context}"
+                    );
+                }
+            }
+        }
+    }
+    assert!(
+        streams_with_empty_tail > 0,
+        "the sweep reaches the empty-tail case"
+    );
 }

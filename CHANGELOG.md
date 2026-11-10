@@ -12,6 +12,10 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 - `examples/perf_suite.rs` (encode + decode timings over synthetic rgb8 / rgb16 / lossy 9-7 / 4K / HTJ2K cases, contract API or registry path, any thread budget) and `examples/corpus_hash.rs` (decoded-sample and codestream hashes over a file corpus plus an encoder option matrix, for comparing two builds).
 - Fuzz: `contract` decodes every input a second time under a worker budget of three and requires the serial outcome (planes or error text); `roundtrip_encode` requires a threaded encode to emit the serial bytes and scripts the `plm` option. Builds made under the fuzzing configuration fan work out whatever its size, so small fuzz inputs still exercise the threaded paths.
 
+### Fixed
+
+- `PLT` (and now `PLM`) cross-validation with relocated packet headers: a packet without code-block data occupies no body bytes under `PPM` / `PPT`, and the check attributed packets to tile-parts by where they start — so an empty packet at the very end of a tile-part (or on a tile-part boundary) was counted to the wrong tile-part or to none, and a conforming stream was rejected with `PltMismatch`. This crate's own encoder produced such streams whenever rate control emptied the trailing packets under `plt` + `PackedHeaders::Ppm` / `Ppt` (found by the round-trip fuzz target). A listed tile-part now owns exactly as many packets as its list has entries; a list that leaves a packet out is still rejected.
+
 ### Performance
 
 - Tier-1 runs code-blocks concurrently under the worker budget, in both directions, and the wavelet transform shares out its rows and column strips. Block results are folded back in block order, so codestreams are byte-identical and decoded samples identical at every thread count, rate-controlled encodes included (`tests/thread_budget.rs`).
