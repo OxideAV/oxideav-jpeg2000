@@ -281,6 +281,35 @@ Tier-2 — is a few percent. The part that stays on one thread (packet
 headers, assembly, the per-thread start-up) is what flattens the curve
 past 8 workers on the smaller pictures.
 
+The MQ coder keeps each context as one word that carries its
+probability estimate `Qe` next to the Table C.2 index and the MPS
+sense, and steps it through a table of whole next-context words, so a
+coding step reads the estimate with the context instead of through a
+second, dependent table read. Interleaved A/B of the two builds on the
+same (busy) machine — median of 4 runs of 5 rounds each, milliseconds,
+encode / decode, before → after; codestream and sample hashes
+identical; the untouched HTJ2K case moved by up to ±3 % (±6 % on its
+best round), which is the noise floor here:
+
+| case | 1 worker | 8 workers |
+|---|---|---|
+| RGB8 1024², lossless 5-3 | 139 / 152 → 133 / 138 | 22.5 / 23.9 → 21.7 / 22.9 |
+| RGB16 1024², lossless 5-3 | 350 / 379 → 340 / 352 | 53.7 / 56.1 → 53.0 / 52.9 |
+| RGB8 512², lossy 9-7 | 48.5 / 53.1 → 47.5 / 49.0 | 8.2 / 10.1 → 7.6 / 9.1 |
+| RGB8 512², lossy 9-7, 4 layers, 96 kB budget | 57.2 / 16.4 → 54.4 / 14.5 | 13.0 / 5.3 → 12.6 / 4.8 |
+| RGB8 3840×2160, lossless 5-3 | 1116 / 1182 → 1104 / 1152 | 186 / 180 → 177 / 163 |
+| RGB8 1024², lossless, 64 tiles of 128² | 140 / 152 → 146 / 149 | 23.8 / 22.6 → 22.6 / 21.1 |
+| RGB8 1024², lossless HTJ2K (not MQ-coded) | 63.6 / 64.7 → 64.9 / 66.4 | 12.1 / 13.3 → 12.2 / 13.6 |
+
+Decoding gains 3 – 11 % wherever the MQ coder runs; the encoder's
+1 – 5 % is inside the noise. Two further restructurings were measured
+the same way and dropped: leaving DECODE / ENCODE early when the
+interval stays normalized (a data-dependent branch: 7 % slower
+encoding, 13 % slower decoding on the 1024² case), and skipping whole
+stripe columns in the significance and refinement passes with one OR
+over the column's four states (3 % slower both ways on these textured
+images, where few columns are empty).
+
 Peak memory for the 3840×2160 case through the contract API is about
 210 MiB decoding and 350 MiB encoding at one worker (the packed
 picture, one `i32` plane per component, one component's coefficients,

@@ -55,7 +55,7 @@
 //! transcribed to integer operations and validated by round-trip against
 //! the independently-written §C.3 decoder.
 
-use crate::mq::{MqContext, QE_PACKED};
+use crate::mq::MqContext;
 
 /// The MQ arithmetic encoder of T.800 §C.2.
 ///
@@ -194,22 +194,14 @@ impl MqEncoder {
     /// one-bit steps as the 16-bit `A` has leading zeros.
     #[inline(always)]
     pub fn encode(&mut self, cx: &mut MqContext, d: u8) {
-        let row = QE_PACKED[cx.index() as usize];
-        let qe = row & 0xFFFF;
-        let more_probable = (d != 0) == cx.mps();
+        let qe = cx.qe();
+        let more_probable = u8::from(d != 0) == cx.mps_bit();
         let reduced = self.a.wrapping_sub(qe);
         let lower = more_probable == (reduced < qe);
         let a = if lower { qe } else { reduced };
         self.c += if lower { 0 } else { qe as u64 };
-
-        let moved = if more_probable {
-            (row >> 16) & 0xFF
-        } else {
-            (row >> 24) & 0x7F
-        } as u8;
         let renormalize = !more_probable | (reduced & 0x8000 == 0);
-        cx.set_index(if renormalize { moved } else { cx.index() });
-        cx.toggle_mps(!more_probable & (row >> 31 != 0));
+        cx.step_if(renormalize, !more_probable);
 
         let shift = (a as u16).leading_zeros();
         if shift < self.ct as u32 {

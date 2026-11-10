@@ -399,23 +399,46 @@ pub const RUN_LENGTH_INDEX: u8 = 3;
 /// (context label 0 in Table D.1).
 pub const ZERO_NEIGHBOURS_INDEX: u8 = 4;
 
-/// [`QE`] packed for the coder's inner step and padded to every `u8`
-/// index: one `u32` per row — `Qe` in bits 0..16, `NMPS` in 16..24,
-/// `NLPS` in 24..31, `SWITCH` in bit 31 — so a row is read with one
-/// unchecked-by-construction load. Rows past Table C.2 repeat its last
-/// (they are never reached: every stored index comes from the table).
-pub(crate) static QE_PACKED: [u32; 256] = {
-    let mut rows = [0u32; 256];
-    let mut i = 0;
-    while i < 256 {
-        let e = &QE[if i < QE.len() { i } else { QE.len() - 1 }];
-        rows[i] = e.qe as u32
-            | ((e.nmps as u32) << 16)
-            | ((e.nlps as u32) << 24)
-            | ((e.switch as u32) << 31);
-        i += 1;
+/// Bit of a context word holding `MPS(CX)`.
+const CONTEXT_MPS_BIT: u32 = 1 << 16;
+/// Shift of the Table C.2 index `I(CX)` inside a context word.
+const CONTEXT_INDEX_SHIFT: u32 = 17;
+
+/// The context word of Table C.2 row `index` with MPS sense `mps`:
+/// `Qe(index)` in bits 0..16, `mps` in bit 16, `index` above it.
+const fn context_word(index: u8, mps: bool) -> u32 {
+    let row = if (index as usize) < QE.len() {
+        index as usize
+    } else {
+        QE.len() - 1
+    };
+    QE[row].qe as u32 | ((mps as u32) << 16) | ((row as u32) << CONTEXT_INDEX_SHIFT)
+}
+
+/// §C.2.5 probability-estimation step on whole context words: entry
+/// `[word >> 16][0]` is the context after a renormalizing MPS (index
+/// `NMPS`, sense kept), entry `[word >> 16][1]` the context after an
+/// LPS (index `NLPS`, sense flipped where Table C.2 has `SWITCH = 1`).
+/// The key is `index × 2 + mps`; keys past Table C.2 repeat its last
+/// row and are never reached.
+pub(crate) static CONTEXT_STEP: [[u32; 2]; 128] = {
+    let mut steps = [[0u32; 2]; 128];
+    let mut key = 0;
+    while key < 128 {
+        let index = if key / 2 < QE.len() {
+            key / 2
+        } else {
+            QE.len() - 1
+        };
+        let mps = key % 2 == 1;
+        let e = &QE[index];
+        steps[key] = [
+            context_word(e.nmps, mps),
+            context_word(e.nlps, mps != e.switch),
+        ];
+        key += 1;
     }
-    rows
+    steps
 };
 
 /// Per-context adaptive state: the current Table C.2 index `I(CX)` and
@@ -429,76 +452,98 @@ pub(crate) static QE_PACKED: [u32; 256] = {
 /// * [`MqContext::uniform`] — UNIFORM: index 46, MPS 0.
 /// * [`MqContext::run_length`] — run-length: index 3, MPS 0.
 /// * [`MqContext::zero_neighbours`] — context label 0: index 4, MPS 0.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// The state is held as one word that also carries `Qe(I(CX))`, so a
+/// coding step reads the estimate with the context itself and consults
+/// Table C.2 only when the index moves.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct MqContext {
-    /// Current Table C.2 index `I(CX)` (`0..=46`).
-    index: u8,
-    /// Current more-probable-symbol sense `MPS(CX)` (`false` = 0).
-    mps: bool,
+    /// `Qe(I)` in bits 0..16, `MPS` in bit 16, `I` from bit 17.
+    word: u32,
+}
+
+impl core::fmt::Debug for MqContext {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("MqContext")
+            .field("index", &self.index())
+            .field("mps", &self.mps())
+            .finish()
+    }
 }
 
 impl Default for MqContext {
     /// Table D.7 "all other contexts": index 0, MPS 0.
     fn default() -> Self {
-        Self {
-            index: 0,
-            mps: false,
-        }
+        Self::with_state(0, false)
     }
 }
 
 impl MqContext {
+    /// A context at Table C.2 index `index` (`0..=46`; larger values
+    /// are taken as 46) with MPS sense `mps`.
+    pub const fn with_state(index: u8, mps: bool) -> Self {
+        Self {
+            word: context_word(index, mps),
+        }
+    }
+
     /// Table D.7 UNIFORM context: index 46, MPS 0.
     pub const fn uniform() -> Self {
-        Self {
-            index: UNIFORM_INDEX,
-            mps: false,
-        }
+        Self::with_state(UNIFORM_INDEX, false)
     }
 
     /// Table D.7 run-length context: index 3, MPS 0.
     pub const fn run_length() -> Self {
-        Self {
-            index: RUN_LENGTH_INDEX,
-            mps: false,
-        }
+        Self::with_state(RUN_LENGTH_INDEX, false)
     }
 
     /// Table D.7 "all-zero-neighbours" context (label 0): index 4,
     /// MPS 0.
     pub const fn zero_neighbours() -> Self {
-        Self {
-            index: ZERO_NEIGHBOURS_INDEX,
-            mps: false,
-        }
+        Self::with_state(ZERO_NEIGHBOURS_INDEX, false)
     }
 
     /// The current Table C.2 index `I(CX)`.
     pub const fn index(&self) -> u8 {
-        self.index
+        (self.word >> CONTEXT_INDEX_SHIFT) as u8
     }
 
     /// The current MPS sense `MPS(CX)` (`false` = 0, `true` = 1).
     pub const fn mps(&self) -> bool {
-        self.mps
+        self.word & CONTEXT_MPS_BIT != 0
     }
 
     /// Set the current Table C.2 index `I(CX)` (the §C.2.5 NMPS / NLPS
     /// transition applied by the [`crate::mqenc`] encoder).
     pub fn set_index(&mut self, index: u8) {
-        self.index = index;
+        self.word = context_word(index, self.mps());
     }
 
     /// Flip the more-probable-symbol sense `MPS(CX)` (the §C.2.5 SWITCH
     /// action, shared by the encoder and decoder LPS paths).
     pub fn flip_mps(&mut self) {
-        self.mps = !self.mps;
+        self.word ^= CONTEXT_MPS_BIT;
     }
 
-    /// [`Self::flip_mps`] when `flip` holds, as a branch-free update.
+    /// `Qe(I(CX))`, the current LPS probability estimate.
     #[inline(always)]
-    pub(crate) fn toggle_mps(&mut self, flip: bool) {
-        self.mps ^= flip;
+    pub(crate) fn qe(&self) -> u32 {
+        self.word & 0xFFFF
+    }
+
+    /// `MPS(CX)` as a bit.
+    #[inline(always)]
+    pub(crate) fn mps_bit(&self) -> u8 {
+        ((self.word >> 16) & 1) as u8
+    }
+
+    /// The §C.2.5 step, taken when `renormalize` holds: to `NLPS`
+    /// (with the SWITCH flip) when the less probable symbol was coded,
+    /// to `NMPS` otherwise. One selection, no branch.
+    #[inline(always)]
+    pub(crate) fn step_if(&mut self, renormalize: bool, less_probable: bool) {
+        let next = CONTEXT_STEP[((self.word >> 16) & 127) as usize][less_probable as usize];
+        self.word = if renormalize { next } else { self.word };
     }
 
     /// Reset this context to its initial state (§C.3.6). The caller
@@ -682,21 +727,13 @@ impl<'a> MqDecoder<'a> {
     /// `Chigh` drops by `Qe` otherwise.
     #[inline(always)]
     pub fn decode(&mut self, cx: &mut MqContext) -> u8 {
-        let row = QE_PACKED[cx.index as usize];
-        let qe = row & 0xFFFF;
+        let qe = cx.qe();
         let reduced = self.a.wrapping_sub(qe);
         let lps = (self.c >> 16) < qe;
         let renormalize = lps | (reduced & 0x8000 == 0);
         let less_probable = lps ^ (reduced < qe);
-
-        let d = (cx.mps ^ less_probable) as u8;
-        let moved = if less_probable {
-            (row >> 24) & 0x7F
-        } else {
-            (row >> 16) & 0xFF
-        } as u8;
-        cx.index = if renormalize { moved } else { cx.index };
-        cx.mps ^= less_probable & (row >> 31 != 0);
+        let d = cx.mps_bit() ^ less_probable as u8;
+        cx.step_if(renormalize, less_probable);
 
         let a = if lps { qe } else { reduced };
         self.c -= if lps { 0 } else { qe << 16 };
@@ -749,36 +786,36 @@ mod tests {
     /// branches and a one-bit RENORMD loop. The reference the
     /// single-selection `decode` must match.
     fn decode_by_flowchart(dec: &mut MqDecoder<'_>, cx: &mut MqContext) -> u8 {
-        let entry = QE[cx.index as usize];
+        let entry = QE[cx.index() as usize];
         let qe = entry.qe as u32;
         dec.a -= qe;
         let d;
         if (dec.c >> 16) < qe {
             if dec.a < qe {
-                d = cx.mps as u8;
-                cx.index = entry.nmps;
+                d = cx.mps() as u8;
+                cx.set_index(entry.nmps);
             } else {
-                d = !cx.mps as u8;
+                d = !cx.mps() as u8;
                 if entry.switch {
-                    cx.mps = !cx.mps;
+                    cx.flip_mps();
                 }
-                cx.index = entry.nlps;
+                cx.set_index(entry.nlps);
             }
             dec.a = qe;
         } else {
             dec.c -= qe << 16;
             if dec.a & 0x8000 != 0 {
-                return cx.mps as u8;
+                return cx.mps() as u8;
             }
             if dec.a < qe {
-                d = !cx.mps as u8;
+                d = !cx.mps() as u8;
                 if entry.switch {
-                    cx.mps = !cx.mps;
+                    cx.flip_mps();
                 }
-                cx.index = entry.nlps;
+                cx.set_index(entry.nlps);
             } else {
-                d = cx.mps as u8;
-                cx.index = entry.nmps;
+                d = cx.mps() as u8;
+                cx.set_index(entry.nmps);
             }
         }
         loop {
@@ -934,33 +971,12 @@ mod tests {
 
     #[test]
     fn initial_context_states() {
-        assert_eq!(
-            MqContext::default(),
-            MqContext {
-                index: 0,
-                mps: false
-            }
-        );
-        assert_eq!(
-            MqContext::uniform(),
-            MqContext {
-                index: 46,
-                mps: false
-            }
-        );
-        assert_eq!(
-            MqContext::run_length(),
-            MqContext {
-                index: 3,
-                mps: false
-            }
-        );
+        assert_eq!(MqContext::default(), MqContext::with_state(0, false));
+        assert_eq!(MqContext::uniform(), MqContext::with_state(46, false));
+        assert_eq!(MqContext::run_length(), MqContext::with_state(3, false));
         assert_eq!(
             MqContext::zero_neighbours(),
-            MqContext {
-                index: 4,
-                mps: false
-            }
+            MqContext::with_state(4, false)
         );
     }
 
