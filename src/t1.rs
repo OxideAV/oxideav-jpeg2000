@@ -972,6 +972,47 @@ impl CodeBlock {
         }
     }
 
+    /// Feed every coefficient, in raster order, to `emit` as its signed
+    /// Equation E-1 value `qb(u, v)` and its §D.2.1 `Nb(u, v)` — the
+    /// same pair [`Self::coefficient`] and [`Self::effective_nb`] yield
+    /// per position, with the block-wide decisions (ROI override, the
+    /// uniform fallback of a block no coding pass touched, packed or
+    /// wide counts) taken once instead of per coefficient.
+    pub(crate) fn for_each_signed_with_nb(
+        &self,
+        uniform_fallback: u32,
+        mut emit: impl FnMut(i64, u32),
+    ) {
+        #[inline(always)]
+        fn signed(magnitude: u32, state: u32) -> i64 {
+            let magnitude = i64::from(magnitude);
+            if state & SELF_SIGN != 0 {
+                -magnitude
+            } else {
+                magnitude
+            }
+        }
+        let pairs = self.magnitudes.iter().zip(&self.coding_state);
+        if let Some(roi) = &self.roi_nb {
+            for ((&magnitude, &state), &nb) in pairs.zip(roi) {
+                emit(signed(magnitude, state), nb);
+            }
+        } else if self.max_decoded_bits() == 0 {
+            for (&magnitude, &state) in pairs {
+                emit(signed(magnitude, state), uniform_fallback);
+            }
+        } else if let Some(wide) = &self.wide_decoded_bits {
+            for ((&magnitude, &state), &bits) in pairs.zip(wide) {
+                emit(signed(magnitude, state), self.zero_bit_planes + bits);
+            }
+        } else {
+            let base = self.zero_bit_planes;
+            for (&magnitude, &state) in pairs {
+                emit(signed(magnitude, state), base + (state >> COUNT_SHIFT));
+            }
+        }
+    }
+
     /// Apply the T.800 §H.1 region-of-interest (Maxshift) decode remap
     /// to this code-block, given the background Equation E-2 `mb` and the
     /// `SPrgn` scaling value `s` (§A.6.3 / Table A.26).

@@ -83,7 +83,7 @@ use crate::geometry::{
 use crate::t1::CodeBlock;
 
 mod surface;
-pub(crate) use surface::CoefficientSurface;
+pub(crate) use surface::{CoefficientSurface, reconstruct_block_5x3, reconstruct_block_9x7};
 
 /// One decoded code-block ready to be scattered into a sub-band array.
 ///
@@ -335,6 +335,24 @@ fn check_placement(
     placement: &PrecinctCodeBlock,
     block: &CodeBlock,
 ) -> Result<(), Error> {
+    check_placement_shape(
+        band,
+        placement,
+        block.width(),
+        block.height(),
+        block.orientation(),
+    )
+}
+
+/// [`check_placement`] against a block described by its dimensions and
+/// orientation alone.
+fn check_placement_shape(
+    band: &SubBand,
+    placement: &PrecinctCodeBlock,
+    width: usize,
+    height: usize,
+    orientation: SubBandOrientation,
+) -> Result<(), Error> {
     if placement.x0 < band.tbx0
         || placement.y0 < band.tby0
         || placement.x1 > band.tbx1
@@ -344,10 +362,10 @@ fn check_placement(
     }
     let placement_w = placement.x1.saturating_sub(placement.x0) as usize;
     let placement_h = placement.y1.saturating_sub(placement.y0) as usize;
-    if block.width() != placement_w || block.height() != placement_h {
+    if width != placement_w || height != placement_h {
         return Err(Error::InvalidMarkerLength);
     }
-    if block.orientation() != band.orientation {
+    if orientation != band.orientation {
         return Err(Error::InvalidMarkerLength);
     }
     Ok(())

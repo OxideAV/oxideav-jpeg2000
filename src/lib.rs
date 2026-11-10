@@ -107,6 +107,7 @@ pub mod options;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod packet;
+mod parallel;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod progression;

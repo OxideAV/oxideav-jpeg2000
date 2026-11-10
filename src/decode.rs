@@ -82,7 +82,9 @@ use crate::progression::{
     ResolutionPrecinctLayout, cprl_packet_order, lrcp_packet_order, pcrl_packet_order,
     poc_volume_packet_order, rlcp_packet_order, rpcl_packet_order,
 };
-use crate::reassemble::{CodedCodeBlock, CoefficientSurface, SubBandQuantization};
+use crate::reassemble::{
+    CoefficientSurface, SubBandQuantization, reconstruct_block_5x3, reconstruct_block_9x7,
+};
 use crate::t1::{BitPlaneSequencer, CodeBlock, reset_contexts};
 use crate::{
     Error, J2kCodestream, MARKER_CAP, MARKER_SIZ, MARKER_SOC, ProgressionOrder, QuantizationStyle,
@@ -303,20 +305,55 @@ enum ComponentSurface<'a> {
 }
 
 impl ComponentSurface<'_> {
-    fn scatter(
-        &mut self,
-        resolution: u8,
-        sub_band: u32,
-        cb: CodedCodeBlock<'_>,
-        quant: &BandQuant,
-    ) -> Result<(), Error> {
-        match self {
-            Self::Reversible(surface) => {
-                surface.scatter_5x3(resolution as usize, sub_band as usize, cb, quant.mb, 0.5)
-            }
-            Self::Irreversible(surface) => {
-                surface.scatter_9x7(resolution as usize, sub_band as usize, cb, quant.quant, 0.5)
-            }
+    /// Place one worker-reconstructed block. The value lane always
+    /// matches the surface (both follow the component's kernel).
+    fn scatter_block(&mut self, block: &ReconstructedBlock) -> Result<(), Error> {
+        let (resolution, sub_band) = (block.resolution as usize, block.sub_band as usize);
+        match (self, &block.values) {
+            (Self::Reversible(surface), BlockValues::Reversible(values)) => surface.scatter_values(
+                resolution,
+                sub_band,
+                &block.placement,
+                block.orientation,
+                values,
+            ),
+            (Self::Irreversible(surface), BlockValues::Irreversible(values)) => surface
+                .scatter_values(
+                    resolution,
+                    sub_band,
+                    &block.placement,
+                    block.orientation,
+                    values,
+                ),
+            _ => Err(Error::InvalidMarkerLength),
+        }
+    }
+}
+
+/// One code-block after tier-1 and Annex E reconstruction, ready to be
+/// placed into its component's coefficient surface.
+struct ReconstructedBlock {
+    resolution: u8,
+    sub_band: u32,
+    placement: crate::geometry::PrecinctCodeBlock,
+    orientation: SubBandOrientation,
+    values: BlockValues,
+}
+
+/// Reconstructed coefficients of one block in its kernel's lane.
+enum BlockValues {
+    Reversible(Vec<i32>),
+    Irreversible(Vec<f64>),
+}
+
+impl BlockValues {
+    /// Equation E-8 (5-3) or E-6 (9-7) over a decoded block, with the
+    /// midpoint reconstruction parameter `r = 0.5`.
+    fn reconstruct(block: &CodeBlock, nb: u32, quant: &BandQuant, reversible: bool) -> Self {
+        if reversible {
+            Self::Reversible(reconstruct_block_5x3(block, nb, quant.mb, 0.5))
+        } else {
+            Self::Irreversible(reconstruct_block_9x7(block, nb, quant.quant, 0.5))
         }
     }
 }
@@ -1205,6 +1242,8 @@ fn decode_tile(
     // When present, the walked packets are cross-validated against
     // the listed lengths — see `validate_plt_lengths`.
     plt: Option<&[TilePartPlt]>,
+    // Worker budget for the tier-1 / synthesis fan-out (1 = serial).
+    threads: usize,
 ) -> Result<Vec<Vec<i32>>, Error> {
     // -- §B.6–§B.12 tile packet plan (geometry, enumeration, walk split) --
     let TilePacketPlan {
@@ -1252,6 +1291,7 @@ fn decode_tile(
             headers,
             discard_levels,
             max_layers,
+            threads,
         )
     };
     if !has_mixed {
@@ -1766,6 +1806,293 @@ fn ht_tier1_block(
     Ok(Some((block, nb_ht)))
 }
 
+/// Everything a tier-1 block job reads besides its own accumulated
+/// contributions — shared by reference across the workers.
+struct BlockJobContext<'a> {
+    comp_coding: &'a [ComponentCoding],
+    precinct_geom: &'a BTreeMap<(u16, u8, u32), PrecinctCodeBlocks>,
+    quant_per_comp: &'a [Vec<Vec<BandQuant>>],
+    roi_shift: &'a [u32],
+    discard_levels: u8,
+    /// Whether the component reconstructs through the reversible 5-3
+    /// lane (Equation E-8) or the irreversible 9-7 lane (E-6).
+    reversible: bool,
+}
+
+/// Validate, tier-1 decode and reconstruct one code-block. `Ok(None)`
+/// is a block that contributes nothing (no passes, above the kept
+/// resolution, or an HT block without a cleanup segment).
+///
+/// `work_block` is the worker's reusable Annex D block: only its
+/// allocation survives from one job to the next.
+fn decode_block_job(
+    job: &BlockJobContext<'_>,
+    work_block: &mut Option<CodeBlock>,
+    key: &BlockKey,
+    acc: &BlockAccum,
+) -> Result<Option<ReconstructedBlock>, Error> {
+    let (c, r, k, sb, cbx, cby) = key;
+    if acc.passes == 0 {
+        return Ok(None);
+    }
+    // Reduced-resolution decode: blocks above the kept resolution
+    // level contribute nothing to the truncated synthesis — skip
+    // their (already length-accounted) tier-1 work entirely.
+    {
+        let keep = job
+            .comp_coding
+            .get(*c as usize)
+            .ok_or(Error::InvalidMarkerLength)?
+            .n_l
+            - job.discard_levels;
+        if *r > keep {
+            return Ok(None);
+        }
+    }
+    let geom = job
+        .precinct_geom
+        .get(&(*c, *r, *k))
+        .ok_or(Error::InvalidPacketHeader)?;
+    let psb = geom
+        .sub_bands
+        .get(*sb as usize)
+        .ok_or(Error::InvalidPacketHeader)?;
+    if *cbx >= psb.grid_wide || *cby >= psb.grid_high {
+        return Err(Error::InvalidPacketHeader);
+    }
+    let placement = psb.code_blocks[(*cby as usize) * (psb.grid_wide as usize) + *cbx as usize];
+    // Per-level band order matches the §B.9 packet sub-band order
+    // ([LL] at r = 0, [HL, LH, HH] at r ≥ 1), so the packet's
+    // sub-band index addresses the quant table directly.
+    let quant = job.quant_per_comp[*c as usize][*r as usize]
+        .get(*sb as usize)
+        .ok_or(Error::InvalidPacketHeader)?;
+    let mb = quant.mb;
+    // §H.1 / §H.2: under an `RGN` Maxshift the encoder shifts ROI
+    // coefficients up into the top `s` bit-planes, so the coded
+    // bit budget is `M'b = Mb + s`. The tier-1 schedule, the
+    // zero-bit-plane bound and the pass-count cap all run against
+    // `M'b`; the §H.1 de-scaling below re-anchors the magnitudes to
+    // the background `Mb` before reassembly. With no `RGN` `s = 0`
+    // and `mb_coded == mb`.
+    let s = job.roi_shift.get(*c as usize).copied().unwrap_or(0);
+    let mb_coded = mb.saturating_add(s);
+    // Implementation limit: tier-1 assembles magnitudes into a
+    // 31-bit `u32` lane (sign carried separately), so the §D.3 /
+    // §7.6 bit-plane weights `2^(M'b − 1 − P) … 2^0` must fit it.
+    // Equation E-2 admits `Mb` up to 37 (`εb = 31`, 7 guard bits)
+    // and an `RGN` shift stacks on top — a coded budget past the
+    // lane cannot be represented, so it is rejected cleanly here
+    // rather than overflowing the pass weights downstream.
+    if mb_coded > 31 {
+        return Err(Error::NotImplemented);
+    }
+    let p = acc.p.ok_or(Error::InvalidPacketHeader)?;
+    if p >= mb_coded {
+        return Err(Error::InvalidPacketHeader);
+    }
+    // The Table A.19 style byte resolved for this block's
+    // component (§A.6.2) — tier-1 dispatch is per component.
+    let style = job
+        .comp_coding
+        .get(*c as usize)
+        .ok_or(Error::InvalidMarkerLength)?
+        .style;
+    // §D.3: at most 3 (M'b − P) − 2 passes fit above bit-plane 0.
+    // The HT path has its own §B.3 cap (Z_blk ≤ 3) and a different
+    // pass↔bit-plane relationship, so the Annex D cap does not
+    // apply; a MIXED block's lane is not known yet, so its cap is
+    // applied on the Annex D side of the dispatch below.
+    if !style.high_throughput && !style.mixed && acc.passes > 3 * (mb_coded - p) - 2 {
+        return Err(Error::InvalidPacketHeader);
+    }
+    // -- HTJ2K (T.814) HT code-block path --
+    // When the tile-component signals HT block coding (SPcod
+    // bit 6, or an HTONLY CAP), every code-block is an HT
+    // code-block (§A.4 HTONLY / HTDECLARED) and an HT tier-1
+    // failure is a stream error. In a §A.4 MIXED tile-component
+    // the lane resolves per block: a tier-2-pinned HT block still
+    // fails hard (driving the caller's depth-first re-walk), a
+    // pinned T.800 block skips straight to Annex D, and an
+    // unresolved block is arbitrated exactly as the §A.4 NOTE
+    // prescribes — "processing the code-block assuming it
+    // conforms to Annex B; failure of such processing indicates
+    // that the code-block might conform to" T.800 — with the
+    // Annex D lane as the fallback.
+    let mixed_ty = style
+        .mixed
+        .then(|| acc.mixed.unwrap_or(crate::packet::MixedBlockType::Unknown));
+    let try_ht = style.high_throughput
+        || matches!(
+            mixed_ty,
+            Some(crate::packet::MixedBlockType::Ht | crate::packet::MixedBlockType::Unknown)
+        );
+    let mut ht_failed = false;
+    if try_ht {
+        match ht_tier1_block(
+            acc,
+            p,
+            mb,
+            mb_coded,
+            s,
+            psb.orientation,
+            placement.width() as usize,
+            placement.height() as usize,
+        ) {
+            Ok(Some((block, nb_ht))) => {
+                return Ok(Some(ReconstructedBlock {
+                    resolution: *r,
+                    sub_band: *sb,
+                    placement,
+                    orientation: psb.orientation,
+                    values: BlockValues::reconstruct(&block, nb_ht, quant, job.reversible),
+                }));
+            }
+            Ok(None) => {
+                // Nothing decodable under the HT reading (only
+                // placeholder passes / absent cleanup segments).
+                // For a genuine HT block that is a valid
+                // all-zero outcome; for an unresolved MIXED
+                // block the T.800 reading of the same record is
+                // a zero-byte contribution decoding to the same
+                // all-zero block — skip either way.
+                return Ok(None);
+            }
+            Err(e) => {
+                if !matches!(mixed_ty, Some(crate::packet::MixedBlockType::Unknown)) {
+                    return Err(e);
+                }
+                // §A.4 NOTE: HT processing failed — the block
+                // might conform to T.800. Fall through.
+                ht_failed = true;
+            }
+        }
+    }
+    let _ = ht_failed;
+    // -- T.800 Annex D path --
+    // For a MIXED block the Annex D reading treats every
+    // accumulated contribution as one continuous §C.3 codeword
+    // segment (the §A.4-derived K(T.800) = 1 — no bypass, no
+    // per-pass termination), so the per-span records concatenate;
+    // and the §D.3 pass cap deferred above applies now.
+    let mixed_concat: Vec<AccumSegment>;
+    let segments: &[AccumSegment] = if mixed_ty.is_some() {
+        if acc.passes > 3 * (mb_coded - p) - 2 {
+            return Err(Error::InvalidPacketHeader);
+        }
+        let mut bytes = Vec::new();
+        for seg in &acc.segments {
+            bytes.extend_from_slice(&seg.bytes);
+        }
+        mixed_concat = vec![AccumSegment {
+            bytes,
+            passes: acc.passes,
+            is_raw: false,
+            start_pass: 0,
+        }];
+        &mixed_concat
+    } else {
+        &acc.segments
+    };
+    let block = match work_block {
+        Some(block) => {
+            block.reset_for_decode(
+                psb.orientation,
+                placement.width() as usize,
+                placement.height() as usize,
+            );
+            block
+        }
+        empty @ None => empty.insert(CodeBlock::new(
+            psb.orientation,
+            placement.width() as usize,
+            placement.height() as usize,
+        )),
+    };
+    let mut ctx = reset_contexts();
+    let mut seq = BitPlaneSequencer::new(mb_coded - 1 - p)
+        .with_segmentation_symbols(style.segmentation_symbols)
+        .with_vertically_causal_context(style.vertically_causal)
+        .with_reset_context_probabilities(style.reset_context_probabilities)
+        .with_termination_on_each_coding_pass(style.termination_on_each_coding_pass)
+        .with_selective_arithmetic_coding_bypass(style.selective_arithmetic_coding_bypass)
+        .with_predictable_termination(style.predictable_termination);
+    // Drive the §D.3 pass schedule across this code-block's §C.3
+    // codeword segments. Each AC segment opens a fresh MqDecoder (the
+    // MQ engine restarts per §C.3 at every termination boundary —
+    // §D.4.1 0xFF-fill is synthesised by `MqDecoder::new`), while
+    // the Annex D context array (`ctx`) persists across segments per
+    // §D.4 (unless the §C.3.6 reset bit is set, which the sequencer
+    // applies internally). The single-segment case is one iteration
+    // carrying every pass; the §D.4.2 per-pass case is one iteration
+    // per terminated pass; the §D.6 bypass case alternates AC and
+    // raw spans (each raw span opens a fresh RawBitReader instead).
+    let last_coded = segments.iter().rposition(|seg| seg.passes > 0);
+    for (si, seg) in segments.iter().enumerate() {
+        if seg.passes == 0 {
+            continue;
+        }
+        if seg.is_raw {
+            // §D.6 raw (lazy) span — the SP / MR passes read from a
+            // bit-stuffed stream. The MQ context array is untouched.
+            let mut raw = crate::t1::RawBitReader::new_with_d4_1_fill(&seg.bytes);
+            seq.decode_passes_raw(block, &mut raw, seg.passes)?;
+        } else {
+            let mut decoder = crate::mq::MqDecoder::new(&seg.bytes);
+            match seq.decode_passes(block, &mut decoder, &mut ctx, seg.passes) {
+                Ok(_) => {}
+                // §D.5 positions the segmentation symbol as error
+                // *detection*. On a layer-limited decode the final
+                // accumulated pass is a deliberate prefix cut whose
+                // tail decisions may diverge under the §D.4.1 fill,
+                // so a mismatch on the last coded segment is the
+                // expected truncation artefact (§J.7 resilience:
+                // keep the decoded passes), not stream corruption.
+                // A full decode still surfaces it.
+                Err(Error::SegmentationSymbolMismatch)
+                    if acc.layer_truncated && Some(si) == last_coded =>
+                {
+                    break;
+                }
+                Err(e) => return Err(e),
+            }
+            // §D.4.2 predictable termination (Table A.19 bit 4)
+            // constrains the *encoder's* flush procedure only — the
+            // decode path is unchanged and the §D.4.1 synthesised
+            // 0xFF extension still applies ("Often at that point
+            // there are more symbols to be decoded. Therefore, the
+            // decoder shall extend the input bit stream … with 0xFF
+            // bytes"). Real predictable-termination codestreams
+            // routinely finish their final renormalisations inside
+            // that synthesised fill, so no landing-position check can
+            // be made without rejecting conforming streams; §J.7
+            // names the segmentation symbol (§D.5) as the in-stream
+            // error-detection mechanism instead.
+        }
+    }
+    // Record the §B.10.5 zero-MSB count so the reassembly bridge can
+    // recover the full per-coefficient §D.2.1 Nb(u, v) =
+    // P + decoded_bits(u, v). The tier-1 passes have already tracked
+    // each coefficient's decoded-bit count; under mid-bit-plane
+    // truncation those counts diverge (the §E.1.1.2 / E.1.2.1
+    // per-coefficient Nb), tightening the Equation E-6 / E-8 lift
+    // versus the per-block `nb` fallback below.
+    block.set_zero_bit_planes(p);
+    let nb = p + completed_bitplanes(acc.passes);
+    // §H.1 region-of-interest (Maxshift) decode: re-anchor every
+    // coefficient from the `M'b = Mb + s` coded budget back to the
+    // background `Mb` and rewrite the per-coefficient Nb(u, v). A
+    // no-op when `s == 0` (no `RGN` for this component).
+    block.apply_roi_maxshift(mb, s);
+    Ok(Some(ReconstructedBlock {
+        resolution: *r,
+        sub_band: *sb,
+        placement,
+        orientation: psb.orientation,
+        values: BlockValues::reconstruct(block, nb, quant, job.reversible),
+    }))
+}
+
 /// Tier-1 / reassembly half of [`decode_tile`], operating on the
 /// already-built [`TilePacketPlan`] and the walked packet headers. Split
 /// out so the geometry/walk half can be reused by the relocated-header
@@ -1785,6 +2112,7 @@ fn decode_tile_from_plan(
     headers: &[(crate::packet::PacketHeader, usize)],
     discard_levels: u8,
     max_layers: u16,
+    threads: usize,
 ) -> Result<Vec<Vec<i32>>, Error> {
     let num_components = siz.components.len();
     let tile = derive_tile_geometry(siz, tile_index)?;
@@ -2117,279 +2445,36 @@ fn decode_tile_from_plan(
             }
             WaveletTransform::Reserved(_) => return Err(Error::NotImplemented),
         };
-        let mut work_block: Option<CodeBlock> = None;
-        while let Some((key, acc)) = accum.next_if(|(key, _)| usize::from(key.0) == c) {
-            let (c, r, k, sb, cbx, cby) = &key;
-            if acc.passes == 0 {
-                continue;
-            }
-            // Reduced-resolution decode: blocks above the kept resolution
-            // level contribute nothing to the truncated synthesis — skip
-            // their (already length-accounted) tier-1 work entirely.
-            {
-                let keep = comp_coding
-                    .get(*c as usize)
-                    .ok_or(Error::InvalidMarkerLength)?
-                    .n_l
-                    - discard_levels;
-                if *r > keep {
-                    continue;
-                }
-            }
-            let geom = precinct_geom
-                .get(&(*c, *r, *k))
-                .ok_or(Error::InvalidPacketHeader)?;
-            let psb = geom
-                .sub_bands
-                .get(*sb as usize)
-                .ok_or(Error::InvalidPacketHeader)?;
-            if *cbx >= psb.grid_wide || *cby >= psb.grid_high {
-                return Err(Error::InvalidPacketHeader);
-            }
-            let placement =
-                psb.code_blocks[(*cby as usize) * (psb.grid_wide as usize) + *cbx as usize];
-            // Per-level band order matches the §B.9 packet sub-band order
-            // ([LL] at r = 0, [HL, LH, HH] at r ≥ 1), so the packet's
-            // sub-band index addresses the quant table directly.
-            let quant = quant_per_comp[*c as usize][*r as usize]
-                .get(*sb as usize)
-                .ok_or(Error::InvalidPacketHeader)?;
-            let mb = quant.mb;
-            // §H.1 / §H.2: under an `RGN` Maxshift the encoder shifts ROI
-            // coefficients up into the top `s` bit-planes, so the coded
-            // bit budget is `M'b = Mb + s`. The tier-1 schedule, the
-            // zero-bit-plane bound and the pass-count cap all run against
-            // `M'b`; the §H.1 de-scaling below re-anchors the magnitudes to
-            // the background `Mb` before reassembly. With no `RGN` `s = 0`
-            // and `mb_coded == mb`.
-            let s = roi_shift.get(*c as usize).copied().unwrap_or(0);
-            let mb_coded = mb.saturating_add(s);
-            // Implementation limit: tier-1 assembles magnitudes into a
-            // 31-bit `u32` lane (sign carried separately), so the §D.3 /
-            // §7.6 bit-plane weights `2^(M'b − 1 − P) … 2^0` must fit it.
-            // Equation E-2 admits `Mb` up to 37 (`εb = 31`, 7 guard bits)
-            // and an `RGN` shift stacks on top — a coded budget past the
-            // lane cannot be represented, so it is rejected cleanly here
-            // rather than overflowing the pass weights downstream.
-            if mb_coded > 31 {
-                return Err(Error::NotImplemented);
-            }
-            let p = acc.p.ok_or(Error::InvalidPacketHeader)?;
-            if p >= mb_coded {
-                return Err(Error::InvalidPacketHeader);
-            }
-            // The Table A.19 style byte resolved for this block's
-            // component (§A.6.2) — tier-1 dispatch is per component.
-            let style = comp_coding
-                .get(*c as usize)
-                .ok_or(Error::InvalidMarkerLength)?
-                .style;
-            // §D.3: at most 3 (M'b − P) − 2 passes fit above bit-plane 0.
-            // The HT path has its own §B.3 cap (Z_blk ≤ 3) and a different
-            // pass↔bit-plane relationship, so the Annex D cap does not
-            // apply; a MIXED block's lane is not known yet, so its cap is
-            // applied on the Annex D side of the dispatch below.
-            if !style.high_throughput && !style.mixed && acc.passes > 3 * (mb_coded - p) - 2 {
-                return Err(Error::InvalidPacketHeader);
-            }
-            // -- HTJ2K (T.814) HT code-block path --
-            // When the tile-component signals HT block coding (SPcod
-            // bit 6, or an HTONLY CAP), every code-block is an HT
-            // code-block (§A.4 HTONLY / HTDECLARED) and an HT tier-1
-            // failure is a stream error. In a §A.4 MIXED tile-component
-            // the lane resolves per block: a tier-2-pinned HT block still
-            // fails hard (driving the caller's depth-first re-walk), a
-            // pinned T.800 block skips straight to Annex D, and an
-            // unresolved block is arbitrated exactly as the §A.4 NOTE
-            // prescribes — "processing the code-block assuming it
-            // conforms to Annex B; failure of such processing indicates
-            // that the code-block might conform to" T.800 — with the
-            // Annex D lane as the fallback.
-            let mixed_ty = style
-                .mixed
-                .then(|| acc.mixed.unwrap_or(crate::packet::MixedBlockType::Unknown));
-            let try_ht = style.high_throughput
-                || matches!(
-                    mixed_ty,
-                    Some(
-                        crate::packet::MixedBlockType::Ht | crate::packet::MixedBlockType::Unknown
-                    )
-                );
-            let mut ht_failed = false;
-            if try_ht {
-                match ht_tier1_block(
-                    &acc,
-                    p,
-                    mb,
-                    mb_coded,
-                    s,
-                    psb.orientation,
-                    placement.width() as usize,
-                    placement.height() as usize,
-                ) {
-                    Ok(Some((block, nb_ht))) => {
-                        surface.scatter(
-                            *r,
-                            *sb,
-                            CodedCodeBlock {
-                                placement,
-                                coefficients: &block,
-                                nb: nb_ht,
-                            },
-                            quant,
-                        )?;
-                        continue;
-                    }
-                    Ok(None) => {
-                        // Nothing decodable under the HT reading (only
-                        // placeholder passes / absent cleanup segments).
-                        // For a genuine HT block that is a valid
-                        // all-zero outcome; for an unresolved MIXED
-                        // block the T.800 reading of the same record is
-                        // a zero-byte contribution decoding to the same
-                        // all-zero block — skip either way.
-                        continue;
-                    }
-                    Err(e) => {
-                        if !matches!(mixed_ty, Some(crate::packet::MixedBlockType::Unknown)) {
-                            return Err(e);
-                        }
-                        // §A.4 NOTE: HT processing failed — the block
-                        // might conform to T.800. Fall through.
-                        ht_failed = true;
-                    }
-                }
-            }
-            let _ = ht_failed;
-            // -- T.800 Annex D path --
-            // For a MIXED block the Annex D reading treats every
-            // accumulated contribution as one continuous §C.3 codeword
-            // segment (the §A.4-derived K(T.800) = 1 — no bypass, no
-            // per-pass termination), so the per-span records concatenate;
-            // and the §D.3 pass cap deferred above applies now.
-            let mixed_concat: Vec<AccumSegment>;
-            let segments: &[AccumSegment] = if mixed_ty.is_some() {
-                if acc.passes > 3 * (mb_coded - p) - 2 {
-                    return Err(Error::InvalidPacketHeader);
-                }
-                let mut bytes = Vec::new();
-                for seg in &acc.segments {
-                    bytes.extend_from_slice(&seg.bytes);
-                }
-                mixed_concat = vec![AccumSegment {
-                    bytes,
-                    passes: acc.passes,
-                    is_raw: false,
-                    start_pass: 0,
-                }];
-                &mixed_concat
-            } else {
-                &acc.segments
-            };
-            let block = match &mut work_block {
-                Some(block) => {
-                    block.reset_for_decode(
-                        psb.orientation,
-                        placement.width() as usize,
-                        placement.height() as usize,
-                    );
-                    block
-                }
-                empty @ None => empty.insert(CodeBlock::new(
-                    psb.orientation,
-                    placement.width() as usize,
-                    placement.height() as usize,
-                )),
-            };
-            let mut ctx = reset_contexts();
-            let mut seq = BitPlaneSequencer::new(mb_coded - 1 - p)
-                .with_segmentation_symbols(style.segmentation_symbols)
-                .with_vertically_causal_context(style.vertically_causal)
-                .with_reset_context_probabilities(style.reset_context_probabilities)
-                .with_termination_on_each_coding_pass(style.termination_on_each_coding_pass)
-                .with_selective_arithmetic_coding_bypass(style.selective_arithmetic_coding_bypass)
-                .with_predictable_termination(style.predictable_termination);
-            // Drive the §D.3 pass schedule across this code-block's §C.3
-            // codeword segments. Each AC segment opens a fresh MqDecoder (the
-            // MQ engine restarts per §C.3 at every termination boundary —
-            // §D.4.1 0xFF-fill is synthesised by `MqDecoder::new`), while
-            // the Annex D context array (`ctx`) persists across segments per
-            // §D.4 (unless the §C.3.6 reset bit is set, which the sequencer
-            // applies internally). The single-segment case is one iteration
-            // carrying every pass; the §D.4.2 per-pass case is one iteration
-            // per terminated pass; the §D.6 bypass case alternates AC and
-            // raw spans (each raw span opens a fresh RawBitReader instead).
-            let last_coded = segments.iter().rposition(|seg| seg.passes > 0);
-            for (si, seg) in segments.iter().enumerate() {
-                if seg.passes == 0 {
-                    continue;
-                }
-                if seg.is_raw {
-                    // §D.6 raw (lazy) span — the SP / MR passes read from a
-                    // bit-stuffed stream. The MQ context array is untouched.
-                    let mut raw = crate::t1::RawBitReader::new_with_d4_1_fill(&seg.bytes);
-                    seq.decode_passes_raw(block, &mut raw, seg.passes)?;
-                } else {
-                    let mut decoder = crate::mq::MqDecoder::new(&seg.bytes);
-                    match seq.decode_passes(block, &mut decoder, &mut ctx, seg.passes) {
-                        Ok(_) => {}
-                        // §D.5 positions the segmentation symbol as error
-                        // *detection*. On a layer-limited decode the final
-                        // accumulated pass is a deliberate prefix cut whose
-                        // tail decisions may diverge under the §D.4.1 fill,
-                        // so a mismatch on the last coded segment is the
-                        // expected truncation artefact (§J.7 resilience:
-                        // keep the decoded passes), not stream corruption.
-                        // A full decode still surfaces it.
-                        Err(Error::SegmentationSymbolMismatch)
-                            if acc.layer_truncated && Some(si) == last_coded =>
-                        {
-                            break;
-                        }
-                        Err(e) => return Err(e),
-                    }
-                    // §D.4.2 predictable termination (Table A.19 bit 4)
-                    // constrains the *encoder's* flush procedure only — the
-                    // decode path is unchanged and the §D.4.1 synthesised
-                    // 0xFF extension still applies ("Often at that point
-                    // there are more symbols to be decoded. Therefore, the
-                    // decoder shall extend the input bit stream … with 0xFF
-                    // bytes"). Real predictable-termination codestreams
-                    // routinely finish their final renormalisations inside
-                    // that synthesised fill, so no landing-position check can
-                    // be made without rejecting conforming streams; §J.7
-                    // names the segmentation symbol (§D.5) as the in-stream
-                    // error-detection mechanism instead.
-                }
-            }
-            // Record the §B.10.5 zero-MSB count so the reassembly bridge can
-            // recover the full per-coefficient §D.2.1 Nb(u, v) =
-            // P + decoded_bits(u, v). The tier-1 passes have already tracked
-            // each coefficient's decoded-bit count; under mid-bit-plane
-            // truncation those counts diverge (the §E.1.1.2 / E.1.2.1
-            // per-coefficient Nb), tightening the Equation E-6 / E-8 lift
-            // versus the per-block `nb` fallback below.
-            block.set_zero_bit_planes(p);
-            let nb = p + completed_bitplanes(acc.passes);
-            // §H.1 region-of-interest (Maxshift) decode: re-anchor every
-            // coefficient from the `M'b = Mb + s` coded budget back to the
-            // background `Mb` and rewrite the per-coefficient Nb(u, v). A
-            // no-op when `s == 0` (no `RGN` for this component).
-            block.apply_roi_maxshift(mb, s);
-            surface.scatter(
-                *r,
-                *sb,
-                CodedCodeBlock {
-                    placement,
-                    coefficients: block,
-                    nb,
-                },
-                quant,
-            )?;
+        // Tier-1 fan-out: the component's blocks are independent, so
+        // they decode on up to `threads` workers; the results are
+        // placed on this thread in block order, so the surface — and
+        // the first error reported — is the same at every budget.
+        let mut jobs: Vec<(BlockKey, BlockAccum)> = Vec::new();
+        while let Some(entry) = accum.next_if(|(key, _)| usize::from(key.0) == c) {
+            jobs.push(entry);
         }
-
-        // No entropy state is needed during IDWT or by later components.
-        drop(work_block);
+        let job_context = BlockJobContext {
+            comp_coding,
+            precinct_geom,
+            quant_per_comp: &quant_per_comp,
+            roi_shift,
+            discard_levels,
+            reversible: matches!(cc.transform, WaveletTransform::Reversible5x3),
+        };
+        crate::parallel::ordered_map(
+            threads,
+            jobs.len(),
+            || None::<CodeBlock>,
+            |work_block, index| {
+                let (key, acc) = &jobs[index];
+                decode_block_job(&job_context, work_block, key, acc)
+            },
+            |_, outcome| match outcome? {
+                Some(block) => surface.scatter_block(&block),
+                None => Ok(()),
+            },
+        )?;
+        drop(jobs);
         let out_level = &levels[keep];
         let tc = &tile.components[c];
         let (tw, th) = if discard_levels == 0 {
@@ -2611,7 +2696,7 @@ pub fn decode_j2k(bytes: &[u8]) -> Result<DecodedImage, Error> {
 /// [`Error::InvalidDecompositionLevels`].
 pub fn decode_j2k_reduced(bytes: &[u8], discard_levels: u8) -> Result<DecodedImage, Error> {
     let cs: J2kCodestream = crate::parse_codestream(bytes)?;
-    decode_codestream_impl(bytes, &cs, discard_levels, u16::MAX)
+    decode_codestream_impl(bytes, &cs, discard_levels, u16::MAX, 1)
 }
 
 /// Decode a J2K codestream from its first `max_layers` quality layers
@@ -2634,13 +2719,13 @@ pub fn decode_j2k_layers(bytes: &[u8], max_layers: u16) -> Result<DecodedImage, 
         return Err(Error::InvalidMarkerLength);
     }
     let cs: J2kCodestream = crate::parse_codestream(bytes)?;
-    decode_codestream_impl(bytes, &cs, 0, max_layers)
+    decode_codestream_impl(bytes, &cs, 0, max_layers, 1)
 }
 
 /// [`decode_j2k`] against an already-parsed [`J2kCodestream`] (the
 /// `bytes` must be the same buffer the codestream was parsed from).
 pub fn decode_codestream(bytes: &[u8], cs: &J2kCodestream) -> Result<DecodedImage, Error> {
-    decode_codestream_impl(bytes, cs, 0, u16::MAX)
+    decode_codestream_impl(bytes, cs, 0, u16::MAX, 1)
 }
 
 /// [`decode_codestream`] with the [`decode_j2k_reduced`] /
@@ -2651,11 +2736,12 @@ pub(crate) fn decode_codestream_with(
     cs: &J2kCodestream,
     discard_levels: u8,
     max_layers: u16,
+    threads: usize,
 ) -> Result<DecodedImage, Error> {
     if max_layers == 0 {
         return Err(Error::InvalidMarkerLength);
     }
-    decode_codestream_impl(bytes, cs, discard_levels, max_layers)
+    decode_codestream_impl(bytes, cs, discard_levels, max_layers, threads)
 }
 
 /// Ceiling division of `v` by `2^d` (Equation B-14's reduced-grid
@@ -2674,6 +2760,7 @@ fn decode_codestream_impl(
     cs: &J2kCodestream,
     discard_levels: u8,
     max_layers: u16,
+    threads: usize,
 ) -> Result<DecodedImage, Error> {
     let ht_sig = reject_unsupported_main_header_markers(bytes, cs.header.bytes_consumed)?;
 
@@ -2976,6 +3063,7 @@ fn decode_codestream_impl(
             discard_levels,
             max_layers,
             any_plt.then_some(plt_plan.as_slice()),
+            threads,
         )?;
 
         // Place each tile-component plane into its image-area plane at

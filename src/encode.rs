@@ -1498,6 +1498,15 @@ pub struct EncodeOptions {
     /// `M'b = Mb + s` to stay within this implementation's 30-bit
     /// magnitude lane (8-bit inputs always fit). Default `None`.
     pub roi: Option<RoiRegion>,
+    /// Worker budget for the encoder's internal fan-out (the forward
+    /// wavelet cascades run one component per worker; Tier-1 codes
+    /// independent code-blocks concurrently). `1` (the default) is
+    /// strictly serial and spawns nothing. The emitted bytes are
+    /// identical at every budget — rate allocation runs on the
+    /// collected block results in a fixed order. `0` is treated as `1`.
+    /// The framework adapter fills this from the
+    /// `oxideav_core::ExecutionContext` it is handed.
+    pub threads: usize,
 }
 
 impl Default for EncodeOptions {
@@ -1534,6 +1543,7 @@ impl Default for EncodeOptions {
             ht_refinement: false,
             ht_mixed: false,
             roi: None,
+            threads: 1,
         }
     }
 }
@@ -1660,6 +1670,12 @@ impl EncodeOptions {
     /// Set (or clear) the `COM` marker text.
     pub fn with_comment(mut self, comment: impl Into<Option<String>>) -> Self {
         self.comment = comment.into();
+        self
+    }
+
+    /// Set the worker budget ([`Self::threads`]; `0` is treated as `1`).
+    pub fn with_threads(mut self, threads: usize) -> Self {
+        self.threads = threads.max(1);
         self
     }
 }
@@ -2388,9 +2404,227 @@ fn encode_core(
     let mut tile_prog: Vec<(Vec<ComponentProgressionInfo>, Vec<ComponentPositionInfo>)> =
         Vec::with_capacity(num_tiles as usize);
 
+    // -- Tier-1 block job ------------------------------------------------
+    // One code-block's forward coding, independent of every other
+    // block: the jobs of a tile run on up to `params.threads` workers
+    // and their results are folded back in block order, so every
+    // order-dependent quantity (block ordinals, the deepest coded
+    // depth, the MAGB bound) is the same at any budget.
+    struct BlockJob<'a> {
+        orientation: SubBandOrientation,
+        cb: crate::geometry::PrecinctCodeBlock,
+        plane: &'a BandPlane,
+        mask_plane: Option<&'a MaskPlane>,
+        roi_shift: u32,
+        mb: u32,
+        weight: f64,
+        /// Where the result lands: precinct key, sub-band index within
+        /// the precinct, block index within the sub-band grid, and
+        /// block index within the precinct's §B.10.8 list.
+        precinct: (u32, u16, u8, u32),
+        sub_band: usize,
+        in_band: usize,
+        in_precinct: usize,
+    }
+    /// A job's result: the coded block (`None` when all-zero), the HT
+    /// magnitude bit count it contributes to MAGB, and its targets
+    /// (kept for the rate-control re-encode).
+    type BlockOutcome = Result<(Option<EncodedBlock>, u32, Vec<Coefficient>), Error>;
+    let encode_block = |job: &BlockJob<'_>| -> BlockOutcome {
+        let (bw, bh) = (job.cb.width() as usize, job.cb.height() as usize);
+        let (plane, mb) = (job.plane, job.mb);
+        let mut ht_bits = 0u32;
+        let mut targets = Vec::with_capacity(bw * bh);
+        for v in job.cb.y0..job.cb.y1 {
+            for u in job.cb.x0..job.cb.x1 {
+                let s =
+                    plane.data[((v - plane.y0) as usize) * plane.width + (u - plane.x0) as usize];
+                let mut magnitude = s.unsigned_abs();
+                // §H.2.1: scale the masked (ROI)
+                // quantized coefficients up by 2^s so
+                // their bits sit above every
+                // background bit-plane.
+                if let Some(mp) = job.mask_plane
+                    && mp.data[((v - mp.y0) as usize) * mp.width + (u - mp.x0) as usize]
+                {
+                    magnitude <<= job.roi_shift;
+                }
+                targets.push(Coefficient {
+                    magnitude,
+                    sigma: false,
+                    sign: s < 0,
+                    already_refined: false,
+                });
+            }
+        }
+        let enc = if params.high_throughput {
+            // T.814 §7.3 (+ §7.4 / §7.5) HT forward
+            // coding: the cleanup pass transports the
+            // full magnitudes (or all but bit-plane 0
+            // under ht_refinement), signalled with
+            // P = Mb − 1 − β so the §7.6 positioning
+            // lands the LSB at weight 2^0 (Nb =
+            // S_blk + 1 + z_n).
+            let maxmag = targets.iter().map(|c| c.magnitude).max().unwrap_or(0);
+            if maxmag == 0 {
+                None
+            } else {
+                let planes = 32 - maxmag.leading_zeros();
+                if planes > mb {
+                    return Err(Error::NotImplemented);
+                }
+                let mag: Vec<u32> = targets.iter().map(|c| c.magnitude).collect();
+                let sgn: Vec<bool> = targets.iter().map(|c| c.sign).collect();
+                if layer_count > 1 {
+                    // T.814 MULTIHT: one §B.1 HT set
+                    // per quality layer, each set one
+                    // magnitude bit-plane finer (the
+                    // §B.3 S_blk grows by one per
+                    // set); P = Mb − J anchors the
+                    // final set at full precision
+                    // (S_blk = Mb − 1). A block too
+                    // shallow for the early layers
+                    // fills them with placeholder
+                    // triples instead of sets, and a
+                    // band too shallow for the layer
+                    // count simply stops
+                    // contributing (J < L).
+                    let j_eff = u32::from(layer_count).min(mb);
+                    let k = j_eff.saturating_sub(planes);
+                    let mut bytes = Vec::new();
+                    let mut lens = Vec::with_capacity((j_eff - k) as usize);
+                    for l in k..j_eff {
+                        let shift = j_eff - 1 - l;
+                        let mag_l: Vec<u32> = mag.iter().map(|&m| m >> shift).collect();
+                        let hb = crate::htenc::encode_ht_codeblock(&mag_l, &sgn, bw, bh, false)?;
+                        debug_assert_eq!(hb.beta, 0);
+                        lens.push(hb.cleanup.len());
+                        bytes.extend_from_slice(&hb.cleanup);
+                    }
+                    ht_bits = ht_bits.max(planes);
+                    Some(EncodedBlock {
+                        zero_bit_planes: mb - j_eff,
+                        coding_passes: 3 * (j_eff - 1) + 1,
+                        bytes,
+                        pass_rates: Vec::new(),
+                        truncation_rates: Vec::new(),
+                        pass_dist: Vec::new(),
+                        d0: 0.0,
+                        weight: 1.0,
+                        ordinal: 0,
+                        reencode: None,
+                        ht_cleanup_len: None,
+                        ht_multi: Some(HtMultiPlan {
+                            placeholder_layers: k,
+                            cleanup_lens: lens,
+                        }),
+                    })
+                } else {
+                    let hb = crate::htenc::encode_ht_codeblock(
+                        &mag,
+                        &sgn,
+                        bw,
+                        bh,
+                        params.ht_refinement,
+                    )?;
+                    ht_bits = ht_bits.max(planes - hb.beta);
+                    let cleanup_len = hb.cleanup.len();
+                    let z_blk = if hb.refinement.is_some() { 3 } else { 1 };
+                    let mut bytes = hb.cleanup;
+                    if let Some(r) = hb.refinement {
+                        bytes.extend_from_slice(&r);
+                    }
+                    Some(EncodedBlock {
+                        zero_bit_planes: mb - 1 - hb.beta,
+                        coding_passes: z_blk,
+                        bytes,
+                        pass_rates: Vec::new(),
+                        truncation_rates: Vec::new(),
+                        pass_dist: Vec::new(),
+                        d0: 0.0,
+                        weight: 1.0,
+                        ordinal: 0,
+                        reencode: None,
+                        ht_cleanup_len: Some(cleanup_len),
+                        ht_multi: None,
+                    })
+                }
+            }
+        } else {
+            let annexd = encode_code_block(
+                job.orientation,
+                bw,
+                bh,
+                &targets,
+                mb,
+                PassCapture {
+                    rates: want_rates,
+                    dist: rate_control,
+                    max_passes: None,
+                    ..PassCapture::styles(params)
+                },
+            )?;
+            if params.ht_mixed {
+                // T.814 §A.4 MIXED: code the block
+                // through the §7.3 HT cleanup pass
+                // as well and keep the HT lane
+                // wherever its cost stays inside
+                // the throughput budget — no more
+                // than one-eighth plus two bytes
+                // over the Annex D codeword (the
+                // §A.4 signalling headroom). MQ
+                // blocks that compress markedly
+                // better (structured content)
+                // stay Annex D. §B.3 requires the
+                // first HT cleanup segment longer
+                // than one byte, so a 0/1-byte HT
+                // candidate stays Annex D too.
+                let maxmag = targets.iter().map(|c| c.magnitude).max().unwrap_or(0);
+                let planes = 32 - maxmag.leading_zeros();
+                let ht = if maxmag > 0 && planes <= mb {
+                    let mag: Vec<u32> = targets.iter().map(|c| c.magnitude).collect();
+                    let sgn: Vec<bool> = targets.iter().map(|c| c.sign).collect();
+                    Some(crate::htenc::encode_ht_codeblock(
+                        &mag, &sgn, bw, bh, false,
+                    )?)
+                } else {
+                    None
+                };
+                match (annexd, ht) {
+                    (Some(a), Some(hb))
+                        if hb.cleanup.len() >= 2
+                            && 8 * hb.cleanup.len() <= 9 * a.bytes.len() + 16 =>
+                    {
+                        ht_bits = ht_bits.max(planes - hb.beta);
+                        let cleanup_len = hb.cleanup.len();
+                        Some(EncodedBlock {
+                            zero_bit_planes: mb - 1 - hb.beta,
+                            coding_passes: 1,
+                            bytes: hb.cleanup,
+                            pass_rates: Vec::new(),
+                            truncation_rates: Vec::new(),
+                            pass_dist: Vec::new(),
+                            d0: 0.0,
+                            weight: 1.0,
+                            ordinal: 0,
+                            reencode: None,
+                            ht_cleanup_len: Some(cleanup_len),
+                            ht_multi: None,
+                        })
+                    }
+                    (a, _) => a,
+                }
+            } else {
+                annexd
+            }
+        };
+        Ok((enc, ht_bits, targets))
+    };
+
     for t in 0..num_tiles {
         let tile = derive_tile_geometry(&siz, t)?;
         let bands = transform_tile(&tile)?;
+        let mut jobs: Vec<BlockJob<'_>> = Vec::new();
         // §H.3.1 wavelet-domain ROI masks for this tile's components.
         let roi_masks: Option<Vec<MaskBands>> = params.roi.as_ref().map(|rect| {
             tile.components
@@ -2453,7 +2687,7 @@ fn encode_core(
                             height: psb.grid_high,
                         };
                         let nblocks = (psb.grid_wide as usize) * (psb.grid_high as usize);
-                        let mut zbp = vec![0u32; nblocks];
+                        let zbp = vec![0u32; nblocks];
                         // Sub-band plane for (ci, r, orientation).
                         let plane: &BandPlane = if level.r == 0 {
                             &bands[ci].ll
@@ -2517,221 +2751,24 @@ fn encode_core(
                             1.0
                         };
                         for (bi, cb) in psb.code_blocks.iter().enumerate() {
-                            let (bw, bh) = (cb.width() as usize, cb.height() as usize);
-                            if bw == 0 || bh == 0 {
-                                blocks.push(None);
+                            let in_precinct = blocks.len();
+                            blocks.push(None);
+                            if cb.width() == 0 || cb.height() == 0 {
                                 continue;
                             }
-                            // Extract the block's coefficients from the band
-                            // plane (absolute Table B.1 band coordinates,
-                            // offset by the plane's corner).
-                            let mut targets = Vec::with_capacity(bw * bh);
-                            for v in cb.y0..cb.y1 {
-                                for u in cb.x0..cb.x1 {
-                                    let s = plane.data[((v - plane.y0) as usize) * plane.width
-                                        + (u - plane.x0) as usize];
-                                    let mut magnitude = s.unsigned_abs();
-                                    // §H.2.1: scale the masked (ROI)
-                                    // quantized coefficients up by 2^s so
-                                    // their bits sit above every
-                                    // background bit-plane.
-                                    if let Some(mp) = mask_plane
-                                        && mp.data[((v - mp.y0) as usize) * mp.width
-                                            + (u - mp.x0) as usize]
-                                    {
-                                        magnitude <<= roi_s[ci];
-                                    }
-                                    targets.push(Coefficient {
-                                        magnitude,
-                                        sigma: false,
-                                        sign: s < 0,
-                                        already_refined: false,
-                                    });
-                                }
-                            }
-                            let mut enc = if params.high_throughput {
-                                // T.814 §7.3 (+ §7.4 / §7.5) HT forward
-                                // coding: the cleanup pass transports the
-                                // full magnitudes (or all but bit-plane 0
-                                // under ht_refinement), signalled with
-                                // P = Mb − 1 − β so the §7.6 positioning
-                                // lands the LSB at weight 2^0 (Nb =
-                                // S_blk + 1 + z_n).
-                                let maxmag = targets.iter().map(|c| c.magnitude).max().unwrap_or(0);
-                                if maxmag == 0 {
-                                    None
-                                } else {
-                                    let planes = 32 - maxmag.leading_zeros();
-                                    if planes > mb {
-                                        return Err(Error::NotImplemented);
-                                    }
-                                    let mag: Vec<u32> =
-                                        targets.iter().map(|c| c.magnitude).collect();
-                                    let sgn: Vec<bool> = targets.iter().map(|c| c.sign).collect();
-                                    if layer_count > 1 {
-                                        // T.814 MULTIHT: one §B.1 HT set
-                                        // per quality layer, each set one
-                                        // magnitude bit-plane finer (the
-                                        // §B.3 S_blk grows by one per
-                                        // set); P = Mb − J anchors the
-                                        // final set at full precision
-                                        // (S_blk = Mb − 1). A block too
-                                        // shallow for the early layers
-                                        // fills them with placeholder
-                                        // triples instead of sets, and a
-                                        // band too shallow for the layer
-                                        // count simply stops
-                                        // contributing (J < L).
-                                        let j_eff = u32::from(layer_count).min(mb);
-                                        let k = j_eff.saturating_sub(planes);
-                                        let mut bytes = Vec::new();
-                                        let mut lens = Vec::with_capacity((j_eff - k) as usize);
-                                        for l in k..j_eff {
-                                            let shift = j_eff - 1 - l;
-                                            let mag_l: Vec<u32> =
-                                                mag.iter().map(|&m| m >> shift).collect();
-                                            let hb = crate::htenc::encode_ht_codeblock(
-                                                &mag_l, &sgn, bw, bh, false,
-                                            )?;
-                                            debug_assert_eq!(hb.beta, 0);
-                                            lens.push(hb.cleanup.len());
-                                            bytes.extend_from_slice(&hb.cleanup);
-                                        }
-                                        ht_max_bits = ht_max_bits.max(planes);
-                                        Some(EncodedBlock {
-                                            zero_bit_planes: mb - j_eff,
-                                            coding_passes: 3 * (j_eff - 1) + 1,
-                                            bytes,
-                                            pass_rates: Vec::new(),
-                                            truncation_rates: Vec::new(),
-                                            pass_dist: Vec::new(),
-                                            d0: 0.0,
-                                            weight: 1.0,
-                                            ordinal: 0,
-                                            reencode: None,
-                                            ht_cleanup_len: None,
-                                            ht_multi: Some(HtMultiPlan {
-                                                placeholder_layers: k,
-                                                cleanup_lens: lens,
-                                            }),
-                                        })
-                                    } else {
-                                        let hb = crate::htenc::encode_ht_codeblock(
-                                            &mag,
-                                            &sgn,
-                                            bw,
-                                            bh,
-                                            params.ht_refinement,
-                                        )?;
-                                        ht_max_bits = ht_max_bits.max(planes - hb.beta);
-                                        let cleanup_len = hb.cleanup.len();
-                                        let z_blk = if hb.refinement.is_some() { 3 } else { 1 };
-                                        let mut bytes = hb.cleanup;
-                                        if let Some(r) = hb.refinement {
-                                            bytes.extend_from_slice(&r);
-                                        }
-                                        Some(EncodedBlock {
-                                            zero_bit_planes: mb - 1 - hb.beta,
-                                            coding_passes: z_blk,
-                                            bytes,
-                                            pass_rates: Vec::new(),
-                                            truncation_rates: Vec::new(),
-                                            pass_dist: Vec::new(),
-                                            d0: 0.0,
-                                            weight: 1.0,
-                                            ordinal: 0,
-                                            reencode: None,
-                                            ht_cleanup_len: Some(cleanup_len),
-                                            ht_multi: None,
-                                        })
-                                    }
-                                }
-                            } else {
-                                let annexd = encode_code_block(
-                                    psb.orientation,
-                                    bw,
-                                    bh,
-                                    &targets,
-                                    mb,
-                                    PassCapture {
-                                        rates: want_rates,
-                                        dist: rate_control,
-                                        max_passes: None,
-                                        ..PassCapture::styles(params)
-                                    },
-                                )?;
-                                if params.ht_mixed {
-                                    // T.814 §A.4 MIXED: code the block
-                                    // through the §7.3 HT cleanup pass
-                                    // as well and keep the HT lane
-                                    // wherever its cost stays inside
-                                    // the throughput budget — no more
-                                    // than one-eighth plus two bytes
-                                    // over the Annex D codeword (the
-                                    // §A.4 signalling headroom). MQ
-                                    // blocks that compress markedly
-                                    // better (structured content)
-                                    // stay Annex D. §B.3 requires the
-                                    // first HT cleanup segment longer
-                                    // than one byte, so a 0/1-byte HT
-                                    // candidate stays Annex D too.
-                                    let maxmag =
-                                        targets.iter().map(|c| c.magnitude).max().unwrap_or(0);
-                                    let planes = 32 - maxmag.leading_zeros();
-                                    let ht = if maxmag > 0 && planes <= mb {
-                                        let mag: Vec<u32> =
-                                            targets.iter().map(|c| c.magnitude).collect();
-                                        let sgn: Vec<bool> =
-                                            targets.iter().map(|c| c.sign).collect();
-                                        Some(crate::htenc::encode_ht_codeblock(
-                                            &mag, &sgn, bw, bh, false,
-                                        )?)
-                                    } else {
-                                        None
-                                    };
-                                    match (annexd, ht) {
-                                        (Some(a), Some(hb))
-                                            if hb.cleanup.len() >= 2
-                                                && 8 * hb.cleanup.len()
-                                                    <= 9 * a.bytes.len() + 16 =>
-                                        {
-                                            ht_max_bits = ht_max_bits.max(planes - hb.beta);
-                                            let cleanup_len = hb.cleanup.len();
-                                            Some(EncodedBlock {
-                                                zero_bit_planes: mb - 1 - hb.beta,
-                                                coding_passes: 1,
-                                                bytes: hb.cleanup,
-                                                pass_rates: Vec::new(),
-                                                truncation_rates: Vec::new(),
-                                                pass_dist: Vec::new(),
-                                                d0: 0.0,
-                                                weight: 1.0,
-                                                ordinal: 0,
-                                                reencode: None,
-                                                ht_cleanup_len: Some(cleanup_len),
-                                                ht_multi: None,
-                                            })
-                                        }
-                                        (a, _) => a,
-                                    }
-                                } else {
-                                    annexd
-                                }
-                            };
-                            if let Some(enc) = &mut enc {
-                                zbp[bi] = enc.zero_bit_planes;
-                                // Depth of the block's final pass on the
-                                // global bit-plane scale.
-                                max_depth = max_depth
-                                    .max(enc.zero_bit_planes + (enc.coding_passes + 1) / 3);
-                                enc.weight = weight;
-                                enc.ordinal = num_blocks;
-                                num_blocks += 1;
-                                if rate_control {
-                                    enc.reencode = Some((psb.orientation, bw, bh, targets, mb));
-                                }
-                            }
-                            blocks.push(enc);
+                            jobs.push(BlockJob {
+                                orientation: psb.orientation,
+                                cb: *cb,
+                                plane,
+                                mask_plane,
+                                roi_shift: roi_s[ci],
+                                mb,
+                                weight,
+                                precinct: (t, ci as u16, level.r, k),
+                                sub_band: sub_bands.len(),
+                                in_band: bi,
+                                in_precinct,
+                            });
                         }
                         sub_bands.push((geom, zbp));
                     }
@@ -2752,6 +2789,35 @@ fn encode_core(
                 resolutions: res_layouts,
             });
         }
+        // Run the tile's block jobs and fold the results back in block
+        // order (the same order the serial coder visited them in).
+        let outcomes: Vec<BlockOutcome> =
+            crate::parallel::collect_ordered(params.threads, jobs.len(), |index| {
+                encode_block(&jobs[index])
+            });
+        for (job, outcome) in jobs.iter().zip(outcomes) {
+            let (enc, ht_bits, targets) = outcome?;
+            ht_max_bits = ht_max_bits.max(ht_bits);
+            let Some(mut enc) = enc else {
+                continue;
+            };
+            let raw = packets
+                .get_mut(&job.precinct)
+                .ok_or(Error::InvalidPacketHeader)?;
+            raw.sub_bands[job.sub_band].1[job.in_band] = enc.zero_bit_planes;
+            // Depth of the block's final pass on the global bit-plane
+            // scale.
+            max_depth = max_depth.max(enc.zero_bit_planes + (enc.coding_passes + 1) / 3);
+            enc.weight = job.weight;
+            enc.ordinal = num_blocks;
+            num_blocks += 1;
+            if rate_control {
+                let (bw, bh) = (job.cb.width() as usize, job.cb.height() as usize);
+                enc.reencode = Some((job.orientation, bw, bh, targets, job.mb));
+            }
+            raw.blocks[job.in_precinct] = Some(enc);
+        }
+        drop(jobs);
         let prog_info: Vec<ComponentProgressionInfo> = precincts_per_comp_res
             .iter()
             .enumerate()

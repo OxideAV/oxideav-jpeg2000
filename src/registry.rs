@@ -18,9 +18,10 @@
 
 use oxideav_core::{
     CodecCapabilities, CodecId, CodecInfo, CodecOptionsStruct, CodecParameters, CodecRegistry,
-    ColorPrimaries, ColorSignal, ContainerRegistry, Decoder, Encoder, Error as CoreError, Frame,
-    MatrixCoefficients, MediaType, OptionField, OptionKind, OptionValue, Packet, PixelFormat,
-    RuntimeContext, TimeBase, TransferCharacteristics, VideoFrame, frame::VideoPlane,
+    ColorPrimaries, ColorSignal, ContainerRegistry, Decoder, Encoder, Error as CoreError,
+    ExecutionContext, Frame, MatrixCoefficients, MediaType, OptionField, OptionKind, OptionValue,
+    Packet, PixelFormat, RuntimeContext, TimeBase, TransferCharacteristics, VideoFrame,
+    frame::VideoPlane,
 };
 
 use crate::encode::{Container, EncodeKernel, EncodeOptions};
@@ -651,6 +652,12 @@ impl Decoder for Jpeg2000Decoder {
         Ok(())
     }
 
+    /// Bound the decoder's internal fan-out by the caller's thread
+    /// budget (serial until called; output is identical at any budget).
+    fn set_execution_context(&mut self, ctx: &ExecutionContext) {
+        self.opts.threads = ctx.threads.max(1);
+    }
+
     fn receive_frame(&mut self) -> oxideav_core::Result<Frame> {
         let Some(pkt) = self.pending.take() else {
             return if self.eof {
@@ -701,6 +708,8 @@ pub struct Jpeg2000Encoder {
     params: CodecParameters,
     pending: Option<Packet>,
     eof: bool,
+    /// Worker budget from the last `set_execution_context` (1 = serial).
+    threads: usize,
 }
 
 impl Jpeg2000Encoder {
@@ -714,6 +723,7 @@ impl Jpeg2000Encoder {
             params: p,
             pending: None,
             eof: false,
+            threads: 1,
         }
     }
 
@@ -733,6 +743,7 @@ impl Jpeg2000Encoder {
             };
             o.target_bytes = Some(usize::try_from(bits_per_frame / 8).unwrap_or(usize::MAX));
         }
+        o.threads = self.threads;
         Ok(o)
     }
 }
@@ -744,6 +755,13 @@ impl Encoder for Jpeg2000Encoder {
 
     fn output_params(&self) -> &CodecParameters {
         &self.params
+    }
+
+    /// Bound the encoder's internal fan-out by the caller's thread
+    /// budget (serial until called; the emitted bytes are identical at
+    /// any budget).
+    fn set_execution_context(&mut self, ctx: &ExecutionContext) {
+        self.threads = ctx.threads.max(1);
     }
 
     fn send_frame(&mut self, frame: &Frame) -> oxideav_core::Result<()> {

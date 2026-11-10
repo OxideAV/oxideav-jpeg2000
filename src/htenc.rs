@@ -403,11 +403,56 @@ fn choose_cxt_vlc(
     u_off: u8,
     b: u8,
 ) -> Result<&'static CxtVlcEntry, Error> {
-    let table: &[CxtVlcEntry] = if first_line_pair {
+    let table: &'static [CxtVlcEntry] = if first_line_pair {
         &CXT_VLC_TABLE_0
     } else {
         &CXT_VLC_TABLE_1
     };
+    if cq >= 8 || rho >= 16 || u_off >= 2 || b >= 16 {
+        return scan_cxt_vlc(table, cq, rho, u_off, b).ok_or(Error::NotImplemented);
+    }
+    // The selection depends only on the 14-bit key below, so the scan
+    // runs once per key and table; later quads read the answer back.
+    static CHOICES: std::sync::OnceLock<Box<[u16]>> = std::sync::OnceLock::new();
+    let choices = CHOICES.get_or_init(|| {
+        let mut slots = vec![0u16; 2 << 13];
+        for (t, table) in [&CXT_VLC_TABLE_0[..], &CXT_VLC_TABLE_1[..]]
+            .into_iter()
+            .enumerate()
+        {
+            for key in 0..1usize << 13 {
+                let (cq, rho) = ((key >> 9) as u8, ((key >> 5) & 15) as u8);
+                let (u_off, b) = (((key >> 4) & 1) as u8, (key & 15) as u8);
+                if let Some(entry) = scan_cxt_vlc(table, cq, rho, u_off, b) {
+                    let position = table
+                        .iter()
+                        .position(|e| std::ptr::eq(e, entry))
+                        .expect("entry comes from this table");
+                    slots[(t << 13) | key] = position as u16 + 1;
+                }
+            }
+        }
+        slots.into_boxed_slice()
+    });
+    let key = (usize::from(cq) << 9)
+        | (usize::from(rho) << 5)
+        | (usize::from(u_off) << 4)
+        | usize::from(b);
+    match choices[(usize::from(!first_line_pair) << 13) | key] {
+        0 => Err(Error::NotImplemented),
+        hit => Ok(&table[usize::from(hit) - 1]),
+    }
+}
+
+/// The table scan behind [`choose_cxt_vlc`]: the usable entry marking
+/// the most samples, then the shortest codeword.
+fn scan_cxt_vlc(
+    table: &'static [CxtVlcEntry],
+    cq: u8,
+    rho: u8,
+    u_off: u8,
+    b: u8,
+) -> Option<&'static CxtVlcEntry> {
     table
         .iter()
         .filter(|e| {
@@ -419,7 +464,6 @@ fn choose_cxt_vlc(
                 && (e.e_1 & e.e_k) == (b & e.e_k)
         })
         .max_by_key(|e| (e.e_k.count_ones(), std::cmp::Reverse(e.len)))
-        .ok_or(Error::NotImplemented)
 }
 
 // ---------------------------------------------------------------------------

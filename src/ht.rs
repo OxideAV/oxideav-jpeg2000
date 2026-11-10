@@ -338,13 +338,30 @@ struct CxtVlcResult {
     e_1: u8,
 }
 
-/// `test_match` over a CxtVLC table: returns the matching entry whose
-/// `cq` agrees and whose `(cwd, len)` equals the supplied codeword.
-fn test_match(table: &[CxtVlcEntry], cq: u8, cwd: u32, len: u32) -> Option<&CxtVlcEntry> {
-    table
-        .iter()
-        .find(|e| e.cq == cq && e.len as u32 == len && e.cwd as u32 == cwd)
+/// Direct-index form of one Annex C CxtVLC table: slot
+/// `(cq << 10) | ((len − 1) << 7) | cwd` holds `1 +` the index of the
+/// first table entry whose `(cq, lw, w)` equals `(cq, len, cwd)`, or
+/// `0` when no entry matches — the §7.3.5 `test_match` predicate
+/// answered in one read instead of a scan over the table.
+const CXT_VLC_SLOTS: usize = 8 << 10;
+
+const fn index_cxt_vlc<const N: usize>(table: &[CxtVlcEntry; N]) -> [u16; CXT_VLC_SLOTS] {
+    let mut slots = [0u16; CXT_VLC_SLOTS];
+    // Walk backwards so the earliest of any duplicated keys wins, the
+    // same entry a front-to-back scan would return.
+    let mut i = N;
+    while i > 0 {
+        i -= 1;
+        let e = &table[i];
+        assert!(e.cq < 8 && e.len >= 1 && e.len <= 7 && e.cwd < 128);
+        let slot = ((e.cq as usize) << 10) | ((e.len as usize - 1) << 7) | e.cwd as usize;
+        slots[slot] = i as u16 + 1;
+    }
+    slots
 }
+
+static CXT_VLC_INDEX_0: [u16; CXT_VLC_SLOTS] = index_cxt_vlc(&CXT_VLC_TABLE_0);
+static CXT_VLC_INDEX_1: [u16; CXT_VLC_SLOTS] = index_cxt_vlc(&CXT_VLC_TABLE_1);
 
 /// §7.3.5 `decodeCxtVLC` — import VLC bits one at a time, growing the
 /// little-endian codeword until a table entry matches.
@@ -353,24 +370,31 @@ fn decode_cxt_vlc(
     cq: u8,
     first_line_pair: bool,
 ) -> Result<CxtVlcResult, Error> {
-    let table: &[CxtVlcEntry] = if first_line_pair {
-        &CXT_VLC_TABLE_0
+    let (table, index): (&[CxtVlcEntry], &[u16; CXT_VLC_SLOTS]) = if first_line_pair {
+        (&CXT_VLC_TABLE_0, &CXT_VLC_INDEX_0)
     } else {
-        &CXT_VLC_TABLE_1
+        (&CXT_VLC_TABLE_1, &CXT_VLC_INDEX_1)
     };
-    let mut len = 1u32;
-    let mut cwd = vlc.bit()? as u32;
+    let context = usize::from(cq & 7) << 10;
+    if cq > 7 {
+        // No table entry carries a context outside 0..=7.
+        return Err(Error::HtCorruptSegment);
+    }
+    let mut len = 1usize;
+    let mut cwd = vlc.bit()? as usize;
     // Codewords are at most 7 bits (lw ≤ 7); guard against a malformed
     // stream that never matches.
-    while test_match(table, cq, cwd, len).is_none() {
+    let e = loop {
+        let hit = index[context | ((len - 1) << 7) | cwd];
+        if hit != 0 {
+            break &table[usize::from(hit) - 1];
+        }
         if len >= 7 {
             return Err(Error::HtCorruptSegment);
         }
-        let bit = vlc.bit()? as u32;
-        cwd |= bit << len;
+        cwd |= (vlc.bit()? as usize) << len;
         len += 1;
-    }
-    let e = test_match(table, cq, cwd, len).expect("matched above");
+    };
     Ok(CxtVlcResult {
         rho: e.rho,
         u_off: e.u_off,

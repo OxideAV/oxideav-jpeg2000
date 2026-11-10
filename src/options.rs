@@ -14,7 +14,7 @@ use crate::error::{Error, Jpeg2000Error};
 /// sample) — at least the size of the returned image. The defaults:
 /// `max_width` / `max_height` of [`DecodeOptions::DEFAULT_MAX_DIMENSION`]
 /// (65 535), no pixel-count limit, [`DecodeOptions::DEFAULT_MAX_BYTES`]
-/// (1 GiB), `strict = false`, full resolution, every layer.
+/// (1 GiB), `strict = false`, full resolution, every layer, one worker.
 ///
 /// `strict` rejects what the lenient decoder tolerates: bytes after the
 /// `EOC` marker of a raw codestream, and a JP2 Image Header box
@@ -46,6 +46,14 @@ pub struct DecodeOptions {
     pub reduce: u8,
     /// Quality layers to decode (`None` = all; `Some(0)` is rejected).
     pub layers: Option<u16>,
+    /// Worker budget for the decoder's internal fan-out (Tier-1 decodes
+    /// independent code-blocks concurrently; the inverse wavelet
+    /// transform splits its row and column passes). `1` (the default)
+    /// is strictly serial and spawns nothing; the decoded samples are
+    /// identical at every budget. `0` is treated as `1`. The framework
+    /// adapter fills this from the `oxideav_core::ExecutionContext` it
+    /// is handed.
+    pub threads: usize,
 }
 
 impl DecodeOptions {
@@ -98,6 +106,12 @@ impl DecodeOptions {
     /// Decode only the first `layers` quality layers (`None` = all).
     pub fn with_layers(mut self, layers: impl Into<Option<u16>>) -> Self {
         self.layers = layers.into();
+        self
+    }
+
+    /// Set the worker budget ([`Self::threads`]; `0` is treated as `1`).
+    pub fn with_threads(mut self, threads: usize) -> Self {
+        self.threads = threads.max(1);
         self
     }
 
@@ -156,6 +170,7 @@ impl Default for DecodeOptions {
             strict: false,
             reduce: 0,
             layers: None,
+            threads: 1,
         }
     }
 }

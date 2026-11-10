@@ -5,13 +5,89 @@
 //! module uses the existing OxideAV dequantisation and inverse DWT routines;
 //! it changes the lifetime of block state, not their arithmetic.
 
-use super::{CodedCodeBlock, SubBandQuantization, check_placement, r_qb_to_i32};
+#[cfg(test)]
+use super::{CodedCodeBlock, check_placement};
+use super::{SubBandQuantization, check_placement_shape, r_qb_to_i32};
 use crate::Error;
-use crate::dequant::{
-    irreversible_step_size, qb_signed, reconstruct_irreversible, reconstruct_reversible,
-};
+use crate::dequant::irreversible_step_size;
 use crate::dwt::{Interleaved2D, sr_2d_5x3, sr_2d_9x7};
-use crate::geometry::{ResolutionLevel, SubBand, SubBandOrientation};
+use crate::geometry::{PrecinctCodeBlock, ResolutionLevel, SubBand, SubBandOrientation};
+use crate::t1::CodeBlock;
+
+/// The Equation E-6 / E-8 reconstruction offsets `r · 2^(Mb − Nb)`,
+/// computed once per distinct shift instead of once per coefficient.
+struct MidpointOffsets {
+    r: f64,
+    cached: [f64; 64],
+}
+
+impl MidpointOffsets {
+    fn new(r: f64) -> Self {
+        Self {
+            r,
+            cached: [f64::NAN; 64],
+        }
+    }
+
+    #[inline]
+    fn get(&mut self, shift: u32) -> f64 {
+        match self.cached.get_mut(shift as usize) {
+            Some(slot) => {
+                if slot.is_nan() {
+                    *slot = self.r * f64::from(shift).exp2();
+                }
+                *slot
+            }
+            None => self.r * f64::from(shift).exp2(),
+        }
+    }
+}
+
+/// Reconstruct a whole reversible code-block per Equation E-8 into a
+/// raster-order `i32` array: `Rqb = qb` once every bit-plane was
+/// decoded (`Nb ≥ Mb`), `qb ± r · 2^(Mb − Nb)` truncated toward zero
+/// otherwise. Value for value this is `r_qb_to_i32(
+/// reconstruct_reversible(qb, mb, Nb, r))` over the block.
+pub(crate) fn reconstruct_block_5x3(block: &CodeBlock, nb: u32, mb: u32, r: f64) -> Vec<i32> {
+    let mut out = Vec::with_capacity(block.width() * block.height());
+    let mut offsets = MidpointOffsets::new(r);
+    block.for_each_signed_with_nb(nb, |qb, nb| {
+        out.push(if nb >= mb {
+            // An integer inside the f64-exact range: the saturating
+            // conversion is the integer clamp.
+            qb.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+        } else if qb == 0 {
+            0
+        } else {
+            let offset = offsets.get(mb - nb);
+            r_qb_to_i32(qb as f64 + if qb > 0 { offset } else { -offset })
+        });
+    });
+    out
+}
+
+/// Reconstruct a whole irreversible code-block per Equation E-6 into a
+/// raster-order `f64` array — value for value
+/// `reconstruct_irreversible(qb, Mb, Nb, Δb, r)` over the block.
+pub(crate) fn reconstruct_block_9x7(
+    block: &CodeBlock,
+    nb: u32,
+    quant: SubBandQuantization,
+    r: f64,
+) -> Vec<f64> {
+    let step = irreversible_step_size(quant.rb, quant.step);
+    let mut out = Vec::with_capacity(block.width() * block.height());
+    let mut offsets = MidpointOffsets::new(r);
+    block.for_each_signed_with_nb(nb, |qb, nb| {
+        out.push(if qb == 0 {
+            0.0
+        } else {
+            let offset = offsets.get(quant.mb.saturating_sub(nb));
+            (qb as f64 + if qb > 0 { offset } else { -offset }) * step
+        });
+    });
+    out
+}
 
 struct BandRegion<T> {
     band: SubBand,
@@ -98,37 +174,39 @@ impl<'a, T: Default + Clone> CoefficientSurface<'a, T> {
         })
     }
 
-    fn scatter_with<F: Fn(u32, i64) -> T>(
+    /// Place one reconstructed code-block (`values` in raster order,
+    /// `width × height` as the placement states) into its sub-band.
+    /// Rejects a placement outside the band, a shape or orientation
+    /// mismatch, and any sample another block already wrote.
+    pub(crate) fn scatter_values(
         &mut self,
         resolution: usize,
         sub_band: usize,
-        cb: CodedCodeBlock<'_>,
-        reconstruct: F,
+        placement: &PrecinctCodeBlock,
+        orientation: SubBandOrientation,
+        values: &[T],
     ) -> Result<(), Error> {
         let region = self
             .bands
             .get_mut(resolution)
             .and_then(|bands| bands.get_mut(sub_band))
             .ok_or(Error::InvalidPacketHeader)?;
-        check_placement(&region.band, &cb.placement, cb.coefficients)?;
+        let block_w = placement.x1.saturating_sub(placement.x0) as usize;
+        let block_h = placement.y1.saturating_sub(placement.y0) as usize;
+        check_placement_shape(&region.band, placement, block_w, block_h, orientation)?;
+        if values.len() != block_w * block_h {
+            return Err(Error::InvalidMarkerLength);
+        }
+        if block_w == 0 {
+            return Ok(());
+        }
         let width = region.band.width() as usize;
-        let dx = (cb.placement.x0 - region.band.tbx0) as usize;
-        let dy = (cb.placement.y0 - region.band.tby0) as usize;
-        let effective_nb = cb.coefficients.effective_nb_resolver(cb.nb);
-        for v in 0..cb.coefficients.height() {
-            for u in 0..cb.coefficients.width() {
-                let target = (dy + v) * width + dx + u;
-                let coverage_index = region.offset + target;
-                let mask = 1u64 << (coverage_index % 64);
-                let word = &mut self.written[coverage_index / 64];
-                if *word & mask != 0 {
-                    return Err(Error::InvalidMarkerLength);
-                }
-                *word |= mask;
-                let qb = qb_signed(cb.coefficients.coefficient(u, v));
-                let nb = effective_nb(u, v);
-                region.data[target] = reconstruct(nb, qb);
-            }
+        let dx = (placement.x0 - region.band.tbx0) as usize;
+        let dy = (placement.y0 - region.band.tby0) as usize;
+        for (v, row) in values.chunks_exact(block_w).enumerate() {
+            let target = (dy + v) * width + dx;
+            claim_bits(&mut self.written, region.offset + target, block_w)?;
+            region.data[target..target + block_w].clone_from_slice(row);
         }
         Ok(())
     }
@@ -183,7 +261,31 @@ impl<'a, T: Default + Clone> CoefficientSurface<'a, T> {
     }
 }
 
+/// Mark `len` consecutive coverage bits starting at `first`, failing
+/// if any of them was already set (two blocks claim one sample).
+fn claim_bits(written: &mut [u64], first: usize, len: usize) -> Result<(), Error> {
+    let mut bit = first;
+    let end = first + len;
+    while bit < end {
+        let in_word = bit % 64;
+        let take = (64 - in_word).min(end - bit);
+        let mask = if take == 64 {
+            u64::MAX
+        } else {
+            ((1u64 << take) - 1) << in_word
+        };
+        let word = &mut written[bit / 64];
+        if *word & mask != 0 {
+            return Err(Error::InvalidMarkerLength);
+        }
+        *word |= mask;
+        bit += take;
+    }
+    Ok(())
+}
+
 impl CoefficientSurface<'_, i32> {
+    #[cfg(test)]
     pub(crate) fn scatter_5x3(
         &mut self,
         resolution: usize,
@@ -192,9 +294,15 @@ impl CoefficientSurface<'_, i32> {
         mb: u32,
         r: f64,
     ) -> Result<(), Error> {
-        self.scatter_with(resolution, sub_band, cb, |nb, qb| {
-            r_qb_to_i32(reconstruct_reversible(qb, mb, nb, r))
-        })
+        self.check_block(resolution, sub_band, &cb)?;
+        let values = reconstruct_block_5x3(cb.coefficients, cb.nb, mb, r);
+        self.scatter_values(
+            resolution,
+            sub_band,
+            &cb.placement,
+            cb.coefficients.orientation(),
+            &values,
+        )
     }
 
     pub(crate) fn into_idwt_5x3(self) -> Result<Interleaved2D<i32>, Error> {
@@ -203,6 +311,7 @@ impl CoefficientSurface<'_, i32> {
 }
 
 impl CoefficientSurface<'_, f64> {
+    #[cfg(test)]
     pub(crate) fn scatter_9x7(
         &mut self,
         resolution: usize,
@@ -211,14 +320,37 @@ impl CoefficientSurface<'_, f64> {
         quant: SubBandQuantization,
         r: f64,
     ) -> Result<(), Error> {
-        let step = irreversible_step_size(quant.rb, quant.step);
-        self.scatter_with(resolution, sub_band, cb, |nb, qb| {
-            reconstruct_irreversible(qb, quant.mb, nb, step, r)
-        })
+        self.check_block(resolution, sub_band, &cb)?;
+        let values = reconstruct_block_9x7(cb.coefficients, cb.nb, quant, r);
+        self.scatter_values(
+            resolution,
+            sub_band,
+            &cb.placement,
+            cb.coefficients.orientation(),
+            &values,
+        )
     }
 
     pub(crate) fn into_idwt_9x7(self) -> Result<Interleaved2D<f64>, Error> {
         self.synthesize(sr_2d_9x7)
+    }
+}
+
+#[cfg(test)]
+impl<T> CoefficientSurface<'_, T> {
+    /// The placement / shape validation of a still-undecoded scatter.
+    fn check_block(
+        &self,
+        resolution: usize,
+        sub_band: usize,
+        cb: &CodedCodeBlock<'_>,
+    ) -> Result<(), Error> {
+        let region = self
+            .bands
+            .get(resolution)
+            .and_then(|bands| bands.get(sub_band))
+            .ok_or(Error::InvalidPacketHeader)?;
+        check_placement(&region.band, &cb.placement, cb.coefficients)
     }
 }
 

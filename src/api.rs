@@ -575,6 +575,7 @@ pub fn decode_with(bytes: &[u8], opts: &DecodeOptions) -> Result<Jpeg2000Image, 
         &cs,
         opts.reduce,
         opts.layers.unwrap_or(u16::MAX),
+        opts.threads,
     )?;
 
     let mut image = if let Some(palette) = plan.palette {

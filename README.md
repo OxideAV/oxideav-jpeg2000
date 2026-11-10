@@ -191,7 +191,7 @@ colourspace on an unsignalled image).
 ## Options
 
 `DecodeOptions { max_width, max_height, max_pixels, max_bytes, strict,
-reduce, layers }` — limits are checked against the `SIZ` geometry
+reduce, layers, threads }` — limits are checked against the `SIZ` geometry
 (after `reduce`) before any sample plane is allocated; `max_bytes`
 bounds the decoder's `i32` working set (4 bytes per sample over every
 component). Defaults: 65 535 × 65 535, no pixel cap, 1 GiB, lenient,
@@ -199,7 +199,8 @@ full resolution, all layers; `None` lifts a limit (`unlimited()` lifts
 all). `strict` rejects trailing bytes after `EOC` and a JP2 `ihdr` that
 disagrees with `SIZ`. `reduce = n` discards the `n` highest resolution
 levels (dimensions `ceil(full / 2^n)`); `layers = Some(n)` decodes the
-first `n` quality layers.
+first `n` quality layers. `threads` is the worker budget (see
+[Threading](#threading)).
 
 `EncodeOptions` — `container` (`Jp2` default / `J2k`), `kernel`
 (`Lossless5x3` / `Lossy9x7 { fine_bits }` via `with_lossless` /
@@ -212,7 +213,25 @@ rate control), `tile_size`, the Table A.19 style flags (`bypass`,
 `plt` / `tlm`, `comment`, `high_throughput` / `ht_refinement` /
 `ht_mixed` (T.814), `tile_parts`, `poc`, `packed_headers`, `roi`,
 `sub_sampling` and `component_overrides` (the last two for the
-plane-level encoders; `encode` derives sub-sampling from the layout).
+plane-level encoders; `encode` derives sub-sampling from the layout),
+and `threads` (the worker budget).
+
+## Threading
+
+Both directions are **serial by default** and take a worker budget:
+`DecodeOptions::with_threads(n)` / `EncodeOptions::with_threads(n)` on
+the standalone API, or the `ExecutionContext` handed to the framework
+`Decoder` / `Encoder` (`set_execution_context`). The budget fans out
+Tier-1 — code-blocks are independent, so they are coded on up to `n`
+scoped `std` threads (no dependency, nothing spawned at `n = 1`).
+
+The output never depends on the budget: block results are folded back
+in block order, so the encoder emits **byte-identical** codestreams
+(rate allocation included) and the decoder **sample-identical** images
+at every thread count, and a corrupt stream reports the same error.
+`tests/thread_budget.rs` pins this; `examples/perf_suite.rs` times the
+standard cases at any budget and `examples/corpus_hash.rs` prints
+output hashes over a corpus for comparing two builds.
 
 ## Metadata and colour
 

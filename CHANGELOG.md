@@ -4,6 +4,17 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- Worker budget: `DecodeOptions::threads` / `with_threads` and `EncodeOptions::threads` / `with_threads`; the framework `Decoder` / `Encoder` adapters take it from `set_execution_context` (`oxideav_core::ExecutionContext`). Serial by default (nothing is spawned at a budget of 1); scoped `std` threads, no new dependency.
+- `examples/perf_suite.rs` (encode + decode timings over synthetic rgb8 / rgb16 / lossy 9-7 / 4K / HTJ2K cases, contract API or registry path, any thread budget) and `examples/corpus_hash.rs` (decoded-sample and codestream hashes over a file corpus plus an encoder option matrix, for comparing two builds).
+
+### Performance
+
+- Tier-1 runs code-blocks concurrently under the worker budget, in both directions. Block results are folded back in block order, so codestreams are byte-identical and decoded samples identical at every thread count, rate-controlled encodes included (`tests/thread_budget.rs`).
+- HTJ2K: the §7.3.5 CxtVLC codeword match is a direct table read instead of a scan over the Annex C table per imported bit (decode), and the encoder's codeword choice is computed once per `(table, context, pattern)` key. HT block decode of a 1024² RGB image drops about 9×, HT encode about 2×.
+- Decoder reconstruction (Equations E-6 / E-8) works a block at a time: the `r · 2^(Mb − Nb)` offsets are computed once per distinct shift instead of through `exp2` per coefficient, and blocks land in the coefficient surface row by row.
+
 ## [0.0.19](https://github.com/OxideAV/oxideav-jpeg2000/compare/v0.0.18...v0.0.19) - 2026-11-07
 
 ### Fixed
