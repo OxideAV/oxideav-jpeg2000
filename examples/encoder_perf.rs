@@ -1,6 +1,7 @@
 //! Standalone lossless encoder benchmark:
-//! `cargo run --release --no-default-features --example encoder_perf -- [width height]`.
-//! Defaults to 512 x 512; generation, comparisons and decoding are not timed.
+//! `cargo run --release --no-default-features --example encoder_perf -- [width height [threads]]`.
+//! Defaults to 512 x 512 on one worker (serial); generation, comparisons
+//! and decoding are not timed.
 
 #![forbid(unsafe_code)]
 
@@ -51,18 +52,24 @@ fn main() -> Result<(), Box<dyn Error>> {
         .skip(1)
         .map(|argument| argument.parse())
         .collect::<Result<_, _>>()?;
-    let (width, height) = match dimensions.as_slice() {
-        [] => (512, 512),
-        [width, height] if *width > 0 && *height > 0 => (*width, *height),
-        _ => return Err(io::Error::other("use [positive width height]").into()),
+    let (width, height, threads) = match dimensions.as_slice() {
+        [] => (512, 512, 1),
+        [width, height] if *width > 0 && *height > 0 => (*width, *height, 1),
+        [width, height, threads] if *width > 0 && *height > 0 && *threads > 0 => {
+            (*width, *height, *threads as usize)
+        }
+        _ => return Err(io::Error::other("use [positive width height [threads]]").into()),
     };
     if cfg!(debug_assertions) {
         return Err(io::Error::other("benchmark requires --release").into());
     }
-    println!("Lossless JP2 RGB {width}x{height}; three encode rounds, validation outside timings");
+    println!(
+        "Lossless JP2 RGB {width}x{height}; three encode rounds on {threads} worker(s), \
+         validation outside timings"
+    );
     for bits in [8, 16] {
         let image = generated_image(width, height, bits)?;
-        let options = EncodeOptions::new();
+        let options = EncodeOptions::new().with_threads(threads);
         let mut times = [Duration::ZERO; 3];
         let mut first: Option<Vec<u8>> = None;
         for (round, time) in times.iter_mut().enumerate() {

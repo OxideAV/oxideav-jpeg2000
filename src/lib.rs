@@ -121,8 +121,8 @@ pub mod registry;
 pub mod t1;
 
 pub use api::{
-    decode, decode_from, decode_rgb8, decode_rgba8, decode_with, encode, encode_rgb8, encode_rgba8,
-    encode_to, info, probe,
+    decode, decode_from, decode_j2k_with, decode_rgb8, decode_rgba8, decode_with, encode,
+    encode_rgb8, encode_rgba8, encode_to, info, probe,
 };
 pub use decode::{
     DecodedComponent, DecodedImage, decode_codestream, decode_j2k, decode_j2k_layers,

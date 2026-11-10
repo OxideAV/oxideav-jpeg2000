@@ -163,6 +163,43 @@ fn every_budget_emits_the_serial_codestream_and_samples() {
 }
 
 #[test]
+fn the_depth_decode_takes_the_same_options() {
+    use oxideav_jpeg2000::{decode_j2k, decode_j2k_layers, decode_j2k_reduced, decode_j2k_with};
+
+    let image = synthetic(120, 88, PixelFormat::Rgb24, 41);
+    let options = EncodeOptions::new()
+        .with_container(Container::J2k)
+        .with_layers(3)
+        .with_tile_size((64, 64));
+    let mut stream = encode(&image, &options).unwrap();
+    for threads in [1, 4] {
+        let budget = DecodeOptions::new().with_threads(threads);
+        assert_eq!(
+            decode_j2k_with(&stream, &budget).unwrap(),
+            decode_j2k(&stream).unwrap()
+        );
+        assert_eq!(
+            decode_j2k_with(&stream, &budget.clone().with_reduce(2)).unwrap(),
+            decode_j2k_reduced(&stream, 2).unwrap()
+        );
+        assert_eq!(
+            decode_j2k_with(&stream, &budget.clone().with_layers(1)).unwrap(),
+            decode_j2k_layers(&stream, 1).unwrap()
+        );
+    }
+    // The limits apply before anything is allocated ...
+    let small = DecodeOptions::new().with_max_width(100);
+    assert!(decode_j2k_with(&stream, &small).is_err());
+    assert!(decode_j2k_with(&stream, &small.with_reduce(1)).is_ok());
+    assert!(decode_j2k_with(&stream, &DecodeOptions::new().with_max_bytes(1000)).is_err());
+    assert!(decode_j2k_with(&stream, &DecodeOptions::new().with_layers(0)).is_err());
+    // ... and `strict` rejects bytes after EOC.
+    stream.push(0);
+    assert!(decode_j2k_with(&stream, &DecodeOptions::new()).is_ok());
+    assert!(decode_j2k_with(&stream, &DecodeOptions::new().with_strict(true)).is_err());
+}
+
+#[test]
 fn corrupt_streams_fail_identically_at_every_budget() {
     let image = synthetic(128, 96, PixelFormat::Rgb24, 21);
     let options = EncodeOptions::new()

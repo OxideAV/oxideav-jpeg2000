@@ -558,17 +558,7 @@ pub fn decode_with(bytes: &[u8], opts: &DecodeOptions) -> Result<Jpeg2000Image, 
 
     let cs = crate::parse_codestream(parsed.codestream)?;
     if opts.strict {
-        let eoc = cs
-            .tile_parts
-            .last()
-            .map_or(cs.header.bytes_consumed, |tp| tp.body_offset + tp.body_len);
-        let end = eoc + 2;
-        if parsed.codestream.len() > end {
-            return Err(Jpeg2000Error::invalid(format!(
-                "{} trailing bytes after EOC",
-                parsed.codestream.len() - end
-            )));
-        }
+        reject_trailing_bytes(parsed.codestream, &cs)?;
     }
     let decoded = crate::decode::decode_codestream_with(
         parsed.codestream,
@@ -596,6 +586,60 @@ pub fn decode_with(bytes: &[u8], opts: &DecodeOptions) -> Result<Jpeg2000Image, 
     image.color = plan.color;
     image.metadata = Metadata::new().with_icc(plan.icc);
     Ok(image)
+}
+
+/// The `strict` check on a raw codestream: nothing after `EOC`.
+fn reject_trailing_bytes(codestream: &[u8], cs: &crate::J2kCodestream) -> Result<(), Error> {
+    let eoc = cs
+        .tile_parts
+        .last()
+        .map_or(cs.header.bytes_consumed, |tp| tp.body_offset + tp.body_len);
+    let end = eoc + 2;
+    if codestream.len() > end {
+        return Err(Jpeg2000Error::invalid(format!(
+            "{} trailing bytes after EOC",
+            codestream.len() - end
+        )));
+    }
+    Ok(())
+}
+
+/// [`crate::decode_j2k`] under [`DecodeOptions`]: a raw codestream
+/// into per-component `i32` planes (any component set, depth or
+/// sub-sampling — the depth surface), with the limits checked against
+/// the `SIZ` geometry before any plane is allocated (`max_width` /
+/// `max_height` / `max_pixels` on component 0's grid, `max_bytes` on
+/// the planes of every component), `strict` rejecting bytes after
+/// `EOC`, `reduce` and `layers` as in [`crate::decode_j2k_reduced`] /
+/// [`crate::decode_j2k_layers`], and `threads` as the worker budget.
+pub fn decode_j2k_with(bytes: &[u8], opts: &DecodeOptions) -> Result<DecodedImage, Error> {
+    if opts.layers == Some(0) {
+        return Err(Jpeg2000Error::invalid(
+            "DecodeOptions::layers = Some(0): an image cannot be reconstructed from zero layers",
+        ));
+    }
+    let cs = crate::parse_codestream(bytes)?;
+    let siz = &cs.header.siz;
+    let first = siz
+        .components
+        .first()
+        .ok_or_else(|| Jpeg2000Error::invalid("codestream has no components"))?;
+    let (width, height) = component_dims(siz, first.h_separation, first.v_separation, opts.reduce);
+    let working_set = siz.components.iter().fold(0u64, |total, c| {
+        let (w, h) = component_dims(siz, c.h_separation, c.v_separation, opts.reduce);
+        total.saturating_add((u64::from(w) * u64::from(h)).saturating_mul(4))
+    });
+    opts.check(width, height, working_set)?;
+    if opts.strict {
+        reject_trailing_bytes(bytes, &cs)?;
+    }
+    crate::decode::decode_codestream_with(
+        bytes,
+        &cs,
+        opts.reduce,
+        opts.layers.unwrap_or(u16::MAX),
+        opts.threads,
+    )
 }
 
 fn pal8_image(

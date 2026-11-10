@@ -96,7 +96,9 @@ components, chroma geometry outside the table — is
 `Error::Unsupported` from `info` and `decode`, naming the set; the depth
 API decodes them all: `decode_j2k` / `jp2::decode_jp2` /
 `decode_j2k_reduced` / `decode_j2k_layers -> DecodedImage` (one `i32`
-plane per component or JP2 channel), `parse_j2k_header` /
+plane per component or JP2 channel) and `decode_j2k_with`, the same
+decode under a `DecodeOptions` (limits, `strict`, `reduce`, `layers`,
+`threads`); `parse_j2k_header` /
 `parse_codestream` (typed markers), `jp2::parse_jp2` (every Annex I
 box), and on the encode side `encode::encode_j2k` / `encode_j2k_u16` /
 `encode_jp2` / `encode_jp2_with` / `jp2::write_jp2` (raw planes with any
@@ -220,7 +222,9 @@ and `threads` (the worker budget).
 
 Both directions are **serial by default** and take a worker budget:
 `DecodeOptions::with_threads(n)` / `EncodeOptions::with_threads(n)` on
-the standalone API, or the `ExecutionContext` handed to the framework
+the standalone API (`decode_with`, the depth-level `decode_j2k_with`,
+`encode` and the raw-plane encoders), or the `ExecutionContext` handed
+to the framework
 `Decoder` / `Encoder` (`set_execution_context`). The budget fans out
 Tier-1 — code-blocks are independent, so they are coded on up to `n`
 scoped `std` threads (no dependency, nothing spawned at `n = 1`) — and

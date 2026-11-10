@@ -1,10 +1,11 @@
 //! Standalone raw-codestream decoder benchmark:
-//! `cargo run --release --no-default-features --example decoder_perf -- image.j2k [rounds]`.
+//! `cargo run --release --no-default-features --example decoder_perf -- image.j2k [rounds [threads]]`.
 //! Input I/O, warmup, sample hashing and output destruction are not timed.
+//! `threads` is the decoder's worker budget (default 1: serial).
 
 #![forbid(unsafe_code)]
 
-use oxideav_jpeg2000::{DecodedImage, decode_j2k};
+use oxideav_jpeg2000::{DecodeOptions, DecodedImage, decode_j2k_with};
 use std::{error::Error, io, time::Instant};
 
 fn sample_hash(image: &DecodedImage) -> u64 {
@@ -26,18 +27,25 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut arguments = std::env::args().skip(1);
     let path = arguments
         .next()
-        .ok_or_else(|| io::Error::other("use image.j2k [positive rounds]"))?;
+        .ok_or_else(|| io::Error::other("use image.j2k [positive rounds [positive threads]]"))?;
     let rounds = arguments
         .next()
         .map(|argument| argument.parse::<usize>())
         .transpose()?
         .unwrap_or(5);
-    if rounds == 0 || arguments.next().is_some() {
-        return Err(io::Error::other("use image.j2k [positive rounds]").into());
+    let threads = arguments
+        .next()
+        .map(|argument| argument.parse::<usize>())
+        .transpose()?
+        .unwrap_or(1);
+    if rounds == 0 || threads == 0 || arguments.next().is_some() {
+        return Err(io::Error::other("use image.j2k [positive rounds [positive threads]]").into());
     }
+    // No limits: this tool times whatever it is handed.
+    let options = DecodeOptions::new().unlimited().with_threads(threads);
     let bytes = std::fs::read(&path)?;
     let reference = {
-        let image = decode_j2k(&bytes)?;
+        let image = decode_j2k_with(&bytes, &options)?;
         (
             image.width,
             image.height,
@@ -46,13 +54,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         )
     };
     println!(
-        "Raw J2K {}x{}, {} components; {} timed rounds after one warmup",
-        reference.0, reference.1, reference.2, rounds
+        "Raw J2K {}x{}, {} components; {} timed rounds after one warmup, {} worker(s)",
+        reference.0, reference.1, reference.2, rounds, threads
     );
     let mut times = Vec::with_capacity(rounds);
     for round in 1..=rounds {
         let start = Instant::now();
-        let image = decode_j2k(&bytes)?;
+        let image = decode_j2k_with(&bytes, &options)?;
         let elapsed = start.elapsed();
         let result = (
             image.width,
