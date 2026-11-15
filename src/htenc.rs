@@ -496,16 +496,17 @@ fn plan_quad(
     sign: &[bool],
     first_line_pair: bool,
 ) -> Result<QuadPlan, Error> {
+    let (qx, qy) = grid.quad_xy(q);
     let mut rho: u8 = 0;
     for j in 0..4 {
-        if let Some((x, y)) = grid.coord(q, j)
+        if let Some((x, y)) = grid.coord(qx, qy, j)
             && mu[x + y * grid.wblk] != 0
         {
             rho |= 1 << j;
         }
     }
-    let cq = quad_context(grid, q);
-    apply_sig_pattern(grid, q, rho);
+    let cq = quad_context(grid, qx, qy);
+    apply_sig_pattern(grid, qx, qy, rho);
     if rho == 0 {
         let (cwd, len) = if cq == 0 {
             // AZC quad answered entirely by the MEL symbol — no
@@ -528,11 +529,11 @@ fn plan_quad(
             len,
         });
     }
-    let kappa = exponent_predictor(grid, q, rho);
+    let kappa = exponent_predictor(grid, qx, qy, rho);
     let mut e_max = 0u32;
     for j in 0..4 {
         if rho & (1 << j) != 0
-            && let Some((x, y)) = grid.coord(q, j)
+            && let Some((x, y)) = grid.coord(qx, qy, j)
         {
             e_max = e_max.max(magnitude_exponent(mu[x + y * grid.wblk]));
         }
@@ -545,7 +546,7 @@ fn plan_quad(
     let mut b: u8 = 0;
     for j in 0..4 {
         if rho & (1 << j) != 0
-            && let Some((x, y)) = grid.coord(q, j)
+            && let Some((x, y)) = grid.coord(qx, qy, j)
         {
             let idx = x + y * grid.wblk;
             let val = 2 * (mu[idx] - 1) + u32::from(sign[idx]);
@@ -582,11 +583,12 @@ fn emit_quad_magsgn(
     grid.quads[q].e_1 = plan.e_1;
     grid.quads[q].u_q = plan.u_q;
     grid.quads[q].u_big = plan.u_big;
+    let (qx, qy) = grid.quad_xy(q);
     for j in 0..4 {
         if plan.rho & (1 << j) == 0 {
             continue;
         }
-        let (x, y) = grid.coord(q, j).ok_or(Error::NotImplemented)?;
+        let (x, y) = grid.coord(qx, qy, j).ok_or(Error::NotImplemented)?;
         let idx = x + y * grid.wblk;
         let m = mu[idx];
         let s = u32::from(sign[idx]);

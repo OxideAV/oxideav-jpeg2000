@@ -53,7 +53,7 @@ pub(crate) const MEL_E: [u8; 13] = [0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 4, 5];
 // §7.1.2 — MagSgn bit-stream recovery (forward, little-endian, 0xFF-stuffed)
 // ---------------------------------------------------------------------------
 
-/// State machine for the HT MagSgn bit-stream (§7.1.2 `importMagSgnBit`).
+/// The HT MagSgn bit-stream (§7.1.2 `importMagSgnBit`).
 ///
 /// Unpacks bits from the MagSgn byte-stream (bytes `0..Pcup` of the HT
 /// cleanup segment) in little-endian order, skipping the stuffing bit
@@ -61,15 +61,27 @@ pub(crate) const MEL_E: [u8; 13] = [0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 4, 5];
 /// After `Pcup` real bytes are exhausted the procedure synthesises a
 /// single `0xFF` byte, then `error()`s — but a conforming codestream
 /// never needs more than that synthesised byte.
+///
+/// Bytes are imported several at a time into a 64-bit window, so a
+/// magnitude is one shift and mask. A byte the procedure would reject —
+/// a set stuffing bit, anything past the synthesised `0xFF` — is not
+/// imported and stops the import for good: the error is raised when a
+/// bit of that byte is first asked for, as §7.1.2 raises it.
 struct MagSgnReader<'a> {
     /// The modified `Dcup` array view (`modDcup` is applied on read).
     dcup: ModDcup<'a>,
     /// Prefix length `Pcup = Lcup − Scup`.
     pcup: usize,
-    ms_pos: usize,
-    ms_bits: u32,
-    ms_tmp: u32,
-    ms_last: u32,
+    /// `MS_pos`: the next byte to import.
+    pos: usize,
+    /// `MS_last`: the last byte imported.
+    last: u32,
+    /// Imported bits not yet handed out, the next one in bit 0.
+    window: u64,
+    /// Number of valid bits in `window`.
+    avail: u32,
+    /// No further byte can be imported.
+    blocked: bool,
 }
 
 impl<'a> MagSgnReader<'a> {
@@ -78,61 +90,64 @@ impl<'a> MagSgnReader<'a> {
         Self {
             dcup,
             pcup,
-            ms_pos: 0,
-            ms_bits: 0,
-            ms_tmp: 0,
-            ms_last: 0,
+            pos: 0,
+            last: 0,
+            window: 0,
+            avail: 0,
+            blocked: false,
         }
     }
 
-    /// The byte-import half of §7.1.2 `importMagSgnBit`: load the next
-    /// MagSgn byte (7 payload bits after a `0xFF`, 8 otherwise),
-    /// rejecting a set stuffing bit and any read past the one
-    /// synthesised `0xFF` that follows the `Pcup` real bytes.
-    #[inline]
-    fn import_byte(&mut self) -> Result<(), Error> {
-        self.ms_bits = if self.ms_last == 0xFF { 7 } else { 8 };
-        if self.ms_pos < self.pcup {
-            self.ms_tmp = self.dcup.get(self.ms_pos) as u32;
-            if self.ms_tmp & (1 << self.ms_bits) != 0 {
-                return Err(Error::HtCorruptSegment);
+    /// The byte-import half of §7.1.2 `importMagSgnBit`, for as many
+    /// bytes as the window has room for: 7 payload bits after a `0xFF`,
+    /// 8 otherwise.
+    #[cold]
+    #[inline(never)]
+    fn import(&mut self) {
+        while self.avail <= 56 && !self.blocked {
+            let bits = if self.last == 0xFF { 7 } else { 8 };
+            let byte = if self.pos < self.pcup {
+                self.dcup.get(self.pos) as u32
+            } else if self.pos == self.pcup {
+                0xFF
+            } else {
+                self.blocked = true;
+                break;
+            };
+            if self.pos < self.pcup && byte & (1 << bits) != 0 {
+                // A set stuffing bit.
+                self.blocked = true;
+                break;
             }
-        } else if self.ms_pos == self.pcup {
-            self.ms_tmp = 0xFF;
-        } else {
-            return Err(Error::HtCorruptSegment);
+            self.window |= u64::from(byte & ((1 << bits) - 1)) << self.avail;
+            self.avail += bits;
+            self.last = byte;
+            self.pos += 1;
         }
-        self.ms_last = self.ms_tmp;
-        self.ms_pos += 1;
-        Ok(())
     }
 
     /// Unpack `m` bits as a little-endian integer (the inner loop of
-    /// §7.3.8 `decodeMagSgnValue`): the bit-import half of §7.1.2
-    /// `importMagSgnBit`, taking every requested bit the current byte
-    /// still holds in one step.
+    /// §7.3.8 `decodeMagSgnValue`).
     ///
     /// A conformant stream in this crate's supported precision range
     /// keeps every magnitude inside the 32-bit lane (`Mb` is bounded
     /// well below 32 by the Equation E-2 quantisation tables), so a
     /// bit count that cannot fit is a corrupt / non-conformant stream,
     /// not a wider integer.
+    #[inline]
     fn bits(&mut self, m: u32) -> Result<u32, Error> {
         if m > 32 {
             return Err(Error::HtCorruptSegment);
         }
-        let mut val = 0u32;
-        let mut got = 0u32;
-        while got < m {
-            if self.ms_bits == 0 {
-                self.import_byte()?;
+        if m > self.avail {
+            self.import();
+            if m > self.avail {
+                return Err(Error::HtCorruptSegment);
             }
-            let take = (m - got).min(self.ms_bits);
-            val |= (self.ms_tmp & ((1u32 << take) - 1)) << got;
-            self.ms_tmp >>= take;
-            self.ms_bits -= take;
-            got += take;
         }
+        let val = (self.window & ((1u64 << m) - 1)) as u32;
+        self.window >>= m;
+        self.avail -= m;
         Ok(val)
     }
 }
@@ -238,7 +253,7 @@ impl<'a> MelDecoder<'a> {
 // §7.1.4 — VLC bit-stream recovery (reverse byte order, little-endian)
 // ---------------------------------------------------------------------------
 
-/// State machine for the HT VLC bit-stream (§7.1.4 `importVLCBit`).
+/// The HT VLC bit-stream (§7.1.4 `importVLCBit`).
 ///
 /// The VLC byte-stream extends *backward* from the last byte of the HT
 /// cleanup segment for at most `Scup` bytes (overlapping the MEL stream).
@@ -247,50 +262,88 @@ impl<'a> MelDecoder<'a> {
 /// all 1 if the previously-consumed byte exceeded `0x8F`. The init
 /// procedure also skips the 12 bits that were overwritten with 1s when
 /// `Scup` was recovered from the last two bytes.
+///
+/// Bytes are imported several at a time into a 64-bit window, so a
+/// CxtVLC codeword is matched on a seven-bit look-ahead instead of bit
+/// by bit. Running off the start of the stream (`Pcup`) is an error
+/// only when a bit past it is actually consumed.
 struct VlcReader<'a> {
     dcup: ModDcup<'a>,
     pcup: usize,
-    vlc_pos: isize,
-    vlc_bits: u32,
-    vlc_tmp: u32,
-    vlc_last: u32,
+    /// `VLC_pos`: the next byte to import.
+    pos: isize,
+    /// `VLC_last`: the last byte imported.
+    last: u32,
+    /// Imported bits not yet consumed, the next one in bit 0.
+    window: u64,
+    /// Number of valid bits in `window`.
+    avail: u32,
 }
 
 impl<'a> VlcReader<'a> {
     fn new(dcup: ModDcup<'a>, pcup: usize, lcup: usize) -> Self {
         // initVLC.
-        let vlc_pos = lcup as isize - 3;
-        let vlc_last = dcup.get(lcup - 2) as u32;
-        let vlc_tmp = vlc_last >> 4;
-        let vlc_bits = if (vlc_tmp & 7) < 7 { 4 } else { 3 };
+        let last = dcup.get(lcup - 2) as u32;
+        let tmp = last >> 4;
+        let avail = if (tmp & 7) < 7 { 4 } else { 3 };
         Self {
             dcup,
             pcup,
-            vlc_pos,
-            vlc_bits,
-            vlc_tmp,
-            vlc_last,
+            pos: lcup as isize - 3,
+            last,
+            window: u64::from(tmp & ((1 << avail) - 1)),
+            avail,
         }
     }
 
-    /// §7.1.4 `importVLCBit`.
-    fn bit(&mut self) -> Result<u8, Error> {
-        if self.vlc_bits == 0 {
-            if self.vlc_pos >= self.pcup as isize {
-                self.vlc_tmp = self.dcup.get(self.vlc_pos as usize) as u32;
+    /// The byte-import half of §7.1.4 `importVLCBit`, for as many bytes
+    /// as the window has room for.
+    #[cold]
+    #[inline(never)]
+    fn import(&mut self) {
+        while self.avail <= 56 && self.pos >= self.pcup as isize {
+            let byte = self.dcup.get(self.pos as usize) as u32;
+            let bits = if self.last > 0x8F && (byte & 0x7F) == 0x7F {
+                7
             } else {
-                return Err(Error::HtCorruptSegment);
-            }
-            self.vlc_bits = 8;
-            if self.vlc_last > 0x8F && (self.vlc_tmp & 0x7F) == 0x7F {
-                self.vlc_bits = 7;
-            }
-            self.vlc_last = self.vlc_tmp;
-            self.vlc_pos -= 1;
+                8
+            };
+            self.window |= u64::from(byte & ((1 << bits) - 1)) << self.avail;
+            self.avail += bits;
+            self.last = byte;
+            self.pos -= 1;
         }
-        let bit = (self.vlc_tmp & 1) as u8;
-        self.vlc_tmp >>= 1;
-        self.vlc_bits -= 1;
+    }
+
+    /// The next seven bits without consuming them; bits past the start
+    /// of the stream read as zero.
+    #[inline]
+    fn peek7(&mut self) -> usize {
+        if self.avail < 7 {
+            self.import();
+        }
+        (self.window & 0x7F) as usize
+    }
+
+    /// Consume `n` bits (at most 7); an error if the stream holds fewer.
+    #[inline]
+    fn consume(&mut self, n: u32) -> Result<(), Error> {
+        if n > self.avail {
+            return Err(Error::HtCorruptSegment);
+        }
+        self.window >>= n;
+        self.avail -= n;
+        Ok(())
+    }
+
+    /// §7.1.4 `importVLCBit`.
+    #[inline]
+    fn bit(&mut self) -> Result<u8, Error> {
+        if self.avail == 0 {
+            self.import();
+        }
+        let bit = (self.window & 1) as u8;
+        self.consume(1)?;
         Ok(bit)
     }
 }
@@ -369,41 +422,67 @@ const fn index_cxt_vlc<const N: usize>(table: &[CxtVlcEntry; N]) -> [u16; CXT_VL
     slots
 }
 
-static CXT_VLC_INDEX_0: [u16; CXT_VLC_SLOTS] = index_cxt_vlc(&CXT_VLC_TABLE_0);
-static CXT_VLC_INDEX_1: [u16; CXT_VLC_SLOTS] = index_cxt_vlc(&CXT_VLC_TABLE_1);
+const CXT_VLC_INDEX_0: [u16; CXT_VLC_SLOTS] = index_cxt_vlc(&CXT_VLC_TABLE_0);
+const CXT_VLC_INDEX_1: [u16; CXT_VLC_SLOTS] = index_cxt_vlc(&CXT_VLC_TABLE_1);
 
-/// §7.3.5 `decodeCxtVLC` — import VLC bits one at a time, growing the
-/// little-endian codeword until a table entry matches.
+/// Look-ahead form of one Annex C CxtVLC table: slot `(cq << 7) | bits`
+/// — the context and the next seven VLC bits, first bit lowest — holds
+/// `(1 + entry index) << 3 | length` of the codeword §7.3.5 matches,
+/// i.e. the shortest prefix of the seven bits that equals a codeword of
+/// that context; `0` when none does.
+const CXT_VLC_AHEAD: usize = 8 << 7;
+
+const fn look_ahead_cxt_vlc(index: &[u16; CXT_VLC_SLOTS]) -> [u16; CXT_VLC_AHEAD] {
+    let mut slots = [0u16; CXT_VLC_AHEAD];
+    let mut key = 0;
+    while key < CXT_VLC_AHEAD {
+        let context = (key >> 7) << 10;
+        let bits = key & 0x7F;
+        let mut len = 1;
+        while len <= 7 {
+            let hit = index[context | ((len - 1) << 7) | (bits & ((1 << len) - 1))];
+            if hit != 0 {
+                assert!(hit < 1 << 13);
+                slots[key] = (hit << 3) | len as u16;
+                break;
+            }
+            len += 1;
+        }
+        key += 1;
+    }
+    slots
+}
+
+static CXT_VLC_AHEAD_0: [u16; CXT_VLC_AHEAD] = look_ahead_cxt_vlc(&CXT_VLC_INDEX_0);
+static CXT_VLC_AHEAD_1: [u16; CXT_VLC_AHEAD] = look_ahead_cxt_vlc(&CXT_VLC_INDEX_1);
+
+/// §7.3.5 `decodeCxtVLC` — the procedure imports VLC bits one at a
+/// time, growing the little-endian codeword until a table entry
+/// matches; the look-ahead table gives that entry and its length for
+/// the next seven bits at once.
 fn decode_cxt_vlc(
     vlc: &mut VlcReader,
     cq: u8,
     first_line_pair: bool,
 ) -> Result<CxtVlcResult, Error> {
-    let (table, index): (&[CxtVlcEntry], &[u16; CXT_VLC_SLOTS]) = if first_line_pair {
-        (&CXT_VLC_TABLE_0, &CXT_VLC_INDEX_0)
+    let (table, ahead): (&[CxtVlcEntry], &[u16; CXT_VLC_AHEAD]) = if first_line_pair {
+        (&CXT_VLC_TABLE_0, &CXT_VLC_AHEAD_0)
     } else {
-        (&CXT_VLC_TABLE_1, &CXT_VLC_INDEX_1)
+        (&CXT_VLC_TABLE_1, &CXT_VLC_AHEAD_1)
     };
-    let context = usize::from(cq & 7) << 10;
     if cq > 7 {
         // No table entry carries a context outside 0..=7.
         return Err(Error::HtCorruptSegment);
     }
-    let mut len = 1usize;
-    let mut cwd = vlc.bit()? as usize;
-    // Codewords are at most 7 bits (lw ≤ 7); guard against a malformed
-    // stream that never matches.
-    let e = loop {
-        let hit = index[context | ((len - 1) << 7) | cwd];
-        if hit != 0 {
-            break &table[usize::from(hit) - 1];
-        }
-        if len >= 7 {
-            return Err(Error::HtCorruptSegment);
-        }
-        cwd |= (vlc.bit()? as usize) << len;
-        len += 1;
-    };
+    // Codewords are at most 7 bits (lw ≤ 7). No match within them, or a
+    // match that needs bits the stream does not have, is a malformed
+    // stream.
+    let hit = ahead[(usize::from(cq) << 7) | vlc.peek7()];
+    if hit == 0 {
+        return Err(Error::HtCorruptSegment);
+    }
+    vlc.consume(u32::from(hit & 7))?;
+    let e = &table[usize::from(hit >> 3) - 1];
     Ok(CxtVlcResult {
         rho: e.rho,
         u_off: e.u_off,
@@ -536,9 +615,8 @@ impl HtGrid {
 
     /// `(x, y)` sub-band coordinates of sample `n = 4q + j`, or `None`
     /// if the sample lies in the odd-dimension pad region.
-    pub(crate) fn coord(&self, q: usize, j: usize) -> Option<(usize, usize)> {
-        let qx = q % self.qw;
-        let qy = q / self.qw;
+    #[inline]
+    pub(crate) fn coord(&self, qx: usize, qy: usize, j: usize) -> Option<(usize, usize)> {
         let x = 2 * qx + (j >> 1);
         let y = 2 * qy + (j & 1);
         if x < self.wblk && y < self.hblk {
@@ -548,17 +626,24 @@ impl HtGrid {
         }
     }
 
-    /// σ of sample `n = 4q + j` (false for padded / out-of-range).
-    fn sigma_n(&self, q: usize, j: usize) -> u8 {
-        match self.coord(q, j) {
+    /// Column and row of quad `q` (`q = qy · QW + qx`) in the quad
+    /// grid — the `(qx, qy)` the per-quad helpers take.
+    #[inline]
+    pub(crate) fn quad_xy(&self, q: usize) -> (usize, usize) {
+        (q % self.qw, q / self.qw)
+    }
+
+    #[inline]
+    fn sigma_at(&self, qx: usize, qy: usize, j: usize) -> u8 {
+        match self.coord(qx, qy, j) {
             Some((x, y)) => self.sigma[x + y * self.wblk] as u8,
             None => 0,
         }
     }
 
-    /// E of sample `n = 4q + j` (0 for padded / out-of-range).
-    fn exp_n(&self, q: usize, j: usize) -> u32 {
-        match self.coord(q, j) {
+    #[inline]
+    fn exp_at(&self, qx: usize, qy: usize, j: usize) -> u32 {
+        match self.coord(qx, qy, j) {
             Some((x, y)) => self.exp[x + y * self.wblk],
             None => 0,
         }
@@ -570,51 +655,42 @@ impl HtGrid {
 ///
 /// First quad row (`q < QW`) uses Formula (1) over `(σˢʷ, σʷ, σˢᶠ, σᶠ)`;
 /// other rows use Formula (2) over the previous-row neighbourhood.
-pub(crate) fn quad_context(grid: &HtGrid, q: usize) -> u8 {
-    let qw = grid.qw;
-    if q < qw {
-        // First line-pair. Neighbours are samples of the previous quad
-        // in the same row: σ_{4q-1}, σ_{4q-2}, σ_{4q-3}, σ_{4q-4}.
-        let (sw, w, sf, f) = if q > 0 {
-            let p = q - 1; // previous quad
+#[inline]
+pub(crate) fn quad_context(grid: &HtGrid, qx: usize, qy: usize) -> u8 {
+    if qy == 0 {
+        let (sw, w, sf, f) = if qx > 0 {
+            let p = qx - 1; // previous quad
             (
-                grid.sigma_n(p, 3), // σ_{4q-1} = sample j=3 of quad q-1
-                grid.sigma_n(p, 2), // σ_{4q-2} = j=2
-                grid.sigma_n(p, 1), // σ_{4q-3} = j=1
-                grid.sigma_n(p, 0), // σ_{4q-4} = j=0
+                grid.sigma_at(p, 0, 3), // σ_{4q-1} = sample j=3 of quad q-1
+                grid.sigma_at(p, 0, 2), // σ_{4q-2} = j=2
+                grid.sigma_at(p, 0, 1), // σ_{4q-3} = j=1
+                grid.sigma_at(p, 0, 0), // σ_{4q-4} = j=0
             )
         } else {
             (0, 0, 0, 0)
         };
-        // c_q = (σᶠ | σˢᶠ) + 2σʷ + 4σˢʷ   (Formula 1)
         (f | sf) + 2 * w + 4 * sw
     } else {
-        // Non-initial quad row. Neighbours from the preceding line.
-        let up = q - qw; // quad directly above
-        let n = grid.sigma_n(up, 1); // σⁿ  = σ_{4(q-QW)+1}
-        let ne = grid.sigma_n(up, 3); // σⁿᵉ = σ_{4(q-QW)+3}
-        let nw = if !q.is_multiple_of(qw) {
-            // σ_{4(q-QW)-1} = sample j=3 of quad (up-1)
-            grid.sigma_n(up - 1, 3)
+        let up = qy - 1; // row of the quad directly above
+        let n = grid.sigma_at(qx, up, 1); // σⁿ  = σ_{4(q-QW)+1}
+        let ne = grid.sigma_at(qx, up, 3); // σⁿᵉ = σ_{4(q-QW)+3}
+        // The quads to the left exist unless this one opens its row,
+        // the one above-right unless it closes it.
+        let nw = if qx > 0 {
+            grid.sigma_at(qx - 1, up, 3)
         } else {
             0
         };
-        let nf = if !(q + 1).is_multiple_of(qw) {
-            // σ_{4(q-QW)+5} = sample j=1 of quad (up+1)
-            grid.sigma_n(up + 1, 1)
+        let nf = if qx + 1 < grid.qw {
+            grid.sigma_at(qx + 1, up, 1)
         } else {
             0
         };
-        // Also the west / south-west samples of the current row (the
-        // "w" and "sw" of Figure 5 — the two samples of the previous
-        // quad in this row).
-        let (w, sw) = if !q.is_multiple_of(qw) {
-            let p = q - 1;
-            (grid.sigma_n(p, 2), grid.sigma_n(p, 3))
+        let (w, sw) = if qx > 0 {
+            (grid.sigma_at(qx - 1, qy, 2), grid.sigma_at(qx - 1, qy, 3))
         } else {
             (0, 0)
         };
-        // c_q = (σⁿʷ | σⁿ) + 2(σʷ | σˢʷ) + 4(σⁿᵉ | σⁿᶠ)   (Formula 2)
         (nw | n) + 2 * (w | sw) + 4 * (ne | nf)
     }
 }
@@ -623,32 +699,29 @@ pub(crate) fn quad_context(grid: &HtGrid, q: usize) -> u8 {
 ///
 /// First quad row: κ_q = 1. Otherwise κ_q is derived from the maximum
 /// of four previous-line exponents, modulated by γ_q (Formula 5/6).
-pub(crate) fn exponent_predictor(grid: &HtGrid, q: usize, rho: u8) -> u32 {
-    let qw = grid.qw;
-    if q < qw {
+#[inline]
+pub(crate) fn exponent_predictor(grid: &HtGrid, qx: usize, qy: usize, rho: u8) -> u32 {
+    if qy == 0 {
         return 1;
     }
-    let up = q - qw;
-    let e_n = grid.exp_n(up, 1);
-    let e_ne = grid.exp_n(up, 3);
-    let e_nw = if !q.is_multiple_of(qw) {
-        grid.exp_n(up - 1, 3)
+    let up = qy - 1;
+    let e_n = grid.exp_at(qx, up, 1);
+    let e_ne = grid.exp_at(qx, up, 3);
+    let e_nw = if qx > 0 {
+        grid.exp_at(qx - 1, up, 3)
     } else {
         0
     };
-    let e_nf = if !(q + 1).is_multiple_of(qw) {
-        grid.exp_n(up + 1, 1)
+    let e_nf = if qx + 1 < grid.qw {
+        grid.exp_at(qx + 1, up, 1)
     } else {
         0
     };
     let emax = e_nw.max(e_n).max(e_ne).max(e_nf);
-    // γ_q = 0 if ρ_q ∈ {0,1,2,4,8} (zero or one significant sample),
-    // else 1 (Formula 6).
     let gamma = !matches!(rho, 0 | 1 | 2 | 4 | 8);
     if gamma {
         1.max(emax.saturating_sub(1))
     } else {
-        // γ_q · (…) = 0, so max{1, 0} = 1.
         1
     }
 }
@@ -691,11 +764,11 @@ fn decode_cleanup(grid: &mut HtGrid, seg: &[u8]) -> Result<(), Error> {
             let q2 = q1 + 1;
 
             // --- CxtVLC (decodeSigEMB) for each quad in the pair ---
-            let r1 = decode_sig_emb(grid, &mut mel, &mut vlc, q1, first_line_pair)?;
-            apply_sig_pattern(grid, q1, r1.rho);
+            let r1 = decode_sig_emb(grid, &mut mel, &mut vlc, qx, qy)?;
+            apply_sig_pattern(grid, qx, qy, r1.rho);
             let r2 = if has_q2 {
-                let r = decode_sig_emb(grid, &mut mel, &mut vlc, q2, first_line_pair)?;
-                apply_sig_pattern(grid, q2, r.rho);
+                let r = decode_sig_emb(grid, &mut mel, &mut vlc, qx + 1, qy)?;
+                apply_sig_pattern(grid, qx + 1, qy, r.rho);
                 Some(r)
             } else {
                 None
@@ -729,9 +802,9 @@ fn decode_cleanup(grid: &mut HtGrid, seg: &[u8]) -> Result<(), Error> {
             }
 
             // --- Predictors + MagSgn for the two quads (§7.3.7/§7.3.8) ---
-            decode_quad_magsgn(grid, &mut magsgn, q1)?;
+            decode_quad_magsgn(grid, &mut magsgn, qx, qy)?;
             if has_q2 {
-                decode_quad_magsgn(grid, &mut magsgn, q2)?;
+                decode_quad_magsgn(grid, &mut magsgn, qx + 1, qy)?;
             }
 
             qx += 2;
@@ -745,10 +818,11 @@ fn decode_sig_emb(
     grid: &HtGrid,
     mel: &mut MelDecoder,
     vlc: &mut VlcReader,
-    q: usize,
-    first_line_pair: bool,
+    qx: usize,
+    qy: usize,
 ) -> Result<CxtVlcResult, Error> {
-    let cq = quad_context(grid, q);
+    let first_line_pair = qy == 0;
+    let cq = quad_context(grid, qx, qy);
     if cq == 0 {
         let sym = mel.sym();
         if sym == 0 {
@@ -760,10 +834,11 @@ fn decode_sig_emb(
 
 /// Set σ_n for the four samples of quad `q` from its significance
 /// pattern ρ_q.
-pub(crate) fn apply_sig_pattern(grid: &mut HtGrid, q: usize, rho: u8) {
+#[inline]
+pub(crate) fn apply_sig_pattern(grid: &mut HtGrid, qx: usize, qy: usize, rho: u8) {
     for j in 0..4 {
         if rho & (1 << j) != 0
-            && let Some((x, y)) = grid.coord(q, j)
+            && let Some((x, y)) = grid.coord(qx, qy, j)
         {
             grid.sigma[x + y * grid.wblk] = true;
         }
@@ -865,9 +940,15 @@ fn decode_u_pair(
 
 /// §7.3.7 + §7.3.8 — compute U_q for quad `q` and recover MagSgn values
 /// for its significant samples, writing μ_n / s_n / σ_n / E_n.
-fn decode_quad_magsgn(grid: &mut HtGrid, magsgn: &mut MagSgnReader, q: usize) -> Result<(), Error> {
+fn decode_quad_magsgn(
+    grid: &mut HtGrid,
+    magsgn: &mut MagSgnReader,
+    qx: usize,
+    qy: usize,
+) -> Result<(), Error> {
+    let q = qy * grid.qw + qx;
     let qs = grid.quads[q];
-    let kappa = exponent_predictor(grid, q, qs.rho);
+    let kappa = exponent_predictor(grid, qx, qy, qs.rho);
     let u_big = kappa + qs.u_q;
     grid.quads[q].u_big = u_big;
 
@@ -902,7 +983,7 @@ fn decode_quad_magsgn(grid: &mut HtGrid, magsgn: &mut MagSgnReader, q: usize) ->
             // fall back defensively.
             (val.max(1), false)
         };
-        if let Some((x, y)) = grid.coord(q, j) {
+        if let Some((x, y)) = grid.coord(qx, qy, j) {
             let idx = x + y * grid.wblk;
             grid.mu[idx] = mu;
             grid.sign[idx] = sign;
@@ -1351,6 +1432,218 @@ mod tests {
 
     /// `modDcup` overwrites the last byte with 0xFF and forces the low
     /// nibble of the second-last byte to 1s (§7.1.1).
+    /// §7.1.2 `importMagSgnBit`, one bit at a time as the procedure is
+    /// written: the reference the windowed reader must match.
+    struct MagSgnBitwise<'a> {
+        dcup: ModDcup<'a>,
+        pcup: usize,
+        pos: usize,
+        bits: u32,
+        tmp: u32,
+        last: u32,
+    }
+
+    impl MagSgnBitwise<'_> {
+        fn bit(&mut self) -> Result<u32, Error> {
+            if self.bits == 0 {
+                self.bits = if self.last == 0xFF { 7 } else { 8 };
+                if self.pos < self.pcup {
+                    self.tmp = self.dcup.get(self.pos) as u32;
+                    if self.tmp & (1 << self.bits) != 0 {
+                        return Err(Error::HtCorruptSegment);
+                    }
+                } else if self.pos == self.pcup {
+                    self.tmp = 0xFF;
+                } else {
+                    return Err(Error::HtCorruptSegment);
+                }
+                self.last = self.tmp;
+                self.pos += 1;
+            }
+            let bit = self.tmp & 1;
+            self.tmp >>= 1;
+            self.bits -= 1;
+            Ok(bit)
+        }
+
+        fn value(&mut self, m: u32) -> Result<u32, Error> {
+            let mut val = 0;
+            for i in 0..m {
+                val |= self.bit()? << i;
+            }
+            Ok(val)
+        }
+    }
+
+    /// §7.1.4 `importVLCBit` as the procedure is written.
+    struct VlcBitwise<'a> {
+        dcup: ModDcup<'a>,
+        pcup: usize,
+        pos: isize,
+        bits: u32,
+        tmp: u32,
+        last: u32,
+    }
+
+    impl<'a> VlcBitwise<'a> {
+        fn new(dcup: ModDcup<'a>, pcup: usize, lcup: usize) -> Self {
+            let last = dcup.get(lcup - 2) as u32;
+            let tmp = last >> 4;
+            VlcBitwise {
+                dcup,
+                pcup,
+                pos: lcup as isize - 3,
+                bits: if (tmp & 7) < 7 { 4 } else { 3 },
+                tmp,
+                last,
+            }
+        }
+
+        fn bit(&mut self) -> Result<u8, Error> {
+            if self.bits == 0 {
+                if self.pos < self.pcup as isize {
+                    return Err(Error::HtCorruptSegment);
+                }
+                self.tmp = self.dcup.get(self.pos as usize) as u32;
+                self.bits = 8;
+                if self.last > 0x8F && (self.tmp & 0x7F) == 0x7F {
+                    self.bits = 7;
+                }
+                self.last = self.tmp;
+                self.pos -= 1;
+            }
+            let bit = (self.tmp & 1) as u8;
+            self.tmp >>= 1;
+            self.bits -= 1;
+            Ok(bit)
+        }
+
+        /// §7.3.5 `decodeCxtVLC`: grow the codeword a bit at a time
+        /// until an entry of the context matches.
+        fn cxt_vlc(&mut self, cq: u8, table: &[CxtVlcEntry]) -> Result<(u8, u8, u8, u8), Error> {
+            let mut cwd = 0u8;
+            for len in 1..=7u8 {
+                cwd |= self.bit()? << (len - 1);
+                if let Some(e) = table
+                    .iter()
+                    .find(|e| e.cq == cq && e.len == len && e.cwd == cwd)
+                {
+                    return Ok((e.rho, e.u_off, e.e_k, e.e_1));
+                }
+            }
+            Err(Error::HtCorruptSegment)
+        }
+    }
+
+    /// Pseudo-random segments with plenty of `0xFF` / `0x7F` bytes, so
+    /// stuffing and the stuffing-bit violation both occur.
+    fn stuffing_heavy_segment(next: &mut impl FnMut() -> u32) -> Vec<u8> {
+        let len = 2 + next() as usize % 60;
+        (0..len)
+            .map(|_| match next() % 7 {
+                0 => 0xFF,
+                1 => 0x7F,
+                2 => 0x8F + (next() % 0x70) as u8,
+                _ => next() as u8,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn windowed_magsgn_reader_matches_the_bitwise_procedure() {
+        let mut state = 0x4d53_0001u32;
+        let mut next = move || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            state >> 8
+        };
+        for round in 0..3000 {
+            let seg = stuffing_heavy_segment(&mut next);
+            let dcup = ModDcup::new(&seg);
+            let pcup = next() as usize % (seg.len() + 1);
+            let mut fast = MagSgnReader::new(dcup, pcup);
+            let mut slow = MagSgnBitwise {
+                dcup,
+                pcup,
+                pos: 0,
+                bits: 0,
+                tmp: 0,
+                last: 0,
+            };
+            loop {
+                // Widths as §7.3.8 asks for them, zero included.
+                let m = match next() % 4 {
+                    0 => 0,
+                    1 => next() % 4,
+                    _ => next() % 32,
+                };
+                let expected = slow.value(m);
+                assert_eq!(
+                    fast.bits(m).ok(),
+                    expected.as_ref().ok().copied(),
+                    "round {round} m {m}"
+                );
+                // An error ends the block decode; what a reader holds
+                // after one is never looked at.
+                if expected.is_err() {
+                    break;
+                }
+            }
+            assert!(fast.bits(33).is_err());
+        }
+    }
+
+    #[test]
+    fn windowed_vlc_reader_and_look_ahead_match_the_bitwise_procedure() {
+        let mut state = 0x564c_4301u32;
+        let mut next = move || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            state >> 8
+        };
+        for round in 0..3000 {
+            let seg = stuffing_heavy_segment(&mut next);
+            let dcup = ModDcup::new(&seg);
+            let pcup = next() as usize % (seg.len() - 1);
+            let mut fast = VlcReader::new(dcup, pcup, seg.len());
+            let mut slow = VlcBitwise::new(dcup, pcup, seg.len());
+            loop {
+                let failed = match next() % 3 {
+                    // A CxtVLC codeword in a random context and table.
+                    0 => {
+                        let cq = (next() % 8) as u8;
+                        let first = next() % 2 == 0;
+                        let table: &[CxtVlcEntry] = if first {
+                            &CXT_VLC_TABLE_0
+                        } else {
+                            &CXT_VLC_TABLE_1
+                        };
+                        let expected = slow.cxt_vlc(cq, table);
+                        let got = decode_cxt_vlc(&mut fast, cq, first)
+                            .map(|r| (r.rho, r.u_off, r.e_k, r.e_1));
+                        assert_eq!(
+                            got.ok(),
+                            expected.as_ref().ok().copied(),
+                            "round {round} cq {cq} first {first}"
+                        );
+                        expected.is_err()
+                    }
+                    // Single bits, as the U-VLC procedures take them.
+                    _ => {
+                        let expected = slow.bit();
+                        assert_eq!(
+                            fast.bit().ok(),
+                            expected.as_ref().ok().copied(),
+                            "round {round}"
+                        );
+                        expected.is_err()
+                    }
+                };
+                if failed {
+                    break;
+                }
+            }
+        }
+    }
+
     #[test]
     fn mod_dcup_rewrite() {
         let bytes = [0x12u8, 0x34, 0x50, 0xA0];
