@@ -260,55 +260,124 @@ comparing two builds.
 
 `cargo run --release --example perf_suite -- --threads N` on one
 18-core Apple M5 Max that other builds were sharing at the time (median
-of 9 rounds, milliseconds, encode / decode; synthetic images — ramps,
-texture, edges and grain — so the lossless streams carry about
+of 5 – 7 rounds, milliseconds, encode / decode; synthetic images —
+ramps, texture, edges and grain — so the lossless streams carry about
 3.6 bit/sample at 8 bits and 12 bit/sample at 16):
-
-| case | 1 worker | 2 | 4 | 8 | 16 |
-|---|---|---|---|---|---|
-| RGB8 1024², lossless 5-3 | 121 / 132 | 63 / 68 | 33 / 36 | 20 / 22 | 13 / 15 |
-| RGB16 1024², lossless 5-3 | 309 / 320 | 158 / 164 | 87 / 89 | 48 / 50 | 30 / 33 |
-| RGB8 512², lossy 9-7 | 51 / 54 | 25 / 26 | 13 / 15 | 7.8 / 9.7 | 5.8 / 7.8 |
-| RGB8 512², lossy 9-7, 4 layers, 96 kB budget | 52 / 13 | 29 / 7.7 | 16 / 5.1 | 11 / 4.6 | 8.3 / 3.8 |
-| RGB8 3840×2160, lossless 5-3 | 984 / 1072 | 536 / 559 | 291 / 300 | 162 / 164 | 99 / 101 |
-| RGB8 1024², lossless, 64 tiles of 128² | 136 / 146 | 72 / 77 | 40 / 40 | 23 / 22 | 16 / 15 |
-| RGB8 1024², lossless HTJ2K | 61 / 59 | 36 / 37 | 20 / 20 | 12 / 12 | 9.3 / 11 |
-
-Serial time is dominated by the MQ coder (one context-adaptive binary
-decision at a time, by construction), so it scales with the number of
-coded bits; everything else — the wavelet transform, colour transform,
-Tier-2 — is a few percent. The part that stays on one thread (packet
-headers, assembly, the per-thread start-up) is what flattens the curve
-past 8 workers on the smaller pictures.
-
-The MQ coder keeps each context as one word that carries its
-probability estimate `Qe` next to the Table C.2 index and the MPS
-sense, and steps it through a table of whole next-context words, so a
-coding step reads the estimate with the context instead of through a
-second, dependent table read. Interleaved A/B of the two builds on the
-same (busy) machine — median of 4 runs of 5 rounds each, milliseconds,
-encode / decode, before → after; codestream and sample hashes
-identical; the untouched HTJ2K case moved by up to ±3 % (±6 % on its
-best round), which is the noise floor here:
 
 | case | 1 worker | 8 workers |
 |---|---|---|
-| RGB8 1024², lossless 5-3 | 139 / 152 → 133 / 138 | 22.5 / 23.9 → 21.7 / 22.9 |
-| RGB16 1024², lossless 5-3 | 350 / 379 → 340 / 352 | 53.7 / 56.1 → 53.0 / 52.9 |
-| RGB8 512², lossy 9-7 | 48.5 / 53.1 → 47.5 / 49.0 | 8.2 / 10.1 → 7.6 / 9.1 |
-| RGB8 512², lossy 9-7, 4 layers, 96 kB budget | 57.2 / 16.4 → 54.4 / 14.5 | 13.0 / 5.3 → 12.6 / 4.8 |
-| RGB8 3840×2160, lossless 5-3 | 1116 / 1182 → 1104 / 1152 | 186 / 180 → 177 / 163 |
-| RGB8 1024², lossless, 64 tiles of 128² | 140 / 152 → 146 / 149 | 23.8 / 22.6 → 22.6 / 21.1 |
-| RGB8 1024², lossless HTJ2K (not MQ-coded) | 63.6 / 64.7 → 64.9 / 66.4 | 12.1 / 13.3 → 12.2 / 13.6 |
+| RGB8 1024², lossless 5-3 | 98 / 84 | 17 / 15 |
+| RGB16 1024², lossless 5-3 | 252 / 207 | 42 / 34 |
+| RGB8 1024², lossy 9-7 | 128 / 111 | 23 / 23 |
+| RGB8 512², lossy 9-7 | 33 / 29 | 6.2 / 6.6 |
+| RGB8 512², lossy 9-7, 4 layers, 96 kB budget | 44 / 8.5 | 11 / 3.6 |
+| RGB8 3840×2160, lossless 5-3 | 782 / 657 | 134 / 111 |
+| RGB8 1024², lossless, 64 tiles of 128² | 101 / 86 | 18 / 14 |
+| RGB8 4000×3000 (12 MP), lossless 5-3 | 1110 / 945 | 196 / 159 |
+| RGB8 4000×3000, lossy 9-7 | 1499 / 1305 | 281 / 244 |
+| RGB16 4000×3000, lossless 5-3 | 2914 / 2400 | 482 / 374 |
+| RGB8 1024², lossless HTJ2K | 51 / 39 | 11 / 9.5 |
+| RGB8 1024², lossy 9-7 HTJ2K | 57 / 47 | 13 / 14 |
 
-Decoding gains 3 – 11 % wherever the MQ coder runs; the encoder's
-1 – 5 % is inside the noise. Two further restructurings were measured
-the same way and dropped: leaving DECODE / ENCODE early when the
-interval stays normalized (a data-dependent branch: 7 % slower
-encoding, 13 % slower decoding on the 1024² case), and skipping whole
-stripe columns in the significance and refinement passes with one OR
-over the column's four states (3 % slower both ways on these textured
-images, where few columns are empty).
+The part that stays on one thread (packet headers, assembly, the
+per-thread start-up) is what flattens the curve past 8 workers on the
+smaller pictures.
+
+#### Where one worker's time goes
+
+Sampled profiles of the same runs (percent of the codec's own time;
+the 1 MP and 12 MP pictures agree within a point or two, so one
+column each):
+
+| decode | RGB8 lossy 9-7 | RGB8 lossless | RGB16 lossless | RGB8 HTJ2K |
+|---|---|---|---|---|
+| Tier-1: significance propagation passes | 43 – 44 | 49 – 51 | 35 | — |
+| Tier-1: magnitude refinement passes | 19 – 20 | 15 – 16 | 42 – 43 | — |
+| Tier-1: cleanup passes | 20 – 22 | 25 – 28 | 17 – 19 | — |
+| arithmetic decoder, byte refill (out of line) | 1.4 | 1.2 | 1.8 | — |
+| HT block decoder (cleanup + refinement) | — | — | — | 82 |
+| dequantisation (Equations E-6 / E-8) | 1.0 | 1.2 | 0.4 | 2.1 |
+| inverse wavelet | 7 – 10 | 3 – 4 | 1.3 | 5.9 |
+| inverse colour transform | 1.5 | 0.5 | 0.3 | 1.5 |
+| packing the output picture | 0.9 | 1.0 | 0.4 | 1.9 |
+| packet parsing / Tier-2 | 0.7 | 0.6 | 0.1 | 0.9 |
+| allocation, clearing, copies | 2.0 | 1.0 | 0.3 | 5.8 |
+
+| encode | RGB8 lossy 9-7 | RGB8 lossless | RGB16 lossless | RGB8 HTJ2K |
+|---|---|---|---|---|
+| Tier-1: significance propagation passes | 42 – 44 | 45 – 46 | 30 | — |
+| Tier-1: magnitude refinement passes | 19 – 20 | 15 – 17 | 42 – 43 | — |
+| Tier-1: cleanup passes | 20 | 24 – 25 | 15 | — |
+| arithmetic encoder, byte output (out of line) | 6.5 – 7 | 6 | 8.5 | — |
+| HT block encoder | — | — | — | 84 |
+| forward wavelet | 5.3 | 1.5 – 2 | 0.7 | 2.7 |
+| unpacking the picture, colour transform | 0.9 | 1.2 | 0.6 | 2.4 |
+| block set-up, rate bookkeeping, Tier-2 | 3.6 | 4 | 1.9 | 8.3 |
+| allocation, clearing, copies | 0.6 | 1.0 | 0.7 | 2.9 |
+
+The arithmetic coder's decision step is inlined into the three pass
+loops, so it is counted in the pass rows: only its byte-level path is
+a function of its own. For scale: the RGB8 1024² lossless stream is
+about 13 million binary decisions, and the bare decoder — one context held
+in a register, nothing else in the loop — takes 2.3 – 2.4 ns per
+decision on this machine (2.7 – 3.3 ns encoding), i.e. about 30 ms of
+the 84 ms. The rest is context formation, the state updates that
+follow a new significance, and the branches on the decoded values,
+which no predictor can follow.
+
+#### The block coder, before and after
+
+The Tier-1 state of a code-block is one 64-bit word per stripe column
+(the four samples a scan step covers): the 6 × 3 significance
+neighbourhood of the column, the matching sign grid, and per row the
+"coded by this plane's significance pass" and "already refined"
+flags, in an array padded by one column and one stripe all round. A
+pass loads one word per column; the Table D.1 label is a 512-entry
+lookup on nine bits of it and the Table D.2 / D.3 entry a 256-entry
+lookup; columns with no candidate are skipped on one test, the
+candidates of the others come from a bit mask; the cleanup pass
+decides run-length mode on the same word; the refinement pass queues
+its samples with their Table D.4 labels and then codes the queue. The
+same kernels serve the arithmetic decoder, the encoder and the raw
+(bypass) reader and writer, each working on local copies of the coder
+registers and contexts. The decoder's code register is 64 bits wide
+and refilled several bytes at a time; the HT block decoder reads its
+MagSgn and VLC streams through 64-bit windows and matches a CxtVLC
+codeword with one table read.
+
+Interleaved A/B against the block coder as it stood before (commit
+`50f24b6`) on the same (busy) machine, one worker — median of 5 runs of 7 rounds (3 runs
+of 3 rounds at 12 MP), milliseconds, before → after; codestream and
+decoded-sample hashes identical over the conformance corpus, the
+fixtures, the fuzz corpus and the encoder option matrix:
+
+| case | decode | encode |
+|---|---|---|
+| RGB8 1024², lossy 9-7 | 168 → 116 (×1.45) | 162 → 133 (×1.22) |
+| RGB8 1024², lossless 5-3 | 124 → 86 (×1.45) | 117 → 99 (×1.18) |
+| RGB16 1024², lossless 5-3 | 298 → 208 (×1.43) | 301 → 254 (×1.19) |
+| RGB8 4000×3000, lossy 9-7 | 1962 → 1356 (×1.45) | 1870 → 1576 (×1.19) |
+| RGB8 4000×3000, lossless 5-3 | 1423 → 988 (×1.44) | 1382 → 1147 (×1.21) |
+| RGB16 4000×3000, lossless 5-3 | 3394 → 2363 (×1.44) | 3542 → 2875 (×1.23) |
+| RGB8 1024², lossless HTJ2K | 57 → 42 (×1.36) | 57 → 54 (×1.06) |
+| RGB8 1024², lossy 9-7 HTJ2K | 69 → 50 (×1.38) | 64 → 62 (×1.03) |
+
+(Cycle counts of the same runs give the same ratios within 0.04.) The
+aim of this pass was ×1.5 decoding and ×1.3 encoding at one worker;
+it reached ×1.43 – 1.45 and ×1.18 – 1.23.
+
+Measured the same way and dropped: leaving DECODE / ENCODE early when
+the interval stays normalized (a data-dependent branch — slower both
+ways); keeping the significance and sign grids in two separate words
+so that a new significance reaches the neighbours before its sign is
+decoded (within the noise either way);
+holding the previous decision's context in a register for every pass
+rather than only the refinement pass, where runs of one context are
+the rule (no gain, by branch or by selection); an encoder that writes
+each byte unconditionally and advances its cursor by selection (more
+instructions, no fewer cycles); and encoder passes that first lay out
+all decisions of a column without branching and then code the list
+(13 % more instructions and 4 % more cycles at 8 bits, worse at 16).
 
 Peak memory for the 3840×2160 case through the contract API is about
 210 MiB decoding and 350 MiB encoding at one worker (the packed
