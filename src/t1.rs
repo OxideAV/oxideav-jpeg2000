@@ -113,7 +113,7 @@
 use crate::Error;
 use crate::geometry::SubBandOrientation;
 use crate::mq::{MqContext, MqDecoder};
-use crate::mqenc::MqEncoder;
+use crate::mqenc::{CoderRegisters, MqEncoder};
 
 /// First Annex D context label devoted to significance propagation
 /// (Table D.1 row "0", the all-insignificant-neighbours row).
@@ -511,10 +511,33 @@ pub struct Coefficient {
     pub already_refined: bool,
 }
 
-/// One rectangular code-block under tier-1 decoding.
+/// One rectangular code-block under tier-1 coding.
 ///
-/// The coefficient grid is stored in raster-major (row-major) order:
-/// `coefficient(u, v)` reads the magnitude and packed flags at that position.
+/// Magnitudes are stored in raster (row-major) order. Everything the
+/// §D.3 passes test — significance, sign, and the two per-plane
+/// membership flags — lives in one 64-bit word per **stripe column**
+/// (the four samples one §D.1 scan step covers), so a pass loads one
+/// word per column and derives every context of its four samples from
+/// it:
+///
+/// * bits `0..18` — the significance grid: 6 rows × 3 columns around
+///   the stripe column. Grid row `j` is sample row `j − 1` of the
+///   stripe (row 0 is the last row of the stripe above, row 5 the first
+///   row of the stripe below); within a row, bit 0 is the column to the
+///   left, bit 1 the column itself, bit 2 the column to the right. The
+///   Figure D.2 neighbourhood of stripe row `r` is therefore the nine
+///   bits starting at bit `3r`, the sample itself in the middle.
+/// * bits `18..36` — the sign grid, same geometry (a sign is meaningful
+///   only where the matching significance bit is set).
+/// * bits `36 + 3r` — row `r` was coded by the significance propagation
+///   pass of the current bit-plane, or became significant in its
+///   cleanup pass (cleared when the next significance pass starts).
+/// * bits `48 + 3r` — row `r` has had a magnitude refinement (Table
+///   D.4 "first refinement" is over).
+///
+/// The words are laid out with one spare column on each side and one
+/// spare stripe above and below, so publishing a new significance to
+/// the eight neighbours never tests for a block edge.
 #[derive(Debug, Clone)]
 pub struct CodeBlock {
     /// Sub-band orientation; selects the Table D.1 column.
@@ -523,144 +546,514 @@ pub struct CodeBlock {
     width: usize,
     /// Code-block height in samples.
     height: usize,
-    /// Full-width magnitudes, in raster order. The coefficient's three
-    /// flags live in `coding_state`; the public Coefficient is a snapshot.
+    /// Full-width magnitudes, in raster order.
     magnitudes: Vec<u32>,
-    /// Packed Figure D.2 neighbour sigma/sign and the two per-plane flags.
-    /// Together with `magnitudes`, uses eight bytes per coefficient.
-    /// Bits 14..16: own sigma, sign and first-refinement flags.
-    /// Bits 17..31: completed-plane count, with full-u32 overflow fallback.
-    /// Bits 0..7: D0, V0, D1, H0, H1, D2, V1, D3 sigma.
-    /// Bits 8..11: V0, H0, H1, V1 signs (meaningful only with sigma).
-    /// Bits 12..13: newly significant in the SP pass (MR skip, D.3.3),
-    /// and coded by the SP pass even when insignificant (cleanup skip, D.3.4).
-    coding_state: Vec<u32>,
-    /// Preassembled/HT blocks need no neighbour cache until Annex D runs.
-    coding_state_ready: bool,
+    /// Stripe-column words: `(stripes + 2) × (width + 2)`.
+    columns: Vec<u64>,
+    /// Whether the neighbour slots of the grids are populated. A block
+    /// handed over already decoded (by the HT block decoder, or by a
+    /// test) carries only each sample's own bits until an Annex D pass
+    /// first runs on it.
+    neighbours_ready: bool,
     /// Per-coefficient count of decoded magnitude bits drawn by the
     /// §D.3 coding passes — the actually-iterated half of the §D.2.1
     /// `Nb(u, v)` (the §B.10.5 zero-MSB count `P` is recorded
     /// separately in [`Self::zero_bit_planes`] and added by
     /// [`Self::effective_nb`]). Every coefficient gets exactly one
-    /// increment per **completed** bit-plane: the SP pass for an
-    /// insignificant coefficient with a non-zero Table D.1 context, the
-    /// MR pass for an already-significant coefficient, or the cleanup
-    /// pass for a coefficient left over (zero-context insignificant).
-    /// When a packet header truncates the decode mid-bit-plane the
-    /// counts diverge — the coefficients the truncated final pass
-    /// reached carry one more decoded bit than those it did not — which
-    /// is exactly the per-coefficient `Nb(u, v)` of §E.1.1.2 /
-    /// §E.1.2.1 Equation E-6 / E-8.
-    /// Counts normally live in `coding_state`. Direct public pass calls
-    /// may exceed that representation; then this stores all full-u32 counts.
-    wide_decoded_bits: Option<Vec<u32>>,
+    /// increment per **completed** bit-plane; when a packet header
+    /// truncates the decode mid-bit-plane the counts diverge — the
+    /// coefficients the truncated final pass reached carry one more
+    /// decoded bit than those it did not — which is exactly the
+    /// per-coefficient `Nb(u, v)` of §E.1.1.2 / §E.1.2.1 Equation E-6 /
+    /// E-8.
+    counts: Counts,
     /// The §B.10.5 zero-most-significant-bit-plane count `P` for this
     /// code-block, recorded by the decode driver via
     /// [`Self::set_zero_bit_planes`]. `Nb(u, v) = P + decoded_bits(u, v)`
-    /// per §D.2.1 ("the number `Nb(u, v)` … includes the number of all
-    /// zero most significant bit-planes signalled in the packet
-    /// header"). Default `0`.
+    /// per §D.2.1. Default `0`.
     zero_bit_planes: u32,
     /// Whether the COD / COC Table A.19 `vertically_causal_context`
-    /// flag is set for this code-block (T.800 §D.7).
-    ///
-    /// When `true`, the §D.3 passes treat the three "below the current
-    /// stripe" neighbour slots (`D2`, `V1`, `D3` of Figure D.2) as
-    /// insignificant for any coefficient sitting on the **bottom row of
-    /// its 4-row stripe** — i.e. they are read as zero exactly the same
-    /// way out-of-block neighbours are read as zero. Coefficients above
-    /// the bottom row of the stripe see their full Figure D.2 neighbour
-    /// set unchanged. Default `false` (full Figure D.2 neighbour read
-    /// everywhere, identical to the round-208 behaviour).
-    ///
-    /// Toggle via [`Self::with_vertically_causal_context`].
+    /// flag is set for this code-block (T.800 §D.7): the passes then
+    /// read the three neighbours below the last row of each stripe as
+    /// insignificant. Toggle via
+    /// [`Self::with_vertically_causal_context`].
     vertically_causal: bool,
     /// Per-coefficient §D.2.1 `Nb(u, v)` after the §H.1 region-of-interest
     /// (Maxshift) remap, when an `RGN` marker is in force. `None` (the
-    /// default) means no ROI: [`Self::effective_nb`] falls back to the
-    /// `P + decoded_bits` reading. When `Some`, every coefficient's
-    /// `Nb(u, v)` was rewritten by [`Self::apply_roi_maxshift`] (the
-    /// §H.1 steps subtract / cap `Nb` per coefficient class) and is read
-    /// directly from this vector. The magnitudes carried in
-    /// [`Self::magnitudes`] are likewise rewritten in place to the
-    /// background-`Mb`-anchored values §E.1 expects.
+    /// default) means no ROI.
     roi_nb: Option<Vec<u32>>,
+    /// Work list of the magnitude refinement pass: `index << 2 | label`
+    /// for every sample the pass codes, in scan order.
+    refinement_queue: Vec<usize>,
 }
 
-const NEWLY_SIGNIFICANT: u32 = 1 << 12;
-const SP_VISITED: u32 = 1 << 13;
-const SELF_SIGMA: u32 = 1 << 14;
-const SELF_SIGN: u32 = 1 << 15;
-const SELF_REFINED: u32 = 1 << 16;
-const COEFFICIENT_FLAGS: u32 = SELF_SIGMA | SELF_SIGN | SELF_REFINED;
-const COUNT_SHIFT: u32 = 17;
-const COUNT_MASK: u32 = u32::MAX << COUNT_SHIFT;
-const PACKED_COUNT_MAX: u32 = u32::MAX >> COUNT_SHIFT;
-
-#[inline]
-fn coefficient_flags(coefficient: Coefficient) -> u32 {
-    (u32::from(coefficient.sigma) * SELF_SIGMA)
-        | (u32::from(coefficient.sign) * SELF_SIGN)
-        | (u32::from(coefficient.already_refined) * SELF_REFINED)
+/// How the per-coefficient decoded-bit counts are held.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Counts {
+    /// The §D.3 schedule so far: `complete` bit-planes coded every
+    /// sample once, and the passes of the unfinished plane coded the
+    /// samples `partial` describes — which the column words identify,
+    /// so no per-sample counter is kept.
+    Planes { complete: u32, partial: Partial },
+    /// One explicit count per sample (raster order): counts supplied by
+    /// the HT block decoder, or passes called out of the §D.3 order.
+    PerSample(Vec<u32>),
 }
 
-// Derive the packed lookups from the same Table D.1/D.2/D.3 rules as the
-// public Neighbours helpers. Plane-local flags never participate in a key.
-const SIGNIFICANCE_CONTEXTS: [[u8; 256]; 3] = build_significance_contexts();
-const SIGN_CONTEXTS: [(u8, u8); 256] = build_sign_contexts();
+/// The passes run on the bit-plane in progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Partial {
+    /// None: every sample has `complete` counts.
+    None,
+    /// Significance propagation: one more for the samples it coded.
+    Sp,
+    /// Significance propagation and magnitude refinement: one more for
+    /// the samples either coded.
+    SpMr,
+}
 
-const fn build_significance_contexts() -> [[u8; 256]; 3] {
-    let mut tables = [[0; 256]; 3];
-    let mut sigma = 0usize;
-    while sigma < 256 {
-        let h = (((sigma >> 3) & 1) + ((sigma >> 4) & 1)) as u8;
-        let v = (((sigma >> 1) & 1) + ((sigma >> 6) & 1)) as u8;
-        let d = ((sigma & 1) + ((sigma >> 2) & 1) + ((sigma >> 5) & 1) + ((sigma >> 7) & 1)) as u8;
-        tables[0][sigma] = sp_label_ll_lh(h, v, d);
-        tables[1][sigma] = sp_label_ll_lh(v, h, d);
-        tables[2][sigma] = sp_label_hh(h + v, d);
-        sigma += 1;
+/// The three §D.3 pass kinds, for the count bookkeeping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PassKind {
+    Sp,
+    Mr,
+    Cleanup,
+}
+
+/// The significance grid of a column word.
+const SIGMA_GRID: u64 = (1 << 18) - 1;
+/// Offset of the sign grid.
+const SIGN_SHIFT: u32 = 18;
+/// Offset of the per-row "coded by this plane's SP pass" bits.
+const VISITED_SHIFT: u32 = 36;
+/// Offset of the per-row "already refined" bits.
+const REFINED_SHIFT: u32 = 48;
+/// One bit per stripe row, at `3r`.
+const ROWS4: u64 = 0o1111;
+/// One bit per grid row, at `3j`.
+const ROWS6: u64 = 0o11_1111;
+/// The centre slot (the column itself) of grid row 0.
+const CENTRE: u64 = 2;
+/// The four own-significance bits of a column word.
+const OWN_SIGMA: u64 = ROWS4 << 4;
+/// The four "coded by the SP pass" bits.
+const VISITED_ROWS: u64 = ROWS4 << VISITED_SHIFT;
+/// Grid row 5 — the first row of the stripe below — in both grids:
+/// what §D.7 vertically causal context formation hides.
+const ROW_BELOW_STRIPE: u64 = (0o7 << 15) | (0o7 << (SIGN_SHIFT + 15));
+
+/// Bit `n` of a lookup-table key.
+const fn key_bit(key: usize, n: usize) -> u8 {
+    ((key >> n) & 1) as u8
+}
+
+/// Table D.1 context labels by 9-bit neighbourhood (bit 4, the sample
+/// itself, is ignored), for the LL / LH, HL and HH columns.
+static SIGNIFICANCE_LABELS: [[u8; 512]; 3] = {
+    let mut tables = [[0u8; 512]; 3];
+    let mut key = 0usize;
+    while key < 512 {
+        let h = key_bit(key, 3) + key_bit(key, 5);
+        let v = key_bit(key, 1) + key_bit(key, 7);
+        let d = key_bit(key, 0) + key_bit(key, 2) + key_bit(key, 6) + key_bit(key, 8);
+        tables[0][key] = sp_label_ll_lh(h, v, d);
+        tables[1][key] = sp_label_ll_lh(v, h, d);
+        tables[2][key] = sp_label_hh(h + v, d);
+        key += 1;
     }
     tables
-}
+};
 
-#[inline]
-fn significance_contexts(orientation: SubBandOrientation) -> &'static [u8; 256] {
-    match orientation {
-        SubBandOrientation::LL | SubBandOrientation::LH => &SIGNIFICANCE_CONTEXTS[0],
-        SubBandOrientation::HL => &SIGNIFICANCE_CONTEXTS[1],
-        SubBandOrientation::HH => &SIGNIFICANCE_CONTEXTS[2],
-    }
-}
-
-const fn build_sign_contexts() -> [(u8, u8); 256] {
-    let mut table = [(0, 0); 256];
+/// Tables D.2 / D.3 by the key of [`sign_key`]: the context index
+/// (`9..=13`) in the low bits, the XORbit in bit 7.
+static SIGN_ENTRIES: [u8; 256] = {
+    let mut table = [0u8; 256];
     let mut key = 0usize;
     while key < 256 {
-        // Low nibble: H0, H1, V0, V1 sigma. High nibble: V0, H0,
-        // H1, V1 sign, retaining the cache's cardinal-sign order.
-        let h = horizontal_or_vertical_contribution(
-            key & 1 != 0,
-            key & (1 << 5) != 0,
-            key & 2 != 0,
-            key & (1 << 6) != 0,
-        );
-        let v = horizontal_or_vertical_contribution(
-            key & 4 != 0,
-            key & (1 << 4) != 0,
-            key & 8 != 0,
-            key & (1 << 7) != 0,
-        );
-        table[key] = sign_label_from_contributions(h, v);
+        // Key bits: significance of the upper, left, right and lower
+        // neighbour in bits 0 / 2 / 4 / 6, their signs one bit higher.
+        let on = [
+            key_bit(key, 0) != 0,
+            key_bit(key, 1) != 0,
+            key_bit(key, 2) != 0,
+            key_bit(key, 3) != 0,
+            key_bit(key, 4) != 0,
+            key_bit(key, 5) != 0,
+            key_bit(key, 6) != 0,
+            key_bit(key, 7) != 0,
+        ];
+        let h = horizontal_or_vertical_contribution(on[2], on[3], on[4], on[5]);
+        let v = horizontal_or_vertical_contribution(on[0], on[1], on[6], on[7]);
+        let (label, xorbit) = sign_label_from_contributions(h, v);
+        table[key] = (SIGN_CTX_OFFSET as u8 + label) | (xorbit << 7);
         key += 1;
     }
     table
-}
+};
 
 #[inline]
-fn packed_sign_context_label(state: u16) -> (u8, u8) {
-    let key = ((state >> 3) & 3) | ((state << 1) & 4) | ((state >> 3) & 8) | ((state >> 4) & 0xf0);
-    SIGN_CONTEXTS[key as usize]
+fn significance_labels(orientation: SubBandOrientation) -> &'static [u8; 512] {
+    match orientation {
+        SubBandOrientation::LL | SubBandOrientation::LH => &SIGNIFICANCE_LABELS[0],
+        SubBandOrientation::HL => &SIGNIFICANCE_LABELS[1],
+        SubBandOrientation::HH => &SIGNIFICANCE_LABELS[2],
+    }
+}
+
+/// The [`SIGN_ENTRIES`] key of the stripe row at bit `b = 3r`: the four
+/// cardinal neighbours' significance interleaved with their signs.
+#[inline(always)]
+fn sign_key(word: u64, b: u32) -> usize {
+    let sigma = (word >> b) & 0xAA;
+    let signs = (word >> (SIGN_SHIFT + b)) & 0xAA;
+    ((sigma >> 1) | signs) as usize
+}
+
+/// For each stripe row (bit `3r`): does any of its eight neighbours
+/// carry a significance bit? This is "Table D.1 context label ≠ 0".
+#[inline(always)]
+fn neighbour_rows(word: u64) -> u64 {
+    let any = (word | (word >> 1) | (word >> 2)) & ROWS6;
+    let sides = (word | (word >> 2)) & ROWS6;
+    (any | (sides >> 3) | (any >> 6)) & ROWS4
+}
+
+/// The row bits (`3r`) of a stripe holding `rows_left.min(4)` rows.
+#[inline(always)]
+fn stripe_rows(rows_left: usize) -> u64 {
+    if rows_left >= 4 {
+        ROWS4
+    } else {
+        ROWS4 & ((1u64 << (3 * rows_left)) - 1)
+    }
+}
+
+/// The stripe row `r` of a row bit position `b = 3r` (`r` in `0..4`).
+#[inline(always)]
+fn row_of(b: u32) -> usize {
+    ((b * 11) >> 5) as usize
+}
+
+/// Record that the sample in column `u`, stripe row at bit `b = 3r`,
+/// is now significant with sign `sign`: its own bits, and its slot in
+/// the grids of the eight neighbouring samples (the two adjacent
+/// columns, plus the stripe above for the first row and the stripe
+/// below for the last). `above`, `own` and `below` are the word rows of
+/// the three stripes, each with its spare column on either side (so
+/// column `u` is word `u + 1`). Returns the column's own word after the
+/// update.
+#[inline(always)]
+fn publish_significance(
+    above: &mut [u64],
+    own: &mut [u64],
+    below: &mut [u64],
+    u: usize,
+    b: u32,
+    sign: bool,
+) -> u64 {
+    let unit = CENTRE | (u64::from(sign) << (SIGN_SHIFT + 1));
+    let mine = unit << (b + 3);
+    let up = if b == 0 { unit << 15 } else { 0 };
+    let down = if b == 9 { unit } else { 0 };
+    // A sample supplied insignificant but with a sign keeps that sign
+    // bit until it becomes significant here.
+    let stale = (CENTRE << SIGN_SHIFT) << (b + 3);
+    above[u] |= up << 1;
+    above[u + 1] |= up;
+    above[u + 2] |= up >> 1;
+    own[u] |= mine << 1;
+    let word = (own[u + 1] & !stale) | mine;
+    own[u + 1] = word;
+    own[u + 2] |= mine >> 1;
+    below[u] |= down << 1;
+    below[u + 1] |= down;
+    below[u + 2] |= down >> 1;
+    word
+}
+
+/// The word rows of stripe `stripe` and of the stripes above and below
+/// it, each `stride` words (spare columns included).
+#[inline(always)]
+fn stripe_rows_mut(
+    columns: &mut [u64],
+    stripe: usize,
+    stride: usize,
+) -> (&mut [u64], &mut [u64], &mut [u64]) {
+    let band = &mut columns[stripe * stride..(stripe + 3) * stride];
+    let (above, rest) = band.split_at_mut(stride);
+    let (own, below) = rest.split_at_mut(stride);
+    (above, own, below)
+}
+
+/// Where a §D.3 pass sends or takes its decisions: the MQ decoder or
+/// encoder, or the §D.6 raw bit reader / writer.
+trait PassCoder {
+    /// One magnitude-bit decision of sample `idx` (raster index)
+    /// against context `cx`.
+    fn magnitude(&mut self, cx: usize, idx: usize) -> Result<u32, Error>;
+    /// One magnitude-refinement decision of sample `idx` against
+    /// context `cx`. Same coding as [`Self::magnitude`]; a separate
+    /// entry point because runs of one context are the rule here.
+    #[inline(always)]
+    fn refinement(&mut self, cx: usize, idx: usize) -> Result<u32, Error> {
+        self.magnitude(cx, idx)
+    }
+    /// The §D.3.2 sign of sample `idx`; `entry` is its
+    /// [`SIGN_ENTRIES`] value. `true` is negative.
+    fn sign(&mut self, entry: u8, idx: usize) -> Result<bool, Error>;
+    /// The Table D.5 run-length decision of the four-sample column
+    /// whose first sample is `top` (rows `width` apart): `None` when
+    /// all four stay insignificant, else the row of the first one that
+    /// does not.
+    fn run(&mut self, top: usize, width: usize) -> Result<Option<u32>, Error>;
+}
+
+/// The Annex D contexts copied into a power-of-two array, so a context
+/// index masks instead of bounds-checking.
+type ContextBank = [MqContext; 32];
+
+#[inline(always)]
+fn load_contexts(ctx: &[MqContext; NUM_CONTEXTS]) -> ContextBank {
+    let mut bank = [MqContext::default(); 32];
+    bank[..NUM_CONTEXTS].copy_from_slice(ctx);
+    bank
+}
+
+/// Arithmetic-decoded passes. The decoder registers are worked on as a
+/// local copy for the length of a pass, and the contexts in a separate
+/// local bank, so the coding loop keeps `A`, `C` and `CT` out of memory.
+///
+/// For the refinement pass the context of the previous decision is
+/// also held in a register (`recent`, `recent_word`): its decisions
+/// come in long runs of one context, and taking the state from the
+/// register instead of reading back the word just stored keeps a
+/// store-to-load round trip out of the decision-to-decision dependency
+/// chain. (The other passes change context all the time; there the
+/// test for "same as before" would cost more than it saves.)
+struct MqSource<'a, 'd> {
+    decoder: MqDecoder<'d>,
+    bank: &'a mut ContextBank,
+    recent: usize,
+    recent_word: u32,
+}
+
+impl MqSource<'_, '_> {
+    #[inline(always)]
+    fn decide(&mut self, cx: usize) -> u8 {
+        self.decoder.decode(&mut self.bank[cx & 31])
+    }
+}
+
+impl PassCoder for MqSource<'_, '_> {
+    #[inline(always)]
+    fn magnitude(&mut self, cx: usize, _idx: usize) -> Result<u32, Error> {
+        Ok(u32::from(self.decide(cx)))
+    }
+
+    #[inline(always)]
+    fn refinement(&mut self, cx: usize, _idx: usize) -> Result<u32, Error> {
+        let cx = cx & 31;
+        let word = if cx == self.recent {
+            self.recent_word
+        } else {
+            self.bank[cx].word()
+        };
+        let (d, word) = self.decoder.decode_word(word);
+        self.bank[cx].set_word(word);
+        self.recent = cx;
+        self.recent_word = word;
+        Ok(u32::from(d))
+    }
+
+    #[inline(always)]
+    fn sign(&mut self, entry: u8, _idx: usize) -> Result<bool, Error> {
+        let d = self.decide(usize::from(entry));
+        Ok(d ^ (entry >> 7) != 0)
+    }
+
+    #[inline(always)]
+    fn run(&mut self, _top: usize, _width: usize) -> Result<Option<u32>, Error> {
+        if self.decide(RUN_LENGTH_CTX) == 0 {
+            return Ok(None);
+        }
+        // Two UNIFORM bits, MSB then LSB: the 0-based row of the first
+        // significant coefficient.
+        let hi = self.decide(UNIFORM_CTX);
+        let lo = self.decide(UNIFORM_CTX);
+        Ok(Some(u32::from((hi << 1) | lo)))
+    }
+}
+
+/// Arithmetic-encoded passes: the decisions come from `targets`. The
+/// encoder registers are a local copy, as in [`MqSource`].
+struct MqSink<'a> {
+    registers: CoderRegisters,
+    out: &'a mut Vec<u8>,
+    bank: &'a mut ContextBank,
+    recent: usize,
+    recent_word: u32,
+    targets: &'a [Coefficient],
+    bitplane: u32,
+}
+
+impl MqSink<'_> {
+    #[inline(always)]
+    fn code(&mut self, cx: usize, d: u8) {
+        let context = &mut self.bank[cx & 31];
+        context.set_word(self.registers.encode(self.out, context.word(), d));
+    }
+}
+
+impl PassCoder for MqSink<'_> {
+    #[inline(always)]
+    fn magnitude(&mut self, cx: usize, idx: usize) -> Result<u32, Error> {
+        let bit = (self.targets[idx].magnitude >> self.bitplane) & 1;
+        self.code(cx, bit as u8);
+        Ok(bit)
+    }
+
+    #[inline(always)]
+    fn refinement(&mut self, cx: usize, idx: usize) -> Result<u32, Error> {
+        // As in `MqSource::refinement`: the previous context from a
+        // register when it repeats.
+        let bit = (self.targets[idx].magnitude >> self.bitplane) & 1;
+        let cx = cx & 31;
+        let word = if cx == self.recent {
+            self.recent_word
+        } else {
+            self.bank[cx].word()
+        };
+        let word = self.registers.encode(self.out, word, bit as u8);
+        self.bank[cx].set_word(word);
+        self.recent = cx;
+        self.recent_word = word;
+        Ok(bit)
+    }
+
+    #[inline(always)]
+    fn sign(&mut self, entry: u8, idx: usize) -> Result<bool, Error> {
+        // §D.3.2: the decoder recovers `sb = D ⊕ XORbit`, so the coded
+        // decision is `D = sb ⊕ XORbit`.
+        let sign = self.targets[idx].sign;
+        self.code(usize::from(entry), u8::from(sign) ^ (entry >> 7));
+        Ok(sign)
+    }
+
+    #[inline(always)]
+    fn run(&mut self, top: usize, width: usize) -> Result<Option<u32>, Error> {
+        let first = (0..4u32).find(|&r| {
+            (self.targets[top + r as usize * width].magnitude >> self.bitplane) & 1 == 1
+        });
+        match first {
+            None => self.code(RUN_LENGTH_CTX, 0),
+            Some(first) => {
+                self.code(RUN_LENGTH_CTX, 1);
+                // Two UNIFORM bits, MSB then LSB, of the row.
+                self.code(UNIFORM_CTX, ((first >> 1) & 1) as u8);
+                self.code(UNIFORM_CTX, (first & 1) as u8);
+            }
+        }
+        Ok(first)
+    }
+}
+
+/// Run `pass` over an arithmetic-decoding source built on local copies
+/// of the decoder and the contexts, then hand both back.
+#[inline(always)]
+fn with_mq_source<'d, T>(
+    decoder: &mut MqDecoder<'d>,
+    ctx: &mut [MqContext; NUM_CONTEXTS],
+    pass: impl FnOnce(&mut MqSource<'_, 'd>) -> T,
+) -> T {
+    let mut bank = load_contexts(ctx);
+    let mut source = MqSource {
+        decoder: decoder.clone(),
+        bank: &mut bank,
+        recent: usize::MAX,
+        recent_word: 0,
+    };
+    let result = pass(&mut source);
+    *decoder = source.decoder;
+    ctx.copy_from_slice(&bank[..NUM_CONTEXTS]);
+    result
+}
+
+/// Run `pass` over an arithmetic-encoding sink built on local copies of
+/// the encoder registers and the contexts, then hand both back.
+#[inline(always)]
+fn with_mq_sink<T>(
+    encoder: &mut MqEncoder,
+    ctx: &mut [MqContext; NUM_CONTEXTS],
+    targets: &[Coefficient],
+    bitplane: u32,
+    pass: impl FnOnce(&mut MqSink<'_>) -> T,
+) -> T {
+    let mut bank = load_contexts(ctx);
+    let registers = encoder.registers();
+    let mut sink = MqSink {
+        registers,
+        out: encoder.output_mut(),
+        bank: &mut bank,
+        recent: usize::MAX,
+        recent_word: 0,
+        targets,
+        bitplane,
+    };
+    let result = pass(&mut sink);
+    let registers = sink.registers;
+    encoder.set_registers(registers);
+    ctx.copy_from_slice(&bank[..NUM_CONTEXTS]);
+    result
+}
+
+/// §D.6 raw (bypass) passes read from the bit-stuffed stream; Equation
+/// D-2: the sign is the raw bit, no XORbit.
+struct RawSource<'a, 'd> {
+    raw: &'a mut RawBitReader<'d>,
+}
+
+impl PassCoder for RawSource<'_, '_> {
+    #[inline(always)]
+    fn magnitude(&mut self, _cx: usize, _idx: usize) -> Result<u32, Error> {
+        self.raw.read_bit().map(u32::from)
+    }
+
+    #[inline(always)]
+    fn sign(&mut self, _entry: u8, _idx: usize) -> Result<bool, Error> {
+        Ok(self.raw.read_bit()? == 1)
+    }
+
+    fn run(&mut self, _top: usize, _width: usize) -> Result<Option<u32>, Error> {
+        // Table D.9: a cleanup pass is never raw.
+        Err(Error::InvalidPacketHeader)
+    }
+}
+
+/// §D.6 raw (bypass) passes written to the bit-stuffed stream.
+struct RawSink<'a> {
+    raw: &'a mut RawBitWriter,
+    targets: &'a [Coefficient],
+    bitplane: u32,
+}
+
+impl PassCoder for RawSink<'_> {
+    #[inline(always)]
+    fn magnitude(&mut self, _cx: usize, idx: usize) -> Result<u32, Error> {
+        let bit = (self.targets[idx].magnitude >> self.bitplane) & 1;
+        self.raw.write_bit(bit as u8);
+        Ok(bit)
+    }
+
+    #[inline(always)]
+    fn sign(&mut self, _entry: u8, idx: usize) -> Result<bool, Error> {
+        let sign = self.targets[idx].sign;
+        self.raw.write_bit(u8::from(sign));
+        Ok(sign)
+    }
+
+    fn run(&mut self, _top: usize, _width: usize) -> Result<Option<u32>, Error> {
+        Err(Error::InvalidPacketHeader)
+    }
 }
 
 impl CodeBlock {
@@ -677,13 +1070,24 @@ impl CodeBlock {
             width,
             height,
             magnitudes: vec![0; width * height],
-            coding_state: vec![0; width * height],
-            coding_state_ready: true,
-            wide_decoded_bits: None,
+            columns: vec![0; Self::column_words(width, height)],
+            neighbours_ready: true,
+            counts: Counts::Planes {
+                complete: 0,
+                partial: Partial::None,
+            },
             zero_bit_planes: 0,
             vertically_causal: false,
             roi_nb: None,
+            refinement_queue: Vec::new(),
         }
+    }
+
+    /// Number of column words of a `width × height` block: one per
+    /// stripe column, with a spare column either side and a spare
+    /// stripe above and below.
+    fn column_words(width: usize, height: usize) -> usize {
+        (height.div_ceil(4) + 2) * (width + 2)
     }
 
     /// Reuse the block buffers for a different, independent decode.
@@ -697,16 +1101,18 @@ impl CodeBlock {
         height: usize,
     ) {
         assert!(width >= 1 && height >= 1);
-        let len = width * height;
         self.orientation = orientation;
         self.width = width;
         self.height = height;
-        self.magnitudes.resize(len, 0);
-        self.magnitudes.fill(0);
-        self.coding_state.resize(len, 0);
-        self.coding_state.fill(0);
-        self.coding_state_ready = true;
-        self.wide_decoded_bits = None;
+        self.magnitudes.clear();
+        self.magnitudes.resize(width * height, 0);
+        self.columns.clear();
+        self.columns.resize(Self::column_words(width, height), 0);
+        self.neighbours_ready = true;
+        self.counts = Counts::Planes {
+            complete: 0,
+            partial: Partial::None,
+        };
         self.zero_bit_planes = 0;
         self.vertically_causal = false;
         self.roi_nb = None;
@@ -732,24 +1138,19 @@ impl CodeBlock {
             width * height,
             "coefficients length must equal width * height",
         );
-        Self {
-            orientation,
-            width,
-            height,
-            magnitudes: coefficients.iter().map(|c| c.magnitude).collect(),
-            // Borrow here so collect cannot reuse the wider Coefficient
-            // allocation (or its spare capacity) for these u32 states.
-            coding_state: coefficients
-                .iter()
-                .copied()
-                .map(coefficient_flags)
-                .collect(),
-            coding_state_ready: false,
-            wide_decoded_bits: None,
-            zero_bit_planes: 0,
-            vertically_causal: false,
-            roi_nb: None,
+        let mut block = Self::new(orientation, width, height);
+        block.neighbours_ready = false;
+        for (row, values) in coefficients.chunks_exact(width).enumerate() {
+            let b = 3 * (row % 4) as u32;
+            let first = block.column_index(0, row);
+            let words = &mut block.columns[first..first + width];
+            let magnitudes = &mut block.magnitudes[row * width..][..width];
+            for ((word, magnitude), coefficient) in words.iter_mut().zip(magnitudes).zip(values) {
+                *magnitude = coefficient.magnitude;
+                *word |= own_bits(*coefficient, b);
+            }
         }
+        block
     }
 
     /// Enable the T.800 §D.7 vertically-causal context-formation toggle.
@@ -769,10 +1170,7 @@ impl CodeBlock {
     /// "Figure D.1 bit 15" worked example).
     ///
     /// Builder-style: returns `self` so it can be chained with
-    /// [`Self::from_coefficients`] / [`Self::new`].
-    ///
-    /// Default is `false` (no clipping; identical neighbour reads to
-    /// the round-208 behaviour).
+    /// [`Self::from_coefficients`] / [`Self::new`]. Default is `false`.
     pub fn with_vertically_causal_context(mut self, enabled: bool) -> Self {
         self.vertically_causal = enabled;
         self
@@ -804,11 +1202,14 @@ impl CodeBlock {
         self.coefficient_at(u + v * self.width)
     }
 
-    /// Whether `(u, v)` became significant in the most recent SP pass.
-    /// Cleared at the start of every SP pass.
+    /// Whether `(u, v)` became significant in the most recent
+    /// significance propagation or cleanup pass. Cleared at the start
+    /// of every SP pass.
     pub fn was_newly_significant(&self, u: usize, v: usize) -> bool {
         debug_assert!(u < self.width && v < self.height);
-        self.coding_state[u + v * self.width] & NEWLY_SIGNIFICANT != 0
+        let word = self.columns[self.column_index(u, v)];
+        let b = 3 * (v % 4) as u32;
+        (word >> (b + 4)) & (word >> (VISITED_SHIFT + b)) & 1 != 0
     }
 
     /// The number of decoded magnitude bits the §D.3 passes have drawn
@@ -826,14 +1227,16 @@ impl CodeBlock {
     /// this to decide whether per-coefficient `Nb(u, v)` data is
     /// available or whether to fall back to a uniform `Nb`.
     pub fn max_decoded_bits(&self) -> u32 {
-        if let Some(bits) = &self.wide_decoded_bits {
-            bits.iter().copied().max().unwrap_or(0)
-        } else {
-            self.coding_state
-                .iter()
-                .map(|s| s >> COUNT_SHIFT)
-                .max()
-                .unwrap_or(0)
+        match &self.counts {
+            Counts::PerSample(counts) => counts.iter().copied().max().unwrap_or(0),
+            Counts::Planes { complete, partial } => {
+                let pending = match partial {
+                    Partial::None => 0,
+                    Partial::Sp => VISITED_ROWS,
+                    Partial::SpMr => VISITED_ROWS | OWN_SIGMA,
+                };
+                complete + u32::from(self.columns.iter().any(|word| word & pending != 0))
+            }
         }
     }
 
@@ -851,56 +1254,131 @@ impl CodeBlock {
         self.zero_bit_planes
     }
 
+    /// Index of the column word of sample `(u, v)`.
+    #[inline]
+    fn column_index(&self, u: usize, v: usize) -> usize {
+        (v / 4 + 1) * (self.width + 2) + 1 + u
+    }
+
+    /// §D.7: the bits of a column word the passes may read.
+    #[inline]
+    fn visible_mask(&self) -> u64 {
+        if self.vertically_causal {
+            !ROW_BELOW_STRIPE
+        } else {
+            !0
+        }
+    }
+
+    /// The one-bit share of the unfinished plane in the count of the
+    /// sample at stripe-row bit `b` of `word`.
+    #[inline(always)]
+    fn partial_bit(partial: Partial, word: u64, b: u32) -> u32 {
+        let coded = match partial {
+            Partial::None => 0,
+            Partial::Sp => word >> (VISITED_SHIFT + b),
+            Partial::SpMr => (word >> (VISITED_SHIFT + b)) | (word >> (b + 4)),
+        };
+        (coded & 1) as u32
+    }
+
     /// Raw per-coefficient completed-plane counts (the iterated half of
-    /// the §D.2.1 `Nb(u, v)`, raster order). The encoder's Annex J.13.4
-    /// distortion estimate reads these between forward coding passes to
-    /// derive each coefficient's midpoint-reconstruction uncertainty.
+    /// the §D.2.1 `Nb(u, v)`, raster order).
     #[inline]
     pub(crate) fn decoded_bits_at(&self, idx: usize) -> u32 {
-        if let Some(bits) = &self.wide_decoded_bits {
-            bits[idx]
-        } else {
-            self.coding_state[idx] >> COUNT_SHIFT
+        match &self.counts {
+            Counts::PerSample(counts) => counts[idx],
+            Counts::Planes { complete, partial } => {
+                let (u, v) = (idx % self.width, idx / self.width);
+                let word = self.columns[self.column_index(u, v)];
+                complete + Self::partial_bit(*partial, word, 3 * (v % 4) as u32)
+            }
+        }
+    }
+
+    /// Feed every sample's decoded-bit count to `emit`, in raster
+    /// order — [`Self::decoded_bits_at`] for each index, with the
+    /// representation resolved once.
+    pub(crate) fn for_each_decoded_bits(&self, mut emit: impl FnMut(u32)) {
+        match &self.counts {
+            Counts::PerSample(counts) => counts.iter().for_each(|&count| emit(count)),
+            Counts::Planes {
+                partial: Partial::None,
+                complete,
+            } => (0..self.width * self.height).for_each(|_| emit(*complete)),
+            Counts::Planes { complete, partial } => {
+                for row in 0..self.height {
+                    let b = 3 * (row % 4) as u32;
+                    let first = self.column_index(0, row);
+                    for &word in &self.columns[first..first + self.width] {
+                        emit(complete + Self::partial_bit(*partial, word, b));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Switch to one explicit count per sample.
+    fn materialise_counts(&mut self) -> &mut Vec<u32> {
+        if let Counts::Planes { .. } = self.counts {
+            let mut counts = Vec::with_capacity(self.width * self.height);
+            self.for_each_decoded_bits(|count| counts.push(count));
+            self.counts = Counts::PerSample(counts);
+        }
+        match &mut self.counts {
+            Counts::PerSample(counts) => counts,
+            Counts::Planes { .. } => unreachable!("counts were just materialised"),
+        }
+    }
+
+    /// Whether the counts keep their closed form when a pass of `kind`
+    /// runs now: the pass continues the §D.3 order (SP, MR, cleanup
+    /// within a plane; or a cleanup over a block in which every sample
+    /// is still uncoded and insignificant, which then codes them all).
+    fn continues_schedule(&self, kind: PassKind) -> bool {
+        let Counts::Planes { partial, .. } = self.counts else {
+            return false;
+        };
+        match (partial, kind) {
+            (Partial::None, PassKind::Sp)
+            | (Partial::Sp, PassKind::Mr)
+            | (Partial::SpMr, PassKind::Cleanup) => true,
+            (Partial::None, PassKind::Cleanup) => self
+                .columns
+                .iter()
+                .all(|word| word & (OWN_SIGMA | VISITED_ROWS) == 0),
+            _ => false,
         }
     }
 
     #[inline]
     fn coefficient_at(&self, idx: usize) -> Coefficient {
-        let state = self.coding_state[idx];
+        let (u, v) = (idx % self.width, idx / self.width);
+        let word = self.columns[self.column_index(u, v)];
+        let b = 3 * (v % 4) as u32;
         Coefficient {
             magnitude: self.magnitudes[idx],
-            sigma: state & SELF_SIGMA != 0,
-            sign: state & SELF_SIGN != 0,
-            already_refined: state & SELF_REFINED != 0,
+            sigma: (word >> (b + 4)) & 1 != 0,
+            sign: (word >> (SIGN_SHIFT + b + 4)) & 1 != 0,
+            already_refined: (word >> (REFINED_SHIFT + b)) & 1 != 0,
         }
     }
 
-    #[inline]
+    /// Overwrite one sample's own magnitude and flags. The neighbour
+    /// grids are not touched.
+    #[cfg(test)]
     fn set_coefficient_at(&mut self, idx: usize, coefficient: Coefficient) {
+        let (u, v) = (idx % self.width, idx / self.width);
+        let b = 3 * (v % 4) as u32;
+        let i = self.column_index(u, v);
         self.magnitudes[idx] = coefficient.magnitude;
-        self.coding_state[idx] =
-            (self.coding_state[idx] & !COEFFICIENT_FLAGS) | coefficient_flags(coefficient);
-    }
-
-    /// Preserve full-u32 direct-pass semantics when packed counts overflow.
-    #[cold]
-    fn promote_decoded_bits(&mut self) {
-        self.wide_decoded_bits = Some(self.coding_state.iter().map(|s| s >> COUNT_SHIFT).collect());
-        for state in &mut self.coding_state {
-            *state &= !COUNT_MASK;
-        }
-    }
-
-    #[inline]
-    fn increment_decoded_bits(&mut self, idx: usize) {
-        if let Some(bits) = &mut self.wide_decoded_bits {
-            bits[idx] += 1;
-        } else if self.coding_state[idx] & COUNT_MASK != COUNT_MASK {
-            self.coding_state[idx] += 1 << COUNT_SHIFT;
-        } else {
-            self.promote_decoded_bits();
-            self.wide_decoded_bits.as_mut().unwrap()[idx] += 1;
-        }
+        let all = Coefficient {
+            magnitude: 0,
+            sigma: true,
+            sign: true,
+            already_refined: true,
+        };
+        self.columns[i] = (self.columns[i] & !own_bits(all, b)) | own_bits(coefficient, b);
     }
 
     #[cfg(test)]
@@ -917,17 +1395,7 @@ impl CodeBlock {
     /// Annex D passes.
     pub(crate) fn set_decoded_bits_raw(&mut self, bits: Vec<u32>) {
         assert_eq!(bits.len(), self.width * self.height);
-        if bits.iter().any(|&b| b > PACKED_COUNT_MAX) {
-            for state in &mut self.coding_state {
-                *state &= !COUNT_MASK;
-            }
-            self.wide_decoded_bits = Some(bits);
-        } else {
-            for (state, bits) in self.coding_state.iter_mut().zip(bits) {
-                *state = (*state & !COUNT_MASK) | (bits << COUNT_SHIFT);
-            }
-            self.wide_decoded_bits = None;
-        }
+        self.counts = Counts::PerSample(bits);
     }
 
     /// The full per-coefficient §D.2.1 `Nb(u, v)` for reconstruction:
@@ -976,39 +1444,79 @@ impl CodeBlock {
     /// Equation E-1 value `qb(u, v)` and its §D.2.1 `Nb(u, v)` — the
     /// same pair [`Self::coefficient`] and [`Self::effective_nb`] yield
     /// per position, with the block-wide decisions (ROI override, the
-    /// uniform fallback of a block no coding pass touched, packed or
-    /// wide counts) taken once instead of per coefficient.
+    /// uniform fallback of a block no coding pass touched, the count
+    /// representation) taken once instead of per coefficient.
     pub(crate) fn for_each_signed_with_nb(
         &self,
         uniform_fallback: u32,
         mut emit: impl FnMut(i64, u32),
     ) {
+        /// One raster row: magnitudes, their column words, the bit of
+        /// the row's sign in those words.
         #[inline(always)]
-        fn signed(magnitude: u32, state: u32) -> i64 {
-            let magnitude = i64::from(magnitude);
-            if state & SELF_SIGN != 0 {
-                -magnitude
-            } else {
-                magnitude
+        fn row(
+            magnitudes: &[u32],
+            words: &[u64],
+            sign_bit: u32,
+            nb: impl Fn(usize, u64) -> u32,
+            emit: &mut impl FnMut(i64, u32),
+        ) {
+            for (u, (&magnitude, &word)) in magnitudes.iter().zip(words).enumerate() {
+                let magnitude = i64::from(magnitude);
+                let negative = (word >> sign_bit) & 1 != 0;
+                emit(if negative { -magnitude } else { magnitude }, nb(u, word));
             }
         }
-        let pairs = self.magnitudes.iter().zip(&self.coding_state);
-        if let Some(roi) = &self.roi_nb {
-            for ((&magnitude, &state), &nb) in pairs.zip(roi) {
-                emit(signed(magnitude, state), nb);
-            }
-        } else if self.max_decoded_bits() == 0 {
-            for (&magnitude, &state) in pairs {
-                emit(signed(magnitude, state), uniform_fallback);
-            }
-        } else if let Some(wide) = &self.wide_decoded_bits {
-            for ((&magnitude, &state), &bits) in pairs.zip(wide) {
-                emit(signed(magnitude, state), self.zero_bit_planes + bits);
-            }
-        } else {
-            let base = self.zero_bit_planes;
-            for (&magnitude, &state) in pairs {
-                emit(signed(magnitude, state), base + (state >> COUNT_SHIFT));
+        let width = self.width;
+        let uniform = self.roi_nb.is_none() && self.max_decoded_bits() == 0;
+        let base = self.zero_bit_planes;
+        for v in 0..self.height {
+            let b = 3 * (v % 4) as u32;
+            let first = self.column_index(0, v);
+            let words = &self.columns[first..first + width];
+            let magnitudes = &self.magnitudes[v * width..][..width];
+            let sign_bit = SIGN_SHIFT + b + 4;
+            if let Some(roi) = &self.roi_nb {
+                let roi = &roi[v * width..][..width];
+                row(magnitudes, words, sign_bit, |u, _| roi[u], &mut emit);
+            } else if uniform {
+                row(
+                    magnitudes,
+                    words,
+                    sign_bit,
+                    |_, _| uniform_fallback,
+                    &mut emit,
+                );
+            } else {
+                match &self.counts {
+                    Counts::PerSample(counts) => {
+                        let counts = &counts[v * width..][..width];
+                        row(
+                            magnitudes,
+                            words,
+                            sign_bit,
+                            |u, _| base + counts[u],
+                            &mut emit,
+                        );
+                    }
+                    Counts::Planes {
+                        complete,
+                        partial: Partial::None,
+                    } => {
+                        let nb = base + complete;
+                        row(magnitudes, words, sign_bit, |_, _| nb, &mut emit);
+                    }
+                    Counts::Planes { complete, partial } => {
+                        let nb = base + complete;
+                        row(
+                            magnitudes,
+                            words,
+                            sign_bit,
+                            |_, word| nb + Self::partial_bit(*partial, word, b),
+                            &mut emit,
+                        );
+                    }
+                }
             }
         }
     }
@@ -1046,29 +1554,334 @@ impl CodeBlock {
         if s == 0 {
             return;
         }
-        let mut roi_nb = vec![0u32; self.width * self.height];
-        for (idx, slot) in roi_nb.iter_mut().enumerate() {
-            let decoded = self.decoded_bits_at(idx);
+        let mut roi_nb = Vec::with_capacity(self.width * self.height);
+        self.for_each_decoded_bits(|decoded| roi_nb.push(decoded));
+        for (slot, magnitude) in roi_nb.iter_mut().zip(&mut self.magnitudes) {
             // Per-coefficient Nb(u, v) under the M'b budget: P + decoded.
-            let nb = self.zero_bit_planes + decoded;
+            let nb = self.zero_bit_planes + *slot;
             // Top `mb` MSBs of the M'b-anchored magnitude.
-            let top = self.magnitudes[idx] >> s;
+            let top = *magnitude >> s;
             if nb >= mb && top == 0 {
                 // §H.1 step 4 — background: magnitude unchanged (its top
                 // `s` bits are already zero), Nb drops by `s`.
                 *slot = nb.saturating_sub(s);
             } else if nb >= mb {
                 // §H.1 step 3 — ROI: keep the top `mb` bits, cap Nb = mb.
-                self.magnitudes[idx] = top;
+                *magnitude = top;
                 *slot = mb;
             } else {
                 // §H.1 step 2 — Nb < mb: re-anchor only (magnitude >> s),
                 // Nb unchanged.
-                self.magnitudes[idx] = top;
+                *magnitude = top;
                 *slot = nb;
             }
         }
         self.roi_nb = Some(roi_nb);
+    }
+
+    // === The three §D.3 passes over column words ======================
+    //
+    // Each kernel walks the §D.1 scan (stripes top to bottom, columns
+    // left to right, rows top to bottom within the column) one column
+    // word at a time, and is generic over the decision sink / source,
+    // so the decoder, the encoder and the §D.6 raw variants share one
+    // context formation and one state update.
+
+    /// §D.3.1: code every insignificant sample that has a significant
+    /// neighbour when the scan reaches it. Returns the number that
+    /// became significant.
+    #[inline(always)]
+    fn significance_kernel<C: PassCoder>(
+        &mut self,
+        bitplane: u32,
+        coder: &mut C,
+    ) -> Result<usize, Error> {
+        let weight = 1u32 << bitplane;
+        let labels = significance_labels(self.orientation);
+        let visible = self.visible_mask();
+        let (width, height) = (self.width, self.height);
+        let stride = width + 2;
+        let columns = &mut self.columns[..];
+        let magnitudes = &mut self.magnitudes[..];
+        let mut newly = 0usize;
+        for stripe in 0..height.div_ceil(4) {
+            let rows = stripe_rows(height - 4 * stripe);
+            let (above, own, below) = stripe_rows_mut(columns, stripe, stride);
+            let top = 4 * stripe * width;
+            for u in 0..width {
+                let mut word = own[u + 1] & visible;
+                // No significant sample in or around the column: no
+                // sample of it has a non-zero context, and none can get
+                // one before the scan leaves the column.
+                if word & SIGMA_GRID == 0 {
+                    continue;
+                }
+                // Rows still insignificant, and of those the ones with
+                // a significant neighbour so far.
+                let open = !(word >> 4) & rows;
+                let mut pending = neighbour_rows(word) & open;
+                let mut visited = 0u64;
+                while pending != 0 {
+                    let b = pending.trailing_zeros();
+                    pending &= pending - 1;
+                    let window = (word >> b) as usize & 0x1ff;
+                    let idx = top + u + row_of(b) * width;
+                    let bit = match coder.magnitude(usize::from(labels[window]), idx) {
+                        Ok(bit) => bit,
+                        Err(error) => {
+                            own[u + 1] |= visited << VISITED_SHIFT;
+                            return Err(error);
+                        }
+                    };
+                    // §D.3.4 / Table D.10 D9: coded in this pass, so
+                    // the same plane's cleanup pass skips it.
+                    visited |= 1 << b;
+                    if bit != 0 {
+                        let sign = match coder.sign(SIGN_ENTRIES[sign_key(word, b)], idx) {
+                            Ok(sign) => sign,
+                            Err(error) => {
+                                own[u + 1] |= visited << VISITED_SHIFT;
+                                return Err(error);
+                            }
+                        };
+                        magnitudes[idx] |= weight;
+                        word = publish_significance(above, own, below, u, b, sign) & visible;
+                        // The row below now has a significant neighbour.
+                        pending |= (8 << b) & open;
+                        newly += 1;
+                    }
+                }
+                own[u + 1] |= visited << VISITED_SHIFT;
+            }
+        }
+        Ok(newly)
+    }
+
+    /// §D.3.3: queue every sample that was significant before this
+    /// plane's significance pass, with its Table D.4 label, then code
+    /// the queue. Returns how many queue entries were coded, and the
+    /// error that stopped the pass early, if any.
+    #[inline(always)]
+    fn refinement_kernel<C: PassCoder>(
+        &mut self,
+        bitplane: u32,
+        coder: &mut C,
+    ) -> (usize, Option<Error>) {
+        let visible = self.visible_mask();
+        let (width, height) = (self.width, self.height);
+        let stride = width + 2;
+        let queue = &mut self.refinement_queue;
+        // A row that is not a candidate still writes (and then
+        // overwrites) the next free slot: room for one stripe column
+        // past the last sample.
+        queue.resize(width * height + 4, 0);
+        let columns = &mut self.columns[..];
+        let mut queued = 0usize;
+        for stripe in 0..height.div_ceil(4) {
+            let first = (stripe + 1) * stride + 1;
+            let top = 4 * stripe * width;
+            for u in 0..width {
+                let stored = columns[first + u];
+                let word = stored & visible;
+                // Significant, and not through this plane's SP pass.
+                let candidates = (word >> 4) & !(word >> VISITED_SHIFT) & ROWS4;
+                if candidates == 0 {
+                    continue;
+                }
+                let neighbours = neighbour_rows(word);
+                let refined = word >> REFINED_SHIFT;
+                for r in 0..4 {
+                    let b = 3 * r as u32;
+                    // Table D.4: 16 once refined, else 15 with a
+                    // significant neighbour, else 14.
+                    let again = (refined >> b) & 1;
+                    let label = (again << 1) | ((neighbours >> b) & 1 & !again);
+                    queue[queued] = ((top + u + r * width) << 2) | label as usize;
+                    queued += ((candidates >> b) & 1) as usize;
+                }
+                columns[first + u] = stored | (candidates << REFINED_SHIFT);
+            }
+        }
+        let magnitudes = &mut self.magnitudes[..];
+        for (done, &entry) in queue[..queued].iter().enumerate() {
+            let idx = entry >> 2;
+            match coder.refinement(REFINEMENT_CTX_OFFSET + (entry & 3), idx) {
+                Ok(bit) => magnitudes[idx] |= bit << bitplane,
+                Err(error) => {
+                    // The samples not reached keep their Table D.4
+                    // "first refinement" state.
+                    for &entry in &queue[done..queued] {
+                        if entry & 3 != 2 {
+                            let (u, v) = ((entry >> 2) % width, (entry >> 2) / width);
+                            columns[(v / 4 + 1) * stride + 1 + u] &=
+                                !(1 << (REFINED_SHIFT + 3 * (v % 4) as u32));
+                        }
+                    }
+                    return (done, Some(error));
+                }
+            }
+        }
+        (queued, None)
+    }
+
+    /// §D.3.4: code every sample this plane's earlier passes left
+    /// uncoded — whole columns through the Table D.5 run-length mode
+    /// where no sample in or around the column is significant. Returns
+    /// the number that became significant.
+    #[inline(always)]
+    fn cleanup_kernel<C: PassCoder>(
+        &mut self,
+        bitplane: u32,
+        coder: &mut C,
+    ) -> Result<usize, Error> {
+        let weight = 1u32 << bitplane;
+        let labels = significance_labels(self.orientation);
+        let visible = self.visible_mask();
+        let (width, height) = (self.width, self.height);
+        let stride = width + 2;
+        let columns = &mut self.columns[..];
+        let magnitudes = &mut self.magnitudes[..];
+        let mut newly = 0usize;
+        for stripe in 0..height.div_ceil(4) {
+            let rows = stripe_rows(height - 4 * stripe);
+            let (above, own, below) = stripe_rows_mut(columns, stripe, stride);
+            let top = 4 * stripe * width;
+            for u in 0..width {
+                let mut word = own[u + 1] & visible;
+                // Not significant, and not coded by the SP pass.
+                let mut pending = !((word >> 4) | (word >> VISITED_SHIFT)) & rows;
+                let mut significant = 0u64;
+                // Table D.10 decision D8: a full column of four
+                // uncoded samples, each with the zero context.
+                if rows == ROWS4 && word & (SIGMA_GRID | VISITED_ROWS) == 0 {
+                    let Some(r) = coder.run(top + u, width)? else {
+                        continue;
+                    };
+                    // Row `r` is significant by construction; only its
+                    // sign is coded (no neighbour is significant: the
+                    // key is zero). The rows below follow normally.
+                    let b = 3 * r;
+                    let idx = top + u + row_of(b) * width;
+                    let sign = coder.sign(SIGN_ENTRIES[0], idx)?;
+                    magnitudes[idx] |= weight;
+                    word = publish_significance(above, own, below, u, b, sign) & visible;
+                    significant |= 1 << b;
+                    newly += 1;
+                    pending &= !((2u64 << b) - 1);
+                }
+                while pending != 0 {
+                    let b = pending.trailing_zeros();
+                    pending &= pending - 1;
+                    let window = (word >> b) as usize & 0x1ff;
+                    let idx = top + u + row_of(b) * width;
+                    if coder.magnitude(usize::from(labels[window]), idx)? != 0 {
+                        let sign = coder.sign(SIGN_ENTRIES[sign_key(word, b)], idx)?;
+                        magnitudes[idx] |= weight;
+                        word = publish_significance(above, own, below, u, b, sign) & visible;
+                        significant |= 1 << b;
+                        newly += 1;
+                    }
+                }
+                // §D.3.3: a sample that turns significant in this pass
+                // is not refined before the next significance pass.
+                own[u + 1] |= significant << VISITED_SHIFT;
+            }
+        }
+        Ok(newly)
+    }
+
+    /// The significance pass with its count bookkeeping.
+    #[inline(always)]
+    fn run_significance<C: PassCoder>(
+        &mut self,
+        bitplane: u32,
+        coder: &mut C,
+    ) -> Result<usize, Error> {
+        self.ensure_neighbours();
+        if !self.continues_schedule(PassKind::Sp) {
+            self.materialise_counts();
+        }
+        // §D.3.3 / §D.3.4: the per-plane membership restarts with
+        // every significance pass.
+        for word in &mut self.columns {
+            *word &= !VISITED_ROWS;
+        }
+        let result = self.significance_kernel(bitplane, coder);
+        // §D.2.1: one magnitude bit for every sample the pass coded —
+        // also when it stopped early.
+        match &mut self.counts {
+            Counts::Planes { partial, .. } => *partial = Partial::Sp,
+            Counts::PerSample(counts) => {
+                let width = self.width;
+                for (v, row) in counts.chunks_exact_mut(width).enumerate() {
+                    let b = VISITED_SHIFT + 3 * (v % 4) as u32;
+                    let first = (v / 4 + 1) * (width + 2) + 1;
+                    for (count, &word) in row.iter_mut().zip(&self.columns[first..first + width]) {
+                        *count += ((word >> b) & 1) as u32;
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    /// The refinement pass with its count bookkeeping.
+    #[inline(always)]
+    fn run_refinement<C: PassCoder>(
+        &mut self,
+        bitplane: u32,
+        coder: &mut C,
+    ) -> Result<usize, Error> {
+        self.ensure_neighbours();
+        if !self.continues_schedule(PassKind::Mr) {
+            self.materialise_counts();
+        }
+        let (done, failure) = self.refinement_kernel(bitplane, coder);
+        if failure.is_some() {
+            // Only part of the candidates were coded.
+            self.materialise_counts();
+        }
+        match &mut self.counts {
+            Counts::Planes { partial, .. } => *partial = Partial::SpMr,
+            Counts::PerSample(counts) => {
+                for &entry in &self.refinement_queue[..done] {
+                    counts[entry >> 2] += 1;
+                }
+            }
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(done),
+        }
+    }
+
+    /// The cleanup pass with its count bookkeeping.
+    #[inline(always)]
+    fn run_cleanup<C: PassCoder>(&mut self, bitplane: u32, coder: &mut C) -> Result<usize, Error> {
+        self.ensure_neighbours();
+        if !self.continues_schedule(PassKind::Cleanup) {
+            self.materialise_counts();
+        }
+        // §D.2.1: the pass codes one magnitude bit of every sample that
+        // is insignificant and was not coded by the SP pass.
+        match &mut self.counts {
+            Counts::Planes { complete, partial } => {
+                *complete += 1;
+                *partial = Partial::None;
+            }
+            Counts::PerSample(counts) => {
+                let width = self.width;
+                for (v, row) in counts.chunks_exact_mut(width).enumerate() {
+                    let b = 3 * (v % 4) as u32;
+                    let first = (v / 4 + 1) * (width + 2) + 1;
+                    for (count, &word) in row.iter_mut().zip(&self.columns[first..first + width]) {
+                        let coded = !((word >> (b + 4)) | (word >> (VISITED_SHIFT + b))) & 1;
+                        *count += coded as u32;
+                    }
+                }
+            }
+        }
+        self.cleanup_kernel(bitplane, coder)
     }
 
     /// Run one §D.3.1 significance-propagation pass over the bit-plane
@@ -1098,83 +1911,9 @@ impl CodeBlock {
         decoder: &mut MqDecoder<'_>,
         ctx: &mut [MqContext; NUM_CONTEXTS],
     ) -> Result<usize, Error> {
-        self.ensure_coding_state();
-        let contexts = significance_contexts(self.orientation);
-        // §D.3.3: clear the "just became significant in the last SP
-        // pass" carry at the start of every new SP pass; bits set during
-        // *this* pass will be visible to the *next* magnitude refinement
-        // pass. The §D.3.4 π pass-membership flags reset on the same
-        // boundary: a new bit-plane's SP pass owns a fresh membership.
-        self.clear_pass_flags();
-
-        let weight: u32 = 1u32 << bitplane;
-        let mut newly = 0usize;
-        // §D.7 vertically causal clip for the last row of each stripe:
-        // D2 / V1 / D3 significance (bits 5..7) and the V1 sign (bit 11),
-        // exactly the bits `coding_state_in_stripe` removes.
-        let causal_clip: u32 = if self.vertically_causal {
-            (7 << 5) | (1 << 11)
-        } else {
-            0
-        };
-        let width = self.width;
-
-        let mut v0 = 0usize;
-        while v0 < self.height {
-            let stripe_h = core::cmp::min(4, self.height - v0);
-            for u in 0..width {
-                for dv in 0..stripe_h {
-                    let v = v0 + dv;
-                    let idx = u + v * width;
-                    let state = self.coding_state[idx];
-
-                    // SP pass: only insignificant coefficients with a
-                    // non-zero Table D.1 context are considered.
-                    if state & SELF_SIGMA != 0 {
-                        continue;
-                    }
-                    let clip = if dv + 1 == stripe_h { causal_clip } else { 0 };
-                    let visible = state & !clip;
-                    let label = contexts[(visible & 0xff) as usize];
-                    if label == 0 {
-                        // Zero context — deferred to the cleanup pass.
-                        continue;
-                    }
-
-                    let cx = &mut ctx[SP_CTX_OFFSET + label as usize];
-                    let bit = decoder.decode(cx);
-                    // §D.3.4 / Table D.10 D9: coded in the SP pass, so the
-                    // same plane's cleanup pass skips it; §D.2.1: one
-                    // magnitude bit decoded toward Nb(u, v).
-                    let mut next = state | SP_VISITED;
-                    if self.wide_decoded_bits.is_none() && state & COUNT_MASK != COUNT_MASK {
-                        next += 1 << COUNT_SHIFT;
-                        self.coding_state[idx] = next;
-                    } else {
-                        self.coding_state[idx] = next;
-                        self.increment_decoded_bits(idx);
-                        next = self.coding_state[idx];
-                    }
-                    if bit == 1 {
-                        // Newly significant: §D.3.2 sign decoding against
-                        // the Table D.3 context of the visible neighbours.
-                        let (sign_label, xorbit) = packed_sign_context_label(visible as u16);
-                        let sign_cx = &mut ctx[SIGN_CTX_OFFSET + sign_label as usize];
-                        let sign_bit = (decoder.decode(sign_cx) ^ xorbit) != 0;
-                        self.magnitudes[idx] |= weight;
-                        self.coding_state[idx] = (next & !SELF_SIGN)
-                            | SELF_SIGMA
-                            | (u32::from(sign_bit) * SELF_SIGN)
-                            | NEWLY_SIGNIFICANT;
-                        self.publish_significance(u, v, sign_bit);
-                        newly += 1;
-                    }
-                }
-            }
-            v0 += 4;
-        }
-
-        Ok(newly)
+        with_mq_source(decoder, ctx, |source| {
+            self.run_significance(bitplane, source)
+        })
     }
 
     /// Run one §D.3.3 magnitude-refinement pass over the bit-plane with
@@ -1185,8 +1924,7 @@ impl CodeBlock {
     /// that are **already significant** *and* did **not** become
     /// significant in the immediately preceding significance-propagation
     /// pass (§D.3.3's "except those that have just become significant in
-    /// the immediately preceding significance propagation pass" — the
-    /// `newly_significant` carry tracks that set).
+    /// the immediately preceding significance propagation pass").
     ///
     /// For each refined coefficient one MQ decision is drawn against the
     /// Table D.4 context: label 14 / 15 for the **first** refinement of
@@ -1198,10 +1936,7 @@ impl CodeBlock {
     ///
     /// The caller-supplied `ctx` array must hold all 19 Annex D contexts
     /// (see [`reset_contexts`]); the refinement pass only mutates entries
-    /// `14..=16`. The `newly_significant` carry is left intact so a
-    /// following pass on the same bit-plane (there is none in the §D.3
-    /// order, but tests may chain passes) still sees it; it is cleared at
-    /// the start of the next SP pass.
+    /// `14..=16`.
     ///
     /// Returns the number of coefficients refined in this pass (exposed
     /// mainly for tests).
@@ -1211,55 +1946,7 @@ impl CodeBlock {
         decoder: &mut MqDecoder<'_>,
         ctx: &mut [MqContext; NUM_CONTEXTS],
     ) -> Result<usize, Error> {
-        self.ensure_coding_state();
-        let mut refined = 0usize;
-        // §D.7: under vertically causal context formation the last row of
-        // each stripe does not see D2 / V1 / D3 (bits 5..7); only the
-        // significance byte feeds the Table D.4 label, so the clip is a
-        // mask on that byte.
-        let causal_clip: u32 = if self.vertically_causal { 7 << 5 } else { 0 };
-        let width = self.width;
-
-        let mut v0 = 0usize;
-        while v0 < self.height {
-            let stripe_h = core::cmp::min(4, self.height - v0);
-            for u in 0..width {
-                for dv in 0..stripe_h {
-                    let idx = u + (v0 + dv) * width;
-                    let state = self.coding_state[idx];
-
-                    // §D.3.3: refine coefficients that are already
-                    // significant, *except* those that became significant
-                    // in the immediately preceding SP pass.
-                    if state & (SELF_SIGMA | NEWLY_SIGNIFICANT) != SELF_SIGMA {
-                        continue;
-                    }
-
-                    // Table D.4 context: label 16 once refined, else 15 when
-                    // any (stripe-clipped) neighbour is significant, else 14.
-                    let label = if state & SELF_REFINED != 0 {
-                        2
-                    } else {
-                        let clip = if dv + 1 == stripe_h { causal_clip } else { 0 };
-                        u8::from(state & 0xff & !clip != 0)
-                    };
-                    let cx = &mut ctx[REFINEMENT_CTX_OFFSET + label as usize];
-                    self.magnitudes[idx] |= u32::from(decoder.decode(cx)) << bitplane;
-                    // §D.2.1: one refinement (magnitude) bit decoded for
-                    // this already-significant coefficient on this plane.
-                    if self.wide_decoded_bits.is_none() && state & COUNT_MASK != COUNT_MASK {
-                        self.coding_state[idx] = (state | SELF_REFINED) + (1 << COUNT_SHIFT);
-                    } else {
-                        self.coding_state[idx] = state | SELF_REFINED;
-                        self.increment_decoded_bits(idx);
-                    }
-                    refined += 1;
-                }
-            }
-            v0 += 4;
-        }
-
-        Ok(refined)
+        with_mq_source(decoder, ctx, |source| self.run_refinement(bitplane, source))
     }
 
     /// Run one §D.3.4 cleanup pass over the bit-plane with positional
@@ -1311,110 +1998,20 @@ impl CodeBlock {
         decoder: &mut MqDecoder<'_>,
         ctx: &mut [MqContext; NUM_CONTEXTS],
     ) -> Result<usize, Error> {
-        self.ensure_coding_state();
-        let contexts = significance_contexts(self.orientation);
-        let weight: u32 = 1u32 << bitplane;
-        let mut newly = 0usize;
-        // §D.7 vertically causal clip of the stripe's last row (D2 / V1 /
-        // D3 significance), as in `coding_state_in_stripe`.
-        let causal_clip: u32 = if self.vertically_causal { 7 << 5 } else { 0 };
-        let width = self.width;
-
-        let mut v0 = 0usize;
-        while v0 < self.height {
-            let stripe_h = core::cmp::min(4, self.height - v0);
-            for u in 0..self.width {
-                // §D.3.4 / Table D.5 run-length eligibility: a full
-                // (4-row) stripe whose column has all four coefficients
-                // still insignificant and each currently carrying the 0
-                // significance context.
-                let mut start_dv = 0usize;
-                if stripe_h == 4 && self.column_run_length_eligible(u, v0) {
-                    let rl_cx = &mut ctx[RUN_LENGTH_CTX];
-                    if decoder.decode(rl_cx) == 0 {
-                        // All four remain insignificant; the run-length
-                        // escape decoded a 0 magnitude bit for every one
-                        // of the column's four coefficients on this
-                        // bit-plane (§D.2.1: count each toward Nb).
-                        for dv in 0..4 {
-                            self.increment_decoded_bits(u + (v0 + dv) * self.width);
-                        }
-                        continue;
-                    }
-                    // At least one significant: two UNIFORM bits (MSB
-                    // then LSB) give the 0-based first-significant index.
-                    let hi = decoder.decode(&mut ctx[UNIFORM_CTX]);
-                    let lo = decoder.decode(&mut ctx[UNIFORM_CTX]);
-                    let first = ((hi << 1) | lo) as usize;
-                    // The first-significant coefficient is significant by
-                    // construction (the run-length escape already told us
-                    // so); decode only its sign, then continue normally
-                    // from the next coefficient down the column.
-                    let v = v0 + first;
-                    self.make_significant_with_sign(u, v, weight, v0, stripe_h, decoder, ctx);
-                    newly += 1;
-                    // §D.2.1: the coefficients above `first` were decoded
-                    // as 0 by the run-length escape; `first` itself was
-                    // decoded as a 1. Each gets one magnitude bit this
-                    // bit-plane. (Coefficients below `first` are coded by
-                    // the normal loop below, which counts them there.)
-                    for dv in 0..=first {
-                        self.increment_decoded_bits(u + (v0 + dv) * self.width);
-                    }
-                    start_dv = first + 1;
-                }
-
-                // Normal §D.3.1-style coding for the remaining
-                // coefficients of the column (or the whole column when
-                // run-length mode did not apply).
-                for dv in start_dv..stripe_h {
-                    let v = v0 + dv;
-                    let idx = u + v * width;
-                    let state = self.coding_state[idx];
-                    // Skip coefficients already significant or already
-                    // coded by this plane's significance propagation
-                    // pass (§D.3.4 "the remaining coefficients … not
-                    // handled by the significance propagation pass").
-                    if state & (SELF_SIGMA | SP_VISITED) != 0 {
-                        continue;
-                    }
-                    let clip = if dv + 1 == stripe_h { causal_clip } else { 0 };
-                    let label = contexts[(state & !clip & 0xff) as usize];
-                    let cx = &mut ctx[SP_CTX_OFFSET + label as usize];
-                    // §D.2.1: this leftover coefficient is coded (a 0 or
-                    // 1 magnitude bit) by the cleanup pass on this plane.
-                    if self.wide_decoded_bits.is_none() && state & COUNT_MASK != COUNT_MASK {
-                        self.coding_state[idx] = state + (1 << COUNT_SHIFT);
-                    } else {
-                        self.increment_decoded_bits(idx);
-                    }
-                    if decoder.decode(cx) == 1 {
-                        self.make_significant_with_sign(u, v, weight, v0, stripe_h, decoder, ctx);
-                        newly += 1;
-                    }
-                }
-            }
-            v0 += 4;
-        }
-
-        Ok(newly)
+        with_mq_source(decoder, ctx, |source| self.run_cleanup(bitplane, source))
     }
 
     // === Encode-side Annex D forward coding passes ===================
     //
-    // These mirror the AC decode passes above bit-for-bit: identical §D.1
-    // scan order, identical Table D.1 / D.3 / D.4 / D.5 context formation,
-    // and the identical progressive-significance state update. The only
-    // difference is that the magnitude / sign bit fed to each MQ coding
-    // decision comes from the caller-supplied `targets` (the fully-known
-    // quantised coefficients) rather than the decoder, and the decision is
-    // handed to [`MqEncoder::encode`]. Because the coefficient state evolves
-    // exactly as the decoder would reconstruct it, every context label the
-    // encoder computes equals the label the decoder will compute — so the
-    // produced codeword segment decodes back to the same coefficients. The
-    // block must be freshly [`Self::new`]-constructed (all-insignificant
-    // progressive state); `targets` is the row-major `width * height`
-    // coefficient grid to code.
+    // These run the same kernels as the decode passes: identical §D.1
+    // scan order, identical Table D.1 / D.3 / D.4 / D.5 context
+    // formation, and the identical progressive-significance state
+    // update. The only difference is that the magnitude / sign bit fed
+    // to each coding decision comes from the caller-supplied `targets`
+    // (the fully-known quantised coefficients) rather than the decoder.
+    // The block must be freshly [`Self::new`]-constructed
+    // (all-insignificant progressive state); `targets` is the row-major
+    // `width * height` coefficient grid to code.
 
     /// Encode one §D.3.1 significance-propagation pass (the forward
     /// counterpart of [`Self::significance_propagation_pass`]).
@@ -1425,65 +2022,10 @@ impl CodeBlock {
         encoder: &mut MqEncoder,
         ctx: &mut [MqContext; NUM_CONTEXTS],
     ) {
-        self.ensure_coding_state();
-        let contexts = significance_contexts(self.orientation);
-        self.clear_pass_flags();
-        let weight: u32 = 1u32 << bitplane;
-        // §D.7 clip of the stripe's last row, as in the decode pass.
-        let causal_clip: u32 = if self.vertically_causal {
-            (7 << 5) | (1 << 11)
-        } else {
-            0
-        };
-        let width = self.width;
-        let mut v0 = 0usize;
-        while v0 < self.height {
-            let stripe_h = core::cmp::min(4, self.height - v0);
-            for u in 0..width {
-                for dv in 0..stripe_h {
-                    let v = v0 + dv;
-                    let idx = u + v * width;
-                    let state = self.coding_state[idx];
-                    if state & SELF_SIGMA != 0 {
-                        continue;
-                    }
-                    let clip = if dv + 1 == stripe_h { causal_clip } else { 0 };
-                    let visible = state & !clip;
-                    let label = contexts[(visible & 0xff) as usize];
-                    if label == 0 {
-                        continue;
-                    }
-                    let target = targets[idx];
-                    let bit = ((target.magnitude >> bitplane) & 1) as u8;
-                    encoder.encode(&mut ctx[SP_CTX_OFFSET + label as usize], bit);
-                    let mut next = state | SP_VISITED;
-                    if self.wide_decoded_bits.is_none() && state & COUNT_MASK != COUNT_MASK {
-                        next += 1 << COUNT_SHIFT;
-                        self.coding_state[idx] = next;
-                    } else {
-                        self.coding_state[idx] = next;
-                        self.increment_decoded_bits(idx);
-                        next = self.coding_state[idx];
-                    }
-                    if bit == 1 {
-                        // §D.3.2: the decoder recovers `sb = D ⊕ XORbit`,
-                        // so the coded decision is `D = sb ⊕ XORbit`.
-                        let (sign_label, xorbit) = packed_sign_context_label(visible as u16);
-                        encoder.encode(
-                            &mut ctx[SIGN_CTX_OFFSET + sign_label as usize],
-                            (target.sign as u8) ^ xorbit,
-                        );
-                        self.magnitudes[idx] |= weight;
-                        self.coding_state[idx] = (next & !SELF_SIGN)
-                            | SELF_SIGMA
-                            | (u32::from(target.sign) * SELF_SIGN)
-                            | NEWLY_SIGNIFICANT;
-                        self.publish_significance(u, v, target.sign);
-                    }
-                }
-            }
-            v0 += 4;
-        }
+        with_mq_sink(encoder, ctx, targets, bitplane, |sink| {
+            self.run_significance(bitplane, sink)
+        })
+        .expect("the MQ encoder accepts every decision");
     }
 
     /// Encode one §D.3.3 magnitude-refinement pass (the forward
@@ -1495,39 +2037,10 @@ impl CodeBlock {
         encoder: &mut MqEncoder,
         ctx: &mut [MqContext; NUM_CONTEXTS],
     ) {
-        self.ensure_coding_state();
-        // §D.7: only the significance byte feeds the Table D.4 label.
-        let causal_clip: u32 = if self.vertically_causal { 7 << 5 } else { 0 };
-        let width = self.width;
-        let mut v0 = 0usize;
-        while v0 < self.height {
-            let stripe_h = core::cmp::min(4, self.height - v0);
-            for u in 0..width {
-                for dv in 0..stripe_h {
-                    let idx = u + (v0 + dv) * width;
-                    let state = self.coding_state[idx];
-                    if state & (SELF_SIGMA | NEWLY_SIGNIFICANT) != SELF_SIGMA {
-                        continue;
-                    }
-                    let label = if state & SELF_REFINED != 0 {
-                        2
-                    } else {
-                        let clip = if dv + 1 == stripe_h { causal_clip } else { 0 };
-                        u8::from(state & 0xff & !clip != 0)
-                    };
-                    let bit = (targets[idx].magnitude >> bitplane) & 1;
-                    encoder.encode(&mut ctx[REFINEMENT_CTX_OFFSET + label as usize], bit as u8);
-                    self.magnitudes[idx] |= bit << bitplane;
-                    if self.wide_decoded_bits.is_none() && state & COUNT_MASK != COUNT_MASK {
-                        self.coding_state[idx] = (state | SELF_REFINED) + (1 << COUNT_SHIFT);
-                    } else {
-                        self.coding_state[idx] = state | SELF_REFINED;
-                        self.increment_decoded_bits(idx);
-                    }
-                }
-            }
-            v0 += 4;
-        }
+        with_mq_sink(encoder, ctx, targets, bitplane, |sink| {
+            self.run_refinement(bitplane, sink)
+        })
+        .expect("the MQ encoder accepts every decision");
     }
 
     /// Encode one §D.6 **raw-mode** significance-propagation pass — the
@@ -1541,41 +2054,13 @@ impl CodeBlock {
         targets: &[Coefficient],
         raw: &mut RawBitWriter,
     ) {
-        self.ensure_coding_state();
-        self.clear_pass_flags();
-        let weight: u32 = 1u32 << bitplane;
-        let mut v0 = 0usize;
-        while v0 < self.height {
-            let stripe_h = core::cmp::min(4, self.height - v0);
-            for u in 0..self.width {
-                for dv in 0..stripe_h {
-                    let v = v0 + dv;
-                    let idx = u + v * self.width;
-                    if self.coefficient_at(idx).sigma {
-                        continue;
-                    }
-                    if self.coding_state_in_stripe(u, v, v0, stripe_h) & 0xff == 0 {
-                        continue;
-                    }
-                    let bit = ((targets[idx].magnitude >> bitplane) & 1) as u8;
-                    raw.write_bit(bit);
-                    self.coding_state[idx] |= SP_VISITED;
-                    self.increment_decoded_bits(idx);
-                    if bit == 1 {
-                        // §D.6 Equation D-2: the sign is one raw bit.
-                        raw.write_bit(targets[idx].sign as u8);
-                        let mut updated = self.coefficient_at(idx);
-                        updated.magnitude |= weight;
-                        updated.sigma = true;
-                        updated.sign = targets[idx].sign;
-                        self.set_coefficient_at(idx, updated);
-                        self.publish_significance(u, v, updated.sign);
-                        self.coding_state[idx] |= NEWLY_SIGNIFICANT;
-                    }
-                }
-            }
-            v0 += 4;
-        }
+        let mut sink = RawSink {
+            raw,
+            targets,
+            bitplane,
+        };
+        self.run_significance(bitplane, &mut sink)
+            .expect("the raw writer accepts every bit");
     }
 
     /// Encode one §D.6 **raw-mode** magnitude-refinement pass — the
@@ -1588,31 +2073,13 @@ impl CodeBlock {
         targets: &[Coefficient],
         raw: &mut RawBitWriter,
     ) {
-        let weight: u32 = 1u32 << bitplane;
-        let mut v0 = 0usize;
-        while v0 < self.height {
-            let stripe_h = core::cmp::min(4, self.height - v0);
-            for u in 0..self.width {
-                for dv in 0..stripe_h {
-                    let v = v0 + dv;
-                    let idx = u + v * self.width;
-                    let coef = self.coefficient_at(idx);
-                    if !coef.sigma || self.coding_state[idx] & NEWLY_SIGNIFICANT != 0 {
-                        continue;
-                    }
-                    let bit = ((targets[idx].magnitude >> bitplane) & 1) as u8;
-                    raw.write_bit(bit);
-                    let mut updated = coef;
-                    if bit == 1 {
-                        updated.magnitude |= weight;
-                    }
-                    updated.already_refined = true;
-                    self.set_coefficient_at(idx, updated);
-                    self.increment_decoded_bits(idx);
-                }
-            }
-            v0 += 4;
-        }
+        let mut sink = RawSink {
+            raw,
+            targets,
+            bitplane,
+        };
+        self.run_refinement(bitplane, &mut sink)
+            .expect("the raw writer accepts every bit");
     }
 
     /// Encode one §D.3.4 cleanup pass (the forward counterpart of
@@ -1624,102 +2091,10 @@ impl CodeBlock {
         encoder: &mut MqEncoder,
         ctx: &mut [MqContext; NUM_CONTEXTS],
     ) {
-        self.ensure_coding_state();
-        let contexts = significance_contexts(self.orientation);
-        let weight: u32 = 1u32 << bitplane;
-        let causal_clip: u32 = if self.vertically_causal { 7 << 5 } else { 0 };
-        let width = self.width;
-        let mut v0 = 0usize;
-        while v0 < self.height {
-            let stripe_h = core::cmp::min(4, self.height - v0);
-            for u in 0..width {
-                let mut start_dv = 0usize;
-                if stripe_h == 4 && self.column_run_length_eligible(u, v0) {
-                    // First column entry whose target bit is 1 on this
-                    // bit-plane (top to bottom), if any.
-                    let first_sig = (0..4).find(|&dv| {
-                        (targets[u + (v0 + dv) * width].magnitude >> bitplane) & 1 == 1
-                    });
-                    match first_sig {
-                        None => {
-                            encoder.encode(&mut ctx[RUN_LENGTH_CTX], 0);
-                            for dv in 0..4 {
-                                self.increment_decoded_bits(u + (v0 + dv) * width);
-                            }
-                            continue;
-                        }
-                        Some(first) => {
-                            encoder.encode(&mut ctx[RUN_LENGTH_CTX], 1);
-                            // Two UNIFORM bits, MSB then LSB, of the 0-based
-                            // index of the first significant coefficient.
-                            encoder.encode(&mut ctx[UNIFORM_CTX], ((first >> 1) & 1) as u8);
-                            encoder.encode(&mut ctx[UNIFORM_CTX], (first & 1) as u8);
-                            let v = v0 + first;
-                            self.code_sign_encode(
-                                u, v, weight, targets, v0, stripe_h, encoder, ctx,
-                            );
-                            for dv in 0..=first {
-                                self.increment_decoded_bits(u + (v0 + dv) * width);
-                            }
-                            start_dv = first + 1;
-                        }
-                    }
-                }
-                for dv in start_dv..stripe_h {
-                    let v = v0 + dv;
-                    let idx = u + v * width;
-                    let state = self.coding_state[idx];
-                    if state & (SELF_SIGMA | SP_VISITED) != 0 {
-                        continue;
-                    }
-                    let clip = if dv + 1 == stripe_h { causal_clip } else { 0 };
-                    let label = contexts[(state & !clip & 0xff) as usize];
-                    let bit = ((targets[idx].magnitude >> bitplane) & 1) as u8;
-                    if self.wide_decoded_bits.is_none() && state & COUNT_MASK != COUNT_MASK {
-                        self.coding_state[idx] = state + (1 << COUNT_SHIFT);
-                    } else {
-                        self.increment_decoded_bits(idx);
-                    }
-                    encoder.encode(&mut ctx[SP_CTX_OFFSET + label as usize], bit);
-                    if bit == 1 {
-                        self.code_sign_encode(u, v, weight, targets, v0, stripe_h, encoder, ctx);
-                    }
-                }
-            }
-            v0 += 4;
-        }
-    }
-
-    /// Encode the §D.3.2 sign subroutine for a coefficient made
-    /// significant on this bit-plane, and fold the magnitude bit + sign
-    /// into the progressive state (the forward counterpart of
-    /// [`Self::make_significant_with_sign`]).
-    ///
-    /// The sign context / XORbit come from the Table D.3 lookup; the
-    /// decoder recovers `sb = D ⊕ XORbit`, so the encoder emits
-    /// `D = sb ⊕ XORbit`.
-    #[allow(clippy::too_many_arguments)]
-    fn code_sign_encode(
-        &mut self,
-        u: usize,
-        v: usize,
-        weight: u32,
-        targets: &[Coefficient],
-        stripe_v0: usize,
-        stripe_h: usize,
-        encoder: &mut MqEncoder,
-        ctx: &mut [MqContext; NUM_CONTEXTS],
-    ) {
-        let idx = u + v * self.width;
-        let (sign_label, xorbit) =
-            packed_sign_context_label(self.coding_state_in_stripe(u, v, stripe_v0, stripe_h));
-        let sign_bit = targets[idx].sign;
-        let d = (sign_bit as u8) ^ xorbit;
-        encoder.encode(&mut ctx[SIGN_CTX_OFFSET + sign_label as usize], d);
-        self.magnitudes[idx] |= weight;
-        self.coding_state[idx] =
-            (self.coding_state[idx] & !SELF_SIGN) | SELF_SIGMA | (u32::from(sign_bit) * SELF_SIGN);
-        self.publish_significance(u, v, sign_bit);
+        with_mq_sink(encoder, ctx, targets, bitplane, |sink| {
+            self.run_cleanup(bitplane, sink)
+        })
+        .expect("the MQ encoder accepts every decision");
     }
 
     /// Run one §D.6 **raw-mode** significance-propagation pass over the
@@ -1740,12 +2115,10 @@ impl CodeBlock {
     /// responsible for the bit-plane-counting that picks AC vs. raw —
     /// the pass method does not check.
     ///
-    /// The `ctx` array is **not** referenced here (no MQ contexts are
-    /// touched in raw mode) but the §D.3 significance state of the
-    /// code-block is still threaded through so the Table D.1 context
-    /// label can be computed to drive the "non-zero context = read
-    /// this bit, zero context = defer to cleanup" filter (§D.6 retains
-    /// the §D.3.1 filter — only the bit's source changes).
+    /// No MQ contexts are touched in raw mode, but the §D.3
+    /// significance state of the code-block still drives the "non-zero
+    /// context = read this bit, zero context = defer to cleanup" filter
+    /// (§D.6 retains the §D.3.1 filter — only the bit's source changes).
     ///
     /// Returns the number of coefficients that **became newly
     /// significant** in this pass.
@@ -1754,60 +2127,7 @@ impl CodeBlock {
         bitplane: u32,
         raw: &mut RawBitReader<'_>,
     ) -> Result<usize, Error> {
-        self.ensure_coding_state();
-        // §D.3.3: clear the "just became significant in the last SP
-        // pass" carry at the start of every new SP pass; the §D.6 raw
-        // path keeps the same MR-skip semantics as the AC path. The
-        // §D.3.4 π pass-membership flags reset on the same boundary.
-        self.clear_pass_flags();
-
-        let weight: u32 = 1u32 << bitplane;
-        let mut newly = 0usize;
-
-        let mut v0 = 0usize;
-        while v0 < self.height {
-            let stripe_h = core::cmp::min(4, self.height - v0);
-            for u in 0..self.width {
-                for dv in 0..stripe_h {
-                    let v = v0 + dv;
-                    let coef = self.coefficient_at(u + v * self.width);
-                    if coef.sigma {
-                        continue;
-                    }
-                    if self.coding_state_in_stripe(u, v, v0, stripe_h) & 0xff == 0 {
-                        // Zero context — deferred to the cleanup pass,
-                        // exactly as in the AC path.
-                        continue;
-                    }
-                    let bit = raw.read_bit()?;
-                    // §D.3.4 / Table D.10 D9: coded in the SP pass —
-                    // skipped by the same plane's cleanup pass.
-                    self.coding_state[u + v * self.width] |= SP_VISITED;
-                    // §D.2.1: one magnitude MSB decoded for this
-                    // coefficient on this bit-plane — count toward
-                    // Nb(u, v).
-                    self.increment_decoded_bits(u + v * self.width);
-                    if bit == 1 {
-                        // §D.6 Equation D-2: signbit = raw_value (no
-                        // XOR-with-XORbit redirection).
-                        let sign_bit = raw.read_bit()? == 1;
-                        let updated = Coefficient {
-                            magnitude: coef.magnitude | weight,
-                            sigma: true,
-                            sign: sign_bit,
-                            already_refined: coef.already_refined,
-                        };
-                        self.set_coefficient_at(u + v * self.width, updated);
-                        self.publish_significance(u, v, sign_bit);
-                        self.coding_state[u + v * self.width] |= NEWLY_SIGNIFICANT;
-                        newly += 1;
-                    }
-                }
-            }
-            v0 += 4;
-        }
-
-        Ok(newly)
+        self.run_significance(bitplane, &mut RawSource { raw })
     }
 
     /// Run one §D.6 **raw-mode** magnitude-refinement pass over the
@@ -1830,233 +2150,62 @@ impl CodeBlock {
         bitplane: u32,
         raw: &mut RawBitReader<'_>,
     ) -> Result<usize, Error> {
-        let weight: u32 = 1u32 << bitplane;
-        let mut refined = 0usize;
-
-        let mut v0 = 0usize;
-        while v0 < self.height {
-            let stripe_h = core::cmp::min(4, self.height - v0);
-            for u in 0..self.width {
-                for dv in 0..stripe_h {
-                    let v = v0 + dv;
-                    let idx = u + v * self.width;
-                    let coef = self.coefficient_at(idx);
-                    if !coef.sigma || self.coding_state[idx] & NEWLY_SIGNIFICANT != 0 {
-                        continue;
-                    }
-                    let bit = raw.read_bit()?;
-                    let mut updated = coef;
-                    if bit == 1 {
-                        updated.magnitude |= weight;
-                    }
-                    updated.already_refined = true;
-                    self.set_coefficient_at(idx, updated);
-                    // §D.2.1: one refinement (magnitude) bit decoded for
-                    // this already-significant coefficient on this plane.
-                    self.increment_decoded_bits(idx);
-                    refined += 1;
-                }
-            }
-            v0 += 4;
-        }
-
-        Ok(refined)
+        self.run_refinement(bitplane, &mut RawSource { raw })
     }
 
-    /// Whether the four-coefficient column starting at `(u, v0)` is
-    /// run-length-eligible per §D.3.4: every one of the four coefficients
-    /// is still insignificant and its current Table D.1 significance
-    /// context label is `0`. Callers must have already established that
-    /// the stripe is a full 4-row stripe.
-    ///
-    /// The label is computed with the **stripe-aware** neighbour read —
-    /// when the §D.7 vertically-causal flag is set, the bottom row of
-    /// the stripe reads its `D2 / V1 / D3` slots as zero, exactly the
-    /// way the §D.3 passes themselves read them.
-    #[inline]
-    fn column_run_length_eligible(&self, u: usize, v0: usize) -> bool {
-        // Table D.10 decision D8 over the packed states: the four
-        // coefficients must be *undecoded* in this bit-plane —
-        // insignificant and not already coded by the SP pass — and
-        // each must carry the zero Table D.1 context, i.e. no
-        // significant (stripe-visible) neighbour. One OR over the
-        // column answers all of it.
-        let width = self.width;
-        let base = u + v0 * width;
-        let rows = &self.coding_state[base..];
-        let last = rows[3 * width];
-        let last_visible = if self.vertically_causal {
-            // §D.7: D2 / V1 / D3 lie below the stripe.
-            last & !(7 << 5)
-        } else {
-            last
-        };
-        let any = rows[0] | rows[width] | rows[2 * width] | last_visible;
-        any & (0xff | SELF_SIGMA | SP_VISITED) == 0
-    }
-
-    /// Make coefficient `(u, v)` significant: set σ, accumulate the
-    /// bit-plane `weight` into the magnitude, decode the sign bit via the
-    /// §D.3.2 subroutine, and flag it newly-significant (the §D.3.3
-    /// carry). Shared by the cleanup pass's run-length and normal modes.
-    ///
-    /// `stripe_v0` / `stripe_h` thread the current stripe extent into
-    /// the §D.3.2 sign-context neighbour read so the §D.7
-    /// vertically-causal flag (when set on the code-block) clips the
-    /// below-stripe `V1` slot to zero for bottom-row coefficients.
-    #[allow(clippy::too_many_arguments)]
-    fn make_significant_with_sign(
-        &mut self,
-        u: usize,
-        v: usize,
-        weight: u32,
-        stripe_v0: usize,
-        stripe_h: usize,
-        decoder: &mut MqDecoder<'_>,
-        ctx: &mut [MqContext; NUM_CONTEXTS],
-    ) {
-        let idx = u + v * self.width;
-        let (sign_label, xorbit) =
-            packed_sign_context_label(self.coding_state_in_stripe(u, v, stripe_v0, stripe_h));
-        let sign_cx = &mut ctx[SIGN_CTX_OFFSET + sign_label as usize];
-        let d = decoder.decode(sign_cx);
-        let sign_bit = (d ^ xorbit) != 0;
-
-        self.magnitudes[idx] |= weight;
-        self.coding_state[idx] =
-            (self.coding_state[idx] & !SELF_SIGN) | SELF_SIGMA | (u32::from(sign_bit) * SELF_SIGN);
-        self.publish_significance(u, v, sign_bit);
-        self.coding_state[idx] |= NEWLY_SIGNIFICANT;
-    }
-
-    /// Lazily populate neighbour bits for a block supplied by reassembly or
-    /// the HT decoder. Those paths never invoke Annex D and need no scatter.
-    fn ensure_coding_state(&mut self) {
-        if self.coding_state_ready {
+    /// Populate the neighbour slots of a block supplied by reassembly or
+    /// the HT decoder, which hold each sample's own bits only. Those
+    /// paths never invoke Annex D and need no scatter.
+    fn ensure_neighbours(&mut self) {
+        if self.neighbours_ready {
             return;
         }
+        let stride = self.width + 2;
         for v in 0..self.height {
+            let b = 3 * (v % 4) as u32;
             for u in 0..self.width {
-                let coef = self.coefficient_at(u + v * self.width);
-                if coef.sigma {
-                    self.publish_significance(u, v, coef.sign);
+                let word = self.columns[self.column_index(u, v)];
+                if (word >> (b + 4)) & 1 != 0 {
+                    let sign = (word >> (SIGN_SHIFT + b + 4)) & 1 != 0;
+                    let (above, own, below) = stripe_rows_mut(&mut self.columns, v / 4, stride);
+                    publish_significance(above, own, below, u, b, sign);
                 }
             }
         }
-        self.coding_state_ready = true;
+        self.neighbours_ready = true;
     }
 
-    /// Clear plane-local flags while retaining monotonic neighbour state.
-    fn clear_pass_flags(&mut self) {
-        for state in &mut self.coding_state {
-            *state &= !(NEWLY_SIGNIFICANT | SP_VISITED);
-        }
-    }
-
-    /// Publish a significance/sign decision to adjacent samples. Edge clipping
-    /// runs once per newly significant coefficient, rather than per decision.
-    #[inline]
-    fn publish_significance(&mut self, u: usize, v: usize, sign: bool) {
-        let idx = u + v * self.width;
-        let w = self.width;
-        let c = &mut self.coding_state;
-        if v > 0 {
-            let above = idx - w;
-            if u > 0 {
-                c[above - 1] |= 1 << 7;
-            }
-            c[above] = (c[above] & !(1 << 11)) | (1 << 6) | ((sign as u32) << 11);
-            if u + 1 < w {
-                c[above + 1] |= 1 << 5;
-            }
-        }
-        if u > 0 {
-            c[idx - 1] = (c[idx - 1] & !(1 << 10)) | (1 << 4) | ((sign as u32) << 10);
-        }
-        if u + 1 < w {
-            c[idx + 1] = (c[idx + 1] & !(1 << 9)) | (1 << 3) | ((sign as u32) << 9);
-        }
-        if v + 1 < self.height {
-            let below = idx + w;
-            if u > 0 {
-                c[below - 1] |= 1 << 2;
-            }
-            c[below] = (c[below] & !(1 << 8)) | (1 << 1) | ((sign as u32) << 8);
-            if u + 1 < w {
-                c[below + 1] |= 1;
-            }
-        }
-    }
-
-    #[inline]
-    fn coding_state_in_stripe(&self, u: usize, v: usize, v0: usize, stripe_h: usize) -> u16 {
-        let state = self.coding_state[u + v * self.width] as u16;
-        if self.vertically_causal && v + 1 == v0 + stripe_h {
-            // Clip D2, V1, D3 and the below-stripe cardinal sign.
-            state & !((7 << 5) | (1 << 11))
-        } else {
-            state
-        }
-    }
-
+    /// The Figure D.2 neighbourhood of `(u, v)` as the passes read it
+    /// (§D.7 clip included), rebuilt from the sample's column word.
     #[cfg(test)]
-    fn coding_neighbours_in_stripe(
-        &self,
-        u: usize,
-        v: usize,
-        v0: usize,
-        stripe_h: usize,
-    ) -> Neighbours {
-        let state = self.coding_state_in_stripe(u, v, v0, stripe_h);
+    fn coding_neighbours(&self, u: usize, v: usize) -> Neighbours {
+        let word = self.columns[self.column_index(u, v)] & self.visible_mask();
+        let b = 3 * (v % 4) as u32;
+        let sigma = |n: u32| (word >> (b + n)) & 1 != 0;
+        let sign = |n: u32| sigma(n) && (word >> (SIGN_SHIFT + b + n)) & 1 != 0;
         Neighbours {
-            d0_sigma: state & 1 != 0,
-            v0_sigma: state & (1 << 1) != 0,
-            d1_sigma: state & (1 << 2) != 0,
-            h0_sigma: state & (1 << 3) != 0,
-            h1_sigma: state & (1 << 4) != 0,
-            d2_sigma: state & (1 << 5) != 0,
-            v1_sigma: state & (1 << 6) != 0,
-            d3_sigma: state & (1 << 7) != 0,
-            v0_sign: state & (1 << 8) != 0,
-            h0_sign: state & (1 << 9) != 0,
-            h1_sign: state & (1 << 10) != 0,
-            v1_sign: state & (1 << 11) != 0,
+            d0_sigma: sigma(0),
+            v0_sigma: sigma(1),
+            v0_sign: sign(1),
+            d1_sigma: sigma(2),
+            h0_sigma: sigma(3),
+            h0_sign: sign(3),
+            h1_sigma: sigma(5),
+            h1_sign: sign(5),
+            d2_sigma: sigma(6),
+            v1_sigma: sigma(7),
+            v1_sign: sign(7),
+            d3_sigma: sigma(8),
         }
     }
 
-    /// Build a [`Neighbours`] snapshot of `(u, v)`'s 8 nearest neighbours,
-    /// **without** the §D.7 stripe clipping.
+    /// Build a [`Neighbours`] snapshot of `(u, v)`'s 8 nearest neighbours
+    /// from the samples' own flags, **without** the §D.7 stripe clipping.
     ///
     /// Out-of-block neighbours are treated as insignificant
     /// (`sigma = false`, `sign = false`) per §D.3 / §D.3.2.
-    ///
-    /// The §D.3 pass methods go through
-    /// [`Self::neighbours_in_stripe`] instead — that path layers the
-    /// §D.7 vertically-causal clip on top of this read.
     #[cfg(test)]
     fn neighbours(&self, u: usize, v: usize) -> Neighbours {
-        // Interior samples have all eight neighbours inside the code-block.
-        // Keep the clipped path below for samples on a code-block edge.
-        if u > 0 && u + 1 < self.width && v > 0 && v + 1 < self.height {
-            let top = (v - 1) * self.width + u;
-            let middle = v * self.width + u;
-            let bottom = (v + 1) * self.width + u;
-            let c = |i: usize| self.coefficient_at(i);
-            return Neighbours {
-                d0_sigma: c(top - 1).sigma,
-                v0_sigma: c(top).sigma,
-                v0_sign: c(top).sign,
-                d1_sigma: c(top + 1).sigma,
-                h0_sigma: c(middle - 1).sigma,
-                h0_sign: c(middle - 1).sign,
-                h1_sigma: c(middle + 1).sigma,
-                h1_sign: c(middle + 1).sign,
-                d2_sigma: c(bottom - 1).sigma,
-                v1_sigma: c(bottom).sigma,
-                v1_sign: c(bottom).sign,
-                d3_sigma: c(bottom + 1).sigma,
-            };
-        }
         let mut nb = Neighbours::default();
         // Iterate the eight (du, dv) offsets in the Figure D.2 grid.
         let positions: [(i32, i32, NeighbourSlot); 8] = [
@@ -2085,29 +2234,10 @@ impl CodeBlock {
         nb
     }
 
-    /// Build a [`Neighbours`] snapshot for the §D.3 pass methods.
-    ///
-    /// `stripe_v0` is the top row of the 4-row stripe currently being
-    /// scanned and `stripe_h` is its height (`1..=4`; less than `4` only
-    /// when the block height is not a multiple of four and the bottom
-    /// partial stripe is in progress). The current coefficient `(u, v)`
-    /// lies inside the stripe (`stripe_v0 <= v < stripe_v0 + stripe_h`).
-    ///
-    /// When the §D.7 vertically-causal flag is **off** (default), this
-    /// is a straight pass-through to [`Self::neighbours`] — the full
-    /// Figure D.2 neighbour set is read.
-    ///
-    /// When the §D.7 vertically-causal flag is **on** and `(u, v)`
-    /// sits on the **bottom row of the stripe** (`v == stripe_v0 +
-    /// stripe_h - 1`), the three "below the current row" Figure D.2
-    /// slots — `D2`, `V1`, `D3` — are clipped to insignificant
-    /// (`sigma = false`, `sign = false`) regardless of whether the
-    /// next row exists in the code-block. Coefficients above the
-    /// stripe bottom (`v < stripe_v0 + stripe_h - 1`) see their
-    /// full neighbour set unchanged: the stripe's bottom row is the
-    /// only one whose `D2 / V1 / D3` slots would otherwise reach
-    /// into the *next* stripe (the four-row layout sketched in §D.7
-    /// — Figure D.1 bit 15 is the worked example).
+    /// [`Self::neighbours`] with the §D.7 clip: when the
+    /// vertically-causal flag is on and `(u, v)` sits on the bottom row
+    /// of the stripe starting at `stripe_v0` (`stripe_h` rows), the
+    /// three slots below — `D2`, `V1`, `D3` — read as insignificant.
     #[cfg(test)]
     fn neighbours_in_stripe(
         &self,
@@ -2118,8 +2248,6 @@ impl CodeBlock {
     ) -> Neighbours {
         let mut nb = self.neighbours(u, v);
         if self.vertically_causal && stripe_h > 0 && v == stripe_v0 + stripe_h - 1 {
-            // §D.7: clip D2, V1, D3 to insignificant on the bottom row
-            // of the current stripe.
             nb.d2_sigma = false;
             nb.v1_sigma = false;
             nb.v1_sign = false;
@@ -2127,6 +2255,15 @@ impl CodeBlock {
         }
         nb
     }
+}
+
+/// The own-sample bits of a column word for the stripe row at bit
+/// `b = 3r`: significance, sign and "already refined".
+#[inline]
+fn own_bits(coefficient: Coefficient, b: u32) -> u64 {
+    (u64::from(coefficient.sigma) << (b + 4))
+        | (u64::from(coefficient.sign) << (SIGN_SHIFT + b + 4))
+        | (u64::from(coefficient.already_refined) << (REFINED_SHIFT + b))
 }
 
 /// The eight Figure D.2 neighbour slots around the current coefficient
@@ -3363,7 +3500,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_coefficient_snapshots_preserve_full_magnitude_and_all_flags() {
+    fn coefficient_snapshots_preserve_full_magnitude_and_all_flags() {
         let coefficients: Vec<_> = [0, 1, 1 << 31, u32::MAX]
             .into_iter()
             .flat_map(|magnitude| {
@@ -3375,78 +3512,39 @@ mod tests {
                 })
             })
             .collect();
-        let mut input = coefficients.clone();
-        input.reserve(1000);
-        let mut block = CodeBlock::from_coefficients(SubBandOrientation::HH, 4, 8, input);
+        let mut block =
+            CodeBlock::from_coefficients(SubBandOrientation::HH, 4, 8, coefficients.clone());
         assert_eq!(block.coefficients_for_test(), coefficients);
-        assert_eq!(block.magnitudes.capacity(), coefficients.len());
-        assert_eq!(block.coding_state.capacity(), coefficients.len());
-        assert!(block.wide_decoded_bits.is_none());
-        block.ensure_coding_state();
-        assert_coding_cache(&block);
+        assert_eq!(block.max_decoded_bits(), 0);
+        block.ensure_neighbours();
+        assert_column_words(&block);
         assert_eq!(block.coefficients_for_test(), coefficients);
         assert_eq!(block.clone().coefficients_for_test(), coefficients);
     }
 
     #[test]
-    fn compact_counts_promote_without_losing_neighbours_flags_or_other_counts() {
+    fn supplied_counts_keep_full_u32_range_and_leave_flags_alone() {
         let mut block = CodeBlock::new(SubBandOrientation::HL, 3, 5);
         block.mark_significant_for_test(1, 3, true, u32::MAX);
-        block.coding_state[10] |= SELF_REFINED | NEWLY_SIGNIFICANT | SP_VISITED;
+        block.set_visited_for_test(10);
         let mut counts: Vec<_> = (0..15).collect();
-        counts[10] = PACKED_COUNT_MAX;
+        counts[10] = u32::MAX - 3;
         block.set_decoded_bits_raw(counts.clone());
         block.set_zero_bit_planes(2);
-        assert!(block.wide_decoded_bits.is_none());
         let coefficients = block.coefficients_for_test();
-        let flags: Vec<_> = block.coding_state.iter().map(|s| s & !COUNT_MASK).collect();
-        block.increment_decoded_bits(10);
-        counts[10] += 1;
-        assert_eq!(block.wide_decoded_bits.as_ref().unwrap(), &counts);
-        assert_eq!(block.coefficients_for_test(), coefficients);
-        assert_eq!(block.coding_state, flags);
-        assert_coding_cache(&block);
+        assert_column_words(&block);
         assert!(block.was_newly_significant(1, 3));
-        assert_eq!(block.effective_nb(1, 3, 0), PACKED_COUNT_MAX + 3);
-        block.clear_pass_flags();
+        assert_eq!(block.effective_nb(1, 3, 0), u32::MAX - 1);
+        assert_eq!(block.max_decoded_bits(), u32::MAX - 3);
+        for (idx, &count) in counts.iter().enumerate() {
+            assert_eq!(block.decoded_bits(idx % 3, idx / 3), count);
+        }
+        block.set_decoded_bits_raw(vec![17; 15]);
+        assert_eq!(block.decoded_bits(0, 0), 17);
+        assert_eq!(block.max_decoded_bits(), 17);
         assert_eq!(block.coefficients_for_test(), coefficients);
-        assert_eq!(block.max_decoded_bits(), PACKED_COUNT_MAX + 1);
-        block.increment_decoded_bits(0);
-        assert_eq!(block.decoded_bits(0, 0), 1);
-        assert_coding_cache(&block);
     }
 
-    #[test]
-    fn imported_full_u32_counts_can_return_to_compact_state() {
-        let mut block = CodeBlock::from_coefficients(
-            SubBandOrientation::LL,
-            2,
-            1,
-            vec![
-                Coefficient {
-                    magnitude: u32::MAX,
-                    sign: true,
-                    ..Coefficient::default()
-                },
-                Coefficient {
-                    sigma: true,
-                    already_refined: true,
-                    ..Coefficient::default()
-                },
-            ],
-        );
-        let coefficients = block.coefficients_for_test();
-        block.set_decoded_bits_raw(vec![u32::MAX, PACKED_COUNT_MAX + 1]);
-        assert_eq!(block.decoded_bits(0, 0), u32::MAX);
-        assert_eq!(block.max_decoded_bits(), u32::MAX);
-        assert_eq!(block.coefficients_for_test(), coefficients);
-        block.set_decoded_bits_raw(vec![17, 0]);
-        assert!(block.wide_decoded_bits.is_none());
-        assert_eq!(block.decoded_bits(0, 0), 17);
-        assert_eq!(block.decoded_bits(1, 0), 0);
-        assert_eq!(block.coefficients_for_test(), coefficients);
-        assert_eq!(block.max_decoded_bits(), 17);
-    }
     fn normalized_signs(mut nb: Neighbours) -> Neighbours {
         nb.v0_sign &= nb.v0_sigma;
         nb.h0_sign &= nb.h0_sigma;
@@ -3455,17 +3553,40 @@ mod tests {
         nb
     }
 
-    fn assert_coding_cache(block: &CodeBlock) {
+    /// The Table D.1 label and Tables D.2 / D.3 entry the passes read
+    /// for `(u, v)` from its column word.
+    fn word_contexts(
+        block: &CodeBlock,
+        u: usize,
+        v: usize,
+        orientation: SubBandOrientation,
+    ) -> (u8, u8) {
+        let word = block.columns[block.column_index(u, v)] & block.visible_mask();
+        let b = 3 * (v % 4) as u32;
+        (
+            significance_labels(orientation)[(word >> b) as usize & 0x1ff],
+            SIGN_ENTRIES[sign_key(word, b)],
+        )
+    }
+
+    /// The sign entry the public Table D.2 / D.3 helper gives.
+    fn sign_entry(nb: Neighbours) -> u8 {
+        let (label, xorbit) = sign_context_label(nb);
+        (SIGN_CTX_OFFSET as u8 + label) | (xorbit << 7)
+    }
+
+    /// Every sample's column word must describe exactly the neighbourhood
+    /// the samples' own flags give, §D.7 clip included.
+    fn assert_column_words(block: &CodeBlock) {
         for v in 0..block.height {
             let v0 = v / 4 * 4;
             let h = (block.height - v0).min(4);
             for u in 0..block.width {
-                let old = normalized_signs(block.neighbours_in_stripe(u, v, v0, h));
-                let cached = block.coding_neighbours_in_stripe(u, v, v0, h);
-                let state = block.coding_state_in_stripe(u, v, v0, h);
+                let expected = normalized_signs(block.neighbours_in_stripe(u, v, v0, h));
                 assert_eq!(
-                    cached, old,
-                    "cache mismatch at ({u},{v}), VSC={}",
+                    block.coding_neighbours(u, v),
+                    expected,
+                    "column word mismatch at ({u},{v}), VSC={}",
                     block.vertically_causal
                 );
                 for orientation in [
@@ -3474,31 +3595,16 @@ mod tests {
                     SubBandOrientation::HL,
                     SubBandOrientation::HH,
                 ] {
-                    let label = significance_context_label(orientation, old);
-                    assert_eq!(label, significance_context_label(orientation, cached));
-                    assert_eq!(
-                        label,
-                        significance_contexts(orientation)[(state & 0xff) as usize]
-                    );
-                    assert_eq!(
-                        label == 0,
-                        block.coding_state_in_stripe(u, v, v0, h) & 0xff == 0
-                    );
-                }
-                assert_eq!(sign_context_label(cached), sign_context_label(old));
-                assert_eq!(packed_sign_context_label(state), sign_context_label(old));
-                for refined in [false, true] {
-                    assert_eq!(
-                        refinement_context_label(cached, refined),
-                        refinement_context_label(old, refined)
-                    );
+                    let (label, sign) = word_contexts(block, u, v, orientation);
+                    assert_eq!(label, significance_context_label(orientation, expected));
+                    assert_eq!(sign, sign_entry(expected));
                 }
             }
         }
     }
 
     #[test]
-    fn reusable_decode_block_clears_dirty_packed_cache_and_every_state() {
+    fn reusable_decode_block_clears_every_state() {
         let mut block = CodeBlock::new(SubBandOrientation::LL, 7, 5);
         for (orientation, width, height) in [
             (SubBandOrientation::HH, 2, 3),
@@ -3507,35 +3613,30 @@ mod tests {
             (SubBandOrientation::LL, 8, 7),
         ] {
             block.magnitudes.fill(u32::MAX);
-            block.coding_state.fill(u32::MAX);
-            block.coding_state_ready = width % 2 == 0;
-            block.wide_decoded_bits = Some(vec![u32::MAX; block.width * block.height]);
+            block.columns.fill(u64::MAX);
+            block.neighbours_ready = width % 2 == 0;
+            block.counts = Counts::PerSample(vec![u32::MAX; block.width * block.height]);
             block.zero_bit_planes = 2;
             block.vertically_causal = true;
             block.roi_nb = Some(vec![3; block.width * block.height]);
             let old_capacity = block.magnitudes.capacity();
             let old_ptr = block.magnitudes.as_ptr();
-            let state_capacity = block.coding_state.capacity();
-            let state_ptr = block.coding_state.as_ptr();
             block.reset_for_decode(orientation, width, height);
             let fresh = CodeBlock::new(orientation, width, height);
             assert_eq!(block.orientation, fresh.orientation);
             assert_eq!(block.width, fresh.width);
             assert_eq!(block.height, fresh.height);
             assert_eq!(block.magnitudes, fresh.magnitudes);
-            assert_eq!(block.coding_state, fresh.coding_state);
-            assert_eq!(block.coding_state_ready, fresh.coding_state_ready);
-            assert_eq!(block.wide_decoded_bits, fresh.wide_decoded_bits);
+            assert_eq!(block.columns, fresh.columns);
+            assert_eq!(block.neighbours_ready, fresh.neighbours_ready);
+            assert_eq!(block.counts, fresh.counts);
             assert_eq!(block.zero_bit_planes, fresh.zero_bit_planes);
             assert_eq!(block.vertically_causal, fresh.vertically_causal);
             assert_eq!(block.roi_nb, fresh.roi_nb);
             if width * height <= old_capacity {
                 assert_eq!(block.magnitudes.as_ptr(), old_ptr);
             }
-            if width * height <= state_capacity {
-                assert_eq!(block.coding_state.as_ptr(), state_ptr);
-            }
-            assert_coding_cache(&block);
+            assert_column_words(&block);
             for v in 0..height {
                 for u in 0..width {
                     assert_eq!(block.effective_nb_resolver(11)(u, v), 11);
@@ -3546,36 +3647,45 @@ mod tests {
     }
 
     #[test]
-    fn packed_contexts_exhaustive_states_match_neighbour_helpers() {
-        // Include arbitrary signs on insignificant neighbours, both pass
-        // flags, and reserved high bits. Only neighbour state may select a
-        // context; the public helpers remain an independent runtime oracle.
-        let mut block = CodeBlock::new(SubBandOrientation::LL, 1, 1);
-        for state in 0u16..=u16::MAX {
-            block.coding_state[0] = u32::from(state);
-            let nb = block.coding_neighbours_in_stripe(0, 0, 0, 1);
-            for orientation in [
-                SubBandOrientation::LL,
-                SubBandOrientation::LH,
-                SubBandOrientation::HL,
-                SubBandOrientation::HH,
-            ] {
-                assert_eq!(
-                    significance_contexts(orientation)[(state & 0xff) as usize],
-                    significance_context_label(orientation, nb),
-                    "significance state={state:#06x}, orientation={orientation:?}"
-                );
+    fn lookup_tables_match_the_neighbour_helpers_for_every_neighbourhood() {
+        // Every 3×3 significance pattern with every 3×3 sign pattern
+        // (signs on insignificant neighbours included), in each row of
+        // a stripe: only neighbour state may select a context; the
+        // public helpers are the independent oracle.
+        let mut block = CodeBlock::new(SubBandOrientation::LL, 1, 4);
+        let i = block.column_index(0, 0);
+        for row in 0..4 {
+            let b = 3 * row as u32;
+            for sigma in 0u64..512 {
+                for signs in 0u64..512 {
+                    block.columns[i] = (sigma << b) | (signs << (SIGN_SHIFT + b));
+                    let nb = block.coding_neighbours(0, row);
+                    for orientation in [
+                        SubBandOrientation::LL,
+                        SubBandOrientation::LH,
+                        SubBandOrientation::HL,
+                        SubBandOrientation::HH,
+                    ] {
+                        let (label, sign) = word_contexts(&block, 0, row, orientation);
+                        assert_eq!(
+                            label,
+                            significance_context_label(orientation, nb),
+                            "significance {sigma:#05x} row {row} {orientation:?}"
+                        );
+                        assert_eq!(sign, sign_entry(nb), "sign {sigma:#05x}/{signs:#05x}");
+                    }
+                    assert_eq!(
+                        neighbour_rows(block.columns[i]) >> b & 1 != 0,
+                        sigma & 0x1ef != 0,
+                        "any-neighbour {sigma:#05x} row {row}"
+                    );
+                }
             }
-            assert_eq!(
-                packed_sign_context_label(state),
-                sign_context_label(nb),
-                "sign state={state:#06x}"
-            );
         }
     }
 
     #[test]
-    fn packed_neighbours_all_masks_and_cardinal_signs_match_existing_contexts() {
+    fn column_words_all_masks_and_cardinal_signs_match_existing_contexts() {
         let offsets = [
             (-1, -1),
             (0, -1),
@@ -3624,15 +3734,10 @@ mod tests {
                             coefficients.clone(),
                         )
                         .with_vertically_causal_context(causal);
-                        block.ensure_coding_state();
-                        assert_coding_cache(&block);
+                        block.ensure_neighbours();
+                        assert_column_words(&block);
                         assert_eq!(block.coefficients_for_test(), coefficients);
-                        assert!(
-                            block
-                                .coding_state
-                                .iter()
-                                .all(|&s| s & (NEWLY_SIGNIFICANT | SP_VISITED) == 0)
-                        );
+                        assert!(block.columns.iter().all(|&word| word & VISITED_ROWS == 0));
                     }
                 }
             }
@@ -3640,7 +3745,7 @@ mod tests {
     }
 
     #[test]
-    fn packed_neighbours_survive_incremental_updates_and_pass_flag_resets() {
+    fn column_words_survive_incremental_updates_and_pass_flag_resets() {
         for (w, h) in [
             (1, 1),
             (1, 9),
@@ -3664,26 +3769,27 @@ mod tests {
                     }
                     for &idx in &order {
                         state = state.wrapping_mul(1664525).wrapping_add(1013904223);
-                        block.set_coefficient_at(
-                            idx,
-                            Coefficient {
-                                sigma: true,
-                                sign: state & 1 != 0,
-                                magnitude: state >> 1,
-                                already_refined: false,
-                            },
+                        block.mark_significant_for_test(
+                            idx % w,
+                            idx / w,
+                            state & 1 != 0,
+                            state >> 1,
                         );
-                        block.publish_significance(idx % w, idx / w, state & 1 != 0);
-                        block.coding_state[idx] |= NEWLY_SIGNIFICANT | SP_VISITED;
-                        assert_coding_cache(&block);
+                        block.set_visited_for_test(idx);
+                        assert!(block.was_newly_significant(idx % w, idx / w));
+                        assert_column_words(&block);
                         let before: Vec<_> = block
-                            .coding_state
+                            .columns
                             .iter()
-                            .map(|s| s & !(NEWLY_SIGNIFICANT | SP_VISITED))
+                            .map(|word| word & !VISITED_ROWS)
                             .collect();
-                        block.clear_pass_flags();
-                        assert_eq!(block.coding_state, before);
-                        assert_coding_cache(&block);
+                        // What every significance pass does first.
+                        for word in &mut block.columns {
+                            *word &= !VISITED_ROWS;
+                        }
+                        assert_eq!(block.columns, before);
+                        assert!(!block.was_newly_significant(idx % w, idx / w));
+                        assert_column_words(&block);
                     }
                     let mut reconstructed = CodeBlock::from_coefficients(
                         SubBandOrientation::HL,
@@ -3692,23 +3798,21 @@ mod tests {
                         block.coefficients_for_test(),
                     )
                     .with_vertically_causal_context(causal);
-                    assert!(!reconstructed.coding_state_ready);
-                    reconstructed.ensure_coding_state();
-                    assert_eq!(reconstructed.coding_state, block.coding_state);
+                    assert!(!reconstructed.neighbours_ready);
+                    reconstructed.ensure_neighbours();
+                    assert_eq!(reconstructed.columns, block.columns);
                     // Changing VSC between passes affects the read mask only.
-                    assert_coding_cache(&block.with_vertically_causal_context(!causal));
+                    assert_column_words(&block.with_vertically_causal_context(!causal));
                 }
             }
         }
     }
 
     #[test]
-    fn packed_decode_passes_match_encoder_state_with_and_without_causal_clip() {
-        // The decode passes read the packed state word directly; the
-        // encoder passes still go through `coding_state_in_stripe`. A
-        // block coded by the encoder must decode to the identical
-        // magnitudes, flags, neighbour cache and decoded-bit counts after
-        // every pass, for full and partial stripes and both §D.7 modes.
+    fn decode_passes_match_encoder_state_with_and_without_causal_clip() {
+        // A block coded by the encoder must decode to the identical
+        // magnitudes, column words and decoded-bit counts after every
+        // pass, for full and partial stripes and both §D.7 modes.
         let mut seed = 0x51ed_270bu32;
         for (width, height) in [(13, 11), (4, 4), (1, 9), (9, 1), (32, 32)] {
             for causal in [false, true] {
@@ -3772,17 +3876,9 @@ mod tests {
                         let tag =
                             format!("{width}x{height} causal={causal} {orientation:?} {what}");
                         assert_eq!(dec.magnitudes, enc.magnitudes, "{tag}");
-                        // The decoder's cleanup marks its new significances
-                        // NEWLY_SIGNIFICANT, the encoder's does not; the
-                        // next SP pass clears the flag before any MR pass
-                        // reads it, so it is masked after cleanup only.
-                        let mask = if what == "CU" { !NEWLY_SIGNIFICANT } else { !0 };
-                        let dec_state: Vec<u32> =
-                            dec.coding_state.iter().map(|s| s & mask).collect();
-                        let enc_state: Vec<u32> =
-                            enc.coding_state.iter().map(|s| s & mask).collect();
-                        assert_eq!(dec_state, enc_state, "{tag}");
-                        assert_eq!(dec.wide_decoded_bits, enc.wide_decoded_bits, "{tag}");
+                        assert_eq!(dec.columns, enc.columns, "{tag}");
+                        assert_eq!(dec.counts, enc.counts, "{tag}");
+                        assert_column_words(dec);
                     };
                     for p in (0..planes).rev() {
                         if p + 1 != planes {
@@ -3801,6 +3897,14 @@ mod tests {
                         check(&dec_block, "CU");
                     }
                     assert_eq!(dec_ctx, enc_ctx);
+                    // A complete schedule never needs per-sample counts.
+                    assert_eq!(
+                        dec_block.counts,
+                        Counts::Planes {
+                            complete: planes,
+                            partial: Partial::None
+                        }
+                    );
                     for (i, t) in targets.iter().enumerate() {
                         let c = dec_block.coefficient_at(i);
                         assert_eq!(c.magnitude, t.magnitude);
@@ -3810,6 +3914,464 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    // -- The column-word kernels against a per-sample transcription ----
+
+    /// One coding decision a pass hands its coder.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Decision {
+        /// Magnitude bit against a context.
+        Bit(usize, u32),
+        /// Sign decision (context, coded decision `D`).
+        Sign(usize, u8),
+        /// Run-length decision of a column: the first significant row.
+        Run(Option<u32>),
+    }
+
+    /// A [`PassCoder`] that takes its decisions from `targets` and logs
+    /// them; stops with an error after `budget` decisions.
+    struct Recorder<'a> {
+        targets: &'a [Coefficient],
+        bitplane: u32,
+        log: Vec<Decision>,
+        budget: usize,
+    }
+
+    impl Recorder<'_> {
+        fn spend(&mut self) -> Result<(), Error> {
+            if self.budget == 0 {
+                return Err(Error::UnexpectedEof);
+            }
+            self.budget -= 1;
+            Ok(())
+        }
+    }
+
+    impl PassCoder for Recorder<'_> {
+        fn magnitude(&mut self, cx: usize, idx: usize) -> Result<u32, Error> {
+            self.spend()?;
+            let bit = (self.targets[idx].magnitude >> self.bitplane) & 1;
+            self.log.push(Decision::Bit(cx, bit));
+            Ok(bit)
+        }
+
+        fn sign(&mut self, entry: u8, idx: usize) -> Result<bool, Error> {
+            self.spend()?;
+            let sign = self.targets[idx].sign;
+            self.log.push(Decision::Sign(
+                usize::from(entry & 31),
+                u8::from(sign) ^ (entry >> 7),
+            ));
+            Ok(sign)
+        }
+
+        fn run(&mut self, top: usize, width: usize) -> Result<Option<u32>, Error> {
+            self.spend()?;
+            let first = (0..4u32).find(|&r| {
+                (self.targets[top + r as usize * width].magnitude >> self.bitplane) & 1 == 1
+            });
+            self.log.push(Decision::Run(first));
+            Ok(first)
+        }
+    }
+
+    /// §D.3 transcribed one sample at a time, straight from the text:
+    /// plain per-sample flags, Figure D.2 neighbourhoods rebuilt from
+    /// them for every decision, the public Table D.1 – D.4 helpers.
+    #[derive(Clone)]
+    struct PerSample {
+        orientation: SubBandOrientation,
+        width: usize,
+        height: usize,
+        causal: bool,
+        coefficients: Vec<Coefficient>,
+        /// Coded by the current plane's SP pass (§D.3.4), or made
+        /// significant by its cleanup pass (§D.3.3 exclusion).
+        visited: Vec<bool>,
+        counts: Vec<u32>,
+        log: Vec<Decision>,
+        budget: usize,
+    }
+
+    impl PerSample {
+        fn new(orientation: SubBandOrientation, width: usize, height: usize, causal: bool) -> Self {
+            PerSample {
+                orientation,
+                width,
+                height,
+                causal,
+                coefficients: vec![Coefficient::default(); width * height],
+                visited: vec![false; width * height],
+                counts: vec![0; width * height],
+                log: Vec::new(),
+                budget: usize::MAX,
+            }
+        }
+
+        fn neighbours(&self, u: usize, v: usize) -> Neighbours {
+            let at = |du: isize, dv: isize| -> (bool, bool) {
+                let (x, y) = (u as isize + du, v as isize + dv);
+                // §D.7: the row below a stripe's last row is not seen.
+                let hidden = self.causal && dv == 1 && v % 4 == 3;
+                if hidden || x < 0 || y < 0 || x >= self.width as isize || y >= self.height as isize
+                {
+                    return (false, false);
+                }
+                let c = self.coefficients[x as usize + y as usize * self.width];
+                (c.sigma, c.sigma && c.sign)
+            };
+            Neighbours {
+                d0_sigma: at(-1, -1).0,
+                v0_sigma: at(0, -1).0,
+                v0_sign: at(0, -1).1,
+                d1_sigma: at(1, -1).0,
+                h0_sigma: at(-1, 0).0,
+                h0_sign: at(-1, 0).1,
+                h1_sigma: at(1, 0).0,
+                h1_sign: at(1, 0).1,
+                d2_sigma: at(-1, 1).0,
+                v1_sigma: at(0, 1).0,
+                v1_sign: at(0, 1).1,
+                d3_sigma: at(1, 1).0,
+            }
+        }
+
+        fn spend(&mut self) -> bool {
+            if self.budget == 0 {
+                return false;
+            }
+            self.budget -= 1;
+            true
+        }
+
+        /// Scan positions in §D.1 order.
+        fn scan(&self) -> Vec<(usize, usize)> {
+            let mut order = Vec::new();
+            for v0 in (0..self.height).step_by(4) {
+                for u in 0..self.width {
+                    for v in v0..(v0 + 4).min(self.height) {
+                        order.push((u, v));
+                    }
+                }
+            }
+            order
+        }
+
+        /// Code the sign of `idx` and make it significant; `false` when
+        /// the budget ran out first.
+        fn make_significant(
+            &mut self,
+            u: usize,
+            v: usize,
+            target: Coefficient,
+            bitplane: u32,
+        ) -> bool {
+            if !self.spend() {
+                return false;
+            }
+            let (label, xorbit) = sign_context_label(self.neighbours(u, v));
+            self.log.push(Decision::Sign(
+                SIGN_CTX_OFFSET + usize::from(label),
+                u8::from(target.sign) ^ xorbit,
+            ));
+            let c = &mut self.coefficients[u + v * self.width];
+            c.sigma = true;
+            c.sign = target.sign;
+            c.magnitude |= 1 << bitplane;
+            self.visited[u + v * self.width] = true;
+            true
+        }
+
+        fn significance(&mut self, bitplane: u32, targets: &[Coefficient]) -> bool {
+            self.visited.fill(false);
+            for (u, v) in self.scan() {
+                let idx = u + v * self.width;
+                let label = significance_context_label(self.orientation, self.neighbours(u, v));
+                if self.coefficients[idx].sigma || label == 0 {
+                    continue;
+                }
+                if !self.spend() {
+                    return false;
+                }
+                let bit = (targets[idx].magnitude >> bitplane) & 1;
+                self.log.push(Decision::Bit(usize::from(label), bit));
+                self.visited[idx] = true;
+                self.counts[idx] += 1;
+                if bit == 1 && !self.make_significant(u, v, targets[idx], bitplane) {
+                    return false;
+                }
+            }
+            true
+        }
+
+        fn refinement(&mut self, bitplane: u32, targets: &[Coefficient]) -> bool {
+            for (u, v) in self.scan() {
+                let idx = u + v * self.width;
+                let c = self.coefficients[idx];
+                if !c.sigma || self.visited[idx] {
+                    continue;
+                }
+                if !self.spend() {
+                    return false;
+                }
+                let label = refinement_context_label(self.neighbours(u, v), c.already_refined);
+                let bit = (targets[idx].magnitude >> bitplane) & 1;
+                self.log.push(Decision::Bit(
+                    REFINEMENT_CTX_OFFSET + usize::from(label),
+                    bit,
+                ));
+                self.coefficients[idx].magnitude |= bit << bitplane;
+                self.coefficients[idx].already_refined = true;
+                self.counts[idx] += 1;
+            }
+            true
+        }
+
+        fn cleanup(&mut self, bitplane: u32, targets: &[Coefficient]) {
+            let bit = |idx: usize| (targets[idx].magnitude >> bitplane) & 1;
+            for v0 in (0..self.height).step_by(4) {
+                for u in 0..self.width {
+                    let rows = (self.height - v0).min(4);
+                    let width = self.width;
+                    let idx = move |r: usize| u + (v0 + r) * width;
+                    let mut start = 0;
+                    let eligible = rows == 4
+                        && (0..4).all(|r| {
+                            !self.coefficients[idx(r)].sigma
+                                && !self.visited[idx(r)]
+                                && significance_context_label(
+                                    self.orientation,
+                                    self.neighbours(u, v0 + r),
+                                ) == 0
+                        });
+                    if eligible {
+                        let first = (0..4usize).find(|&r| bit(idx(r)) == 1);
+                        self.log.push(Decision::Run(first.map(|r| r as u32)));
+                        let Some(first) = first else {
+                            for r in 0..4 {
+                                self.counts[idx(r)] += 1;
+                            }
+                            continue;
+                        };
+                        for r in 0..=first {
+                            self.counts[idx(r)] += 1;
+                        }
+                        self.make_significant(u, v0 + first, targets[idx(first)], bitplane);
+                        start = first + 1;
+                    }
+                    for r in start..rows {
+                        if self.coefficients[idx(r)].sigma || self.visited[idx(r)] {
+                            continue;
+                        }
+                        let label = significance_context_label(
+                            self.orientation,
+                            self.neighbours(u, v0 + r),
+                        );
+                        self.log
+                            .push(Decision::Bit(usize::from(label), bit(idx(r))));
+                        self.counts[idx(r)] += 1;
+                        if bit(idx(r)) == 1 {
+                            self.make_significant(u, v0 + r, targets[idx(r)], bitplane);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn assert_same_state(block: &CodeBlock, reference: &PerSample, tag: &str) {
+        assert_eq!(
+            block.coefficients_for_test(),
+            reference.coefficients,
+            "{tag}"
+        );
+        for (idx, &visited) in reference.visited.iter().enumerate() {
+            let (u, v) = (idx % block.width, idx / block.width);
+            assert_eq!(block.visited_for_test(idx), visited, "{tag} visited {idx}");
+            assert_eq!(
+                block.was_newly_significant(u, v),
+                visited && reference.coefficients[idx].sigma,
+                "{tag} newly {idx}"
+            );
+            assert_eq!(
+                block.decoded_bits(u, v),
+                reference.counts[idx],
+                "{tag} count {idx}"
+            );
+        }
+        let mut counts = Vec::new();
+        block.for_each_decoded_bits(|count| counts.push(count));
+        assert_eq!(counts, reference.counts, "{tag}");
+        assert_eq!(
+            block.max_decoded_bits(),
+            reference.counts.iter().copied().max().unwrap(),
+            "{tag}"
+        );
+        assert_column_words(block);
+    }
+
+    #[test]
+    fn kernels_match_the_per_sample_transcription_in_any_pass_order() {
+        let mut seed = 0x0bad_5eedu32;
+        let mut next = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            seed >> 8
+        };
+        let orientations = [
+            SubBandOrientation::LL,
+            SubBandOrientation::LH,
+            SubBandOrientation::HL,
+            SubBandOrientation::HH,
+        ];
+        for round in 0..240 {
+            let (width, height) = [
+                (1, 1),
+                (1, 6),
+                (7, 1),
+                (4, 4),
+                (5, 9),
+                (9, 5),
+                (16, 13),
+                (3, 12),
+            ][round % 8];
+            let orientation = orientations[(round / 8) % 4];
+            let causal = (round / 32) % 2 == 1;
+            // Dense, sparse and empty magnitude fields.
+            let density = [1, 3, 8, 64][(round / 4) % 4];
+            let targets: Vec<Coefficient> = (0..width * height)
+                .map(|_| Coefficient {
+                    magnitude: if next() % density == 0 {
+                        next() & 0x7f
+                    } else {
+                        0
+                    },
+                    sigma: false,
+                    sign: next() & 1 != 0,
+                    already_refined: false,
+                })
+                .collect();
+            let mut block =
+                CodeBlock::new(orientation, width, height).with_vertically_causal_context(causal);
+            let mut reference = PerSample::new(orientation, width, height, causal);
+            // Even rounds follow §D.3 (cleanup, then SP / MR / cleanup
+            // per plane); odd rounds call the passes in a random order.
+            let scheduled = round % 2 == 0;
+            let mut plane = 6u32;
+            for step in 0..17 {
+                let (kind, bitplane) = if scheduled {
+                    let kind = [PassKind::Cleanup, PassKind::Sp, PassKind::Mr][step % 3];
+                    if step > 0 && kind == PassKind::Sp {
+                        plane -= 1;
+                    }
+                    (kind, plane)
+                } else {
+                    (
+                        [PassKind::Cleanup, PassKind::Sp, PassKind::Mr][next() as usize % 3],
+                        next() % 7,
+                    )
+                };
+                let mut coder = Recorder {
+                    targets: &targets,
+                    bitplane,
+                    log: Vec::new(),
+                    budget: usize::MAX,
+                };
+                reference.log.clear();
+                match kind {
+                    PassKind::Sp => {
+                        block.run_significance(bitplane, &mut coder).unwrap();
+                        reference.significance(bitplane, &targets);
+                    }
+                    PassKind::Mr => {
+                        block.run_refinement(bitplane, &mut coder).unwrap();
+                        reference.refinement(bitplane, &targets);
+                    }
+                    PassKind::Cleanup => {
+                        block.run_cleanup(bitplane, &mut coder).unwrap();
+                        reference.cleanup(bitplane, &targets);
+                    }
+                }
+                let tag = format!(
+                    "round {round} {width}x{height} {orientation:?} causal={causal} step {step} {kind:?}@{bitplane}"
+                );
+                assert_eq!(coder.log, reference.log, "{tag}");
+                assert_same_state(&block, &reference, &tag);
+                if scheduled {
+                    // The §D.3 order never needs per-sample counters.
+                    assert!(matches!(block.counts, Counts::Planes { .. }), "{tag}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_pass_stopped_by_its_source_leaves_the_transcription_state() {
+        // The raw (bypass) passes can run out of data mid-pass: every
+        // decision before the failure must have had its full effect,
+        // and nothing after it any.
+        let mut seed = 0x7e57_ab1eu32;
+        let mut next = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            seed >> 8
+        };
+        for round in 0..120 {
+            let (width, height) = [(5, 9), (8, 8), (1, 7), (11, 3)][round % 4];
+            let causal = round % 8 >= 4;
+            let targets: Vec<Coefficient> = (0..width * height)
+                .map(|_| Coefficient {
+                    magnitude: if next() % 3 == 0 { next() & 0xf } else { 0 },
+                    sigma: false,
+                    sign: next() & 1 != 0,
+                    already_refined: false,
+                })
+                .collect();
+            let mut block = CodeBlock::new(SubBandOrientation::HL, width, height)
+                .with_vertically_causal_context(causal);
+            let mut reference = PerSample::new(SubBandOrientation::HL, width, height, causal);
+            let recorder = |bitplane, budget| Recorder {
+                targets: &targets,
+                bitplane,
+                log: Vec::new(),
+                budget,
+            };
+            // Two full planes, then a significance and a refinement
+            // pass each cut short somewhere.
+            block.run_cleanup(3, &mut recorder(3, usize::MAX)).unwrap();
+            reference.cleanup(3, &targets);
+            block
+                .run_significance(2, &mut recorder(2, usize::MAX))
+                .unwrap();
+            reference.significance(2, &targets);
+            block
+                .run_refinement(2, &mut recorder(2, usize::MAX))
+                .unwrap();
+            reference.refinement(2, &targets);
+            block.run_cleanup(2, &mut recorder(2, usize::MAX)).unwrap();
+            reference.cleanup(2, &targets);
+
+            let budget = next() as usize % 12;
+            let mut coder = recorder(1, budget);
+            let stopped = block.run_significance(1, &mut coder).is_err();
+            reference.log.clear();
+            reference.budget = budget;
+            assert_eq!(
+                !reference.significance(1, &targets),
+                stopped,
+                "round {round}"
+            );
+            assert_eq!(coder.log, reference.log, "round {round} SP");
+            assert_same_state(&block, &reference, &format!("round {round} cut SP"));
+
+            let budget = next() as usize % 12;
+            let mut coder = recorder(1, budget);
+            let stopped = block.run_refinement(1, &mut coder).is_err();
+            reference.log.clear();
+            reference.budget = budget;
+            assert_eq!(!reference.refinement(1, &targets), stopped, "round {round}");
+            assert_eq!(coder.log, reference.log, "round {round} MR");
+            assert_same_state(&block, &reference, &format!("round {round} cut MR"));
         }
     }
 
@@ -4384,10 +4946,10 @@ mod tests {
                 decoded.coefficients_for_test(),
                 block.coefficients_for_test()
             );
-            // Packed magnitudes, flags, neighbour cache and decoded counts.
+            // Magnitudes, column words and decoded counts.
             assert_eq!(decoded.magnitudes, block.magnitudes);
-            assert_eq!(decoded.coding_state, block.coding_state);
-            assert_eq!(decoded.wide_decoded_bits, block.wide_decoded_bits);
+            assert_eq!(decoded.columns, block.columns);
+            assert_eq!(decoded.counts, block.counts);
         }
     }
 
@@ -4854,7 +5416,7 @@ mod tests {
             sign: bool,
             magnitude: u32,
         ) {
-            self.ensure_coding_state();
+            self.ensure_neighbours();
             let idx = u + v * self.width;
             self.set_coefficient_at(
                 idx,
@@ -4865,12 +5427,37 @@ mod tests {
                     already_refined: false,
                 },
             );
-            self.publish_significance(u, v, sign);
+            let stride = self.width + 2;
+            let (above, own, below) = stripe_rows_mut(&mut self.columns, v / 4, stride);
+            publish_significance(above, own, below, u, 3 * (v % 4) as u32, sign);
         }
 
-        /// Test-only: set the "newly significant" flag for a coefficient.
+        /// Test-only: set the "newly significant" flag for a (significant)
+        /// coefficient.
         pub(super) fn set_newly_significant_for_test(&mut self, u: usize, v: usize) {
-            self.coding_state[u + v * self.width] |= NEWLY_SIGNIFICANT;
+            self.set_visited_for_test(u + v * self.width);
+        }
+
+        /// Test-only: whether the sample carries the per-plane "coded by
+        /// the SP pass" flag.
+        pub(super) fn visited_for_test(&self, idx: usize) -> bool {
+            let (u, v) = (idx % self.width, idx / self.width);
+            let word = self.columns[self.column_index(u, v)];
+            (word >> (VISITED_SHIFT + 3 * (v % 4) as u32)) & 1 != 0
+        }
+
+        /// Test-only: set the per-plane "coded by the SP pass" flag.
+        pub(super) fn set_visited_for_test(&mut self, idx: usize) {
+            let (u, v) = (idx % self.width, idx / self.width);
+            let i = self.column_index(u, v);
+            self.columns[i] |= 1 << (VISITED_SHIFT + 3 * (v % 4) as u32);
+        }
+
+        /// Test-only: Table D.10 decision D8 for the full stripe column
+        /// holding `(u, v0)`.
+        pub(super) fn run_length_eligible_for_test(&self, u: usize, v0: usize) -> bool {
+            let word = self.columns[self.column_index(u, v0)] & self.visible_mask();
+            word & (SIGMA_GRID | VISITED_ROWS) == 0
         }
 
         /// Test-only: set a coefficient's decoded-bit count directly so a
@@ -6742,11 +7329,11 @@ mod tests {
             .significance_propagation_pass(1, &mut dec, &mut ctx)
             .unwrap();
         assert!(
-            block.coding_state[1] & SP_VISITED != 0,
+            block.visited_for_test(1),
             "(1, 0) was coded by the SP pass — π must be set"
         );
         assert!(
-            block.coding_state[0] & SP_VISITED == 0,
+            !block.visited_for_test(0),
             "(0, 0) is significant — SP does not code it"
         );
     }
@@ -6763,7 +7350,7 @@ mod tests {
         block.mark_significant_for_test(1, 0, true, 2);
         for idx in 0..6 {
             if !block.coefficient_at(idx).sigma {
-                block.coding_state[idx] |= SP_VISITED;
+                block.set_visited_for_test(idx);
             }
         }
         let before = block.coefficients_for_test();
@@ -6784,9 +7371,9 @@ mod tests {
         // zero-context column is eligible; flagging any entry as
         // SP-coded revokes it.
         let mut block = CodeBlock::new(SubBandOrientation::LL, 1, 4);
-        assert!(block.column_run_length_eligible(0, 0));
-        block.coding_state[2] |= SP_VISITED;
-        assert!(!block.column_run_length_eligible(0, 0));
+        assert!(block.run_length_eligible_for_test(0, 0));
+        block.set_visited_for_test(2);
+        assert!(!block.run_length_eligible_for_test(0, 0));
     }
 
     #[test]
@@ -6794,8 +7381,8 @@ mod tests {
         // π membership belongs to one bit-plane's SP pass; the next SP
         // pass starts from a clean slate.
         let mut block = CodeBlock::new(SubBandOrientation::LL, 2, 1);
-        block.coding_state[0] |= SP_VISITED;
-        block.coding_state[1] |= SP_VISITED;
+        block.set_visited_for_test(0);
+        block.set_visited_for_test(1);
         // No significant coefficient anywhere → every context is zero
         // and the SP pass codes nothing; the flags must still clear.
         let bytes = [0u8; 2];
@@ -6804,8 +7391,8 @@ mod tests {
         block
             .significance_propagation_pass(0, &mut dec, &mut ctx)
             .unwrap();
-        assert!(block.coding_state[0] & SP_VISITED == 0);
-        assert!(block.coding_state[1] & SP_VISITED == 0);
+        assert!(!block.visited_for_test(0));
+        assert!(!block.visited_for_test(1));
     }
 
     // -- §C.3.6 / §D.4 reset of context probabilities (Scod bit-1) ----

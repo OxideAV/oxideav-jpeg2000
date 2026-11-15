@@ -8,8 +8,11 @@
 //!
 //! Cases: `rgb8-1024` and `rgb16-1024` lossless 5-3, `rgb8-512` lossy
 //! 9-7 (plain and rate-controlled), `rgb8-4k` lossless, a 64-tile
-//! `rgb8-1024-tiles128`, and an HTJ2K
-//! `ht-rgb8-1024` lossless stream. Each case is encoded and decoded
+//! `rgb8-1024-tiles128`, an HTJ2K `ht-rgb8-1024` lossless stream, a
+//! 1 MP lossy `rgb8-1024-lossy97` (plain and HTJ2K), and three 12 MP
+//! pictures (`rgb8-12mp` lossless and lossy, `rgb16-12mp` lossless).
+//! `--case` takes a substring, or `=NAME` for one exact case. Each case
+//! is encoded and decoded
 //! `rounds` times after one warm-up; the median and the fastest round
 //! (milliseconds) are printed together
 //! with FNV-1a hashes of the codestream and of the decoded samples, so
@@ -196,6 +199,59 @@ fn cases() -> Vec<Case> {
             registry_keys: &[("levels", "5"), ("ht", "true")],
             lossless: true,
         },
+        Case {
+            name: "rgb8-1024-lossy97",
+            width: 1024,
+            height: 1024,
+            bits: 8,
+            options: base().with_decomposition_levels(5).with_lossy(2),
+            registry_keys: &[("levels", "5"), ("lossless", "false"), ("fine_bits", "2")],
+            lossless: false,
+        },
+        Case {
+            name: "ht-rgb8-1024-lossy97",
+            width: 1024,
+            height: 1024,
+            bits: 8,
+            options: base()
+                .with_decomposition_levels(5)
+                .with_lossy(2)
+                .with_high_throughput(true),
+            registry_keys: &[
+                ("levels", "5"),
+                ("lossless", "false"),
+                ("fine_bits", "2"),
+                ("ht", "true"),
+            ],
+            lossless: false,
+        },
+        Case {
+            name: "rgb8-12mp-lossless",
+            width: 4000,
+            height: 3000,
+            bits: 8,
+            options: base().with_decomposition_levels(5),
+            registry_keys: &[("levels", "5")],
+            lossless: true,
+        },
+        Case {
+            name: "rgb8-12mp-lossy97",
+            width: 4000,
+            height: 3000,
+            bits: 8,
+            options: base().with_decomposition_levels(5).with_lossy(2),
+            registry_keys: &[("levels", "5"), ("lossless", "false"), ("fine_bits", "2")],
+            lossless: false,
+        },
+        Case {
+            name: "rgb16-12mp-lossless",
+            width: 4000,
+            height: 3000,
+            bits: 16,
+            options: base().with_decomposition_levels(5),
+            registry_keys: &[("levels", "5")],
+            lossless: true,
+        },
     ]
 }
 
@@ -346,7 +402,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         "case", "enc med", "enc min", "dec med", "dec min", "bytes", "stream fnv", "samples fnv"
     );
     for case in cases() {
-        if filter.as_ref().is_some_and(|f| !case.name.contains(f)) {
+        let selected = filter.as_deref().is_none_or(|f| match f.strip_prefix('=') {
+            Some(exact) => case.name == exact,
+            None => case.name.contains(f),
+        });
+        if !selected {
             continue;
         }
         // With --load the process never holds the source picture.

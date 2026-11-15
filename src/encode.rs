@@ -799,12 +799,12 @@ fn encode_code_block(
     // equals the integer sum, which the fast lane forms directly.
     let exact_integer_sum = planes <= 20 && targets.len() <= 1 << 12;
     let dist_of = |blk: &CodeBlock| -> f64 {
+        let mut coefficients = targets.iter();
         if exact_integer_sum {
             let mut d = 0u64;
-            for (i, c) in targets.iter().enumerate() {
-                let m = c.magnitude;
-                let done = blk.decoded_bits_at(i).min(planes);
-                let t = planes - done;
+            blk.for_each_decoded_bits(|done| {
+                let m = coefficients.next().map_or(0, |c| c.magnitude);
+                let t = planes - done.min(planes);
                 let known = (m >> t) << t;
                 // Midpoint reconstruction `known + 2^(t−1)` once any
                 // bit is known (exactly `m` at t = 0), zero before.
@@ -815,17 +815,16 @@ fn encode_code_block(
                 };
                 let e = u64::from(m.abs_diff(rec));
                 d += e * e;
-            }
+            });
             return d as f64;
         }
         let mut d = 0.0;
-        for (i, c) in targets.iter().enumerate() {
-            let m = c.magnitude;
+        blk.for_each_decoded_bits(|done| {
+            let m = coefficients.next().map_or(0, |c| c.magnitude);
             if m == 0 {
-                continue;
+                return;
             }
-            let done = blk.decoded_bits_at(i).min(planes);
-            let t = planes - done;
+            let t = planes - done.min(planes);
             let known = (m >> t) << t;
             let rec = if known == 0 {
                 0.0
@@ -836,7 +835,7 @@ fn encode_code_block(
             };
             let e = f64::from(m) - rec;
             d += e * e;
-        }
+        });
         d
     };
     // The coding sink. With the §D.6 selective-AC-bypass style the
