@@ -21,6 +21,7 @@ All notable changes to `oxideav-jpeg2000` are recorded here.
 
 ### Changed
 
+- `t1::CodeBlock::was_newly_significant` answers the same after `cleanup_encode` as after `cleanup_pass`: a sample the cleanup pass made significant counts until the next significance pass starts (the encoder-side cleanup used not to mark it). Within the §D.3 pass order nothing reads the flag in between, so codestreams are unaffected; a magnitude refinement pass called directly after a cleanup pass now skips those samples on both sides alike.
 - The framework demuxer no longer reports `("icc", "present")` in `metadata()`: the profile itself is on the stream's blobs.
 
 - `PLM` (T.800 §A.7.2, packet lengths in the main header), both directions. `EncodeOptions::plm` / `with_plm` (registry key `plm`) emits the `(Nplm, Iplm…)` series for every tile-part in `Zplm`-indexed segments; a tile-part whose lengths need more than the 8-bit `Nplm` can count makes the encode an error, as the marker "shall not be used" there. The decoder gathers the series (runs may continue in the next segment; a segment or run ending inside a packet length, a truncated series and a repeated `Zplm` are rejected) and cross-validates it against the walked packets of every tile-part exactly as it does `PLT`; a disagreement is the new `Error::PlmMismatch`. Previously a `PLM` was skipped unread and never written.
