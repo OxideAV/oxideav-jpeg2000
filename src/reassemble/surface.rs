@@ -51,18 +51,32 @@ impl MidpointOffsets {
 pub(crate) fn reconstruct_block_5x3(block: &CodeBlock, nb: u32, mb: u32, r: f64) -> Vec<i32> {
     let mut out = Vec::with_capacity(block.width() * block.height());
     let mut offsets = MidpointOffsets::new(r);
-    block.for_each_signed_with_nb(nb, |qb, nb| {
-        out.push(if nb >= mb {
-            // An integer inside the f64-exact range: the saturating
-            // conversion is the integer clamp.
-            qb.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
-        } else if qb == 0 {
+    // An integer inside the f64-exact range: the saturating conversion
+    // is the integer clamp.
+    let whole = |qb: i64| qb.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+    let partial = |qb: i64, offset: f64| {
+        if qb == 0 {
             0
         } else {
-            let offset = offsets.get(mb - nb);
             r_qb_to_i32(qb as f64 + if qb > 0 { offset } else { -offset })
-        });
-    });
+        }
+    };
+    match block.uniform_nb(nb) {
+        // The usual block: one `Nb` for all its samples, so the
+        // Equation E-8 case is chosen once.
+        Some(nb) if nb >= mb => block.extend_signed(&mut out, whole),
+        Some(nb) => {
+            let offset = offsets.get(mb - nb);
+            block.extend_signed(&mut out, |qb| partial(qb, offset));
+        }
+        None => block.for_each_signed_with_nb(nb, |qb, nb| {
+            out.push(if nb >= mb {
+                whole(qb)
+            } else {
+                partial(qb, offsets.get(mb - nb))
+            });
+        }),
+    }
     out
 }
 
@@ -78,14 +92,23 @@ pub(crate) fn reconstruct_block_9x7(
     let step = irreversible_step_size(quant.rb, quant.step);
     let mut out = Vec::with_capacity(block.width() * block.height());
     let mut offsets = MidpointOffsets::new(r);
-    block.for_each_signed_with_nb(nb, |qb, nb| {
-        out.push(if qb == 0 {
+    let value = |qb: i64, offset: f64| {
+        if qb == 0 {
             0.0
         } else {
-            let offset = offsets.get(quant.mb.saturating_sub(nb));
             (qb as f64 + if qb > 0 { offset } else { -offset }) * step
-        });
-    });
+        }
+    };
+    match block.uniform_nb(nb) {
+        // One `Nb` for the whole block: one midpoint offset.
+        Some(nb) => {
+            let offset = offsets.get(quant.mb.saturating_sub(nb));
+            block.extend_signed(&mut out, |qb| value(qb, offset));
+        }
+        None => block.for_each_signed_with_nb(nb, |qb, nb| {
+            out.push(value(qb, offsets.get(quant.mb.saturating_sub(nb))));
+        }),
+    }
     out
 }
 

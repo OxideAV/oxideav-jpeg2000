@@ -1395,7 +1395,14 @@ impl CodeBlock {
     /// Annex D passes.
     pub(crate) fn set_decoded_bits_raw(&mut self, bits: Vec<u32>) {
         assert_eq!(bits.len(), self.width * self.height);
-        self.counts = Counts::PerSample(bits);
+        // One count for every sample is the "whole planes" form.
+        self.counts = match bits.split_first() {
+            Some((&first, rest)) if rest.iter().all(|&count| count == first) => Counts::Planes {
+                complete: first,
+                partial: Partial::None,
+            },
+            _ => Counts::PerSample(bits),
+        };
     }
 
     /// The full per-coefficient §D.2.1 `Nb(u, v)` for reconstruction:
@@ -1518,6 +1525,48 @@ impl CodeBlock {
                     }
                 }
             }
+        }
+    }
+
+    /// The §D.2.1 `Nb` every sample of the block shares, if they all
+    /// share one: no ROI remap, and either no coding pass ran (the
+    /// `uniform_fallback`) or the passes stopped on a bit-plane
+    /// boundary. `None` when the samples have to be asked one by one.
+    pub(crate) fn uniform_nb(&self, uniform_fallback: u32) -> Option<u32> {
+        if self.roi_nb.is_some() {
+            return None;
+        }
+        match self.counts {
+            Counts::Planes {
+                complete,
+                partial: Partial::None,
+            } => Some(if complete == 0 {
+                uniform_fallback
+            } else {
+                self.zero_bit_planes + complete
+            }),
+            _ => None,
+        }
+    }
+
+    /// Append `map(qb)` for every coefficient, in raster order, where
+    /// `qb` is its signed Equation E-1 value — the first half of what
+    /// [`Self::for_each_signed_with_nb`] yields, a row at a time.
+    pub(crate) fn extend_signed<T>(&self, out: &mut Vec<T>, map: impl Fn(i64) -> T) {
+        let width = self.width;
+        out.reserve(width * self.height);
+        for (v, magnitudes) in self.magnitudes.chunks_exact(width).enumerate() {
+            let sign_bit = SIGN_SHIFT + 3 * (v % 4) as u32 + 4;
+            let first = self.column_index(0, v);
+            let words = &self.columns[first..first + width];
+            out.extend(magnitudes.iter().zip(words).map(|(&magnitude, &word)| {
+                let magnitude = i64::from(magnitude);
+                map(if (word >> sign_bit) & 1 != 0 {
+                    -magnitude
+                } else {
+                    magnitude
+                })
+            }));
         }
     }
 
@@ -3539,10 +3588,28 @@ mod tests {
         for (idx, &count) in counts.iter().enumerate() {
             assert_eq!(block.decoded_bits(idx % 3, idx / 3), count);
         }
+        // Per-sample counts never share one `Nb`.
+        assert_eq!(block.uniform_nb(9), None);
         block.set_decoded_bits_raw(vec![17; 15]);
         assert_eq!(block.decoded_bits(0, 0), 17);
         assert_eq!(block.max_decoded_bits(), 17);
+        assert_eq!(block.uniform_nb(9), Some(19));
         assert_eq!(block.coefficients_for_test(), coefficients);
+        // No pass at all: the caller's fallback, as `effective_nb` gives.
+        block.set_decoded_bits_raw(vec![0; 15]);
+        assert_eq!(block.uniform_nb(9), Some(9));
+        assert_eq!(block.effective_nb(1, 3, 9), 9);
+        // Whatever the form of the counts, the bulk read is the
+        // per-sample read.
+        let mut signed = Vec::new();
+        block.extend_signed(&mut signed, |qb| qb);
+        let mut expected = Vec::new();
+        block.for_each_signed_with_nb(9, |qb, nb| {
+            assert_eq!(nb, 9);
+            expected.push(qb);
+        });
+        assert_eq!(signed, expected);
+        assert_eq!(signed[10], -i64::from(u32::MAX));
     }
 
     fn normalized_signs(mut nb: Neighbours) -> Neighbours {
@@ -4209,6 +4276,16 @@ mod tests {
             reference.counts.iter().copied().max().unwrap(),
             "{tag}"
         );
+        // A shared `Nb` is claimed only when every sample has it.
+        if let Some(nb) = block.uniform_nb(u32::MAX) {
+            let first = reference.counts[0];
+            assert!(
+                reference.counts.iter().all(|&count| count == first),
+                "{tag}"
+            );
+            let expected = if first == 0 { u32::MAX } else { first };
+            assert_eq!(nb, block.zero_bit_planes() + expected, "{tag}");
+        }
         assert_column_words(block);
     }
 
