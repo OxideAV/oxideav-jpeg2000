@@ -81,69 +81,53 @@ pub struct MqEncoder {
     out: Vec<u8>,
 }
 
-impl MqEncoder {
-    /// INITENC — initialise the encoder (T.800 §C.2.8, Figure C.10).
-    ///
-    /// `A = 0x8000`, `C = 0`, `CT = 12` (three spacer bits plus the byte
-    /// field must fill before the first BYTEOUT), and `BP` parked before
-    /// the first output byte (an empty buffer). The "preceding byte" is
-    /// absent, so no spurious stuff bit and `CT` is not bumped.
-    pub fn new() -> Self {
-        MqEncoder {
-            a: 0x8000,
-            c: 0,
-            ct: 12,
-            out: Vec::new(),
-        }
-    }
+/// The §C.2.1 registers of an [`MqEncoder`], as a plain value: a coding
+/// loop that holds one in a local variable keeps `A`, `C` and `CT` out
+/// of memory between decisions (nothing takes their address — the
+/// byte-emitting path receives and returns them by value).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CoderRegisters {
+    a: u32,
+    c: u64,
+    ct: i32,
+}
 
-    /// The byte currently under `BP` — the last completed byte, or a
-    /// non-`0xFF` sentinel when the buffer is still empty (the INITENC
-    /// "byte preceding `BPST`" whose value we take as not-`0xFF`).
-    fn cur_byte(&self) -> u8 {
-        self.out.last().copied().unwrap_or(0)
-    }
-
-    /// BYTEOUT's "increment BP, then B = value" — append a completed byte.
-    fn emit(&mut self, value: u8) {
-        self.out.push(value);
-    }
-
-    /// BYTEOUT's carry-propagation "B = B + 1" — add the carry into the
-    /// most-recently-written byte.
-    fn add_carry(&mut self) {
-        if let Some(last) = self.out.last_mut() {
-            *last = last.wrapping_add(1);
-        }
-    }
-
-    /// BYTEOUT — remove one completed byte from `C` (T.800 §C.2.7,
-    /// Figure C.9), applying the bit-stuffing and carry handling.
-    fn byteout(&mut self) {
-        if self.cur_byte() == 0xFF {
+impl CoderRegisters {
+    /// BYTEOUT (T.800 §C.2.7, Figure C.9) onto `out`, whose last byte
+    /// is the spec's `B`. `BP` is modelled as `out.len() − 1`:
+    /// "increment BP then write B" is a `push`, the carry-propagation
+    /// "B = B + 1" mutates the last pushed byte in place, and INITENC's
+    /// "`BP = BPST − 1`" is the empty buffer (whose missing byte is
+    /// taken as not-`0xFF`).
+    fn byteout(&mut self, out: &mut Vec<u8>) {
+        let last = out.last().copied().unwrap_or(0);
+        if last == 0xFF {
             // Previous byte was 0xFF: stuff a leading 0 bit, so only 7
             // data bits leave (bits 26..=20) and `CT = 7`. A carry cannot
             // reach past the 0xFF because of this stuffing, so bit 27 is
             // guaranteed clear here.
-            self.emit(((self.c >> 20) & 0xFF) as u8);
+            out.push(((self.c >> 20) & 0xFF) as u8);
             self.c &= 0xF_FFFF;
             self.ct = 7;
         } else if self.c & 0x800_0000 == 0 {
             // No carry (bit 27 clear): emit bits 26..=19 and `CT = 8`.
-            self.emit(((self.c >> 19) & 0xFF) as u8);
+            out.push(((self.c >> 19) & 0xFF) as u8);
             self.c &= 0x7_FFFF;
             self.ct = 8;
         } else {
             // Carry: propagate it into the last byte, then re-test whether
             // that byte is now 0xFF (which forces a stuff on the next).
-            self.add_carry();
-            if self.cur_byte() == 0xFF {
+            let carried = last.wrapping_add(1);
+            if let Some(byte) = out.last_mut() {
+                *byte = carried;
+            }
+            if !out.is_empty() && carried == 0xFF {
                 self.c &= 0x7FF_FFFF;
-                self.emit(((self.c >> 20) & 0xFF) as u8);
+                out.push(((self.c >> 20) & 0xFF) as u8);
                 self.c &= 0xF_FFFF;
                 self.ct = 7;
             } else {
-                self.emit(((self.c >> 19) & 0xFF) as u8);
+                out.push(((self.c >> 19) & 0xFF) as u8);
                 self.c &= 0x7_FFFF;
                 self.ct = 8;
             }
@@ -160,7 +144,7 @@ impl MqEncoder {
     /// together.
     #[cold]
     #[inline(never)]
-    fn renorme_across_bytes(&mut self, mut shift: u32) {
+    fn renorme_across_bytes(mut self, mut shift: u32, out: &mut Vec<u8>) -> Self {
         while shift > 0 {
             let step = shift.min(self.ct as u32);
             self.a <<= step;
@@ -168,9 +152,93 @@ impl MqEncoder {
             self.ct -= step as i32;
             shift -= step;
             if self.ct == 0 {
-                self.byteout();
+                self.byteout(out);
             }
         }
+        self
+    }
+
+    /// CODEMPS / CODELPS up to the renormalization: the interval and
+    /// code registers after the sub-interval choice, the RENORME shift
+    /// count, and the context word after the §C.2.5 step.
+    #[inline(always)]
+    fn subdivide(&self, word: u32, d: u8) -> (u32, u64, u32, u32) {
+        let qe = word & 0xFFFF;
+        let more_probable = u32::from(d != 0) == (word >> 16) & 1;
+        let reduced = self.a.wrapping_sub(qe);
+        let lower = more_probable == (reduced < qe);
+        let a = if lower { qe } else { reduced };
+        let c = self.c + if lower { 0 } else { qe as u64 };
+        let renormalize = !more_probable | (reduced & 0x8000 == 0);
+        let word = crate::mq::stepped_word(word, renormalize, !more_probable);
+        (a, c, (a << 16).leading_zeros(), word)
+    }
+
+    /// ENCODE one decision `d` against context word `word` (see
+    /// [`MqEncoder::encode`]); returns the context word after the
+    /// §C.2.5 step.
+    #[inline(always)]
+    pub(crate) fn encode(&mut self, out: &mut Vec<u8>, word: u32, d: u8) -> u32 {
+        let (a, c, shift, word) = self.subdivide(word, d);
+        if shift < self.ct as u32 {
+            self.a = a << shift;
+            self.c = c << shift;
+            self.ct -= shift as i32;
+        } else {
+            *self = CoderRegisters { a, c, ct: self.ct }.renorme_across_bytes(shift, out);
+        }
+        word
+    }
+}
+
+impl MqEncoder {
+    /// INITENC — initialise the encoder (T.800 §C.2.8, Figure C.10).
+    ///
+    /// `A = 0x8000`, `C = 0`, `CT = 12` (three spacer bits plus the byte
+    /// field must fill before the first BYTEOUT), and `BP` parked before
+    /// the first output byte (an empty buffer). The "preceding byte" is
+    /// absent, so no spurious stuff bit and `CT` is not bumped.
+    pub fn new() -> Self {
+        MqEncoder {
+            a: 0x8000,
+            c: 0,
+            ct: 12,
+            out: Vec::new(),
+        }
+    }
+
+    /// BYTEOUT — remove one completed byte from `C` (T.800 §C.2.7,
+    /// Figure C.9), applying the bit-stuffing and carry handling.
+    fn byteout(&mut self) {
+        let mut registers = self.registers();
+        registers.byteout(&mut self.out);
+        self.set_registers(registers);
+    }
+
+    /// The `A` / `C` / `CT` registers, for a coding loop that keeps
+    /// them in local variables.
+    #[inline(always)]
+    pub(crate) fn registers(&self) -> CoderRegisters {
+        CoderRegisters {
+            a: self.a,
+            c: self.c,
+            ct: self.ct,
+        }
+    }
+
+    /// Store registers a coding loop worked on back into the encoder.
+    #[inline(always)]
+    pub(crate) fn set_registers(&mut self, registers: CoderRegisters) {
+        self.a = registers.a;
+        self.c = registers.c;
+        self.ct = registers.ct;
+    }
+
+    /// The compressed bytes written so far (for a coding loop that
+    /// works on [`Self::registers`]).
+    #[inline(always)]
+    pub(crate) fn output_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.out
     }
 
     /// Encode one binary decision `D` against the adaptive state in `cx`
@@ -194,24 +262,9 @@ impl MqEncoder {
     /// one-bit steps as the 16-bit `A` has leading zeros.
     #[inline(always)]
     pub fn encode(&mut self, cx: &mut MqContext, d: u8) {
-        let qe = cx.qe();
-        let more_probable = u8::from(d != 0) == cx.mps_bit();
-        let reduced = self.a.wrapping_sub(qe);
-        let lower = more_probable == (reduced < qe);
-        let a = if lower { qe } else { reduced };
-        self.c += if lower { 0 } else { qe as u64 };
-        let renormalize = !more_probable | (reduced & 0x8000 == 0);
-        cx.step_if(renormalize, !more_probable);
-
-        let shift = (a as u16).leading_zeros();
-        if shift < self.ct as u32 {
-            self.a = a << shift;
-            self.c <<= shift;
-            self.ct -= shift as i32;
-        } else {
-            self.a = a;
-            self.renorme_across_bytes(shift);
-        }
+        let mut registers = self.registers();
+        cx.set_word(registers.encode(self.output_mut(), cx.word(), d));
+        self.set_registers(registers);
     }
 
     /// SETBITS — force the low bits of `C` to `1` up to the interval bound

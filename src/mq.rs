@@ -415,14 +415,19 @@ const fn context_word(index: u8, mps: bool) -> u32 {
     QE[row].qe as u32 | ((mps as u32) << 16) | ((row as u32) << CONTEXT_INDEX_SHIFT)
 }
 
-/// §C.2.5 probability-estimation step on whole context words: entry
-/// `[word >> 16][0]` is the context after a renormalizing MPS (index
-/// `NMPS`, sense kept), entry `[word >> 16][1]` the context after an
-/// LPS (index `NLPS`, sense flipped where Table C.2 has `SWITCH = 1`).
+/// §C.2.5 probability-estimation step on whole context words: the low
+/// half of entry `word >> 16` is the context after a renormalizing MPS
+/// (index `NMPS`, sense kept), the high half the context after an LPS
+/// (index `NLPS`, sense flipped where Table C.2 has `SWITCH = 1`).
 /// The key is `index × 2 + mps`; keys past Table C.2 repeat its last
 /// row and are never reached.
-pub(crate) static CONTEXT_STEP: [[u32; 2]; 128] = {
-    let mut steps = [[0u32; 2]; 128];
+///
+/// Both successors sit in one word so that a coding step reads them
+/// with a single load whose address depends on the context alone — the
+/// choice between them (which depends on the interval comparison) is a
+/// register selection afterwards, not part of the address.
+pub(crate) static CONTEXT_STEP: [u64; 128] = {
+    let mut steps = [0u64; 128];
     let mut key = 0;
     while key < 128 {
         let index = if key / 2 < QE.len() {
@@ -432,14 +437,26 @@ pub(crate) static CONTEXT_STEP: [[u32; 2]; 128] = {
         };
         let mps = key % 2 == 1;
         let e = &QE[index];
-        steps[key] = [
-            context_word(e.nmps, mps),
-            context_word(e.nlps, mps != e.switch),
-        ];
+        steps[key] = context_word(e.nmps, mps) as u64
+            | ((context_word(e.nlps, mps != e.switch) as u64) << 32);
         key += 1;
     }
     steps
 };
+
+/// The §C.2.5 step of context word `word`, taken when `renormalize`
+/// holds: to `NLPS` (with the SWITCH flip) when the less probable
+/// symbol was coded, to `NMPS` otherwise. Selections only, no branch.
+#[inline(always)]
+pub(crate) fn stepped_word(word: u32, renormalize: bool, less_probable: bool) -> u32 {
+    let both = CONTEXT_STEP[((word >> 16) & 127) as usize];
+    let next = if less_probable {
+        (both >> 32) as u32
+    } else {
+        both as u32
+    };
+    if renormalize { next } else { word }
+}
 
 /// Per-context adaptive state: the current Table C.2 index `I(CX)` and
 /// the current sense of the more-probable symbol `MPS(CX)`.
@@ -525,25 +542,17 @@ impl MqContext {
         self.word ^= CONTEXT_MPS_BIT;
     }
 
-    /// `Qe(I(CX))`, the current LPS probability estimate.
+    /// The whole state word (`Qe`, `MPS`, `I`), for a coding loop that
+    /// steps it in a local variable.
     #[inline(always)]
-    pub(crate) fn qe(&self) -> u32 {
-        self.word & 0xFFFF
+    pub(crate) fn word(&self) -> u32 {
+        self.word
     }
 
-    /// `MPS(CX)` as a bit.
+    /// Store a state word produced by a coding step.
     #[inline(always)]
-    pub(crate) fn mps_bit(&self) -> u8 {
-        ((self.word >> 16) & 1) as u8
-    }
-
-    /// The §C.2.5 step, taken when `renormalize` holds: to `NLPS`
-    /// (with the SWITCH flip) when the less probable symbol was coded,
-    /// to `NMPS` otherwise. One selection, no branch.
-    #[inline(always)]
-    pub(crate) fn step_if(&mut self, renormalize: bool, less_probable: bool) {
-        let next = CONTEXT_STEP[((self.word >> 16) & 127) as usize][less_probable as usize];
-        self.word = if renormalize { next } else { self.word };
+    pub(crate) fn set_word(&mut self, word: u32) {
+        self.word = word;
     }
 
     /// Reset this context to its initial state (§C.3.6). The caller
@@ -566,13 +575,25 @@ impl MqContext {
 pub struct MqDecoder<'a> {
     /// Compressed byte slice (`BPST .. end`).
     data: &'a [u8],
-    /// Byte pointer `BP`, the §C.3 buffer cursor (index into `data`).
+    /// Index of the last byte read into `c` — the §C.3 byte pointer
+    /// `BP` plus the bytes read ahead (see `c`).
     bp: usize,
     /// Interval register `A` (16-bit value held in a `u32`).
     a: u32,
-    /// Code register `C` (the §C.3.1 32-bit Chigh:Clow concatenation).
-    c: u32,
-    /// Bit counter `CT` (§C.3.3).
+    /// Code register: the §C.3.1 32-bit `Chigh:Clow` concatenation in
+    /// the upper half, and below it the bytes read ahead of the §C.3.4
+    /// schedule. BYTEIN places a byte in the eight bits under the ones
+    /// still to be shifted into `Chigh`; a byte that follows a
+    /// non-`0xFF` byte is a plain continuation of that bit string, so
+    /// it can be appended as soon as there is room instead of when `CT`
+    /// reaches zero, and one refill then covers several
+    /// renormalizations. The byte after a `0xFF` is different — its top
+    /// bit is *added* to the bit above (the stuffed-bit rule) or it
+    /// ends the segment — so it is read exactly when Figure C.19 reads
+    /// it, never ahead.
+    c: u64,
+    /// Bits of `c` below `Chigh` not yet shifted into it: the §C.3.3
+    /// counter `CT` plus eight for every byte read ahead.
     ct: i32,
     /// Whether the BYTEIN procedure ever synthesised an `0xFF` fill byte
     /// because the input slice ran out before the decoder asked for the
@@ -612,7 +633,7 @@ impl<'a> MqDecoder<'a> {
             data,
             bp: 0,
             a: 0,
-            c: (first as u32) << 16,
+            c: (first as u64) << 48,
             ct: 0,
             synthetic_fill_used,
         };
@@ -656,13 +677,13 @@ impl<'a> MqDecoder<'a> {
             let b1 = raw_b1.unwrap_or(0xFF);
             if b1 > 0x8F {
                 // Marker code: feed 1-bits, BP stays on the 0xFF prefix.
-                self.c += 0xFF00;
+                self.c += 0xFF00 << 32;
                 self.ct = 8;
             } else {
                 // Stuffed bit: B1 added so the stuff bit (any carry)
                 // aligns with the low order bit of Chigh.
                 self.bp += 1;
-                self.c += (b1 as u32) << 9;
+                self.c += (b1 as u64) << 41;
                 self.ct = 7;
             }
         } else {
@@ -672,8 +693,22 @@ impl<'a> MqDecoder<'a> {
                 self.synthetic_fill_used = true;
             }
             let nb = raw_nb.unwrap_or(0xFF);
-            self.c += (nb as u32) << 8;
+            self.c += (nb as u64) << 40;
             self.ct = 8;
+        }
+    }
+
+    /// BYTEIN, then read ahead: while the last byte read is not `0xFF`
+    /// and another byte exists, the BYTEIN that Figure C.18 would run
+    /// eight shifts later is the plain `C += B << 8` case — applied
+    /// now, one byte position lower. Never reads past the end of the
+    /// data, so the synthesised fill keeps its exact timing.
+    fn refill(&mut self) {
+        self.bytein();
+        while self.ct <= 40 && self.bp + 1 < self.data.len() && self.data[self.bp] != 0xFF {
+            self.bp += 1;
+            self.c += (self.data[self.bp] as u64) << (40 - self.ct);
+            self.ct += 8;
         }
     }
 
@@ -686,12 +721,16 @@ impl<'a> MqDecoder<'a> {
     /// `A ≥ 0x8000`. `shift` is that number of single-bit steps (the
     /// leading zeros of the 16-bit `A`); between two BYTEINs the steps
     /// are applied together.
+    ///
+    /// Takes and returns the decoder by value: the caller's registers
+    /// then never have their address taken, so a coding loop can keep
+    /// `A`, `C` and `CT` out of memory between decisions.
     #[cold]
     #[inline(never)]
-    fn renormd_across_bytes(&mut self, mut shift: u32) {
+    fn renormd_across_bytes(mut self, mut shift: u32) -> Self {
         while shift > 0 {
             if self.ct == 0 {
-                self.bytein();
+                self.refill();
             }
             let step = shift.min(self.ct as u32);
             self.a <<= step;
@@ -699,6 +738,7 @@ impl<'a> MqDecoder<'a> {
             self.ct -= step as i32;
             shift -= step;
         }
+        self
     }
 
     /// DECODE — decode one binary decision `D ∈ {0, 1}` against the
@@ -727,29 +767,55 @@ impl<'a> MqDecoder<'a> {
     /// `Chigh` drops by `Qe` otherwise.
     #[inline(always)]
     pub fn decode(&mut self, cx: &mut MqContext) -> u8 {
-        let qe = cx.qe();
+        let (d, word) = self.decode_word(cx.word);
+        cx.word = word;
+        d
+    }
+
+    /// [`Self::decode`] on a bare context word: returns the decision
+    /// and the context word after the §C.2.5 step.
+    #[inline(always)]
+    pub(crate) fn decode_word(&mut self, word: u32) -> (u8, u32) {
+        let qe = word & 0xFFFF;
         let reduced = self.a.wrapping_sub(qe);
-        let lps = (self.c >> 16) < qe;
+        let lps = ((self.c >> 48) as u32) < qe;
         let renormalize = lps | (reduced & 0x8000 == 0);
         let less_probable = lps ^ (reduced < qe);
-        let d = cx.mps_bit() ^ less_probable as u8;
-        cx.step_if(renormalize, less_probable);
+        let d = ((word >> 16) & 1) as u8 ^ less_probable as u8;
+        let word = stepped_word(word, renormalize, less_probable);
 
         let a = if lps { qe } else { reduced };
-        self.c -= if lps { 0 } else { qe << 16 };
+        let c = self.c - if lps { 0 } else { (qe as u64) << 48 };
         // RENORMD: the number of one-bit steps Figure C.18 takes is the
         // count of leading zeros of the 16-bit `A` (zero when no
         // renormalization is due).
-        let shift = (a as u16).leading_zeros();
+        let shift = (a << 16).leading_zeros();
         if shift <= self.ct as u32 {
             self.a = a << shift;
-            self.c <<= shift;
+            self.c = c << shift;
             self.ct -= shift as i32;
         } else {
-            self.a = a;
-            self.renormd_across_bytes(shift);
+            *self = MqDecoder {
+                data: self.data,
+                bp: self.bp,
+                a,
+                c,
+                ct: self.ct,
+                synthetic_fill_used: self.synthetic_fill_used,
+            }
+            .renormd_across_bytes(shift);
         }
-        d
+        (d, word)
+    }
+
+    /// The registers as §C.3 defines them — `A`, the 32-bit `C`, `CT`,
+    /// `BP` — with the bytes read ahead taken back out. Valid between
+    /// decisions.
+    #[cfg(test)]
+    fn standard_registers(&self) -> (u32, u32, i32, usize) {
+        let ct = self.ct % 8;
+        let c = (self.c >> 32) as u32 & !((1u32 << (16 - ct)) - 1);
+        (self.a, c, ct, self.byte_pointer())
     }
 
     /// The current byte pointer `BP` (index into the input slice).
@@ -757,7 +823,9 @@ impl<'a> MqDecoder<'a> {
     /// Useful for the coding-pass layer to learn how many compressed
     /// bytes the decoder consumed for a terminated segment.
     pub fn byte_pointer(&self) -> usize {
-        self.bp
+        // Between decisions `CT < 8` (a BYTEIN is always followed by a
+        // shift), so every whole byte in the count was read ahead.
+        self.bp - (self.ct / 8) as usize
     }
 
     /// Whether the §C.3.4 0xFF-fill synthesis has ever fired on this
@@ -781,11 +849,68 @@ impl<'a> MqDecoder<'a> {
 mod tests {
     use super::*;
 
+    /// The decoder exactly as §C.3 draws it: 32-bit `C`, one BYTEIN per
+    /// eight shifts (Figure C.19), INITDEC (Figure C.20).
+    struct Flowchart<'a> {
+        data: &'a [u8],
+        bp: usize,
+        a: u32,
+        c: u32,
+        ct: i32,
+        fill: bool,
+    }
+
+    impl<'a> Flowchart<'a> {
+        fn new(data: &'a [u8]) -> Self {
+            let mut dec = Flowchart {
+                data,
+                bp: 0,
+                a: 0,
+                c: (data.first().copied().unwrap_or(0xFF) as u32) << 16,
+                ct: 0,
+                fill: data.is_empty(),
+            };
+            dec.bytein();
+            dec.c <<= 7;
+            dec.ct -= 7;
+            dec.a = 0x8000;
+            dec
+        }
+
+        fn byte(&mut self, at: usize) -> u8 {
+            match self.data.get(at) {
+                Some(&byte) => byte,
+                None => {
+                    self.fill = true;
+                    0xFF
+                }
+            }
+        }
+
+        fn bytein(&mut self) {
+            if self.byte(self.bp) == 0xFF {
+                let b1 = self.byte(self.bp + 1);
+                if b1 > 0x8F {
+                    self.c += 0xFF00;
+                    self.ct = 8;
+                } else {
+                    self.bp += 1;
+                    self.c += (b1 as u32) << 9;
+                    self.ct = 7;
+                }
+            } else {
+                self.bp += 1;
+                self.c += (self.byte(self.bp) as u32) << 8;
+                self.ct = 8;
+            }
+        }
+    }
+
     /// DECODE transcribed flowchart by flowchart (Figures C.15 – C.18):
     /// the MPS-path and LPS-path conditional exchanges as separate
     /// branches and a one-bit RENORMD loop. The reference the
     /// single-selection `decode` must match.
-    fn decode_by_flowchart(dec: &mut MqDecoder<'_>, cx: &mut MqContext) -> u8 {
+    fn decode_by_flowchart(dec: &mut Flowchart<'_>, cx: &mut MqContext) -> u8 {
         let entry = QE[cx.index() as usize];
         let qe = entry.qe as u32;
         dec.a -= qe;
@@ -860,7 +985,12 @@ mod tests {
                 })
                 .collect();
             let mut fast = MqDecoder::new(&bytes);
-            let mut reference = MqDecoder::new(&bytes);
+            let mut reference = Flowchart::new(&bytes);
+            assert_eq!(
+                fast.standard_registers(),
+                (reference.a, reference.c, reference.ct, reference.bp),
+                "round {round} INITDEC"
+            );
             let mut fast_cx = [MqContext::default(); 19];
             fast_cx[18] = MqContext::uniform();
             fast_cx[17] = MqContext::run_length();
@@ -876,13 +1006,10 @@ mod tests {
                 let expected = decode_by_flowchart(&mut reference, &mut reference_cx[context]);
                 assert_eq!(d, expected, "round {round} step {step}");
                 assert_eq!(
-                    (fast.a, fast.c, fast.ct, fast.bp, fast.synthetic_fill_used),
+                    (fast.standard_registers(), fast.synthetic_fill_used),
                     (
-                        reference.a,
-                        reference.c,
-                        reference.ct,
-                        reference.bp,
-                        reference.synthetic_fill_used
+                        (reference.a, reference.c, reference.ct, reference.bp),
+                        reference.fill
                     ),
                     "round {round} step {step}"
                 );
@@ -1021,9 +1148,7 @@ mod tests {
         //   A = 0x8000
         let bytes = [0x12u8, 0x34, 0x56];
         let dec = MqDecoder::new(&bytes);
-        assert_eq!(dec.c, 0x091A_0000);
-        assert_eq!(dec.ct, 1);
-        assert_eq!(dec.bp, 1);
+        assert_eq!(dec.standard_registers(), (0x8000, 0x091A_0000, 1, 1));
     }
 
     #[test]
@@ -1035,10 +1160,7 @@ mod tests {
         //           C += 0xFF00 → 0x00FF_FF00, CT=8, BP stays 0.
         //   C <<= 7 → 0x7FFF_8000 ; CT -= 7 → 1 ; A = 0x8000
         let dec = MqDecoder::new(&[]);
-        assert_eq!(dec.a, 0x8000);
-        assert_eq!(dec.c, 0x7FFF_8000);
-        assert_eq!(dec.ct, 1);
-        assert_eq!(dec.bp, 0);
+        assert_eq!(dec.standard_registers(), (0x8000, 0x7FFF_8000, 1, 0));
     }
 
     // -- BYTEIN stuff-bit handling (T.800 §C.3.4) ---------------------
